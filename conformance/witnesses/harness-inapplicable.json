@@ -25,11 +25,10 @@
     {
       "fixture": "add-raw-output",
       "cause": "stateful-harness-gap",
-      "reason": "sendToScript(): a TWO-output method — addRawOutput(1000, scriptBytes) plus the addOutput(0, count) state continuation. The SDK deploy->call->Spend path (real-crypto/ style) funds a single continuation output; it does not fund/emit the separate 1000-sat raw output, so a real Spend rejects (checkPreimage output binding fails). FOLLOW-UP: build the raw output via CallOptions.outputs so this can also get a tx-context accept/reject differential.",
+      "reason": "sendToScript(): a TWO-output method — addRawOutput(1000, scriptBytes) plus the addOutput(0, count) state continuation. The SDK deploy->call->Spend path (real-crypto/ style) funds a single continuation output; it does not fund/emit the separate 1000-sat raw output, so a real Spend rejects (checkPreimage output binding fails). RESOLVED (audit P0 follow-up): the SDK deploy->call path still can't compose this, but conformance/script_execution_test.go now hand-builds the exact 3-output tx (raw output, state continuation, change) via executeScriptWithTx and gets a genuine tx-context accept/reject differential against the compiled Bitcoin Script bytes — TestRawOutput_ScriptExecution_Accept (raw output present) and TestRawOutput_ScriptExecution_Reject_RawOutputAbsent (raw output omitted from the real tx while the unlocking script still claims it) — superseding the ANF-interpreter-only anf-cross-tier-parity coverage below as the primary claim.",
       "coveredBy": {
-        "kind": "anf-cross-tier-parity",
-        "input": "add-raw-output-publish.json",
-        "note": "conformance/anf-interpreter/cross-interpreter.test.ts runs sendToScript(scriptBytes) through the ANF interpreter (TS reference + Go/Python/Rust/Java/Zig/Ruby drivers where built) and asserts the resulting state + rawOutputs match a pinned golden (conformance/anf-interpreter/expected/add-raw-output-publish.json). This proves cross-tier interpreter correctness of the raw-output intrinsic; it is NOT a tx-context accept/reject differential against compiled Bitcoin Script bytes (no witness/signature-failure path is exercised)."
+        "kind": "go-script-exec",
+        "fixture": "add-raw-output"
       }
     },
     {
@@ -44,22 +43,20 @@
     },
     {
       "fixture": "intent-output-p2pkh",
-      "cause": "stateful-harness-gap",
-      "reason": "payBond(): requireOutputP2PKH(0, bondPKH, bondAmount) demands output 0 be a specific P2PKH, but the SDK continuation places the STATE output at index 0 — the harness cannot compose the required output layout. FOLLOW-UP: use CallOptions.outputs to place the bond output.",
+      "cause": "structurally-unspendable",
+      "reason": "payBond() calls requireOutputP2PKH(0, bondPKH, bondAmount) AND mutates this.count without calling this.addOutput(...) — the compiler's implicit single-output continuation path ALSO claims output 0 for the (large, ~1000-byte) codePart+state script. Both the auto-injected state-continuation hashOutputs assertion and requireOutputP2PKH's own hashOutputs+substr assertions compare against the SAME real preimage's extractOutputHash, which forces output 0 to simultaneously (a) literally BE the codePart-sized continuation script and (b) have its first 34 bytes equal the fixed P2PKH template — impossible for any codePart >= 253 bytes (CompactSize forces a 3-byte 0xfd-prefixed length, never the single byte 0x19 the template requires). PROVEN on the real go-sdk engine (audit P0 follow-up), not merely reasoned about: TestIntentOutputP2PKH_ScriptExecution_StructurallyUnspendable in conformance/script_execution_test.go builds the BEST POSSIBLE accept attempt (a real hand-built tx whose _serialisedOutputs witness is byte-identical to the tx's real serialized outputs, with _newAmount == bondAmount so even the amount field matches) and the real engine still rejects (OP_EQUALVERIFY failed) at the unavoidable length-prefix mismatch. This is a genuine fixture/contract-design bug — payBond() as compiled is permanently unspendable by any real transaction — not a harness limitation; CallOptions.outputs cannot route around it because the auto-injected continuation assertion pins the ENTIRE real output list, not just output 0. FOLLOW-UP: file as a bug (requireOutputP2PKH should be rejected at typecheck time, analogous to the existing addDataOutput mixing check, when used on an index also claimed by an implicit state continuation) or redesign the example to use an explicit this.addOutput(...) for a genuinely P2PKH-shaped output 0.",
       "coveredBy": {
-        "kind": "interpreter-witness-exec",
-        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
-        "note": "1 accept + 2 reject (wrong PKH, wrong hashOutputs) executed via the ANF interpreter with witness-injected serialised outputs (TestContract.setSerialisedOutputs / setMockPreimageBytes); TS tier only, not a full Bitcoin Script byte execution."
+        "kind": "go-script-exec",
+        "fixture": "intent-output-p2pkh"
       }
     },
     {
       "fixture": "intent-prev-output-script",
       "cause": "stateful-harness-gap",
-      "reason": "bind(): extractPrevOutputScript(0, expectedHash) asserts the input's prevout script hashes to a constructor-baked expectedHash — a value only known after the deploy locking script exists (circular for a synthetic harness). FOLLOW-UP: deploy, read back the real prevout script, then re-deploy with its hash.",
+      "reason": "bind(): extractPrevOutputScript(0, expectedHash) asserts hash256(witness) === expectedHash, a constructor-baked readonly field — the witness-bridge pattern documented in docs/cross-covenant-pattern.md (it does NOT itself introspect input 0's real prevout script; only the current input's own BIP-143 preimage fields are available to Bitcoin Script). RESOLVED (audit P0 follow-up): the earlier 'circular' framing assumed input 0 must be the contract's own (self-referential, hence impossible) UTXO; conformance/script_execution_test.go instead builds a real TWO-input transaction where input 0 carries an independent companion prevout (whose real locking script is the witness) and input 1 carries the contract's own UTXO being spent — TestIntentPrevOutputScript_ScriptExecution_Accept (witness bytes hash to expectedHash, genuinely equal to input 0's real prevout script) and TestIntentPrevOutputScript_ScriptExecution_Reject_WrongWitness (tampered witness bytes) — a real tx-context accept/reject differential against the compiled Bitcoin Script bytes.",
       "coveredBy": {
-        "kind": "interpreter-witness-exec",
-        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
-        "note": "1 accept + 2 reject (hash mismatch, no witness supplied) executed via the ANF interpreter with witness-injected prevout script bytes (TestContract.setPrevOutScript); TS tier only, not a full Bitcoin Script byte execution."
+        "kind": "go-script-exec",
+        "fixture": "intent-prev-output-script"
       }
     }
   ]

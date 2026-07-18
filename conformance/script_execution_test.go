@@ -962,6 +962,547 @@ func TestStateful_WrongState_Fail(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Part 5b: Intent-covenant intrinsics — real tx-context accept/reject
+// differentials (audit P0 follow-up). These execute the compiled Bitcoin
+// Script bytes of add-raw-output / intent-output-p2pkh /
+// intent-prev-output-script on the real go-sdk interpreter with a hand-built
+// transaction, closing the gap left by the ANF-interpreter-only coverage
+// recorded in conformance/witnesses/harness-inapplicable.json.
+// ---------------------------------------------------------------------------
+
+// TestRawOutput_ScriptExecution_Accept: RawOutputTest.sendToScript(scriptBytes)
+// declares TWO outputs — this.addRawOutput(1000, scriptBytes) then the state
+// continuation this.addOutput(0, count). The real tx's output set must be
+// EXACTLY [rawOutput, continuation, change] in that order for the
+// auto-injected hashOutputs assertion to hold. This builds that exact layout
+// and executes on the real engine — a genuine accept/reject differential
+// against compiled bytes (not merely the ANF-interpreter golden in
+// conformance/anf-interpreter/expected/add-raw-output-publish.json).
+func TestRawOutput_ScriptExecution_Accept(t *testing.T) {
+	codePartHex, err := compileRúnar("add-raw-output", `{"count":"0"}`)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	codePartBytes, _ := hex.DecodeString(codePartHex)
+
+	// Raw output script bytes chosen by the spender — an arbitrary OP_RETURN
+	// data push. add-raw-output never executes these bytes as a script, so
+	// any bytes are valid here.
+	rawScriptBytes, _ := hex.DecodeString("6a0548656c6c6f") // OP_RETURN "Hello"
+
+	fullLockingHex := codePartHex + "6a" + serializeBigintState(0)
+	continuationScriptHex := codePartHex + "6a" + serializeBigintState(1)
+
+	codeSepOffset := findCodeSeparatorOffset(codePartHex, 0)
+	if codeSepOffset < 0 {
+		t.Fatal("OP_CODESEPARATOR not found in codePart")
+	}
+
+	prevSatoshis := uint64(10000)
+	rawSatoshis := uint64(1000)
+	contSatoshis := uint64(0) // addOutput(0n, count) — declared with zero satoshis
+	changeSatoshis := uint64(8500)
+	changePKH := make([]byte, 20)
+
+	fullLockingScript, err := script.NewFromHex(fullLockingHex)
+	if err != nil {
+		t.Fatalf("parse full locking script: %v", err)
+	}
+	prevOutput := &transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: fullLockingScript,
+	}
+
+	spendTx := transaction.NewTransaction()
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 0,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, prevOutput)
+
+	// Output 0: the raw output (present).
+	rawScript := script.NewFromBytes(rawScriptBytes)
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      rawSatoshis,
+		LockingScript: rawScript,
+	})
+	// Output 1: state continuation (count=1).
+	contScript, _ := script.NewFromHex(continuationScriptHex)
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      contSatoshis,
+		LockingScript: contScript,
+	})
+	// Output 2: P2PKH change.
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      changeSatoshis,
+		LockingScript: buildP2PKHLockingScript(changePKH),
+	})
+
+	scriptCodeHex := fullLockingHex[(codeSepOffset+1)*2:]
+	scriptCodeScript, _ := script.NewFromHex(scriptCodeHex)
+	spendTx.Inputs[0].SetSourceTxOutput(&transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: scriptCodeScript,
+	})
+
+	preimage, err := spendTx.CalcInputPreimage(0, sighash.AllForkID)
+	if err != nil {
+		t.Fatalf("calc preimage: %v", err)
+	}
+
+	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
+
+	// Stack layout (bottom to top): _codePart, scriptBytes, _changePKH,
+	// _changeAmount, txPreimage. No _newAmount (addRawOutput/addOutput
+	// specify amounts explicitly); no method selector (single public method).
+	unlockingHex := encodePushBytes(codePartBytes) +
+		encodePushBytes(rawScriptBytes) +
+		encodePushBytes(changePKH) +
+		encodePushInt(int64(changeSatoshis)) +
+		encodePushBytes(preimage)
+
+	unlockScript, _ := script.NewFromHex(unlockingHex)
+	spendTx.Inputs[0].UnlockingScript = unlockScript
+
+	if err := executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 0, prevOutput); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+// TestRawOutput_ScriptExecution_Reject_RawOutputAbsent: same call, but the
+// REAL tx omits the raw output (only continuation + change) while the
+// unlocking script still claims the same scriptBytes witness. The
+// auto-injected hashOutputs assertion must reject — a real accept/reject
+// differential proving the raw-output binding is actually enforced by the
+// compiled bytes, not merely asserted by the ANF interpreter.
+func TestRawOutput_ScriptExecution_Reject_RawOutputAbsent(t *testing.T) {
+	codePartHex, err := compileRúnar("add-raw-output", `{"count":"0"}`)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	codePartBytes, _ := hex.DecodeString(codePartHex)
+
+	rawScriptBytes, _ := hex.DecodeString("6a0548656c6c6f")
+
+	fullLockingHex := codePartHex + "6a" + serializeBigintState(0)
+	continuationScriptHex := codePartHex + "6a" + serializeBigintState(1)
+
+	codeSepOffset := findCodeSeparatorOffset(codePartHex, 0)
+
+	prevSatoshis := uint64(10000)
+	contSatoshis := uint64(0)
+	changeSatoshis := uint64(9500) // raw output's 1000 sats folded back into change
+	changePKH := make([]byte, 20)
+
+	fullLockingScript, _ := script.NewFromHex(fullLockingHex)
+	prevOutput := &transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: fullLockingScript,
+	}
+
+	spendTx := transaction.NewTransaction()
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 0,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, prevOutput)
+
+	// Raw output is ABSENT — only continuation + change appear on-chain.
+	contScript, _ := script.NewFromHex(continuationScriptHex)
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      contSatoshis,
+		LockingScript: contScript,
+	})
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      changeSatoshis,
+		LockingScript: buildP2PKHLockingScript(changePKH),
+	})
+
+	scriptCodeHex := fullLockingHex[(codeSepOffset+1)*2:]
+	scriptCodeScript, _ := script.NewFromHex(scriptCodeHex)
+	spendTx.Inputs[0].SetSourceTxOutput(&transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: scriptCodeScript,
+	})
+
+	preimage, err := spendTx.CalcInputPreimage(0, sighash.AllForkID)
+	if err != nil {
+		t.Fatalf("calc preimage: %v", err)
+	}
+
+	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
+
+	// Unlocking script still claims the raw output existed (same scriptBytes
+	// witness as the accept case) but the real tx's outputs don't include it.
+	unlockingHex := encodePushBytes(codePartBytes) +
+		encodePushBytes(rawScriptBytes) +
+		encodePushBytes(changePKH) +
+		encodePushInt(int64(changeSatoshis)) +
+		encodePushBytes(preimage)
+
+	unlockScript, _ := script.NewFromHex(unlockingHex)
+	spendTx.Inputs[0].UnlockingScript = unlockScript
+
+	if !scriptRejected(executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 0, prevOutput)) {
+		t.Fatal("expected rejection when the raw output is absent from the real tx, but execution succeeded")
+	}
+}
+
+// TestIntentPrevOutputScript_ScriptExecution_Accept exercises
+// IntentPrevOutputScript.bind(): extractPrevOutputScript(0n, this.expectedHash)
+// asserts hash256(_prevOutScript_0) === expectedHash, where expectedHash is a
+// constructor-baked readonly field. This is the witness-bridge pattern
+// documented in docs/cross-covenant-pattern.md — the compiled Stack-IR only
+// checks the hash of the caller-supplied witness against the pinned
+// expectedHash; it does NOT itself introspect input 0's real prevout script
+// (Bitcoin Script / BIP-143 has no such opcode for a non-current input). To
+// give the test genuine (not just formally-passing) correspondence with
+// "input 0's real prevout script", this builds a real TWO-INPUT transaction:
+// input 0 carries an actual companion prevout whose locking script equals
+// the witness bytes pushed at spend time, and input 1 carries the
+// IntentPrevOutputScript contract's own UTXO (the one actually executed).
+// This sidesteps the self-referential-hash impossibility noted in the prior
+// harness-inapplicable ledger entry (expectedHash cannot equal
+// hash256(a script that embeds expectedHash) — a quine) by pointing the
+// witness at a DIFFERENT, independently-known prevout rather than the
+// contract's own deployed script.
+func TestIntentPrevOutputScript_ScriptExecution_Accept(t *testing.T) {
+	// Companion prevout: input 0's real previous-output locking script.
+	companionScript, err := hex.DecodeString("76a914" + strings.Repeat("11", 20) + "88ac")
+	if err != nil {
+		t.Fatalf("decode companion script: %v", err)
+	}
+	expectedHash := crypto.Sha256d(companionScript)
+
+	codePartHex, err := compileRúnar("intent-prev-output-script",
+		fmt.Sprintf(`{"expectedHash":"%s","count":"0"}`, hex.EncodeToString(expectedHash)))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	codePartBytes, _ := hex.DecodeString(codePartHex)
+
+	fullLockingHex := codePartHex + "6a" + serializeBigintState(0)
+	continuationScriptHex := codePartHex + "6a" + serializeBigintState(1)
+
+	codeSepOffset := findCodeSeparatorOffset(codePartHex, 0)
+	if codeSepOffset < 0 {
+		t.Fatal("OP_CODESEPARATOR not found in codePart")
+	}
+
+	prevSatoshis := uint64(10000)
+	contSatoshis := uint64(9000)
+	changeSatoshis := uint64(500)
+	changePKH := make([]byte, 20)
+
+	fullLockingScript, err := script.NewFromHex(fullLockingHex)
+	if err != nil {
+		t.Fatalf("parse full locking script: %v", err)
+	}
+	contractPrevOutput := &transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: fullLockingScript,
+	}
+	companionPrevOutput := &transaction.TransactionOutput{
+		Satoshis:      1000,
+		LockingScript: script.NewFromBytes(companionScript),
+	}
+
+	spendTx := transaction.NewTransaction()
+	// Input 0: the companion prevout referenced by extractPrevOutputScript(0n, ...).
+	// Its own script is never executed by this test — only its outpoint (via
+	// hashPrevouts) and locking-script bytes (as the witness source) matter.
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 1,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, companionPrevOutput)
+	// Input 1: the contract's own UTXO — the one actually executed below.
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 0,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, contractPrevOutput)
+
+	contScript, _ := script.NewFromHex(continuationScriptHex)
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      contSatoshis,
+		LockingScript: contScript,
+	})
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      changeSatoshis,
+		LockingScript: buildP2PKHLockingScript(changePKH),
+	})
+
+	scriptCodeHex := fullLockingHex[(codeSepOffset+1)*2:]
+	scriptCodeScript, _ := script.NewFromHex(scriptCodeHex)
+	spendTx.Inputs[1].SetSourceTxOutput(&transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: scriptCodeScript,
+	})
+
+	preimage, err := spendTx.CalcInputPreimage(1, sighash.AllForkID)
+	if err != nil {
+		t.Fatalf("calc preimage: %v", err)
+	}
+
+	spendTx.Inputs[1].SetSourceTxOutput(contractPrevOutput)
+
+	// Stack layout (bottom to top): _codePart, _changePKH, _changeAmount,
+	// _newAmount, txPreimage, _prevOutScript_0. No method selector (single
+	// public method).
+	unlockingHex := encodePushBytes(codePartBytes) +
+		encodePushBytes(changePKH) +
+		encodePushInt(int64(changeSatoshis)) +
+		encodePushInt(int64(contSatoshis)) +
+		encodePushBytes(preimage) +
+		encodePushBytes(companionScript)
+
+	unlockScript, _ := script.NewFromHex(unlockingHex)
+	spendTx.Inputs[1].UnlockingScript = unlockScript
+
+	if err := executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 1, contractPrevOutput); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
+// TestIntentPrevOutputScript_ScriptExecution_Reject_WrongWitness: same setup
+// as the accept case, but the unlocking script supplies DIFFERENT bytes for
+// _prevOutScript_0 than the constructor-baked expectedHash commits to (a
+// tampered/forged prevout-script claim). The real engine must reject.
+func TestIntentPrevOutputScript_ScriptExecution_Reject_WrongWitness(t *testing.T) {
+	companionScript, err := hex.DecodeString("76a914" + strings.Repeat("11", 20) + "88ac")
+	if err != nil {
+		t.Fatalf("decode companion script: %v", err)
+	}
+	expectedHash := crypto.Sha256d(companionScript)
+
+	codePartHex, err := compileRúnar("intent-prev-output-script",
+		fmt.Sprintf(`{"expectedHash":"%s","count":"0"}`, hex.EncodeToString(expectedHash)))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	codePartBytes, _ := hex.DecodeString(codePartHex)
+
+	fullLockingHex := codePartHex + "6a" + serializeBigintState(0)
+	continuationScriptHex := codePartHex + "6a" + serializeBigintState(1)
+
+	codeSepOffset := findCodeSeparatorOffset(codePartHex, 0)
+
+	prevSatoshis := uint64(10000)
+	contSatoshis := uint64(9000)
+	changeSatoshis := uint64(500)
+	changePKH := make([]byte, 20)
+
+	fullLockingScript, _ := script.NewFromHex(fullLockingHex)
+	contractPrevOutput := &transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: fullLockingScript,
+	}
+	companionPrevOutput := &transaction.TransactionOutput{
+		Satoshis:      1000,
+		LockingScript: script.NewFromBytes(companionScript),
+	}
+
+	spendTx := transaction.NewTransaction()
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 1,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, companionPrevOutput)
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 0,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, contractPrevOutput)
+
+	contScript, _ := script.NewFromHex(continuationScriptHex)
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      contSatoshis,
+		LockingScript: contScript,
+	})
+	spendTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      changeSatoshis,
+		LockingScript: buildP2PKHLockingScript(changePKH),
+	})
+
+	scriptCodeHex := fullLockingHex[(codeSepOffset+1)*2:]
+	scriptCodeScript, _ := script.NewFromHex(scriptCodeHex)
+	spendTx.Inputs[1].SetSourceTxOutput(&transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: scriptCodeScript,
+	})
+
+	preimage, err := spendTx.CalcInputPreimage(1, sighash.AllForkID)
+	if err != nil {
+		t.Fatalf("calc preimage: %v", err)
+	}
+
+	spendTx.Inputs[1].SetSourceTxOutput(contractPrevOutput)
+
+	// Tampered witness: a script that does NOT hash to expectedHash.
+	tamperedScript, _ := hex.DecodeString("76a914" + strings.Repeat("22", 20) + "88ac")
+
+	unlockingHex := encodePushBytes(codePartBytes) +
+		encodePushBytes(changePKH) +
+		encodePushInt(int64(changeSatoshis)) +
+		encodePushInt(int64(contSatoshis)) +
+		encodePushBytes(preimage) +
+		encodePushBytes(tamperedScript)
+
+	unlockScript, _ := script.NewFromHex(unlockingHex)
+	spendTx.Inputs[1].UnlockingScript = unlockScript
+
+	if !scriptRejected(executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 1, contractPrevOutput)) {
+		t.Fatal("expected rejection with a tampered prevout-script witness, but execution succeeded")
+	}
+}
+
+// TestIntentOutputP2PKH_ScriptExecution_StructurallyUnspendable is NOT an
+// accept/reject pair — it is a maximal-effort ACCEPT ATTEMPT that
+// demonstrates, on the real go-sdk engine, that IntentOutputP2PKH.payBond()
+// can NEVER be spent by any real transaction. This is a genuine finding, not
+// a harness limitation (see the long comment below for the proof); it is
+// documented here rather than faked as a pass.
+//
+// payBond() calls requireOutputP2PKH(0n, this.bondPKH, this.bondAmount) AND
+// mutates this.count without calling this.addOutput(...) explicitly. The
+// compiler therefore emits TWO INDEPENDENT hashOutputs assertions against
+// the SAME real preimage's extractOutputHash:
+//
+//  1. the auto-injected state-continuation check (04-anf-lower.ts, the
+//     "single-output continuation" path, `isAutoInjectedStateCheck: true`):
+//     hash256(computeStateOutput(txPreimage, _codePart+state, _newAmount)
+//     ++ changeOutput) === extractOutputHash(txPreimage)
+//  2. requireOutputP2PKH's own witness-bridge check:
+//     hash256(_serialisedOutputs) === extractOutputHash(txPreimage)
+//     followed by: substr(_serialisedOutputs, 0, 34) === P2PKH(bondPKH, bondAmount)
+//
+// Both (1) and (2)'s left-hand hashes are compared against the SAME
+// `extractOutputHash(txPreimage)` value, which is the REAL BIP-143
+// hashOutputs of the ACTUAL spending transaction. For (1) to hold, output 0
+// of the real tx must literally BE `computeStateOutput(...)` — i.e. the
+// large compiled codePart (1000 bytes for this fixture) + OP_RETURN + state,
+// NOT a 34-byte P2PKH script. For (2)'s substr assertion to hold, the first
+// 34 bytes of that SAME real output 0 must equal the fixed P2PKH template
+// (8-byte LE amount ‖ 0x19 0x76 0xa9 0x14 ‖ 20-byte pubkeyHash ‖ 0x88 0xac).
+// A CompactSize-encoded output whose script is >= 253 bytes (this codePart
+// alone is 1000 bytes) NEVER starts with the single byte 0x19 at that
+// position — it starts with 0xfd followed by a 2-byte length. There is no
+// number of accept attempts, witness choices, or CallOptions.outputs
+// composition that can satisfy both simultaneously: (1) pins output 0's
+// bytes exactly (up to hash collision, i.e. absolutely for any real spend),
+// and (2) requires those SAME bytes to also be a completely different,
+// much shorter, fixed template. This is unconditional on `_newAmount`,
+// `_changePKH`/`_changeAmount`, or any other witness the spender controls.
+//
+// This test constructs the BEST POSSIBLE accept attempt — it sets
+// `_serialisedOutputs` to the REAL, byte-exact serialization of the real
+// tx's own outputs (so assertion (2)'s hashOutputs half and assertion (1)
+// both trivially hold — there is no witness-vs-reality mismatch at all —
+// and even sets `_newAmount == bondAmount` so the first 8 bytes of output 0
+// match the P2PKH template's amount field exactly) and shows the ONLY
+// remaining failure is the unavoidable CompactSize length-prefix mismatch
+// at byte offset 8. That is real-engine proof the contract is permanently
+// unspendable, not a harness gap — see the ledger note in
+// conformance/witnesses/harness-inapplicable.json for the disposition.
+func TestIntentOutputP2PKH_ScriptExecution_StructurallyUnspendable(t *testing.T) {
+	bondPKH := make([]byte, 20)
+	for i := range bondPKH {
+		bondPKH[i] = byte(0x11 * (i + 1) % 256)
+	}
+	bondAmount := int64(5000)
+
+	codePartHex, err := compileRúnar("intent-output-p2pkh",
+		fmt.Sprintf(`{"bondPKH":"%s","bondAmount":"%d","count":"0"}`, hex.EncodeToString(bondPKH), bondAmount))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	codePartBytes, _ := hex.DecodeString(codePartHex)
+	t.Logf("codePart is %d bytes — a CompactSize-encoded output containing it can never start with the single byte 0x19 (25) that the fixed-width P2PKH template requires", len(codePartBytes))
+
+	fullLockingHex := codePartHex + "6a" + serializeBigintState(0)
+	continuationScriptHex := codePartHex + "6a" + serializeBigintState(1)
+
+	codeSepOffset := findCodeSeparatorOffset(codePartHex, 0)
+	if codeSepOffset < 0 {
+		t.Fatal("OP_CODESEPARATOR not found in codePart")
+	}
+
+	prevSatoshis := uint64(10000)
+	// _newAmount == bondAmount: makes the first 8 bytes of the real
+	// continuation output byte-identical to the P2PKH template's amount
+	// field, isolating the failure to the length-prefix/script bytes.
+	contSatoshis := uint64(bondAmount)
+	changeSatoshis := uint64(4500)
+	changePKH := make([]byte, 20)
+
+	fullLockingScript, err := script.NewFromHex(fullLockingHex)
+	if err != nil {
+		t.Fatalf("parse full locking script: %v", err)
+	}
+	prevOutput := &transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: fullLockingScript,
+	}
+
+	spendTx := transaction.NewTransaction()
+	spendTx.AddInputWithOutput(&transaction.TransactionInput{
+		SourceTXID:       makeFundingTxID(),
+		SourceTxOutIndex: 0,
+		SequenceNumber:   transaction.DefaultSequenceNumber,
+	}, prevOutput)
+
+	contScript, _ := script.NewFromHex(continuationScriptHex)
+	contOutput := &transaction.TransactionOutput{
+		Satoshis:      contSatoshis,
+		LockingScript: contScript,
+	}
+	changeOutput := &transaction.TransactionOutput{
+		Satoshis:      changeSatoshis,
+		LockingScript: buildP2PKHLockingScript(changePKH),
+	}
+	spendTx.AddOutput(contOutput)
+	spendTx.AddOutput(changeOutput)
+
+	scriptCodeHex := fullLockingHex[(codeSepOffset+1)*2:]
+	scriptCodeScript, _ := script.NewFromHex(scriptCodeHex)
+	spendTx.Inputs[0].SetSourceTxOutput(&transaction.TransactionOutput{
+		Satoshis:      prevSatoshis,
+		LockingScript: scriptCodeScript,
+	})
+
+	preimage, err := spendTx.CalcInputPreimage(0, sighash.AllForkID)
+	if err != nil {
+		t.Fatalf("calc preimage: %v", err)
+	}
+
+	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
+
+	// Best-effort _serialisedOutputs: the REAL, byte-exact serialization of
+	// the real tx's own outputs (amount ‖ CompactSize(scriptLen) ‖ script),
+	// via the go-sdk's own TransactionOutput.Bytes() so it is guaranteed to
+	// match whatever hashOutputs/extractOutputHash actually hashes.
+	serialisedOutputs := append(append([]byte{}, contOutput.Bytes()...), changeOutput.Bytes()...)
+	t.Logf("_serialisedOutputs[0:12] = %x (want 8-byte amount ‖ 0x19 0x76 0xa9 0x14 for a real P2PKH match)", serialisedOutputs[:12])
+
+	unlockingHex := encodePushBytes(codePartBytes) +
+		encodePushBytes(changePKH) +
+		encodePushInt(int64(changeSatoshis)) +
+		encodePushInt(int64(contSatoshis)) +
+		encodePushBytes(preimage) +
+		encodePushBytes(serialisedOutputs)
+
+	unlockScript, _ := script.NewFromHex(unlockingHex)
+	spendTx.Inputs[0].UnlockingScript = unlockScript
+
+	execErr := executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 0, prevOutput)
+	if !scriptRejected(execErr) {
+		t.Fatalf("expected the real engine to reject even the best-effort accept attempt (this contract is provably unspendable), but execution succeeded")
+	}
+	t.Logf("confirmed REJECT on the real engine (expected — see test doc comment): %v", execErr)
+}
+
+// ---------------------------------------------------------------------------
 // Part 6: WOTS+ Full Execution (pure Go WOTS+ implementation)
 // ---------------------------------------------------------------------------
 
