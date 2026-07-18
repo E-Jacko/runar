@@ -781,8 +781,12 @@ def _emit_slh_fors(emit: Callable, p: SLHCodegenParams) -> None:
         bit_start = i * a
         byte_start = bit_start // 8
         bit_offset = bit_start % 8
-        bits_in_first = min(8 - bit_offset, a)
-        take = 1 if a <= bits_in_first else 2
+        # Number of bytes the `a`-bit field spans starting at bit_offset. The prior
+        # `a > bits_in_first ? 2 : 1` capped this at 2 bytes, but a field of a>8 bits
+        # at an unlucky alignment spans 3 bytes (e.g. a=14, bit_offset in {4,6} for
+        # 192s/256s) -- matching slh-dsa.ts extractForsIdx, which reads bytes until
+        # bitsRead >= a. total_bits = take*8 below then shifts/masks generically.
+        take = (bit_offset + a + 7) // 8
 
         if byte_start > 0:
             emit(_make_stack_op(op="push", value=_big_int_push(byte_start)))
@@ -953,7 +957,11 @@ def _emit_slh_hmsg(emit: Callable, n: int, out_len: int) -> None:
                 emit(_make_stack_op(op="opcode", code="OP_CAT"))
                 emit(_make_stack_op(op="swap"))
             else:
-                emit(_make_stack_op(op="swap"))
+                # Last block: stack is `resultAcc block`, append block at the END
+                # (resultAcc || block). A bare OP_CAT does exactly that (2nd-from-top
+                # || top). The prior `swap` here produced `block || resultAcc`, which
+                # reversed the final MGF1 block for every digest spanning >1 SHA-256
+                # block (all SLH-DSA sets except 128s) -- see slh-dsa.ts Hmsg().
                 emit(_make_stack_op(op="opcode", code="OP_CAT"))
 
 

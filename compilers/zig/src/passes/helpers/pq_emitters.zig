@@ -803,14 +803,13 @@ fn emitSLHFors(builder: *Builder, p: SLHCodegenParams) PqEmitterError!void {
         const bit_start = i * a;
         const byte_start = bit_start / 8;
         const bit_offset = bit_start % 8;
-        const bits_in_first = @min(8 - bit_offset, a);
-        // Match the TS / Rust / Python / Ruby / Java reference exactly:
-        // `take = (a <= bits_in_first) ? 1 : 2`. Using a ceil(...)/8 formula
-        // here produces a different byte-extraction width for the 192s/256s
-        // param sets (a=14) when the bit window straddles three bytes; all
-        // five reference tiers deliberately cap `take` at 2 and rely on the
-        // OP_MOD below to mask off any out-of-range bits.
-        const take: usize = if (a > bits_in_first) 2 else 1;
+        // Number of bytes the `a`-bit field spans starting at bit_offset. The
+        // prior `a > bits_in_first ? 2 : 1` capped this at 2 bytes, but a field
+        // of a>8 bits at an unlucky alignment spans 3 bytes (e.g. a=14,
+        // bit_offset in {4,6} for 192s/256s) — matching slh-dsa.ts extractForsIdx,
+        // which reads bytes until bitsRead >= a. total_bits = take*8 below then
+        // shifts/masks generically.
+        const take: usize = (bit_offset + a + 7) / 8;
 
         if (byte_start > 0) {
             try builder.emitPushInt(@intCast(byte_start));
@@ -826,10 +825,10 @@ fn emitSLHFors(builder: *Builder, p: SLHCodegenParams) PqEmitterError!void {
         try builder.emitOp("OP_NUM2BIN");
         try builder.emitOp("OP_CAT");
         try builder.emitOp("OP_BIN2NUM");
-        // Signed math: with TS-style take=2 capping, `total_bits - bit_offset
-        // - a` can be negative (e.g. 192s i=1 → 16 - 6 - 14 = -4). In that
-        // case the reference compilers skip the OP_DIV. Use signed arithmetic
-        // here to avoid usize underflow.
+        // total_bits = take*8 >= bit_offset + a with the ceil-based take above,
+        // so right_shift is never negative; signed i64 math is kept to compute
+        // it without usize underflow at the type level. right_shift == 0 skips
+        // the OP_DIV, matching the reference tiers.
         const total_bits: i64 = @as(i64, @intCast(take)) * 8;
         const right_shift: i64 = total_bits - @as(i64, @intCast(bit_offset)) - @as(i64, @intCast(a));
         if (right_shift > 0) {
@@ -971,7 +970,11 @@ fn emitSLHHmsg(builder: *Builder, out_len: usize) PqEmitterError!void {
             try builder.emitOp("OP_CAT");
             try builder.emitOp("OP_SWAP");
         } else {
-            try builder.emitOp("OP_SWAP");
+            // Last block: stack is `resultAcc block`, append block at the END
+            // (resultAcc || block). A bare OP_CAT does exactly that (2nd-from-top
+            // || top). The prior `swap` here produced `block || resultAcc`, which
+            // reversed the final MGF1 block for every digest spanning >1 SHA-256
+            // block (all SLH-DSA sets except 128s) — see slh-dsa.ts Hmsg().
             try builder.emitOp("OP_CAT");
         }
     }

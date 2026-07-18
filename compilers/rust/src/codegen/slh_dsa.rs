@@ -999,8 +999,12 @@ fn emit_slh_fors(emit: &mut dyn FnMut(StackOp), p: &SLHCodegenParams) {
         let bit_start = i * a;
         let byte_start = bit_start / 8;
         let bit_offset = bit_start % 8;
-        let bits_in_first = std::cmp::min(8 - bit_offset, a);
-        let take = if a > bits_in_first { 2 } else { 1 };
+        // Number of bytes the `a`-bit field spans starting at bit_offset. The
+        // prior `a > bits_in_first ? 2 : 1` capped this at 2 bytes, but a field of
+        // a>8 bits at an unlucky alignment spans 3 bytes (e.g. a=14, bit_offset in
+        // {4,6} for 192s/256s) -- matching slh-dsa.ts extractForsIdx, which reads
+        // bytes until bitsRead >= a. total_bits = take*8 below shifts/masks generically.
+        let take = (bit_offset + a + 7) / 8;
 
         if byte_start > 0 {
             emit(StackOp::Push(PushValue::Int(BigInt::from(byte_start as i128))));
@@ -1252,7 +1256,11 @@ fn emit_slh_hmsg(emit: &mut dyn FnMut(StackOp), n: usize, out_len: usize) {
                 emit(StackOp::Opcode("OP_CAT".into()));
                 emit(StackOp::Swap);
             } else {
-                emit(StackOp::Swap);
+                // Last block: stack is `resultAcc block`, append block at the END
+                // (resultAcc || block). A bare OP_CAT does exactly that (2nd-from-top
+                // || top). The prior `swap` here produced `block || resultAcc`, which
+                // reversed the final MGF1 block for every digest spanning >1 SHA-256
+                // block (all SLH-DSA sets except 128s) -- see slh-dsa.ts Hmsg().
                 emit(StackOp::Opcode("OP_CAT".into()));
             }
         }

@@ -58,11 +58,14 @@ func TestSlhdsaEmitOpCountGoldens(t *testing.T) {
 		param string
 		want  int
 	}{
-		// BUG-011: each verifySLHDSA_* prologue now emits an OP_SIZE exact-length
-		// guard (5 additional ops per parameter set) before the existing FORS /
-		// Merkle path expansion.
-		{"SHA2_128f", 85766},
-		{"SHA2_192s", 41904},
+		// Counts reflect the SLH-DSA codegen miscompile fix (audit #2): emitSLHHmsg
+		// dropped one reversing swap on the final multi-block MGF1 block (-1 op per
+		// set with a >1-block digest), and emitSLHFors now sizes the FORS index
+		// window to ceil((bitOffset+a)/8) instead of capping at 2 bytes, so a=14
+		// sets (192s/256s) emit a 3-byte window on unlucky alignments. Must match
+		// the TS peer goldens in slh-dsa-codegen.test.ts.
+		{"SHA2_128f", 85765},
+		{"SHA2_192s", 41951},
 	}
 	for _, tc := range cases {
 		t.Run(tc.param, func(t *testing.T) {

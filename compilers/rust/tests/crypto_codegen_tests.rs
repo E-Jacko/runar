@@ -210,13 +210,20 @@ fn test_emit_verify_slh_dsa_op_counts_match_go_reference() {
     // guard (+5 ops per parameter set) before the existing FORS / Merkle
     // path expansion. Counts updated in lockstep with the Go reference
     // (compilers/go/codegen/crypto_codegen_test.go).
+    //
+    // SLH-DSA codegen miscompile fix (audit #2): emit_slh_hmsg dropped one
+    // reversing swap on the final multi-block MGF1 block (-1 op per set with a
+    // >1-block digest: 128f/192f/256f/192s/256s), and emit_slh_fors now sizes
+    // the FORS index window to ceil((bit_offset+a)/8) instead of capping at 2
+    // bytes, so the a=14 sets (192s/256s) emit a 3-byte window on unlucky
+    // alignments (+48 for 192s, +66 for 256s). Numbers match the Go/TS peers.
     let expected = [
         ("SHA2_128s", 29564usize),
-        ("SHA2_128f", 85766),
-        ("SHA2_192s", 41904),
-        ("SHA2_192f", 121713),
-        ("SHA2_256s", 61128),
-        ("SHA2_256f", 122998),
+        ("SHA2_128f", 85765),
+        ("SHA2_192s", 41951),
+        ("SHA2_192f", 121712),
+        ("SHA2_256s", 61193),
+        ("SHA2_256f", 122997),
     ];
     for (key, want) in expected {
         let ops = collect(|s| emit_verify_slh_dsa(s, key));

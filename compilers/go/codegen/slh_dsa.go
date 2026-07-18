@@ -960,14 +960,12 @@ func emitSLHFors(emit func(StackOp), p SLHCodegenParams) {
 		bitStart := i * a
 		byteStart := bitStart / 8
 		bitOffset := bitStart % 8
-		bitsInFirst := 8 - bitOffset
-		if bitsInFirst > a {
-			bitsInFirst = a
-		}
-		take := 1
-		if a > bitsInFirst {
-			take = 2
-		}
+		// Number of bytes the `a`-bit field spans starting at bitOffset. The
+		// prior `a > bitsInFirst ? 2 : 1` capped this at 2 bytes, but a field of
+		// a>8 bits at an unlucky alignment spans 3 bytes (e.g. a=14, bitOffset in
+		// {4,6} for 192s/256s) — matching slh-dsa.ts extractForsIdx, which reads
+		// bytes until bitsRead >= a. totalBits = take*8 below shifts/masks generically.
+		take := (bitOffset + a + 7) / 8
 
 		if byteStart > 0 {
 			emit(StackOp{Op: "push", Value: bigIntPush(int64(byteStart))})
@@ -1210,7 +1208,11 @@ func emitSLHHmsg(emit func(StackOp), n, outLen int) {
 				emit(StackOp{Op: "opcode", Code: "OP_CAT"})
 				emit(StackOp{Op: "swap"})
 			} else {
-				emit(StackOp{Op: "swap"})
+				// Last block: stack is `resultAcc block`, append block at the END
+				// (resultAcc || block). A bare OP_CAT does exactly that (2nd-from-top
+				// || top). The prior `swap` here produced `block || resultAcc`, which
+				// reversed the final MGF1 block for every digest spanning >1 SHA-256
+				// block (all SLH-DSA sets except 128s) -- see slh-dsa.ts Hmsg().
 				emit(StackOp{Op: "opcode", Code: "OP_CAT"})
 			}
 		}

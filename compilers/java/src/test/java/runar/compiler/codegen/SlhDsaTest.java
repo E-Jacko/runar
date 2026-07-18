@@ -139,30 +139,43 @@ class SlhDsaTest {
     // pushBytes(sigLen), OP_EQUALVERIFY, OP_SWAP) directly after the existing
     // three-OP_TOALTSTACK preamble (`007b7b7b`). Lengths match the original
     // prefix lengths so the assertEquals substring contract is preserved.
+    //
+    // SLH-DSA MGF1 byte-order fix: the Hmsg last-block `swap` removal deletes an
+    // OP_SWAP (`7c`) from the MGF1 tail, which falls inside the 100-byte prefix
+    // window for 192s/192f/256s/256f (their shorter pkSeedPad padding puts the
+    // MGF1 loop earlier than 128f's, whose window ends before it). Prefixes for
+    // those four sets re-captured from the fixed pipeline.
     private static final String EXPECTED_PREFIX_128S =
         "007b7b7b7c8202b01e887c607f78300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007e537a607f785579557958797e7e7ea804000000007ea8011e7f7501157f577f7c517f517f";
     private static final String EXPECTED_PREFIX_128F =
         "007b7b7b7c8202c042887c607f78300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007e537a607f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea8";
     private static final String EXPECTED_PREFIX_192S =
-        "007b7b7b7c8202603f887c01187f7828000000000000000000000000000000000000000000000000000000000000000000000000000000007e537a01187f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea8577f757c7e01";
+        "007b7b7b7c8202603f887c01187f7828000000000000000000000000000000000000000000000000000000000000000000000000000000007e537a01187f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea8577f757e011e";
     private static final String EXPECTED_PREFIX_192F =
-        "007b7b7b7c8203508b00887c01187f7828000000000000000000000000000000000000000000000000000000000000000000000000000000007e537a01187f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea85a7f757c7e";
+        "007b7b7b7c8203508b00887c01187f7828000000000000000000000000000000000000000000000000000000000000000000000000000000007e537a01187f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea85a7f757e01";
     private static final String EXPECTED_PREFIX_256S =
-        "007b7b7b7c82026074887c01207f782000000000000000000000000000000000000000000000000000000000000000007e537a01207f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea85f7f757c7e01277f577f7c517f51";
+        "007b7b7b7c82026074887c01207f782000000000000000000000000000000000000000000000000000000000000000007e537a01207f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea85f7f757e01277f577f7c517f517f";
     private static final String EXPECTED_PREFIX_256F =
-        "007b7b7b7c820360be00887c01207f782000000000000000000000000000000000000000000000000000000000000000007e537a01207f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea85c7f757c7e01237f587f7c517f";
+        "007b7b7b7c820360be00887c01207f782000000000000000000000000000000000000000000000000000000000000000007e537a01207f785579557958797e7e7ea8007c7604000000007ea87b7c7e7c04000000017ea85c7f757e01237f587f7c517f51";
 
     // BUG-011: each verifySLHDSA_* prologue now emits an OP_SIZE exact-length
     // guard (+5 Stack-IR ops per parameter set, +14 or +16 hex chars depending
     // on the size-push encoding) before the existing FORS / Merkle path
     // expansion. Numbers captured by running the test under the post-merge
     // codegen and reading the assertion-error report.
+    //
+    // SLH-DSA MGF1/FORS byte-order fix: the Hmsg last-block `swap` removal
+    // trims one OP (-2 hex chars) for every digest spanning >1 SHA-256 block
+    // (all sets except 128s), and the FORS index-extraction ceil fix widens the
+    // 14-bit-field span from 2 to 3 bytes for 192s/256s (a=14), adding ops. New
+    // lengths re-captured from the fixed pipeline; all 5 conformance goldens
+    // (expected-script.hex) match the same codegen byte-for-byte.
     private static final int EXPECTED_HEX_LEN_128S = 377194;
-    private static final int EXPECTED_HEX_LEN_128F = 1067824;
-    private static final int EXPECTED_HEX_LEN_192S = 553064;
-    private static final int EXPECTED_HEX_LEN_192F = 1576080;
-    private static final int EXPECTED_HEX_LEN_256S = 738206;
-    private static final int EXPECTED_HEX_LEN_256F = 1458728;
+    private static final int EXPECTED_HEX_LEN_128F = 1067822;
+    private static final int EXPECTED_HEX_LEN_192S = 553166;
+    private static final int EXPECTED_HEX_LEN_192F = 1576078;
+    private static final int EXPECTED_HEX_LEN_256S = 738346;
+    private static final int EXPECTED_HEX_LEN_256F = 1458726;
 
     @Test
     void compilesSlhDsa128sToCanonicalHex() throws Exception {

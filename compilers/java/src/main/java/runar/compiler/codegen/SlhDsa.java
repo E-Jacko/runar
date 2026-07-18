@@ -814,8 +814,12 @@ public final class SlhDsa {
             int bitStart = i * a;
             int byteStart = bitStart / 8;
             int bitOffset = bitStart % 8;
-            int bitsInFirst = Math.min(8 - bitOffset, a);
-            int take = a <= bitsInFirst ? 1 : 2;
+            // Number of bytes the `a`-bit field spans starting at bitOffset. The
+            // prior `a <= bitsInFirst ? 1 : 2` capped this at 2 bytes, but a field
+            // of a>8 bits at an unlucky alignment spans 3 bytes (e.g. a=14,
+            // bitOffset in {4,6} for 192s/256s). totalBits = take*8 below then
+            // shifts/masks generically.
+            int take = (bitOffset + a + 7) / 8;
 
             if (byteStart > 0) {
                 emit.accept(pushInt(byteStart));
@@ -1005,7 +1009,12 @@ public final class SlhDsa {
                     emit.accept(new OpcodeOp("OP_CAT"));
                     emit.accept(new SwapOp());
                 } else {
-                    emit.accept(new SwapOp());
+                    // Last block: stack is `resultAcc block`, append block at the
+                    // END (resultAcc || block). A bare OP_CAT does exactly that
+                    // (2nd-from-top || top). The prior `swap` here produced
+                    // `block || resultAcc`, reversing the final MGF1 block for
+                    // every digest spanning >1 SHA-256 block (all SLH-DSA sets
+                    // except 128s).
                     emit.accept(new OpcodeOp("OP_CAT"));
                 }
             }

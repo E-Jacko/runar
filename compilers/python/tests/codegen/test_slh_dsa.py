@@ -28,12 +28,18 @@ SUPPORTED_KEYS = [
     # BUG-011: each verifySLHDSA_* prologue now emits an OP_SIZE exact-length
     # guard (5 additional ops per parameter set) before the existing FORS /
     # Merkle path expansion.
+    #
+    # SLH-DSA Hmsg/FORS codegen fix: (1) the Hmsg MGF1 last-block reversal drops
+    # one OP_SWAP for every digest spanning >1 SHA-256 block (all sets except
+    # 128s), and (2) the FORS index extraction now reads a 3-byte window when an
+    # a-bit field straddles it (a=14 sets 192s/256s), adding ops there. New
+    # counts match byte-for-byte against the regenerated goldens.
     ("SHA2_128s",  29564),
-    ("SHA2_128f",  85766),
-    ("SHA2_192s",  41904),
-    ("SHA2_192f", 121713),
-    ("SHA2_256s",  61128),
-    ("SHA2_256f", 122998),
+    ("SHA2_128f",  85765),
+    ("SHA2_192s",  41951),
+    ("SHA2_192f", 121712),
+    ("SHA2_256s",  61193),
+    ("SHA2_256f", 122997),
 ])
 def test_op_count(key, expected):
     ops: list[StackOp] = []

@@ -24,12 +24,15 @@ function countSlhdsaOps(paramKey: string): number {
 
 describe('SLH-DSA codegen — op-count goldens (T-006)', () => {
   const goldens: Array<[paramKey: string, expected: number]> = [
-    // +5 ops vs pre-BUG-011 baseline: the new OP_SIZE / push / OP_EQUALVERIFY
-    // length guard adds 3 ops, and the rearranged tracker ordering (sig brought
-    // to top first now) adds one swap on the new toTop("sig") and one swap on
-    // the following toTop("pubkey") that the old code emitted as a no-op.
-    ['SHA2_128f', 85766],
-    ['SHA2_192s', 41904],
+    // Counts reflect the SLH-DSA codegen miscompile fix (audit #2): emitSLHHmsg
+    // dropped one reversing `swap` on the final multi-block MGF1 block (-1 op on
+    // every set whose digest spans >1 SHA-256 block), and emitSLHFors now sizes
+    // the FORS index window to ceil((bitOffset+a)/8) instead of capping at 2
+    // bytes — so a=14 sets (192s/256s) emit a 3-byte window (an extra reverse
+    // pair + the previously-skipped right-shift) on unlucky alignments. 128f
+    // (a=6) sees only the Hmsg -1; 192s sees -1 + 48.
+    ['SHA2_128f', 85765],
+    ['SHA2_192s', 41951],
   ];
 
   for (const [paramKey, expected] of goldens) {

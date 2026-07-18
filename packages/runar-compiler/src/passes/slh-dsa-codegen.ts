@@ -850,8 +850,12 @@ function emitSLHFors(
     const bitStart = i * a;
     const byteStart = Math.floor(bitStart / 8);
     const bitOffset = bitStart % 8;
-    const bitsInFirst = Math.min(8 - bitOffset, a);
-    const take = a > bitsInFirst ? 2 : 1;
+    // Number of bytes the `a`-bit field spans starting at bitOffset. The prior
+    // `a > bitsInFirst ? 2 : 1` capped this at 2 bytes, but a field of a>8 bits
+    // at an unlucky alignment spans 3 bytes (e.g. a=14, bitOffset in {4,6} for
+    // 192s/256s) — matching slh-dsa.ts extractForsIdx, which reads bytes until
+    // `bitsRead >= a`. totalBits = take*8 below then shifts/masks generically.
+    const take = Math.ceil((bitOffset + a) / 8);
 
     if (byteStart > 0) {
       emit({ op: 'push', value: BigInt(byteStart) });
@@ -1091,7 +1095,11 @@ function emitSLHHmsg(
         emit({ op: 'opcode', code: 'OP_CAT' });
         emit({ op: 'swap' });
       } else {
-        emit({ op: 'swap' });
+        // Last block: stack is `resultAcc block`, append block at the END
+        // (resultAcc || block). A bare OP_CAT does exactly that (2nd-from-top
+        // || top). The prior `swap` here produced `block || resultAcc`, which
+        // reversed the final MGF1 block for every digest spanning >1 SHA-256
+        // block (all SLH-DSA sets except 128s) — see slh-dsa.ts Hmsg().
         emit({ op: 'opcode', code: 'OP_CAT' });
       }
     }
