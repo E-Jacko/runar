@@ -43,7 +43,13 @@ A skip not in this file is a bug. If you must skip a test:
 | Test | File:line | Category | Rationale |
 |---|---|---|---|
 | `TestWOTS_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:1093,1123,1154` | Environmental | WOTS+ script execution is several seconds per test. Run with `go test -count=1 ./...` (no `-short`) to enable. |
-| `TestSLHDSA_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:1192,1243,1281` | Environmental | SLH-DSA generates a ~248 KB script; running it through the BSV interpreter takes minutes. Drop `-short` to enable. |
+| `TestStatefulWOTSGate_ScriptExecution` (+ `_TamperedSig`) | `conformance/script_execution_test.go:1218,1326` | Environmental | Composes the stateful preimage/continuation covenant with a WOTS+ verify in one script (`examples/ts/stateful-wots-gate/StatefulWOTSGate.runar.ts`); same WOTS+ cost as the plain `TestWOTS_ScriptExecution` rows. Drop `-short` to enable. |
+| `TestSLHDSA_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:1432,1483,1521` | Environmental | SLH-DSA-SHA2-128s generates a ~248 KB script; running it through the BSV interpreter takes minutes. Drop `-short` to enable. |
+| `TestSLHDSA128f_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:2249,2263,2281` | Environmental | SLH-DSA-SHA2-128f generates a ~534 KB script. Drop `-short` to enable. Accept test: the compiled script must accept a valid signature (the pre-existing `emitSLHHmsg` multi-block CAT-order codegen bug is now fixed, audit #2). |
+| `TestSLHDSA192s_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:2313,2327,2345` | Environmental | SLH-DSA-SHA2-192s generates a ~277 KB script. Drop `-short` to enable. Accept test: script must accept a valid signature (the `emitSLHHmsg` + `emitSLHFors` a=14 codegen bugs are now fixed, audit #2). |
+| `TestSLHDSA192f_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:2363,2377,2395` | Environmental | SLH-DSA-SHA2-192f generates a ~788 KB script; the largest of the six parameter sets. Drop `-short` to enable. Accept test: script must accept a valid signature (the `emitSLHHmsg` codegen bug is now fixed, audit #2). |
+| `TestSLHDSA256s_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:2413,2427,2445` | Environmental | SLH-DSA-SHA2-256s generates a ~369 KB script. Drop `-short` to enable. Accept test: script must accept a valid signature (the `emitSLHHmsg` + `emitSLHFors` a=14 codegen bugs are now fixed, audit #2). |
+| `TestSLHDSA256f_ScriptExecution` (+ `_TamperedSig`, `_WrongMessage`) | `conformance/script_execution_test.go:2463,2477,2495` | Environmental | SLH-DSA-SHA2-256f generates a ~729 KB script; minutes on the go-sdk interpreter. Drop `-short` to enable. Accept test: script must accept a valid signature (the `emitSLHHmsg` codegen bug is now fixed, audit #2). |
 | `TestWOTS_ValidSpend` (+ `_TamperedSig`, `_WrongMessage`) | `integration/go/wots_test.go:168,219,268` | Environmental | Same WOTS+ slowness; integration suite already requires `-tags=integration` + regtest, dropping `-short` enables. |
 | `TestSLHDSA_*` regtest tests | `integration/go/slhdsa_test.go:173,219,263` | Environmental | Same SLH-DSA cost note as conformance row. |
 | `TestGroth16WA_Regtest_Deploy_SP1` (+ `_Spend`, `_Tamper`, `_Tamper2`) | `integration/go/groth16_wa_test.go:418,437,459,506` | Environmental | Witness-assisted Groth16 verifier produces a ~470 KB locking script; full deploy + spend round-trip is multi-second. |
@@ -117,6 +123,34 @@ opt-outs at the conformance-runner level, not test-level skips. See
 `conformance/README.md` for the per-fixture allowlist.
 
 ### Pre-existing breakages found during the audit (now fixed)
+
+- **SLH-DSA codegen miscompile, 5 of 6 FIPS 205 SHA2 parameter sets (audit #2)** —
+  `conformance/script_execution_test.go` `TestSLHDSA128f_ScriptExecution`,
+  `TestSLHDSA192s_ScriptExecution`, `TestSLHDSA192f_ScriptExecution`,
+  `TestSLHDSA256s_ScriptExecution`, `TestSLHDSA256f_ScriptExecution`. Adding
+  real script-execution coverage for the five SLH-DSA parameter sets that
+  previously had only self-produced byte goldens (128s was already executed)
+  surfaced that the compiled script REJECTED a genuinely valid signature for
+  all five — funds-lockable, and green because nothing ever executed it.
+  Root-caused to TWO independent bugs in the SLH-DSA verify emitter, byte-ported
+  into all 7 tiers (non-allowlisted fixtures ⇒ cross-tier hex parity guaranteed
+  all shared the defect):
+  1. `emitSLHHmsg`'s final MGF1 block was appended in reversed order
+     (`block || resultAcc` via a spurious `swap`) whenever the digest needs
+     more than one 32-byte SHA-256 block (`digestLen > 32`) — every set except
+     128s (digestLen=30). Fixed to `resultAcc || block` (bare `OP_CAT`).
+  2. `emitSLHFors`'s FORS-index bit-window capped `take` at 2 bytes; the correct
+     bound is `ceil((bitOffset + a) / 8)`, which needs 3 bytes for `a=14`
+     (192s/256s) at `bitOffset ∈ {4,6}`. `a ≤ 8` sets and 128s's lucky `a=12`
+     alignment never needed a 3rd byte. Fixed to the ceil form.
+  **Now FIXED** across all 7 tiers (TS reference + byte-identical Go/Rust/Python/
+  Ruby/Zig/Java ports); the five affected `expected-script.hex` goldens were
+  regenerated fold-OFF and re-verified byte-identical across all tiers, and the
+  five accept tests now assert the script ACCEPTS a valid signature (verified on
+  the go-sdk interpreter). Scope: this fixes INTERNAL consistency (runar signer
+  ↔ on-chain verifier). True FIPS-205 conformance for 192/256 additionally needs
+  MGF1-SHA-512, which Bitcoin Script cannot express (no `OP_SHA512`) — that
+  remains the separate #137 gap; the runar SLH-DSA is a SHA-256-only variant.
 
 - `examples/sol/go-dsl-bytestring-literal/GoDslBytestringLiteral.runar.sol` —
   Sol parser rejected the capitalised `Int` type alias used in the cross-format

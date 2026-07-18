@@ -98,28 +98,48 @@
     },
     {
       "fixture": "post-quantum-slhdsa-128f",
-      "reason": "SLH-DSA-SHA2-128f verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
-      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+      "reason": "SLH-DSA-SHA2-128f verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-128f",
+        "note": "compileRúnar(\"post-quantum-slhdsa-128f\", ...) is executed by TestSLHDSA128f_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
     },
     {
       "fixture": "post-quantum-slhdsa-192f",
-      "reason": "SLH-DSA-SHA2-192f verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
-      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+      "reason": "SLH-DSA-SHA2-192f verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-192f",
+        "note": "compileRúnar(\"post-quantum-slhdsa-192f\", ...) is executed by TestSLHDSA192f_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
     },
     {
       "fixture": "post-quantum-slhdsa-192s",
-      "reason": "SLH-DSA-SHA2-192s verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
-      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+      "reason": "SLH-DSA-SHA2-192s verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order + emitSLHFors 3-byte FORS window for a=14) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-192s",
+        "note": "compileRúnar(\"post-quantum-slhdsa-192s\", ...) is executed by TestSLHDSA192s_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
     },
     {
       "fixture": "post-quantum-slhdsa-256f",
-      "reason": "SLH-DSA-SHA2-256f verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
-      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+      "reason": "SLH-DSA-SHA2-256f verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-256f",
+        "note": "compileRúnar(\"post-quantum-slhdsa-256f\", ...) is executed by TestSLHDSA256f_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
     },
     {
       "fixture": "post-quantum-slhdsa-256s",
-      "reason": "SLH-DSA-SHA2-256s verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
-      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+      "reason": "SLH-DSA-SHA2-256s verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order + emitSLHFors 3-byte FORS window for a=14) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-256s",
+        "note": "compileRúnar(\"post-quantum-slhdsa-256s\", ...) is executed by TestSLHDSA256s_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
     },
     {
       "fixture": "post-quantum-wallet",
@@ -177,8 +197,12 @@
     },
     {
       "fixture": "stateful-wots-gate",
-      "reason": "WOTS+ verification gate + checkPreimage — WOTS+ one-time witness + tx context; real PQ signature required",
-      "coveredBy": { "kind": "codegen-golden", "family": "wots" }
+      "reason": "WOTS+ verification gate + checkPreimage — WOTS+ one-time witness + tx context. UPGRADED from byte-golden-only: script_execution_test.go now compiles and EXECUTES this exact fixture with a real tx-context spend (stateful preimage check + state continuation composed with a real WOTS+ signature in one script) on the go-sdk Spend engine.",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "stateful-wots-gate",
+        "note": "compileRúnar(\"stateful-wots-gate\", ...) is executed by TestStatefulWOTSGate_ScriptExecution (accept, real tx-context spend via executeScriptWithTx) and TestStatefulWOTSGate_ScriptExecution_TamperedSig (reject) in script_execution_test.go."
+      }
     }
   ]
 }

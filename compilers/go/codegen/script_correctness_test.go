@@ -1067,3 +1067,102 @@ func TestFiatShamirKB_SqueezeRateExhaustion_Script(t *testing.T) {
 		t.Errorf("Fiat-Shamir squeeze rate exhaustion script failed: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BabyBear ext4 script tests (audit finding, lower priority per task —
+// EmitBBExt4Inv0..3 had no Go execution/unit test at all: not even the
+// op-count-golden style coverage the SLH-DSA family had. This closes that
+// gap using the same real-vector script-execution pattern as
+// TestKBExt4Inv_Script above (BabyBear's KoalaBear-family sibling), against
+// the checked-in tests/vectors/babybear_ext4_inv.json reference vectors
+// (also consumed off-chain by packages/runar-go/babybear_ext4_test.go and
+// integration/go/babybear_vectors_test.go — this test is the missing
+// on-chain-codegen leg of that same vector set). BabyBear/KoalaBear/etc. are
+// Go-only proof-system primitives by project policy (see CLAUDE.md), so
+// there is no cross-tier parity concern and no TS `compileRúnar` path to
+// go through — EmitBBExt4Inv0..3 are exercised directly at the Stack-IR
+// level via BuildAndExecuteOps, exactly like the sibling KoalaBear/BN254/
+// Poseidon2/Fiat-Shamir tests in this file.
+// ---------------------------------------------------------------------------
+
+type bbExt4VectorFile struct {
+	Vectors []bbExt4Vector `json:"vectors"`
+}
+
+type bbExt4Vector struct {
+	A    [4]int64  `json:"a"`
+	B    *[4]int64 `json:"b,omitempty"`
+	Exp  [4]int64  `json:"expected"`
+	Desc string    `json:"description"`
+}
+
+func loadBBExt4Vectors(t *testing.T, filename string) []bbExt4Vector {
+	data, err := os.ReadFile("../../../tests/vectors/" + filename)
+	if err != nil {
+		t.Fatalf("load vectors: %v", err)
+	}
+	var f bbExt4VectorFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(f.Vectors) == 0 {
+		t.Fatalf("no vectors loaded from %s", filename)
+	}
+	return f.Vectors
+}
+
+// TestBBExt4Inv_Script executes EmitBBExt4Inv0..3 (the BabyBear ext4 field
+// inverse codegen, compilers/go/codegen/babybear.go) through the real
+// go-sdk Bitcoin Script interpreter against every vector in
+// tests/vectors/babybear_ext4_inv.json, including the a=0 (non-invertible)
+// edge case if present. Each of the 4 result components is checked
+// independently against the vector's expected value.
+func TestBBExt4Inv_Script(t *testing.T) {
+	vecs := loadBBExt4Vectors(t, "babybear_ext4_inv.json")
+
+	inv0Ops := gatherOps(EmitBBExt4Inv0)
+	inv1Ops := gatherOps(EmitBBExt4Inv1)
+	inv2Ops := gatherOps(EmitBBExt4Inv2)
+	inv3Ops := gatherOps(EmitBBExt4Inv3)
+
+	for _, v := range vecs {
+		t.Run(v.Desc, func(t *testing.T) {
+			for comp, compOps := range [][]StackOp{inv0Ops, inv1Ops, inv2Ops, inv3Ops} {
+				var ops []StackOp
+				for _, val := range v.A {
+					ops = append(ops, pushInt64(val))
+				}
+				ops = append(ops, compOps...)
+				ops = append(ops, pushInt64(v.Exp[comp]))
+				ops = append(ops, opcode("OP_EQUALVERIFY"))
+				ops = append(ops, opcode("OP_1"))
+
+				if err := buildAndExecute(t, ops); err != nil {
+					t.Errorf("component %d failed: %v", comp, err)
+				}
+			}
+		})
+	}
+}
+
+// TestBBExt4Inv_Script_WrongResult is the reject-path near-miss: asserting
+// a deliberately wrong expected value must fail script execution rather
+// than silently succeeding (guards against a vacuously-true op sequence,
+// e.g. one that leaves an unrelated truthy value on the stack regardless of
+// input).
+func TestBBExt4Inv_Script_WrongResult(t *testing.T) {
+	inv0Ops := gatherOps(EmitBBExt4Inv0)
+
+	var ops []StackOp
+	ops = append(ops, pushInt64(2), pushInt64(0), pushInt64(0), pushInt64(0))
+	ops = append(ops, inv0Ops...)
+	// inv((2,0,0,0)) component 0 is 1006632961 (from the vector file); assert
+	// a wrong value instead.
+	ops = append(ops, pushInt64(1))
+	ops = append(ops, opcode("OP_EQUALVERIFY"))
+	ops = append(ops, opcode("OP_1"))
+
+	if err := buildAndExecute(t, ops); err == nil {
+		t.Error("expected script failure with wrong expected value but execution succeeded")
+	}
+}
