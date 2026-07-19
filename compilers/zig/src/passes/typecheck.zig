@@ -467,6 +467,31 @@ const TypeChecker = struct {
                 .{method.name},
             );
         }
+
+        // Reject requireOutputP2PKH(0) in a StatefulSmartContract method whose
+        // implicit single-output state continuation ALSO claims output 0. A
+        // method that mutates state but uses no this.addOutput()/addRawOutput()
+        // re-creates the contract's own (large codePart) script at output 0;
+        // requiring output 0 to also be a 34-byte P2PKH is impossible
+        // (codePart >= 253 bytes forces a 3-byte CompactSize length prefix,
+        // never the P2PKH template's 0x19), so the contract is PERMANENTLY
+        // unspendable. The terminal case (no state mutation -> no continuation)
+        // stays valid, and addOutput/addRawOutput layouts are left to the
+        // developer. Mirrors compilers/../03-typecheck.ts analyzeMethodOutputSignals.
+        if (self.contract.parent_class == .stateful_smart_contract) {
+            const signals = analyzeMethodOutputSignals(method.body, self.contract.properties);
+            if (signals.requires_output_p2pkh_zero and signals.mutates_state and !signals.has_state_output) {
+                self.addError(
+                    "method '{s}' calls requireOutputP2PKH(0, ...) but also mutates state " ++
+                        "without this.addOutput()/addRawOutput() — the auto-injected single-output state " ++
+                        "continuation already claims output 0 (the contract's codePart), so output 0 cannot " ++
+                        "simultaneously be the required 34-byte P2PKH. This contract would be permanently " ++
+                        "unspendable. Assert the bond on a non-continuation output index, or make the method " ++
+                        "terminal (no state mutation)",
+                    .{method.name},
+                );
+            }
+        }
     }
 
     fn checkStatements(self: *TypeChecker, stmts: []const Statement, env: *TypeEnv) void {
@@ -1253,6 +1278,129 @@ fn exprContainsAddDataOutput(expr: Expression) bool {
         },
         else => false,
     };
+}
+
+// ============================================================================
+// Single-output-continuation vs requireOutputP2PKH(0) collision analysis
+// ============================================================================
+// A StatefulSmartContract method that mutates state but calls no
+// this.addOutput()/this.addRawOutput() takes the "single-output continuation"
+// path: the compiler re-creates the contract's own (large codePart) script at
+// output index 0. requireOutputP2PKH(0, ...) additionally asserts output 0 is a
+// 34-byte P2PKH — impossible for any codePart >= 253 bytes — so the contract is
+// permanently unspendable. Detect the three signals in one walk. Mirrors the
+// TS reference `analyzeMethodOutputSignals` in 03-typecheck.ts.
+
+const MethodOutputSignals = struct {
+    /// assigns to / ++/-- a non-readonly property
+    mutates_state: bool = false,
+    /// calls this.addOutput() or this.addRawOutput()
+    has_state_output: bool = false,
+    /// calls requireOutputP2PKH(0, ...)
+    requires_output_p2pkh_zero: bool = false,
+};
+
+/// True when `name` is a non-readonly (mutable) contract property.
+fn isMutableProperty(properties: []const types.PropertyNode, name: []const u8) bool {
+    for (properties) |prop| {
+        if (!prop.readonly and std.mem.eql(u8, prop.name, name)) return true;
+    }
+    return false;
+}
+
+fn analyzeMethodOutputSignals(body: []const Statement, properties: []const types.PropertyNode) MethodOutputSignals {
+    var signals = MethodOutputSignals{};
+    for (body) |stmt| walkStmtForOutputSignals(stmt, properties, &signals);
+    return signals;
+}
+
+fn walkStmtForOutputSignals(stmt: Statement, properties: []const types.PropertyNode, signals: *MethodOutputSignals) void {
+    switch (stmt) {
+        .assign => |a| {
+            // Scalar property write (`this.count = ...`). Index-target writes
+            // (`this.board[i] = v`) are not scalar state mutation here — they
+            // mirror TS, which only flags a `property_access` assignment target.
+            if (a.index_target == null and isMutableProperty(properties, a.target)) signals.mutates_state = true;
+            walkExprForOutputSignals(a.value, properties, signals);
+        },
+        .const_decl => |d| walkExprForOutputSignals(d.value, properties, signals),
+        .let_decl => |d| {
+            if (d.value) |v| walkExprForOutputSignals(v, properties, signals);
+        },
+        .if_stmt => |s| {
+            walkExprForOutputSignals(s.condition, properties, signals);
+            for (s.then_body) |t| walkStmtForOutputSignals(t, properties, signals);
+            if (s.else_body) |eb| {
+                for (eb) |e| walkStmtForOutputSignals(e, properties, signals);
+            }
+        },
+        .for_stmt => |s| {
+            for (s.body) |b| walkStmtForOutputSignals(b, properties, signals);
+        },
+        .expr_stmt => |e| walkExprForOutputSignals(e, properties, signals),
+        .assert_stmt => |s| walkExprForOutputSignals(s.condition, properties, signals),
+        .return_stmt => |rv| {
+            if (rv) |v| walkExprForOutputSignals(v, properties, signals);
+        },
+    }
+}
+
+fn walkExprForOutputSignals(expr: Expression, properties: []const types.PropertyNode, signals: *MethodOutputSignals) void {
+    switch (expr) {
+        .increment => |i| {
+            switch (i.operand) {
+                .property_access => |pa| {
+                    if (isMutableProperty(properties, pa.property)) signals.mutates_state = true;
+                },
+                else => {},
+            }
+            walkExprForOutputSignals(i.operand, properties, signals);
+        },
+        .decrement => |d| {
+            switch (d.operand) {
+                .property_access => |pa| {
+                    if (isMutableProperty(properties, pa.property)) signals.mutates_state = true;
+                },
+                else => {},
+            }
+            walkExprForOutputSignals(d.operand, properties, signals);
+        },
+        .method_call => |mc| {
+            if (std.mem.eql(u8, mc.method, "addOutput") or std.mem.eql(u8, mc.method, "addRawOutput")) {
+                signals.has_state_output = true;
+            }
+            for (mc.args) |arg| walkExprForOutputSignals(arg, properties, signals);
+        },
+        .call => |c| {
+            if (std.mem.eql(u8, c.callee, "requireOutputP2PKH") and c.args.len > 0) {
+                switch (c.args[0]) {
+                    .literal_int => |v| {
+                        if (v == 0) signals.requires_output_p2pkh_zero = true;
+                    },
+                    else => {},
+                }
+            }
+            for (c.args) |arg| walkExprForOutputSignals(arg, properties, signals);
+        },
+        .binary_op => |b| {
+            walkExprForOutputSignals(b.left, properties, signals);
+            walkExprForOutputSignals(b.right, properties, signals);
+        },
+        .unary_op => |u| walkExprForOutputSignals(u.operand, properties, signals),
+        .ternary => |t| {
+            walkExprForOutputSignals(t.condition, properties, signals);
+            walkExprForOutputSignals(t.then_expr, properties, signals);
+            walkExprForOutputSignals(t.else_expr, properties, signals);
+        },
+        .index_access => |ia| {
+            walkExprForOutputSignals(ia.object, properties, signals);
+            walkExprForOutputSignals(ia.index, properties, signals);
+        },
+        .array_literal => |elems| {
+            for (elems) |el| walkExprForOutputSignals(el, properties, signals);
+        },
+        else => {},
+    }
 }
 
 // ============================================================================

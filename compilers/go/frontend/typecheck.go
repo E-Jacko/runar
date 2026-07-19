@@ -442,6 +442,34 @@ func (tc *typeChecker) checkMethod(method MethodNode) {
 				"variable-length OP_RETURN outputs break the offset computation; "+
 				"split the addDataOutput call into a separate method", method.Name))
 	}
+
+	// Reject requireOutputP2PKH(0) in a method whose implicit single-output
+	// state continuation ALSO claims output 0. A StatefulSmartContract method
+	// that mutates state but uses no this.addOutput()/addRawOutput() re-creates
+	// the contract's own (large codePart) script at output 0; requiring output
+	// 0 to also be a 34-byte P2PKH is impossible (codePart >= 253 bytes forces a
+	// 3-byte CompactSize length prefix, never the P2PKH template's 0x19), so the
+	// contract is PERMANENTLY unspendable. The terminal case (no state mutation
+	// -> no continuation) stays valid, and addOutput/addRawOutput layouts are
+	// left to the developer. Mirrors the TS reference guard in 03-typecheck.ts.
+	if tc.contract != nil && tc.contract.ParentClass == "StatefulSmartContract" {
+		mutableProps := make(map[string]bool)
+		for _, p := range tc.contract.Properties {
+			if !p.Readonly {
+				mutableProps[p.Name] = true
+			}
+		}
+		sig := analyzeMethodOutputSignals(method.Body, mutableProps)
+		if sig.requiresOutputP2PKHZero && sig.mutatesState && !sig.hasStateOutput {
+			tc.addError(fmt.Sprintf(
+				"method '%s' calls requireOutputP2PKH(0, ...) but also mutates state "+
+					"without this.addOutput()/addRawOutput() — the auto-injected single-output state "+
+					"continuation already claims output 0 (the contract's codePart), so output 0 cannot "+
+					"simultaneously be the required 34-byte P2PKH. This contract would be permanently "+
+					"unspendable. Assert the bond on a non-continuation output index, or make the method "+
+					"terminal (no state mutation)", method.Name))
+		}
+	}
 }
 
 // bodyCallsBuiltin reports whether any statement in `body` (recursively)
@@ -611,6 +639,129 @@ func exprContainsAddDataOutput(expr Expression) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Single-output-continuation vs requireOutputP2PKH(0) collision analysis
+// ---------------------------------------------------------------------------
+// A StatefulSmartContract method that mutates state but calls no
+// this.addOutput()/this.addRawOutput() takes the "single-output continuation"
+// path: the compiler re-creates the contract's own (large codePart) script at
+// output index 0. requireOutputP2PKH(0, ...) additionally asserts output 0 is a
+// 34-byte P2PKH — impossible for any codePart >= 253 bytes — so the contract is
+// permanently unspendable. Detect the three signals in one walk. Mirrors the TS
+// analyzeMethodOutputSignals in 03-typecheck.ts.
+
+// stateOutputMethodNames are the intrinsics that emit an explicit output and
+// thereby OPT the method OUT of the auto-injected single-output continuation.
+var stateOutputMethodNames = map[string]bool{"addOutput": true, "addRawOutput": true}
+
+// methodOutputSignals captures the three signals the collision guard needs,
+// collected in one body walk.
+type methodOutputSignals struct {
+	mutatesState            bool // assigns to / ++/-- a non-readonly property
+	hasStateOutput          bool // calls this.addOutput() or this.addRawOutput()
+	requiresOutputP2PKHZero bool // calls requireOutputP2PKH(0n, ...)
+}
+
+func analyzeMethodOutputSignals(body []Statement, mutableProps map[string]bool) methodOutputSignals {
+	sig := methodOutputSignals{}
+	for _, stmt := range body {
+		walkStmtForOutputSignals(stmt, mutableProps, &sig)
+	}
+	return sig
+}
+
+func walkStmtForOutputSignals(stmt Statement, mutableProps map[string]bool, sig *methodOutputSignals) {
+	switch s := stmt.(type) {
+	case AssignmentStmt:
+		if pa, ok := s.Target.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
+			sig.mutatesState = true
+		}
+		walkExprForOutputSignals(s.Target, mutableProps, sig)
+		walkExprForOutputSignals(s.Value, mutableProps, sig)
+	case ExpressionStmt:
+		walkExprForOutputSignals(s.Expr, mutableProps, sig)
+	case VariableDeclStmt:
+		walkExprForOutputSignals(s.Init, mutableProps, sig)
+	case IfStmt:
+		walkExprForOutputSignals(s.Condition, mutableProps, sig)
+		for _, t := range s.Then {
+			walkStmtForOutputSignals(t, mutableProps, sig)
+		}
+		for _, e := range s.Else {
+			walkStmtForOutputSignals(e, mutableProps, sig)
+		}
+	case ForStmt:
+		walkStmtForOutputSignals(s.Init, mutableProps, sig)
+		walkExprForOutputSignals(s.Condition, mutableProps, sig)
+		if s.Update != nil {
+			walkStmtForOutputSignals(s.Update, mutableProps, sig)
+		}
+		for _, b := range s.Body {
+			walkStmtForOutputSignals(b, mutableProps, sig)
+		}
+	case ReturnStmt:
+		if s.Value != nil {
+			walkExprForOutputSignals(s.Value, mutableProps, sig)
+		}
+	}
+}
+
+func walkExprForOutputSignals(expr Expression, mutableProps map[string]bool, sig *methodOutputSignals) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case IncrementExpr:
+		if pa, ok := e.Operand.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
+			sig.mutatesState = true
+		}
+		walkExprForOutputSignals(e.Operand, mutableProps, sig)
+	case DecrementExpr:
+		if pa, ok := e.Operand.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
+			sig.mutatesState = true
+		}
+		walkExprForOutputSignals(e.Operand, mutableProps, sig)
+	case CallExpr:
+		if pa, ok := e.Callee.(PropertyAccessExpr); ok && stateOutputMethodNames[pa.Property] {
+			sig.hasStateOutput = true
+		}
+		if me, ok := e.Callee.(MemberExpr); ok && stateOutputMethodNames[me.Property] {
+			sig.hasStateOutput = true
+		}
+		if id, ok := e.Callee.(Identifier); ok && id.Name == "requireOutputP2PKH" {
+			if len(e.Args) > 0 {
+				if lit, ok := e.Args[0].(BigIntLiteral); ok && lit.Value != nil && lit.Value.Sign() == 0 {
+					sig.requiresOutputP2PKHZero = true
+				}
+			}
+		}
+		for _, a := range e.Args {
+			walkExprForOutputSignals(a, mutableProps, sig)
+		}
+		if _, ok := e.Callee.(Identifier); !ok {
+			walkExprForOutputSignals(e.Callee, mutableProps, sig)
+		}
+	case BinaryExpr:
+		walkExprForOutputSignals(e.Left, mutableProps, sig)
+		walkExprForOutputSignals(e.Right, mutableProps, sig)
+	case UnaryExpr:
+		walkExprForOutputSignals(e.Operand, mutableProps, sig)
+	case TernaryExpr:
+		walkExprForOutputSignals(e.Condition, mutableProps, sig)
+		walkExprForOutputSignals(e.Consequent, mutableProps, sig)
+		walkExprForOutputSignals(e.Alternate, mutableProps, sig)
+	case IndexAccessExpr:
+		walkExprForOutputSignals(e.Object, mutableProps, sig)
+		walkExprForOutputSignals(e.Index, mutableProps, sig)
+	case MemberExpr:
+		walkExprForOutputSignals(e.Object, mutableProps, sig)
+	case ArrayLiteralExpr:
+		for _, el := range e.Elements {
+			walkExprForOutputSignals(el, mutableProps, sig)
+		}
+	}
 }
 
 func (tc *typeChecker) checkStatements(stmts []Statement, env *typeEnv) {

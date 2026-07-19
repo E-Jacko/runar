@@ -160,7 +160,10 @@ describe('intent-intrinsics interpreter — intent-output-p2pkh', () => {
     const r = c.call('payBond');
     expect(r.success).toBe(true);
     expect(r.error).toBeUndefined();
-    expect(c.state.count).toBe(1n);
+    // payBond is terminal (asserts the bond output only, no state mutation),
+    // so count is unchanged — see the guard against requireOutputP2PKH(0) on a
+    // single-output state continuation in 03-typecheck.ts.
+    expect(c.state.count).toBe(0n);
   });
 
   it('failure: wrong pubkey-hash in serialised outputs → substring mismatch', () => {

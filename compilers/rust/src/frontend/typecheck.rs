@@ -453,6 +453,37 @@ split the addDataOutput call into a separate method",
                 method.name
             ));
         }
+
+        // Reject requireOutputP2PKH(0) in a method whose implicit single-output
+        // state continuation ALSO claims output 0. A StatefulSmartContract method
+        // that mutates state but uses no this.addOutput()/addRawOutput() re-creates
+        // the contract's own (large codePart) script at output 0; requiring output
+        // 0 to also be a 34-byte P2PKH is impossible (codePart >= 253 bytes forces a
+        // 3-byte CompactSize length prefix, never the P2PKH template's 0x19), so the
+        // contract is PERMANENTLY unspendable. The terminal case (no state mutation
+        // -> no continuation) stays valid, and addOutput/addRawOutput layouts are
+        // left to the developer. Mirrors the TS reference in 03-typecheck.ts.
+        if self.contract.parent_class == "StatefulSmartContract" {
+            let mutable_props: HashSet<String> = self
+                .contract
+                .properties
+                .iter()
+                .filter(|p| !p.readonly)
+                .map(|p| p.name.clone())
+                .collect();
+            let sig = analyze_method_output_signals(&method.body, &mutable_props);
+            if sig.requires_output_p2pkh_zero && sig.mutates_state && !sig.has_state_output {
+                self.add_error(format!(
+                    "method '{}' calls requireOutputP2PKH(0, ...) but also mutates state \
+without this.addOutput()/addRawOutput() — the auto-injected single-output state \
+continuation already claims output 0 (the contract's codePart), so output 0 cannot \
+simultaneously be the required 34-byte P2PKH. This contract would be permanently \
+unspendable. Assert the bond on a non-continuation output index, or make the method \
+terminal (no state mutation)",
+                    method.name
+                ));
+            }
+        }
     }
 
     fn check_statements(&mut self, stmts: &[Statement], env: &mut TypeEnv) {
@@ -1715,6 +1746,176 @@ fn expr_contains_add_data_output(expr: &Expression) -> bool {
         | Expression::DecrementExpr { operand, .. } => expr_contains_add_data_output(operand),
         Expression::MemberExpr { object, .. } => expr_contains_add_data_output(object),
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-output-continuation vs requireOutputP2PKH(0) collision analysis
+// ---------------------------------------------------------------------------
+// A StatefulSmartContract method that mutates state but calls no
+// this.addOutput()/this.addRawOutput() takes the "single-output continuation"
+// path: the compiler re-creates the contract's own (large codePart) script at
+// output index 0. requireOutputP2PKH(0, ...) additionally asserts output 0 is a
+// 34-byte P2PKH — impossible for any codePart >= 253 bytes — so the contract is
+// permanently unspendable. Detect the three signals in one walk. Mirrors the TS
+// reference `analyzeMethodOutputSignals` in
+// packages/runar-compiler/src/passes/03-typecheck.ts.
+
+const STATE_OUTPUT_METHOD_NAMES: &[&str] = &["addOutput", "addRawOutput"];
+
+#[derive(Default)]
+struct MethodOutputSignals {
+    /// assigns to / ++/-- a non-readonly property
+    mutates_state: bool,
+    /// calls this.addOutput() or this.addRawOutput()
+    has_state_output: bool,
+    /// calls requireOutputP2PKH(0n, ...)
+    requires_output_p2pkh_zero: bool,
+}
+
+fn analyze_method_output_signals(
+    body: &[Statement],
+    mutable_props: &HashSet<String>,
+) -> MethodOutputSignals {
+    let mut sig = MethodOutputSignals::default();
+    for stmt in body {
+        walk_stmt_for_output_signals(stmt, mutable_props, &mut sig);
+    }
+    sig
+}
+
+fn walk_stmt_for_output_signals(
+    stmt: &Statement,
+    mutable_props: &HashSet<String>,
+    sig: &mut MethodOutputSignals,
+) {
+    match stmt {
+        Statement::Assignment { target, value, .. } => {
+            if let Expression::PropertyAccess { property } = target {
+                if mutable_props.contains(property) {
+                    sig.mutates_state = true;
+                }
+            }
+            walk_expr_for_output_signals(target, mutable_props, sig);
+            walk_expr_for_output_signals(value, mutable_props, sig);
+        }
+        Statement::ExpressionStatement { expression, .. } => {
+            walk_expr_for_output_signals(expression, mutable_props, sig);
+        }
+        Statement::VariableDecl { init, .. } => {
+            walk_expr_for_output_signals(init, mutable_props, sig);
+        }
+        Statement::IfStatement {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            walk_expr_for_output_signals(condition, mutable_props, sig);
+            for s in then_branch {
+                walk_stmt_for_output_signals(s, mutable_props, sig);
+            }
+            if let Some(else_b) = else_branch {
+                for s in else_b {
+                    walk_stmt_for_output_signals(s, mutable_props, sig);
+                }
+            }
+        }
+        Statement::ForStatement {
+            init,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            walk_stmt_for_output_signals(init, mutable_props, sig);
+            walk_expr_for_output_signals(condition, mutable_props, sig);
+            walk_stmt_for_output_signals(update, mutable_props, sig);
+            for s in body {
+                walk_stmt_for_output_signals(s, mutable_props, sig);
+            }
+        }
+        Statement::ReturnStatement { value, .. } => {
+            if let Some(v) = value {
+                walk_expr_for_output_signals(v, mutable_props, sig);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_output_signals(
+    expr: &Expression,
+    mutable_props: &HashSet<String>,
+    sig: &mut MethodOutputSignals,
+) {
+    match expr {
+        Expression::IncrementExpr { operand, .. }
+        | Expression::DecrementExpr { operand, .. } => {
+            if let Expression::PropertyAccess { property } = operand.as_ref() {
+                if mutable_props.contains(property) {
+                    sig.mutates_state = true;
+                }
+            }
+            walk_expr_for_output_signals(operand, mutable_props, sig);
+        }
+        Expression::CallExpr { callee, args, .. } => {
+            match callee.as_ref() {
+                Expression::PropertyAccess { property }
+                    if STATE_OUTPUT_METHOD_NAMES.contains(&property.as_str()) =>
+                {
+                    sig.has_state_output = true;
+                }
+                Expression::MemberExpr { property, .. }
+                    if STATE_OUTPUT_METHOD_NAMES.contains(&property.as_str()) =>
+                {
+                    sig.has_state_output = true;
+                }
+                Expression::Identifier { name } if name == "requireOutputP2PKH" => {
+                    if let Some(Expression::BigIntLiteral { value }) = args.first() {
+                        use num_traits::Zero;
+                        if value.is_zero() {
+                            sig.requires_output_p2pkh_zero = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for arg in args {
+                walk_expr_for_output_signals(arg, mutable_props, sig);
+            }
+            if !matches!(callee.as_ref(), Expression::Identifier { .. }) {
+                walk_expr_for_output_signals(callee, mutable_props, sig);
+            }
+        }
+        Expression::BinaryExpr { left, right, .. } => {
+            walk_expr_for_output_signals(left, mutable_props, sig);
+            walk_expr_for_output_signals(right, mutable_props, sig);
+        }
+        Expression::UnaryExpr { operand, .. } => {
+            walk_expr_for_output_signals(operand, mutable_props, sig);
+        }
+        Expression::TernaryExpr {
+            condition,
+            consequent,
+            alternate,
+        } => {
+            walk_expr_for_output_signals(condition, mutable_props, sig);
+            walk_expr_for_output_signals(consequent, mutable_props, sig);
+            walk_expr_for_output_signals(alternate, mutable_props, sig);
+        }
+        Expression::IndexAccess { object, index } => {
+            walk_expr_for_output_signals(object, mutable_props, sig);
+            walk_expr_for_output_signals(index, mutable_props, sig);
+        }
+        Expression::MemberExpr { object, .. } => {
+            walk_expr_for_output_signals(object, mutable_props, sig);
+        }
+        Expression::ArrayLiteral { elements } => {
+            for el in elements {
+                walk_expr_for_output_signals(el, mutable_props, sig);
+            }
+        }
+        _ => {}
     }
 }
 

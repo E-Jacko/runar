@@ -1,11 +1,11 @@
 {
   "_comment": [
-    "GOLDEN-REGENERATION INTEGRITY GATE — provenance allowlist (issue #122).",
+    "GOLDEN-REGENERATION INTEGRITY GATE \u2014 provenance allowlist (issue #122).",
     "Goldens/vectors are self-produced by the implementation-under-test. This file",
     "is how a PR carries an INDEPENDENT justification for changing one. Every entry",
     "pins a specific golden file to the exact NEW content it is authorizing, via a",
     "sha256 of that file's bytes. Because the pin is content-addressed, an entry can",
-    "only ever justify the ONE value it was reviewed for — a later, different",
+    "only ever justify the ONE value it was reviewed for \u2014 a later, different",
     "regeneration of the same file fails the gate again and forces a fresh entry.",
     "See conformance/README.md -> 'Golden-regeneration integrity gate' for the full",
     "design and the two ways to satisfy the gate.",
@@ -29,7 +29,7 @@
       "path": "conformance/runtime-vectors/blake3-official-kat.json",
       "sha256": "6bbc509a9e6dfa3a6a5cba24ba0f4b9744fe65e9df18f5edda101eaa60318c0a",
       "verified-against": "official-KAT",
-      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9…. These ARE the independent oracle, not compiler-produced bytes — the fix for the BUG-101 self-golden gap.",
+      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9\u2026. These ARE the independent oracle, not compiler-produced bytes \u2014 the fix for the BUG-101 self-golden gap.",
       "reviewer": "gh:icellan",
       "date": "2026-07-08"
     },
@@ -117,7 +117,7 @@
       "path": "conformance/tests/bounded-loop/expected-ir.json",
       "sha256": "35b23e46b5fbfbfdb56160d64599f7e5cb80fa4b0cee06cd6d4e506fbded5077",
       "verified-against": "intentional-spec-change",
-      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change — the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
+      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change \u2014 the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
       "reviewer": "gh:icellan",
       "date": "2026-07-09"
     },
@@ -203,7 +203,7 @@
     },
     {
       "path": "conformance/tests/intent-output-p2pkh/expected-ir.json",
-      "sha256": "adf9912cd5dfe703e999fd7494a8188669d398d754c70389b35549f794699095",
+      "sha256": "8c831a058cce47915a5b3360d4ab77279289c273ae04718555566a9ea150f9bd",
       "verified-against": "intentional-spec-change",
       "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
       "reviewer": "gh:icellan",
@@ -211,7 +211,7 @@
     },
     {
       "path": "conformance/tests/intent-output-p2pkh/expected-script.hex",
-      "sha256": "508435c06b3504a5f4536468b7e9710b3f98153822b123ccc60b170d901f9790",
+      "sha256": "aa85919fee39579b201d27aa561aacd780aa0122638aa392057d040c9739ab1d",
       "verified-against": "intentional-spec-change",
       "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
       "reviewer": "gh:icellan",

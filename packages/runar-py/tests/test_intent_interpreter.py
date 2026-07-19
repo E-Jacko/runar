@@ -198,7 +198,10 @@ class TestIntentOutputP2PKH:
 
         assert r.success is True, r.error
         assert r.error is None
-        assert c.state['count'] == 1
+        # payBond is terminal (no state mutation) — a requireOutputP2PKH(0)
+        # bond assert collides with a single-output state continuation at
+        # output 0, so the fixture leaves count unchanged.
+        assert c.state['count'] == 0
 
     def test_failure_wrong_pubkey_hash_in_serialised_outputs(self):
         # Wrong PKH inside the serialised set. hashOutputs must still

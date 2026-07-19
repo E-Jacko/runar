@@ -392,6 +392,57 @@ class TestIntentIntrinsics < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
+  # requireOutputP2PKH(0) + single-output state continuation collision.
+  # A StatefulSmartContract method that mutates a non-readonly property but
+  # emits no this.addOutput()/addRawOutput() takes the implicit single-output
+  # continuation path, which re-creates the contract's own (large codePart)
+  # script at output 0. Requiring output 0 to ALSO be a 34-byte P2PKH is
+  # impossible, so the contract would be permanently unspendable. Mirrors the
+  # TS reference guard in packages/runar-compiler/src/passes/03-typecheck.ts.
+  # ---------------------------------------------------------------------------
+
+  def test_require_output_p2pkh_zero_with_state_mutation_errors
+    source = <<~GO
+      package x
+
+      import runar "github.com/icellan/runar/packages/runar-go"
+
+      type Cov struct {
+      \trunar.StatefulSmartContract
+      \tBondPKH runar.ByteString `runar:"readonly"`
+      \tBond    runar.Bigint     `runar:"readonly"`
+      \tCount   runar.Bigint
+      }
+
+      func (c *Cov) PayBond() {
+      \trunar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+      \tc.Count = c.Count + 1
+      }
+    GO
+    expect_typecheck_error(source, "permanently unspendable")
+  end
+
+  def test_require_output_p2pkh_zero_terminal_no_mutation_ok
+    source = <<~GO
+      package x
+
+      import runar "github.com/icellan/runar/packages/runar-go"
+
+      type Cov struct {
+      \trunar.StatefulSmartContract
+      \tBondPKH runar.ByteString `runar:"readonly"`
+      \tBond    runar.Bigint     `runar:"readonly"`
+      \tCount   runar.Bigint
+      }
+
+      func (c *Cov) PayBond() {
+      \trunar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+      }
+    GO
+    must_lower_go(source) # terminal method (no state mutation) -> accepted
+  end
+
+  # ---------------------------------------------------------------------------
   # End-to-end compile test (mirrors Go's intent_intrinsics_compile_test.go)
   # ---------------------------------------------------------------------------
 

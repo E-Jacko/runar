@@ -25,6 +25,5 @@ pub struct IntentOutputP2PKH {
 impl IntentOutputP2PKH {
     pub fn payBond(&mut self) {
         requireOutputP2PKH(0, self.bondPKH, self.bondAmount);
-        self.count = self.count + 1;
     }
 }

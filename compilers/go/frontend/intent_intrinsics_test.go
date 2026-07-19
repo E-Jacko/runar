@@ -385,6 +385,57 @@ func (c *Cov) PayBond() {
 	mustLowerGoSource(t, source) // must not error
 }
 
+// requireOutputP2PKH(0) + single-output state continuation collision ---------
+//
+// A StatefulSmartContract method that requires output 0 to be a 34-byte P2PKH
+// AND mutates state without an explicit this.addOutput()/addRawOutput() takes
+// the auto-injected single-output continuation path — the compiler re-creates
+// the contract's own (large codePart) script at output 0, so output 0 cannot
+// simultaneously be the required P2PKH. Such a contract is permanently
+// unspendable and must be rejected at typecheck. The terminal variant (no state
+// mutation -> no continuation) stays valid.
+
+func TestRequireOutputP2PKHZero_MutatingContinuation_Rejects(t *testing.T) {
+	source := `
+package x
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type Cov struct {
+	runar.StatefulSmartContract
+	BondPKH runar.ByteString ` + "`runar:\"readonly\"`" + `
+	Bond    runar.Bigint     ` + "`runar:\"readonly\"`" + `
+	Count   runar.Bigint
+}
+
+func (c *Cov) PayBond() {
+	runar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+	c.Count = c.Count + 1
+}
+`
+	expectIntrinsicTypeError(t, source, "permanently unspendable")
+}
+
+func TestRequireOutputP2PKHZero_Terminal_OK(t *testing.T) {
+	source := `
+package x
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type Cov struct {
+	runar.StatefulSmartContract
+	BondPKH runar.ByteString ` + "`runar:\"readonly\"`" + `
+	Bond    runar.Bigint     ` + "`runar:\"readonly\"`" + `
+	Count   runar.Bigint
+}
+
+func (c *Cov) PayBond() {
+	runar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+}
+`
+	mustLowerGoSource(t, source) // terminal (no mutation) — must not error
+}
+
 // -------------------------------------------------------------------------
 
 func TestExtractPrevOutputScript_NonLiteralIndex_Errors(t *testing.T) {

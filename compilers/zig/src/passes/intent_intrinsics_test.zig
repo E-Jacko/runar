@@ -499,6 +499,67 @@ test "intent: requireOutputP2PKH without addDataOutput ok" {
 }
 
 // ============================================================================
+// requireOutputP2PKH(0) + single-output state continuation collision
+// ============================================================================
+
+test "intent: requireOutputP2PKH(0) with state mutation is permanently unspendable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // payBond mutates Count (single-output continuation claims output 0) AND
+    // asserts output 0 is a bond P2PKH — output 0 cannot be both codePart and
+    // a 34-byte P2PKH.
+    const source =
+        \\package x
+        \\
+        \\import runar "github.com/icellan/runar/packages/runar-go"
+        \\
+        \\type Cov struct {
+        \\    runar.StatefulSmartContract
+        \\    BondPKH runar.ByteString `runar:"readonly"`
+        \\    Bond    runar.Bigint     `runar:"readonly"`
+        \\    Count   runar.Bigint
+        \\}
+        \\
+        \\func (c *Cov) PayBond() {
+        \\    runar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+        \\    c.Count = c.Count + 1
+        \\}
+    ;
+
+    try expectIntrinsicTypeError(allocator, source, "permanently unspendable");
+}
+
+test "intent: requireOutputP2PKH(0) terminal method (no mutation) ok" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // No state mutation -> no auto-injected continuation on output 0, so the
+    // bond P2PKH at output 0 is valid. Same struct as the mutating variant;
+    // only the `c.Count = ...` line is removed.
+    const source =
+        \\package x
+        \\
+        \\import runar "github.com/icellan/runar/packages/runar-go"
+        \\
+        \\type Cov struct {
+        \\    runar.StatefulSmartContract
+        \\    BondPKH runar.ByteString `runar:"readonly"`
+        \\    Bond    runar.Bigint     `runar:"readonly"`
+        \\    Count   runar.Bigint
+        \\}
+        \\
+        \\func (c *Cov) PayBond() {
+        \\    runar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+        \\}
+    ;
+
+    _ = try mustLowerGoSource(allocator, source);
+}
+
+// ============================================================================
 // R-2 — index-literal bounds on extractPrevOutputScript / requireOutputP2PKH
 // ============================================================================
 

@@ -462,3 +462,58 @@ describe('requireOutputP2PKH + addDataOutput mix (Crit-3)', () => {
     expect(mixErr).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// requireOutputP2PKH(0) vs the implicit single-output state continuation
+// ---------------------------------------------------------------------------
+
+describe('requireOutputP2PKH(0) + single-output state continuation', () => {
+  it('rejects requireOutputP2PKH(0) in a method that mutates state (permanently unspendable)', () => {
+    // payBond mutates count (single-output continuation at output 0) AND asserts
+    // output 0 is a bond P2PKH — output 0 cannot be both the codePart and a P2PKH.
+    const source = `
+      class Bond extends StatefulSmartContract {
+        readonly bondPKH: ByteString;
+        readonly bond: bigint;
+        count: bigint;
+
+        constructor(bondPKH: ByteString, bond: bigint, count: bigint) {
+          super(bondPKH, bond, count);
+          this.bondPKH = bondPKH;
+          this.bond = bond;
+          this.count = count;
+        }
+
+        public payBond() {
+          requireOutputP2PKH(0n, this.bondPKH, this.bond);
+          this.count = this.count + 1n;
+        }
+      }
+    `;
+    expectErrorContains(typecheckSource(source), 'permanently unspendable');
+  });
+
+  it('accepts requireOutputP2PKH(0) in a terminal method (no state mutation, no continuation)', () => {
+    const source = `
+      class Bond extends StatefulSmartContract {
+        readonly bondPKH: ByteString;
+        readonly bond: bigint;
+        count: bigint;
+
+        constructor(bondPKH: ByteString, bond: bigint, count: bigint) {
+          super(bondPKH, bond, count);
+          this.bondPKH = bondPKH;
+          this.bond = bond;
+          this.count = count;
+        }
+
+        public payBond() {
+          requireOutputP2PKH(0n, this.bondPKH, this.bond);
+        }
+      }
+    `;
+    const result = typecheckSource(source);
+    const err = result.errors.find(e => e.message.includes('permanently unspendable'));
+    expect(err).toBeUndefined();
+  });
+});

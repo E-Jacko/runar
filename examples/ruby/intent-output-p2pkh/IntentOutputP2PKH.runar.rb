@@ -25,6 +25,5 @@ class IntentOutputP2PKH < Runar::StatefulSmartContract
   runar_public
   def payBond
     requireOutputP2PKH(0, @bondPKH, @bondAmount)
-    @count = @count + 1
   end
 end

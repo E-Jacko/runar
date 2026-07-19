@@ -278,6 +278,90 @@ func (c *Cov) PayBond() {
 
 
 # ---------------------------------------------------------------------------
+# requireOutputP2PKH(0) vs the implicit single-output state continuation
+# ---------------------------------------------------------------------------
+
+class TestRequireOutputP2PKHSingleOutputContinuation:
+    """A StatefulSmartContract method that mutates state but adds no explicit
+    ``this.addOutput()``/``addRawOutput()`` takes the single-output state
+    continuation path: the compiler re-creates the contract's own (large
+    codePart) script at output index 0. ``requireOutputP2PKH(0, ...)`` also
+    asserts output 0 is a 34-byte P2PKH — impossible for any codePart >= 253
+    bytes — so the contract is permanently unspendable. The terminal case (no
+    state mutation, no continuation) stays valid. Mirrors the TS reference
+    describe 'requireOutputP2PKH(0) + single-output state continuation'.
+    """
+
+    # payBond mutates count (single-output continuation at output 0) AND
+    # asserts output 0 is a bond P2PKH — output 0 cannot be both the codePart
+    # and a P2PKH.
+    _MUTATING = """
+from runar import (
+    StatefulSmartContract, ByteString, Bigint, Readonly, public,
+)
+
+
+class Bond(StatefulSmartContract):
+    bondPKH: Readonly[ByteString]
+    bond: Readonly[Bigint]
+    count: Bigint
+
+    def __init__(self, bondPKH: ByteString, bond: Bigint, count: Bigint):
+        super().__init__(bondPKH, bond, count)
+        self.bondPKH = bondPKH
+        self.bond = bond
+        self.count = count
+
+    @public
+    def payBond(self):
+        requireOutputP2PKH(0, self.bondPKH, self.bond)
+        self.count = self.count + 1
+"""
+
+    # Terminal: no state mutation -> no continuation -> output 0 is free to be
+    # the required P2PKH.
+    _TERMINAL = """
+from runar import (
+    StatefulSmartContract, ByteString, Bigint, Readonly, public,
+)
+
+
+class Bond(StatefulSmartContract):
+    bondPKH: Readonly[ByteString]
+    bond: Readonly[Bigint]
+    count: Bigint
+
+    def __init__(self, bondPKH: ByteString, bond: Bigint, count: Bigint):
+        super().__init__(bondPKH, bond, count)
+        self.bondPKH = bondPKH
+        self.bond = bond
+        self.count = count
+
+    @public
+    def payBond(self):
+        requireOutputP2PKH(0, self.bondPKH, self.bond)
+"""
+
+    def test_mutating_variant_permanently_unspendable(self):
+        result = parse_source(self._MUTATING, "Bond.runar.py")
+        assert result.errors == [], result.error_strings()
+        tc_result = type_check(result.contract)
+        msgs = [d.format_message() for d in tc_result.errors]
+        assert any("permanently unspendable" in m for m in msgs), (
+            f"expected 'permanently unspendable' typecheck error, got: {msgs}"
+        )
+
+    def test_terminal_variant_accepted(self):
+        result = parse_source(self._TERMINAL, "Bond.runar.py")
+        assert result.errors == [], result.error_strings()
+        tc_result = type_check(result.contract)
+        msgs = [d.format_message() for d in tc_result.errors]
+        assert tc_result.errors == [], (
+            f"expected clean typecheck for terminal method, got: {msgs}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # requireOutputP2PKH
 # ---------------------------------------------------------------------------
 

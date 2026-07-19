@@ -13,6 +13,5 @@ pub const IntentOutputP2PKH = struct {
 
     pub fn payBond(self: *IntentOutputP2PKH) void {
         runar.requireOutputP2PKH(0, self.bondPKH, self.bondAmount);
-        self.count = self.count + 1;
     }
 };

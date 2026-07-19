@@ -22,5 +22,4 @@ type IntentOutputP2PKH struct {
 
 func (c *IntentOutputP2PKH) PayBond() {
 	runar.RequireOutputP2PKH(0, c.BondPKH, c.BondAmount)
-	c.Count = c.Count + 1
 }

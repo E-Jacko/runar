@@ -401,6 +401,59 @@ class IntentIntrinsicsTest {
     }
 
     // ------------------------------------------------------------------
+    // requireOutputP2PKH(0) + single-output state continuation collision
+    // ------------------------------------------------------------------
+
+    @Test
+    void requireOutputP2PKHZero_mutatingContinuation_errors() {
+        // PayBond mutates Count (single-output continuation at output 0) AND
+        // asserts output 0 is a bond P2PKH — output 0 cannot be both the
+        // codePart and a 34-byte P2PKH, so the contract is permanently
+        // unspendable.
+        String src = """
+            package x
+
+            import runar "github.com/icellan/runar/packages/runar-go"
+
+            type Bond struct {
+            \trunar.StatefulSmartContract
+            \tBondPKH runar.ByteString `runar:"readonly"`
+            \tBond    runar.Bigint     `runar:"readonly"`
+            \tCount   runar.Bigint
+            }
+
+            func (c *Bond) PayBond() {
+            \trunar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+            \tc.Count = c.Count + 1
+            }
+            """;
+        expectTypeError(src, "permanently unspendable");
+    }
+
+    @Test
+    void requireOutputP2PKHZero_terminalMethod_ok() {
+        // No state mutation -> no single-output continuation, so output 0 is
+        // free to be the required bond P2PKH. Accepted.
+        String src = """
+            package x
+
+            import runar "github.com/icellan/runar/packages/runar-go"
+
+            type Bond struct {
+            \trunar.StatefulSmartContract
+            \tBondPKH runar.ByteString `runar:"readonly"`
+            \tBond    runar.Bigint     `runar:"readonly"`
+            \tCount   runar.Bigint
+            }
+
+            func (c *Bond) PayBond() {
+            \trunar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+            }
+            """;
+        mustLower(src); // must not throw — terminal method, no continuation
+    }
+
+    // ------------------------------------------------------------------
     // currentBlockHeight
     // ------------------------------------------------------------------
 

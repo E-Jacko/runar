@@ -13,6 +13,5 @@ module IntentOutputP2PKH {
 
     public fun payBond(contract: &mut IntentOutputP2PKH) {
         requireOutputP2PKH(0, contract.bondPKH, contract.bondAmount);
-        contract.count = contract.count + 1;
     }
 }

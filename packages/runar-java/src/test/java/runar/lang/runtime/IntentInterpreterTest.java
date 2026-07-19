@@ -209,8 +209,8 @@ class IntentInterpreterTest {
             List.of(HEX.formatHex(bondPKH), BigInteger.valueOf(bondAmount), BigInteger.ZERO),
             witness
         );
-        assertEquals(BigInteger.ONE, r.newState.get("count"),
-            "count must increment after both assertions pass");
+        assertEquals(BigInteger.ZERO, r.newState.get("count"),
+            "count is unchanged — payBond is terminal (no state mutation)");
     }
 
     @Test

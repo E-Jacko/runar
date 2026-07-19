@@ -17,6 +17,5 @@ contract IntentOutputP2PKH is StatefulSmartContract {
 
     function payBond() public {
         requireOutputP2PKH(0, this.bondPKH, this.bondAmount);
-        this.count = this.count + 1;
     }
 }

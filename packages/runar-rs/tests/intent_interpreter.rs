@@ -252,7 +252,10 @@ fn intent_output_p2pkh_success() {
         &witness,
     );
     let (new_state, _, _) = res.expect("expected successful call");
-    assert_eq!(new_state.get("count"), Some(&SdkValue::Int(1)));
+    // payBond is now terminal (no state mutation) — the requireOutputP2PKH(0)
+    // + single-output-continuation guard forbids mutating state while
+    // asserting a P2PKH at output 0, so count is unchanged.
+    assert_eq!(new_state.get("count"), Some(&SdkValue::Int(0)));
 }
 
 #[test]

@@ -460,3 +460,66 @@ func (c *Cov) PayBond() {
     // Must lower without errors (no mix).
     let _ = lower_go(source);
 }
+
+// ---------------------------------------------------------------------------
+// requireOutputP2PKH(0) vs the implicit single-output state continuation
+// ---------------------------------------------------------------------------
+// A StatefulSmartContract method that mutates state without
+// this.addOutput()/addRawOutput() takes the single-output continuation path:
+// the compiler re-creates the contract's own (large) codePart at output 0.
+// requireOutputP2PKH(0, ...) additionally demands output 0 be a 34-byte P2PKH,
+// which is impossible — the contract would be permanently unspendable.
+
+#[test]
+fn test_require_output_p2pkh_zero_with_state_mutation_errors() {
+    // payBond asserts a bond P2PKH at output 0 AND mutates Count (single-output
+    // continuation also claims output 0) — output 0 cannot be both codePart and
+    // a P2PKH, so the contract is permanently unspendable.
+    let source = r#"
+package x
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type Bond struct {
+    runar.StatefulSmartContract
+    BondPKH runar.ByteString `runar:"readonly"`
+    Bond    runar.Bigint     `runar:"readonly"`
+    Count   runar.Bigint
+}
+
+func (c *Bond) PayBond() {
+    runar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+    c.Count = c.Count + 1
+}
+"#;
+    let errors = typecheck_errors(source);
+    assert_error_contains(&errors, "permanently unspendable");
+}
+
+#[test]
+fn test_require_output_p2pkh_zero_terminal_method_ok() {
+    // Terminal payBond: no state mutation -> no auto-injected continuation, so
+    // requireOutputP2PKH(0, ...) is a legitimate output-0 P2PKH assertion.
+    let source = r#"
+package x
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type Bond struct {
+    runar.StatefulSmartContract
+    BondPKH runar.ByteString `runar:"readonly"`
+    Bond    runar.Bigint     `runar:"readonly"`
+    Count   runar.Bigint
+}
+
+func (c *Bond) PayBond() {
+    runar.RequireOutputP2PKH(0, c.BondPKH, c.Bond)
+}
+"#;
+    let errors = typecheck_errors(source);
+    assert!(
+        !errors.iter().any(|e| e.contains("permanently unspendable")),
+        "terminal requireOutputP2PKH(0) must be accepted; got: {:?}",
+        errors
+    );
+}

@@ -255,9 +255,10 @@ test "intent-prev-output-script — failure: no witness supplied → MissingWitn
 // ---------------------------------------------------------------------------
 // IntentOutputP2PKH: ANF body matching the `payBond` method desugar.
 //
-// Source method body (Rúnar):
+// Source method body (Rúnar) — terminal (no state mutation), since
+// requireOutputP2PKH(0) + a state continuation on output 0 is rejected as
+// permanently unspendable by the typecheck guard:
 //   requireOutputP2PKH(0n, this.bondPKH, this.bondAmount);
-//   this.count = this.count + 1n;
 //
 // ANF lowering (slimmed to the witness-bridge + per-output substring
 // check; full pipeline would also build the change output + state output,
@@ -286,10 +287,7 @@ test "intent-prev-output-script — failure: no witness supplied → MissingWitn
 //   t_outEq       = bin_op === t_extracted t_expected
 //   _             = assert t_outEq                 <-- per-output check
 //
-//   t_count       = load_prop count
-//   t_one         = load_const 1
-//   t_newCount    = bin_op + t_count t_one
-//   _             = update_prop count = t_newCount
+//   (no count mutation — terminal method)
 // ---------------------------------------------------------------------------
 
 fn buildIntentOutputP2PKHAnf() ANFProgram {
@@ -353,11 +351,9 @@ fn buildIntentOutputP2PKHAnf() ANFProgram {
             .{ .name = "t_extracted", .value = .{ .call = .{ .func = "substr", .args = &substr_args.a } } },
             .{ .name = "t_outEq", .value = .{ .bin_op = .{ .op = "===", .left = "t_extracted", .right = "t_expected", .result_type = "bytes" } } },
             .{ .name = "assertOut", .value = .{ .assert_node = .{ .value = "t_outEq" } } },
-            // Increment count
-            .{ .name = "t_count", .value = .{ .load_prop = .{ .name = "count" } } },
-            .{ .name = "t_one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
-            .{ .name = "t_newCount", .value = .{ .bin_op = .{ .op = "+", .left = "t_count", .right = "t_one", .result_type = "int" } } },
-            .{ .name = "updCount", .value = .{ .update_prop = .{ .name = "count", .value = "t_newCount" } } },
+            // payBond is terminal: no state mutation (see the typecheck guard —
+            // requireOutputP2PKH(0) + a count mutation would be permanently
+            // unspendable). count is left unchanged.
         };
     };
     const methods = struct {
@@ -372,7 +368,7 @@ fn buildIntentOutputP2PKHAnf() ANFProgram {
     };
 }
 
-test "intent-output-p2pkh — success: serialised P2PKH matches → count increments" {
+test "intent-output-p2pkh — success: serialised P2PKH matches → count unchanged (terminal)" {
     const allocator = std.testing.allocator;
     const anf = buildIntentOutputP2PKHAnf();
 
@@ -409,7 +405,7 @@ test "intent-output-p2pkh — success: serialised P2PKH matches → count increm
     );
     defer freeResult(allocator, &result);
 
-    try std.testing.expectEqual(@as(i64, 1), result.state.get("count").?.int);
+    try std.testing.expectEqual(@as(i64, 0), result.state.get("count").?.int);
 }
 
 test "intent-output-p2pkh — failure: wrong pubkey-hash → per-output AssertionFailure" {

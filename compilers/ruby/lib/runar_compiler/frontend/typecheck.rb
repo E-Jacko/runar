@@ -356,6 +356,34 @@ module RunarCompiler
             "split the addDataOutput call into a separate method"
           )
         end
+
+        # Reject requireOutputP2PKH(0) in a method whose implicit single-output
+        # state continuation ALSO claims output 0. A StatefulSmartContract
+        # method that mutates state but uses no this.addOutput()/addRawOutput()
+        # re-creates the contract's own (large codePart) script at output 0;
+        # requiring output 0 to also be a 34-byte P2PKH is impossible
+        # (codePart >= 253 bytes forces a 3-byte CompactSize length prefix,
+        # never the P2PKH template's 0x19), so the contract is PERMANENTLY
+        # unspendable. The terminal case (no state mutation -> no continuation)
+        # stays valid, and addOutput/addRawOutput layouts are left to the
+        # developer. Mirrors the TS reference guard in 03-typecheck.ts.
+        if @contract.parent_class == "StatefulSmartContract"
+          mutable_props = {}
+          @contract.properties.each do |prop|
+            mutable_props[prop.name] = true unless prop.readonly
+          end
+          sig = TypeChecker.analyze_method_output_signals(method.body, mutable_props)
+          if sig[:requires_output_p2pkh_zero] && sig[:mutates_state] && !sig[:has_state_output]
+            add_error(
+              "method '#{method.name}' calls requireOutputP2PKH(0, ...) but also mutates state " \
+              "without this.addOutput()/addRawOutput() -- the auto-injected single-output state " \
+              "continuation already claims output 0 (the contract's codePart), so output 0 cannot " \
+              "simultaneously be the required 34-byte P2PKH. This contract would be permanently " \
+              "unspendable. Assert the bond on a non-continuation output index, or make the method " \
+              "terminal (no state mutation)"
+            )
+          end
+        end
       end
 
       # -------------------------------------------------------------------
@@ -471,6 +499,91 @@ module RunarCompiler
           expr.elements.any? { |el| expr_contains_add_data_output?(el) }
         else
           false
+        end
+      end
+
+      # -------------------------------------------------------------------
+      # Single-output-continuation vs requireOutputP2PKH(0) collision walk.
+      # Detects the three signals in one pass over a method body:
+      #   * mutates_state           -- assigns to / ++/-- a non-readonly prop
+      #   * has_state_output        -- calls this.addOutput()/addRawOutput()
+      #   * requires_output_p2pkh_zero -- calls requireOutputP2PKH(0, ...)
+      # Mirrors analyzeMethodOutputSignals in TS 03-typecheck.ts.
+      # -------------------------------------------------------------------
+
+      STATE_OUTPUT_METHOD_NAMES = %w[addOutput addRawOutput].freeze
+
+      def self.analyze_method_output_signals(body, mutable_props)
+        sig = { mutates_state: false, has_state_output: false, requires_output_p2pkh_zero: false }
+        body.each { |stmt| walk_stmt_for_output_signals(stmt, mutable_props, sig) }
+        sig
+      end
+
+      def self.walk_stmt_for_output_signals(stmt, mutable_props, sig)
+        case stmt
+        when AssignmentStmt
+          if stmt.target.is_a?(PropertyAccessExpr) && mutable_props.key?(stmt.target.property)
+            sig[:mutates_state] = true
+          end
+          walk_expr_for_output_signals(stmt.target, mutable_props, sig)
+          walk_expr_for_output_signals(stmt.value, mutable_props, sig)
+        when ExpressionStmt
+          walk_expr_for_output_signals(stmt.expr, mutable_props, sig)
+        when VariableDeclStmt
+          walk_expr_for_output_signals(stmt.init, mutable_props, sig)
+        when IfStmt
+          walk_expr_for_output_signals(stmt.condition, mutable_props, sig)
+          stmt.then.each { |t| walk_stmt_for_output_signals(t, mutable_props, sig) }
+          stmt.else_.each { |e| walk_stmt_for_output_signals(e, mutable_props, sig) } unless stmt.else_.empty?
+        when ForStmt
+          walk_stmt_for_output_signals(stmt.init, mutable_props, sig) unless stmt.init.nil?
+          walk_expr_for_output_signals(stmt.condition, mutable_props, sig)
+          walk_stmt_for_output_signals(stmt.update, mutable_props, sig) unless stmt.update.nil?
+          stmt.body.each { |b| walk_stmt_for_output_signals(b, mutable_props, sig) }
+        when ReturnStmt
+          walk_expr_for_output_signals(stmt.value, mutable_props, sig) unless stmt.value.nil?
+        end
+      end
+
+      def self.walk_expr_for_output_signals(expr, mutable_props, sig)
+        return if expr.nil?
+
+        case expr
+        when IncrementExpr, DecrementExpr
+          if expr.operand.is_a?(PropertyAccessExpr) && mutable_props.key?(expr.operand.property)
+            sig[:mutates_state] = true
+          end
+          walk_expr_for_output_signals(expr.operand, mutable_props, sig)
+        when CallExpr
+          callee = expr.callee
+          if (callee.is_a?(PropertyAccessExpr) || callee.is_a?(MemberExpr)) &&
+             STATE_OUTPUT_METHOD_NAMES.include?(callee.property)
+            sig[:has_state_output] = true
+          end
+          if callee.is_a?(Identifier) && callee.name == "requireOutputP2PKH"
+            idx = expr.args[0]
+            if !idx.nil? && idx.is_a?(BigIntLiteral) && idx.value == 0
+              sig[:requires_output_p2pkh_zero] = true
+            end
+          end
+          expr.args.each { |arg| walk_expr_for_output_signals(arg, mutable_props, sig) }
+          walk_expr_for_output_signals(callee, mutable_props, sig) unless callee.is_a?(Identifier)
+        when BinaryExpr
+          walk_expr_for_output_signals(expr.left, mutable_props, sig)
+          walk_expr_for_output_signals(expr.right, mutable_props, sig)
+        when UnaryExpr
+          walk_expr_for_output_signals(expr.operand, mutable_props, sig)
+        when TernaryExpr
+          walk_expr_for_output_signals(expr.condition, mutable_props, sig)
+          walk_expr_for_output_signals(expr.consequent, mutable_props, sig)
+          walk_expr_for_output_signals(expr.alternate, mutable_props, sig)
+        when IndexAccessExpr
+          walk_expr_for_output_signals(expr.object, mutable_props, sig)
+          walk_expr_for_output_signals(expr.index, mutable_props, sig)
+        when MemberExpr
+          walk_expr_for_output_signals(expr.object, mutable_props, sig)
+        when ArrayLiteralExpr
+          expr.elements.each { |el| walk_expr_for_output_signals(el, mutable_props, sig) }
         end
       end
 

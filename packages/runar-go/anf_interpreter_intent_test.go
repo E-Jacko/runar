@@ -138,8 +138,11 @@ func anfIntentPrevOutputScript() *ANFProgram {
 func anfIntentOutputP2PKH() *ANFProgram {
 	// public payBond() {
 	//   requireOutputP2PKH(0n, this.bondPKH, this.bondAmount);
-	//   this.count = this.count + 1n;
 	// }
+	// TERMINAL: no state mutation. requireOutputP2PKH(0) collides with the
+	// auto-injected single-output continuation, so a mutating payBond would be
+	// permanently unspendable and is now rejected at typecheck (see the Go
+	// frontend guard). count therefore stays at its input value after payBond.
 	return &ANFProgram{
 		ContractName: "IntentOutputP2PKH",
 		Properties: []ANFProperty{
@@ -165,15 +168,6 @@ func anfIntentOutputP2PKH() *ANFProgram {
 						"kind": "call",
 						"func": "requireOutputP2PKH",
 						"args": []interface{}{"t_idx", "t_pkh", "t_amt"},
-					}},
-					// this.count = this.count + 1n;
-					{Name: "t_c", Value: map[string]interface{}{"kind": "load_prop", "name": "count"}},
-					{Name: "t_one", Value: map[string]interface{}{"kind": "load_const", "value": float64(1)}},
-					{Name: "t_sum", Value: map[string]interface{}{
-						"kind": "bin_op", "op": "+", "left": "t_c", "right": "t_one", "resultType": "bigint",
-					}},
-					{Name: "t_upd", Value: map[string]interface{}{
-						"kind": "update_prop", "name": "count", "value": "t_sum",
 					}},
 				},
 			},
@@ -442,9 +436,10 @@ func TestIntentInterpreter_OutputP2PKH_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteStrictWithFixture: %v", err)
 	}
+	// payBond is terminal (no state mutation) — count stays at its input value.
 	c, ok := state["count"].(*big.Int)
-	if !ok || c.Int64() != 1 {
-		t.Fatalf("expected count=1, got %v", state["count"])
+	if !ok || c.Int64() != 0 {
+		t.Fatalf("expected count=0, got %v", state["count"])
 	}
 }
 

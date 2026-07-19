@@ -136,7 +136,9 @@ RSpec.describe 'Runar::SDK::ANFInterpreter intent intrinsics' do
       )
       expect(r[:success]).to be(true)
       expect(r[:error]).to be_nil
-      expect(r[:state]['count']).to eq(1)
+      # payBond is a terminal method now (no state mutation), so count is
+      # unchanged from its initial value.
+      expect(r[:state]['count']).to eq(0)
     end
 
     it 'failure: wrong pubkey-hash in serialised outputs → substring mismatch' do

@@ -404,6 +404,35 @@ class _TypeChecker:
                 "split the addDataOutput call into a separate method"
             )
 
+        # Reject requireOutputP2PKH(0) in a method whose implicit single-output
+        # state continuation ALSO claims output 0. A StatefulSmartContract
+        # method that mutates state but uses no this.addOutput()/addRawOutput()
+        # re-creates the contract's own (large codePart) script at output 0;
+        # requiring output 0 to also be a 34-byte P2PKH is impossible
+        # (codePart >= 253 bytes forces a 3-byte CompactSize length prefix,
+        # never the P2PKH template's 0x19), so the contract is PERMANENTLY
+        # unspendable. The terminal case (no state mutation -> no continuation)
+        # stays valid, and addOutput/addRawOutput layouts are left to the
+        # developer.
+        if self.contract.parent_class == "StatefulSmartContract":
+            mutable_props = {
+                p.name for p in self.contract.properties if not p.readonly
+            }
+            sig = _analyze_method_output_signals(method.body, mutable_props)
+            if (
+                sig.requires_output_p2pkh_zero
+                and sig.mutates_state
+                and not sig.has_state_output
+            ):
+                self._add_error(
+                    f"method '{method.name}' calls requireOutputP2PKH(0, ...) but also mutates state "
+                    "without this.addOutput()/addRawOutput() — the auto-injected single-output state "
+                    "continuation already claims output 0 (the contract's codePart), so output 0 cannot "
+                    "simultaneously be the required 34-byte P2PKH. This contract would be permanently "
+                    "unspendable. Assert the bond on a non-continuation output index, or make the method "
+                    "terminal (no state mutation)"
+                )
+
     def _check_statements(self, stmts: list[Statement], env: _TypeEnv) -> None:
         for stmt in stmts:
             self._check_statement(stmt, env)
@@ -1319,3 +1348,131 @@ def _expr_contains_add_data_output(expr: Expression | None) -> bool:
             if _expr_contains_add_data_output(el):
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Single-output-continuation vs requireOutputP2PKH(0) collision analysis
+# ---------------------------------------------------------------------------
+# A StatefulSmartContract method that mutates state but calls no
+# this.addOutput()/this.addRawOutput() takes the "single-output continuation"
+# path: the compiler re-creates the contract's own (large codePart) script at
+# output index 0. requireOutputP2PKH(0, ...) additionally asserts output 0 is a
+# 34-byte P2PKH — impossible for any codePart >= 253 bytes — so the contract is
+# permanently unspendable. Detect the three signals in one walk. Mirrors
+# analyzeMethodOutputSignals in
+# packages/runar-compiler/src/passes/03-typecheck.ts.
+
+_STATE_OUTPUT_METHOD_NAMES = frozenset({"addOutput", "addRawOutput"})
+
+
+@dataclass
+class _MethodOutputSignals:
+    """Three signals detected in a single method-body walk."""
+
+    mutates_state: bool = False  # assigns to / ++/-- a non-readonly property
+    has_state_output: bool = False  # calls this.addOutput()/this.addRawOutput()
+    requires_output_p2pkh_zero: bool = False  # calls requireOutputP2PKH(0, ...)
+
+
+def _analyze_method_output_signals(
+    body: list[Statement], mutable_props: set[str]
+) -> _MethodOutputSignals:
+    sig = _MethodOutputSignals()
+    for stmt in body:
+        _walk_stmt_for_output_signals(stmt, mutable_props, sig)
+    return sig
+
+
+def _walk_stmt_for_output_signals(
+    stmt: Statement, mutable_props: set[str], sig: _MethodOutputSignals
+) -> None:
+    if isinstance(stmt, AssignmentStmt):
+        if (
+            isinstance(stmt.target, PropertyAccessExpr)
+            and stmt.target.property in mutable_props
+        ):
+            sig.mutates_state = True
+        _walk_expr_for_output_signals(stmt.target, mutable_props, sig)
+        _walk_expr_for_output_signals(stmt.value, mutable_props, sig)
+        return
+    if isinstance(stmt, ExpressionStmt):
+        _walk_expr_for_output_signals(stmt.expr, mutable_props, sig)
+        return
+    if isinstance(stmt, VariableDeclStmt):
+        _walk_expr_for_output_signals(stmt.init, mutable_props, sig)
+        return
+    if isinstance(stmt, IfStmt):
+        _walk_expr_for_output_signals(stmt.condition, mutable_props, sig)
+        for t in stmt.then:
+            _walk_stmt_for_output_signals(t, mutable_props, sig)
+        for e in stmt.else_:
+            _walk_stmt_for_output_signals(e, mutable_props, sig)
+        return
+    if isinstance(stmt, ForStmt):
+        if stmt.init is not None:
+            _walk_stmt_for_output_signals(stmt.init, mutable_props, sig)
+        _walk_expr_for_output_signals(stmt.condition, mutable_props, sig)
+        if stmt.update is not None:
+            _walk_stmt_for_output_signals(stmt.update, mutable_props, sig)
+        for b in stmt.body:
+            _walk_stmt_for_output_signals(b, mutable_props, sig)
+        return
+    if isinstance(stmt, ReturnStmt):
+        if stmt.value is not None:
+            _walk_expr_for_output_signals(stmt.value, mutable_props, sig)
+        return
+
+
+def _walk_expr_for_output_signals(
+    expr: Expression | None, mutable_props: set[str], sig: _MethodOutputSignals
+) -> None:
+    if expr is None:
+        return
+    if isinstance(expr, (IncrementExpr, DecrementExpr)):
+        if (
+            isinstance(expr.operand, PropertyAccessExpr)
+            and expr.operand.property in mutable_props
+        ):
+            sig.mutates_state = True
+        _walk_expr_for_output_signals(expr.operand, mutable_props, sig)
+        return
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if (
+            isinstance(callee, (PropertyAccessExpr, MemberExpr))
+            and callee.property in _STATE_OUTPUT_METHOD_NAMES
+        ):
+            sig.has_state_output = True
+        if isinstance(callee, Identifier) and callee.name == "requireOutputP2PKH":
+            if expr.args:
+                idx = expr.args[0]
+                if isinstance(idx, BigIntLiteral) and idx.value == 0:
+                    sig.requires_output_p2pkh_zero = True
+        for arg in expr.args:
+            _walk_expr_for_output_signals(arg, mutable_props, sig)
+        if not isinstance(callee, Identifier):
+            _walk_expr_for_output_signals(callee, mutable_props, sig)
+        return
+    if isinstance(expr, BinaryExpr):
+        _walk_expr_for_output_signals(expr.left, mutable_props, sig)
+        _walk_expr_for_output_signals(expr.right, mutable_props, sig)
+        return
+    if isinstance(expr, UnaryExpr):
+        _walk_expr_for_output_signals(expr.operand, mutable_props, sig)
+        return
+    if isinstance(expr, TernaryExpr):
+        _walk_expr_for_output_signals(expr.condition, mutable_props, sig)
+        _walk_expr_for_output_signals(expr.consequent, mutable_props, sig)
+        _walk_expr_for_output_signals(expr.alternate, mutable_props, sig)
+        return
+    if isinstance(expr, IndexAccessExpr):
+        _walk_expr_for_output_signals(expr.object, mutable_props, sig)
+        _walk_expr_for_output_signals(expr.index, mutable_props, sig)
+        return
+    if isinstance(expr, MemberExpr):
+        _walk_expr_for_output_signals(expr.object, mutable_props, sig)
+        return
+    if isinstance(expr, ArrayLiteralExpr):
+        for el in expr.elements:
+            _walk_expr_for_output_signals(el, mutable_props, sig)
+        return

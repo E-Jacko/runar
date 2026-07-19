@@ -32,4 +32,3 @@ class IntentOutputP2PKH(StatefulSmartContract):
     @public
     def payBond(self):
         requireOutputP2PKH(0, self.bondPKH, self.bondAmount)
-        self.count = self.count + 1

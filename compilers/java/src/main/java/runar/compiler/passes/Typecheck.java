@@ -106,6 +106,14 @@ public final class Typecheck {
 
     private static final Set<String> AFFINE_TYPES = Set.of("Sig", "SigHashPreimage");
 
+    /**
+     * State-output intrinsics: a call to either signals that the method builds
+     * its own output layout, so the compiler does NOT inject a single-output
+     * state continuation. Mirrors {@code STATE_OUTPUT_METHOD_NAMES} in
+     * {@code packages/runar-compiler/src/passes/03-typecheck.ts}.
+     */
+    private static final Set<String> STATE_OUTPUT_METHOD_NAMES = Set.of("addOutput", "addRawOutput");
+
     private static final Map<String, int[]> CONSUMING_FUNCTIONS = Map.of(
         "checkSig", new int[]{0},
         "checkMultiSig", new int[]{0},
@@ -289,6 +297,38 @@ public final class Typecheck {
                     m.sourceLocation()
                 ));
             }
+
+            // Reject requireOutputP2PKH(0) in a method whose implicit
+            // single-output state continuation ALSO claims output 0. A
+            // StatefulSmartContract method that mutates state but uses no
+            // this.addOutput()/addRawOutput() re-creates the contract's own
+            // (large codePart) script at output 0; requiring output 0 to also
+            // be a 34-byte P2PKH is impossible (codePart >= 253 bytes forces a
+            // 3-byte CompactSize length prefix, never the P2PKH template's
+            // 0x19), so the contract is PERMANENTLY unspendable. The terminal
+            // case (no state mutation -> no continuation) stays valid, and
+            // addOutput/addRawOutput layouts are left to the developer. Mirrors
+            // the guard in packages/runar-compiler/src/passes/03-typecheck.ts.
+            if (contract.parentClass() == ParentClass.STATEFUL_SMART_CONTRACT) {
+                Set<String> mutableProps = new HashSet<>();
+                for (PropertyNode p : contract.properties()) {
+                    if (!p.readonly()) mutableProps.add(p.name());
+                }
+                MethodOutputSignals sig = analyzeMethodOutputSignals(m.body(), mutableProps);
+                if (sig.requiresOutputP2PKHZero && sig.mutatesState && !sig.hasStateOutput) {
+                    errors.add(format(
+                        "method '" + m.name() + "' calls requireOutputP2PKH(0, ...) but also "
+                            + "mutates state without this.addOutput()/addRawOutput() — the "
+                            + "auto-injected single-output state continuation already claims "
+                            + "output 0 (the contract's codePart), so output 0 cannot "
+                            + "simultaneously be the required 34-byte P2PKH. This contract "
+                            + "would be permanently unspendable. Assert the bond on a "
+                            + "non-continuation output index, or make the method terminal "
+                            + "(no state mutation)",
+                        m.sourceLocation()
+                    ));
+                }
+            }
         }
 
         // --------------------------------------------------------------
@@ -454,6 +494,107 @@ public final class Typecheck {
                 }
             }
             return false;
+        }
+
+        // --------------------------------------------------------------
+        // Single-output-continuation vs requireOutputP2PKH(0) collision.
+        // A StatefulSmartContract method that mutates state but calls no
+        // this.addOutput()/addRawOutput() takes the single-output
+        // continuation path (codePart at output 0); requireOutputP2PKH(0,
+        // ...) additionally asserts output 0 is a 34-byte P2PKH — impossible
+        // for any codePart >= 253 bytes. Detect the three signals in one
+        // walk. Mirrors analyzeMethodOutputSignals in
+        // packages/runar-compiler/src/passes/03-typecheck.ts.
+        // --------------------------------------------------------------
+
+        /** Three output-layout signals gathered from a single method body walk. */
+        private static final class MethodOutputSignals {
+            boolean mutatesState;             // assigns to / ++/-- a non-readonly property
+            boolean hasStateOutput;           // calls this.addOutput() or this.addRawOutput()
+            boolean requiresOutputP2PKHZero;  // calls requireOutputP2PKH(0, ...)
+        }
+
+        private static MethodOutputSignals analyzeMethodOutputSignals(
+                List<Statement> body, Set<String> mutableProps) {
+            MethodOutputSignals sig = new MethodOutputSignals();
+            for (Statement s : body) walkStmtForOutputSignals(s, mutableProps, sig);
+            return sig;
+        }
+
+        private static void walkStmtForOutputSignals(
+                Statement s, Set<String> mutableProps, MethodOutputSignals sig) {
+            if (s instanceof AssignmentStatement a) {
+                if (a.target() instanceof PropertyAccessExpr pa && mutableProps.contains(pa.property())) {
+                    sig.mutatesState = true;
+                }
+                walkExprForOutputSignals(a.target(), mutableProps, sig);
+                walkExprForOutputSignals(a.value(), mutableProps, sig);
+            } else if (s instanceof ExpressionStatement e) {
+                walkExprForOutputSignals(e.expression(), mutableProps, sig);
+            } else if (s instanceof VariableDeclStatement v) {
+                walkExprForOutputSignals(v.init(), mutableProps, sig);
+            } else if (s instanceof IfStatement i) {
+                walkExprForOutputSignals(i.condition(), mutableProps, sig);
+                for (Statement t : i.thenBody()) walkStmtForOutputSignals(t, mutableProps, sig);
+                if (i.elseBody() != null) {
+                    for (Statement t : i.elseBody()) walkStmtForOutputSignals(t, mutableProps, sig);
+                }
+            } else if (s instanceof ForStatement f) {
+                if (f.init() != null) walkStmtForOutputSignals(f.init(), mutableProps, sig);
+                walkExprForOutputSignals(f.condition(), mutableProps, sig);
+                if (f.update() != null) walkStmtForOutputSignals(f.update(), mutableProps, sig);
+                for (Statement b : f.body()) walkStmtForOutputSignals(b, mutableProps, sig);
+            } else if (s instanceof ReturnStatement r) {
+                if (r.value() != null) walkExprForOutputSignals(r.value(), mutableProps, sig);
+            }
+        }
+
+        private static void walkExprForOutputSignals(
+                Expression e, Set<String> mutableProps, MethodOutputSignals sig) {
+            if (e == null) return;
+            if (e instanceof IncrementExpr inc) {
+                if (inc.operand() instanceof PropertyAccessExpr pa && mutableProps.contains(pa.property())) {
+                    sig.mutatesState = true;
+                }
+                walkExprForOutputSignals(inc.operand(), mutableProps, sig);
+            } else if (e instanceof DecrementExpr dec) {
+                if (dec.operand() instanceof PropertyAccessExpr pa && mutableProps.contains(pa.property())) {
+                    sig.mutatesState = true;
+                }
+                walkExprForOutputSignals(dec.operand(), mutableProps, sig);
+            } else if (e instanceof CallExpr c) {
+                Expression callee = c.callee();
+                if (callee instanceof PropertyAccessExpr pa && STATE_OUTPUT_METHOD_NAMES.contains(pa.property())) {
+                    sig.hasStateOutput = true;
+                }
+                if (callee instanceof MemberExpr me && STATE_OUTPUT_METHOD_NAMES.contains(me.property())) {
+                    sig.hasStateOutput = true;
+                }
+                if (callee instanceof Identifier id && "requireOutputP2PKH".equals(id.name())) {
+                    if (!c.args().isEmpty() && c.args().get(0) instanceof BigIntLiteral idx
+                            && idx.value().signum() == 0) {
+                        sig.requiresOutputP2PKHZero = true;
+                    }
+                }
+                for (Expression arg : c.args()) walkExprForOutputSignals(arg, mutableProps, sig);
+                if (!(callee instanceof Identifier)) walkExprForOutputSignals(callee, mutableProps, sig);
+            } else if (e instanceof BinaryExpr b) {
+                walkExprForOutputSignals(b.left(), mutableProps, sig);
+                walkExprForOutputSignals(b.right(), mutableProps, sig);
+            } else if (e instanceof UnaryExpr u) {
+                walkExprForOutputSignals(u.operand(), mutableProps, sig);
+            } else if (e instanceof TernaryExpr t) {
+                walkExprForOutputSignals(t.condition(), mutableProps, sig);
+                walkExprForOutputSignals(t.consequent(), mutableProps, sig);
+                walkExprForOutputSignals(t.alternate(), mutableProps, sig);
+            } else if (e instanceof IndexAccessExpr ia) {
+                walkExprForOutputSignals(ia.object(), mutableProps, sig);
+                walkExprForOutputSignals(ia.index(), mutableProps, sig);
+            } else if (e instanceof MemberExpr me) {
+                walkExprForOutputSignals(me.object(), mutableProps, sig);
+            } else if (e instanceof ArrayLiteralExpr al) {
+                for (Expression el : al.elements()) walkExprForOutputSignals(el, mutableProps, sig);
+            }
         }
 
         private void checkStatements(List<Statement> stmts, Env env) {

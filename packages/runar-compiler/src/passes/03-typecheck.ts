@@ -441,6 +441,107 @@ function exprContainsAddDataOutput(expr: Expression): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Single-output-continuation vs requireOutputP2PKH(0) collision analysis
+// ---------------------------------------------------------------------------
+// A StatefulSmartContract method that mutates state but calls no
+// this.addOutput()/this.addRawOutput() takes the "single-output continuation"
+// path: the compiler re-creates the contract's own (large codePart) script at
+// output index 0. requireOutputP2PKH(0, ...) additionally asserts output 0 is a
+// 34-byte P2PKH — impossible for any codePart >= 253 bytes — so the contract is
+// permanently unspendable. Detect the three signals in one walk. Mirrors the
+// state-output intrinsic set in side-effect-summary.ts.
+
+const STATE_OUTPUT_METHOD_NAMES = new Set(['addOutput', 'addRawOutput']);
+
+interface MethodOutputSignals {
+  mutatesState: boolean;      // assigns to / ++/-- a non-readonly property
+  hasStateOutput: boolean;    // calls this.addOutput() or this.addRawOutput()
+  requiresOutputP2PKHZero: boolean; // calls requireOutputP2PKH(0n, ...)
+}
+
+function analyzeMethodOutputSignals(body: Statement[], mutableProps: Set<string>): MethodOutputSignals {
+  const sig: MethodOutputSignals = { mutatesState: false, hasStateOutput: false, requiresOutputP2PKHZero: false };
+  for (const stmt of body) walkStmtForOutputSignals(stmt, mutableProps, sig);
+  return sig;
+}
+
+function walkStmtForOutputSignals(stmt: Statement, mutableProps: Set<string>, sig: MethodOutputSignals): void {
+  switch (stmt.kind) {
+    case 'assignment':
+      if (stmt.target.kind === 'property_access' && mutableProps.has(stmt.target.property)) sig.mutatesState = true;
+      walkExprForOutputSignals(stmt.target, mutableProps, sig);
+      walkExprForOutputSignals(stmt.value, mutableProps, sig);
+      return;
+    case 'expression_statement':
+      walkExprForOutputSignals(stmt.expression, mutableProps, sig);
+      return;
+    case 'variable_decl':
+      walkExprForOutputSignals(stmt.init, mutableProps, sig);
+      return;
+    case 'if_statement':
+      walkExprForOutputSignals(stmt.condition, mutableProps, sig);
+      for (const t of stmt.then) walkStmtForOutputSignals(t, mutableProps, sig);
+      if (stmt.else) for (const e of stmt.else) walkStmtForOutputSignals(e, mutableProps, sig);
+      return;
+    case 'for_statement':
+      walkStmtForOutputSignals(stmt.init, mutableProps, sig);
+      walkExprForOutputSignals(stmt.condition, mutableProps, sig);
+      walkStmtForOutputSignals(stmt.update, mutableProps, sig);
+      for (const b of stmt.body) walkStmtForOutputSignals(b, mutableProps, sig);
+      return;
+    case 'return_statement':
+      if (stmt.value) walkExprForOutputSignals(stmt.value, mutableProps, sig);
+      return;
+  }
+}
+
+function walkExprForOutputSignals(expr: Expression, mutableProps: Set<string>, sig: MethodOutputSignals): void {
+  if (!expr) return;
+  switch (expr.kind) {
+    case 'increment_expr':
+    case 'decrement_expr':
+      if (expr.operand.kind === 'property_access' && mutableProps.has(expr.operand.property)) sig.mutatesState = true;
+      walkExprForOutputSignals(expr.operand, mutableProps, sig);
+      return;
+    case 'call_expr': {
+      const callee = expr.callee;
+      if ((callee.kind === 'property_access' || callee.kind === 'member_expr') && STATE_OUTPUT_METHOD_NAMES.has(callee.property)) {
+        sig.hasStateOutput = true;
+      }
+      if (callee.kind === 'identifier' && callee.name === 'requireOutputP2PKH') {
+        const idx = expr.args[0];
+        if (idx && idx.kind === 'bigint_literal' && idx.value === 0n) sig.requiresOutputP2PKHZero = true;
+      }
+      for (const arg of expr.args) walkExprForOutputSignals(arg, mutableProps, sig);
+      if (callee.kind !== 'identifier') walkExprForOutputSignals(callee, mutableProps, sig);
+      return;
+    }
+    case 'binary_expr':
+      walkExprForOutputSignals(expr.left, mutableProps, sig);
+      walkExprForOutputSignals(expr.right, mutableProps, sig);
+      return;
+    case 'unary_expr':
+      walkExprForOutputSignals(expr.operand, mutableProps, sig);
+      return;
+    case 'ternary_expr':
+      walkExprForOutputSignals(expr.condition, mutableProps, sig);
+      walkExprForOutputSignals(expr.consequent, mutableProps, sig);
+      walkExprForOutputSignals(expr.alternate, mutableProps, sig);
+      return;
+    case 'index_access':
+      walkExprForOutputSignals(expr.object, mutableProps, sig);
+      walkExprForOutputSignals(expr.index, mutableProps, sig);
+      return;
+    case 'member_expr':
+      walkExprForOutputSignals(expr.object, mutableProps, sig);
+      return;
+    case 'array_literal':
+      for (const el of expr.elements) walkExprForOutputSignals(el, mutableProps, sig);
+      return;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Type environment
 // ---------------------------------------------------------------------------
 
@@ -596,6 +697,34 @@ class TypeChecker {
         'error',
         method.sourceLocation,
       ));
+    }
+
+    // Reject requireOutputP2PKH(0) in a method whose implicit single-output
+    // state continuation ALSO claims output 0. A StatefulSmartContract method
+    // that mutates state but uses no this.addOutput()/addRawOutput() re-creates
+    // the contract's own (large codePart) script at output 0; requiring output
+    // 0 to also be a 34-byte P2PKH is impossible (codePart >= 253 bytes forces a
+    // 3-byte CompactSize length prefix, never the P2PKH template's 0x19), so the
+    // contract is PERMANENTLY unspendable. The terminal case (no state mutation
+    // -> no continuation) stays valid, and addOutput/addRawOutput layouts are
+    // left to the developer.
+    if (this.contract.parentClass === 'StatefulSmartContract') {
+      const mutableProps = new Set(
+        this.contract.properties.filter(p => !p.readonly).map(p => p.name),
+      );
+      const sig = analyzeMethodOutputSignals(method.body, mutableProps);
+      if (sig.requiresOutputP2PKHZero && sig.mutatesState && !sig.hasStateOutput) {
+        this.errors.push(makeDiagnostic(
+          `method '${method.name}' calls requireOutputP2PKH(0, ...) but also mutates state ` +
+            `without this.addOutput()/addRawOutput() — the auto-injected single-output state ` +
+            `continuation already claims output 0 (the contract's codePart), so output 0 cannot ` +
+            `simultaneously be the required 34-byte P2PKH. This contract would be permanently ` +
+            `unspendable. Assert the bond on a non-continuation output index, or make the method ` +
+            `terminal (no state mutation)`,
+          'error',
+          method.sourceLocation,
+        ));
+      }
     }
   }
 

@@ -27,6 +27,5 @@ class IntentOutputP2PKH extends StatefulSmartContract {
 
   public payBond() {
     requireOutputP2PKH(0n, this.bondPKH, this.bondAmount);
-    this.count = this.count + 1n;
   }
 }

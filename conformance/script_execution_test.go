@@ -1358,149 +1358,45 @@ func TestIntentPrevOutputScript_ScriptExecution_Reject_WrongWitness(t *testing.T
 	}
 }
 
-// TestIntentOutputP2PKH_ScriptExecution_StructurallyUnspendable is NOT an
-// accept/reject pair — it is a maximal-effort ACCEPT ATTEMPT that
-// demonstrates, on the real go-sdk engine, that IntentOutputP2PKH.payBond()
-// can NEVER be spent by any real transaction. This is a genuine finding, not
-// a harness limitation (see the long comment below for the proof); it is
-// documented here rather than faked as a pass.
-//
-// payBond() calls requireOutputP2PKH(0n, this.bondPKH, this.bondAmount) AND
-// mutates this.count without calling this.addOutput(...) explicitly. The
-// compiler therefore emits TWO INDEPENDENT hashOutputs assertions against
-// the SAME real preimage's extractOutputHash:
-//
-//  1. the auto-injected state-continuation check (04-anf-lower.ts, the
-//     "single-output continuation" path, `isAutoInjectedStateCheck: true`):
-//     hash256(computeStateOutput(txPreimage, _codePart+state, _newAmount)
-//     ++ changeOutput) === extractOutputHash(txPreimage)
-//  2. requireOutputP2PKH's own witness-bridge check:
-//     hash256(_serialisedOutputs) === extractOutputHash(txPreimage)
-//     followed by: substr(_serialisedOutputs, 0, 34) === P2PKH(bondPKH, bondAmount)
-//
-// Both (1) and (2)'s left-hand hashes are compared against the SAME
-// `extractOutputHash(txPreimage)` value, which is the REAL BIP-143
-// hashOutputs of the ACTUAL spending transaction. For (1) to hold, output 0
-// of the real tx must literally BE `computeStateOutput(...)` — i.e. the
-// large compiled codePart (1000 bytes for this fixture) + OP_RETURN + state,
-// NOT a 34-byte P2PKH script. For (2)'s substr assertion to hold, the first
-// 34 bytes of that SAME real output 0 must equal the fixed P2PKH template
-// (8-byte LE amount ‖ 0x19 0x76 0xa9 0x14 ‖ 20-byte pubkeyHash ‖ 0x88 0xac).
-// A CompactSize-encoded output whose script is >= 253 bytes (this codePart
-// alone is 1000 bytes) NEVER starts with the single byte 0x19 at that
-// position — it starts with 0xfd followed by a 2-byte length. There is no
-// number of accept attempts, witness choices, or CallOptions.outputs
-// composition that can satisfy both simultaneously: (1) pins output 0's
-// bytes exactly (up to hash collision, i.e. absolutely for any real spend),
-// and (2) requires those SAME bytes to also be a completely different,
-// much shorter, fixed template. This is unconditional on `_newAmount`,
-// `_changePKH`/`_changeAmount`, or any other witness the spender controls.
-//
-// This test constructs the BEST POSSIBLE accept attempt — it sets
-// `_serialisedOutputs` to the REAL, byte-exact serialization of the real
-// tx's own outputs (so assertion (2)'s hashOutputs half and assertion (1)
-// both trivially hold — there is no witness-vs-reality mismatch at all —
-// and even sets `_newAmount == bondAmount` so the first 8 bytes of output 0
-// match the P2PKH template's amount field exactly) and shows the ONLY
-// remaining failure is the unavoidable CompactSize length-prefix mismatch
-// at byte offset 8. That is real-engine proof the contract is permanently
-// unspendable, not a harness gap — see the ledger note in
-// conformance/witnesses/harness-inapplicable.json for the disposition.
-func TestIntentOutputP2PKH_ScriptExecution_StructurallyUnspendable(t *testing.T) {
-	bondPKH := make([]byte, 20)
-	for i := range bondPKH {
-		bondPKH[i] = byte(0x11 * (i + 1) % 256)
+// TestIntentOutputP2PKH_GuardRejectsMutatingVariant verifies the typecheck guard
+// (03-typecheck.ts + its 7-tier peers): a StatefulSmartContract method that calls
+// requireOutputP2PKH(0, ...) AND mutates state without this.addOutput()/
+// addRawOutput() is PERMANENTLY UNSPENDABLE — the implicit single-output state
+// continuation already claims output 0 (the large codePart), so output 0 cannot
+// also be the required 34-byte P2PKH (a codePart >= 253 bytes forces a 3-byte
+// CompactSize length prefix, never the P2PKH template's 0x19). This variant used
+// to compile to an un-spendable script (proven on the real go-sdk engine); it is
+// now a compile-time error. The shipped intent-output-p2pkh fixture is the
+// spendable TERMINAL form (requireOutputP2PKH(0), no state mutation), whose real
+// requireOutputP2PKH accept/reject semantics are covered by the 7-tier
+// intent-intrinsics interpreter tests + cross-tier hex conformance.
+func TestIntentOutputP2PKH_GuardRejectsMutatingVariant(t *testing.T) {
+	mutatingSource := `import { StatefulSmartContract, ByteString, requireOutputP2PKH } from 'runar-lang';
+class IntentOutputP2PKH extends StatefulSmartContract {
+  readonly bondPKH: ByteString;
+  readonly bondAmount: bigint;
+  count: bigint;
+  constructor(bondPKH: ByteString, bondAmount: bigint, count: bigint) {
+    super(bondPKH, bondAmount, count);
+    this.bondPKH = bondPKH;
+    this.bondAmount = bondAmount;
+    this.count = count;
+  }
+  public payBond() {
+    requireOutputP2PKH(0n, this.bondPKH, this.bondAmount);
+    this.count = this.count + 1n;
+  }
+}`
+	_, err := compileRúnarInline(mutatingSource,
+		`{"bondPKH":"00112233445566778899aabbccddeeff00112233","bondAmount":"5000","count":"0"}`,
+		"IntentOutputP2PKH.runar.ts")
+	if err == nil {
+		t.Fatal("expected the compiler to REJECT requireOutputP2PKH(0) + state mutation (permanently unspendable), but compilation succeeded")
 	}
-	bondAmount := int64(5000)
-
-	codePartHex, err := compileRúnar("intent-output-p2pkh",
-		fmt.Sprintf(`{"bondPKH":"%s","bondAmount":"%d","count":"0"}`, hex.EncodeToString(bondPKH), bondAmount))
-	if err != nil {
-		t.Fatalf("compile: %v", err)
+	if !strings.Contains(err.Error(), "permanently unspendable") {
+		t.Fatalf("expected 'permanently unspendable' guard error, got: %v", err)
 	}
-	codePartBytes, _ := hex.DecodeString(codePartHex)
-	t.Logf("codePart is %d bytes — a CompactSize-encoded output containing it can never start with the single byte 0x19 (25) that the fixed-width P2PKH template requires", len(codePartBytes))
-
-	fullLockingHex := codePartHex + "6a" + serializeBigintState(0)
-	continuationScriptHex := codePartHex + "6a" + serializeBigintState(1)
-
-	codeSepOffset := findCodeSeparatorOffset(codePartHex, 0)
-	if codeSepOffset < 0 {
-		t.Fatal("OP_CODESEPARATOR not found in codePart")
-	}
-
-	prevSatoshis := uint64(10000)
-	// _newAmount == bondAmount: makes the first 8 bytes of the real
-	// continuation output byte-identical to the P2PKH template's amount
-	// field, isolating the failure to the length-prefix/script bytes.
-	contSatoshis := uint64(bondAmount)
-	changeSatoshis := uint64(4500)
-	changePKH := make([]byte, 20)
-
-	fullLockingScript, err := script.NewFromHex(fullLockingHex)
-	if err != nil {
-		t.Fatalf("parse full locking script: %v", err)
-	}
-	prevOutput := &transaction.TransactionOutput{
-		Satoshis:      prevSatoshis,
-		LockingScript: fullLockingScript,
-	}
-
-	spendTx := transaction.NewTransaction()
-	spendTx.AddInputWithOutput(&transaction.TransactionInput{
-		SourceTXID:       makeFundingTxID(),
-		SourceTxOutIndex: 0,
-		SequenceNumber:   transaction.DefaultSequenceNumber,
-	}, prevOutput)
-
-	contScript, _ := script.NewFromHex(continuationScriptHex)
-	contOutput := &transaction.TransactionOutput{
-		Satoshis:      contSatoshis,
-		LockingScript: contScript,
-	}
-	changeOutput := &transaction.TransactionOutput{
-		Satoshis:      changeSatoshis,
-		LockingScript: buildP2PKHLockingScript(changePKH),
-	}
-	spendTx.AddOutput(contOutput)
-	spendTx.AddOutput(changeOutput)
-
-	scriptCodeHex := fullLockingHex[(codeSepOffset+1)*2:]
-	scriptCodeScript, _ := script.NewFromHex(scriptCodeHex)
-	spendTx.Inputs[0].SetSourceTxOutput(&transaction.TransactionOutput{
-		Satoshis:      prevSatoshis,
-		LockingScript: scriptCodeScript,
-	})
-
-	preimage, err := spendTx.CalcInputPreimage(0, sighash.AllForkID)
-	if err != nil {
-		t.Fatalf("calc preimage: %v", err)
-	}
-
-	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
-
-	// Best-effort _serialisedOutputs: the REAL, byte-exact serialization of
-	// the real tx's own outputs (amount ‖ CompactSize(scriptLen) ‖ script),
-	// via the go-sdk's own TransactionOutput.Bytes() so it is guaranteed to
-	// match whatever hashOutputs/extractOutputHash actually hashes.
-	serialisedOutputs := append(append([]byte{}, contOutput.Bytes()...), changeOutput.Bytes()...)
-	t.Logf("_serialisedOutputs[0:12] = %x (want 8-byte amount ‖ 0x19 0x76 0xa9 0x14 for a real P2PKH match)", serialisedOutputs[:12])
-
-	unlockingHex := encodePushBytes(codePartBytes) +
-		encodePushBytes(changePKH) +
-		encodePushInt(int64(changeSatoshis)) +
-		encodePushInt(int64(contSatoshis)) +
-		encodePushBytes(preimage) +
-		encodePushBytes(serialisedOutputs)
-
-	unlockScript, _ := script.NewFromHex(unlockingHex)
-	spendTx.Inputs[0].UnlockingScript = unlockScript
-
-	execErr := executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 0, prevOutput)
-	if !scriptRejected(execErr) {
-		t.Fatalf("expected the real engine to reject even the best-effort accept attempt (this contract is provably unspendable), but execution succeeded")
-	}
-	t.Logf("confirmed REJECT on the real engine (expected — see test doc comment): %v", execErr)
+	t.Logf("guard correctly rejected the unspendable requireOutputP2PKH(0)+mutation variant")
 }
 
 // ---------------------------------------------------------------------------
