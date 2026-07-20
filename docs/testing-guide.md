@@ -399,13 +399,13 @@ The conformance fuzzer in `conformance/fuzzer/` generates random ANF programs an
 
 ```bash
 # Run the differential fuzzer
-pnpm run fuzz -- --iterations 10000
+pnpm run fuzz -- --num 10000
 
 # Run with a specific seed for reproducibility
-pnpm run fuzz -- --seed 42 --iterations 5000
+pnpm run fuzz -- --seed 42 --num 5000
 
-# Run until a mismatch is found
-pnpm run fuzz -- --until-fail
+# Run the source-vs-script execution oracle (accept/reject + state)
+pnpm run fuzz -- --execute --num 200
 ```
 
 The fuzzer follows this pipeline:
@@ -941,7 +941,7 @@ runar compile conformance/tests/my-test/my-test.runar.ts --ir --canonical
 When the spec or compiler changes in a way that affects output:
 
 ```bash
-pnpm run conformance:update-golden
+cd conformance && pnpm run update-golden
 ```
 
 Review the diffs carefully. An unexpected change in a golden file indicates either a compiler bug or an unintended spec change.

@@ -56,3 +56,8 @@ examples/end2end-example/java/build/
 integration/java/build/
 conformance/sdk-output/tools/java-driver/build/
 
+
+# Scratch work-aids (plans/reviews/specs) — never committed per project convention
+_review/
+.planning/
+docs/superpowers/

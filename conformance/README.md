@@ -102,7 +102,7 @@ tests/
 
 ### Per-fixture compiler allowlist
 
-`source.json` may carry an optional `"compilers"` field that restricts which compilers run against that fixture. **When the field is absent, the contract is implicit: every tier (TypeScript, Go, Rust, Python, Zig, Ruby, Java) must produce byte-identical IR + script output.** When present, only the listed tiers are exercised — both the IR-stage and hex-stage golden checks honour the allowlist (see `runner/runner.ts` and `runner/source-parity.ts`).
+`source.json` may carry an optional `"compilers"` field that restricts which compilers run against that fixture. **When the field is absent, the contract is implicit: every tier (TypeScript, Go, Rust, Python, Zig, Ruby, Java) must produce byte-identical IR + script output.** When present, only the listed tiers are exercised — both the IR-stage and hex-stage golden checks honour the allowlist (see `runner/runner.ts`).
 
 Allowlists are reserved for fixtures whose underlying Stack-IR primitives are intentionally not yet implemented in every tier. They are not a place to hide ordinary cross-compiler bugs — the lone supported reasons are documented below.
 
@@ -194,10 +194,10 @@ pnpm run test:markdown
 # Filter to a specific test
 pnpm run test:filter -- arithmetic
 
-# Test all input format variants (.ts, .sol, .move, .go, .rs, .py, .zig, .rb)
+# Test all input format variants (.ts, .sol, .move, .go, .rs, .py, .zig, .rb, .java)
 pnpm test -- --multi-format
 
-# Run cross-SDK locking-script conformance (all 6 SDK tools)
+# Run cross-SDK locking-script conformance (all 7 SDK tools)
 pnpm run sdk-output
 ```
 
@@ -446,13 +446,14 @@ The suite currently contains **64 fixtures** under `tests/` — that directory i
 
 ### Script execution oracle
 
-`script_execution_test.go` compiles each contract to its **fold-ON deployed
-bytes** (the compiler default), builds a valid spend witness, and executes the
-unlocking+locking scripts through the go-sdk Bitcoin Script interpreter. Every
-contract family also ships adversarial **near-miss** witnesses (wrong key,
-wrong state, tampered signature, off-curve point) that MUST fail. Gated in CI
-by the `Script Execution Oracle` job. This is the only oracle that executes
-fold-ON bytes against a script engine with per-contract witnesses.
+`script_execution_test.go` compiles a curated set of contract families to their
+**fold-ON deployed bytes** (the compiler default), builds a valid spend witness,
+and executes the unlocking+locking scripts through the go-sdk Bitcoin Script
+interpreter. Every contract family also ships adversarial **near-miss** witnesses
+(wrong key, wrong state, tampered signature, off-curve point) that MUST fail.
+Gated in CI by the `Script Execution Oracle` job. It is a curated family list
+(not a completeness gate over every fixture); the TS `witnesses/differential.test.ts`
+ScriptVM also executes fold-ON bytes against a script engine.
 
 ### SDK-output conformance (46 fixtures, 7 SDKs)
 

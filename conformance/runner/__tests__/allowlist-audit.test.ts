@@ -10,9 +10,12 @@ const CONFORMANCE_TESTS_DIR = join(__dirname, '../../tests');
  * The pinned set of conformance fixtures that are allowed to opt out of
  * one or more compiler tiers via the `compilers` field in source.json.
  *
- * Adding or modifying an entry here REQUIRES a matching update to
- * conformance/README.md ("Per-fixture compiler allowlist") with a
- * one-line rationale. If those two are not in sync, this test fails.
+ * This constant is the SOURCE OF TRUTH the test enforces: it asserts that
+ * every fixture's source.json `compilers` field matches an entry here, and
+ * that every entry here corresponds to a real fixture. It does NOT read
+ * conformance/README.md. When adding/modifying an entry, also update
+ * conformance/README.md ("Per-fixture compiler allowlist") with a one-line
+ * rationale — that documentation sync is a convention, not enforced here.
  *
  * Removing an entry means the fixture must either:
  *   (a) drop the `compilers` field entirely from its source.json, or
@@ -149,6 +152,33 @@ describe('conformance allowlist audit', () => {
       `why the listed tiers are scoped (e.g. "Codegen for {primitive} is ` +
       `Go-only by project policy — see CLAUDE.md" or "Java Stack-IR pass ` +
       `for {feature} is deferred — see HANDOFF").`,
+    ).toEqual([]);
+  });
+
+  // `parserSkip` in source.json is an escape hatch from the "no exceptions"
+  // frontend-parity invariant (every available tier must parse every format
+  // for every fixture). It has ZERO users today. This pin governs it the same
+  // way APPROVED_ALLOWLISTS governs the codegen allowlist: it MUST stay empty
+  // unless a fixture is explicitly approved here — so a parser opt-out cannot
+  // land silently and erode frontend parity. (The runner also requires a
+  // non-empty parserSkipReason at runtime, but a self-written reason string is
+  // not review-gated; this audit pin is.)
+  const APPROVED_PARSER_SKIPS: Record<string, string[]> = {};
+  it('no fixture opts a format out of parser coverage unless approved (parserSkip stays governed)', () => {
+    const offenders: string[] = [];
+    for (const fixture of listFixtureDirs()) {
+      const sj = readSourceJson(fixture);
+      const ps = sj?.parserSkip;
+      if (!Array.isArray(ps) || ps.length === 0) continue;
+      if (!(fixture in APPROVED_PARSER_SKIPS)) {
+        offenders.push(`  - ${fixture}: parserSkip=${JSON.stringify(ps)} not in APPROVED_PARSER_SKIPS`);
+      }
+    }
+    expect(
+      offenders,
+      `Unapproved parserSkip(s) — frontend parity is "no exceptions". Add the fixture ` +
+      `to APPROVED_PARSER_SKIPS with a rationale (and document it) or remove the ` +
+      `parserSkip:\n${offenders.join('\n')}`,
     ).toEqual([]);
   });
 });
