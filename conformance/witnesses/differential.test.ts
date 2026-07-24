@@ -21,6 +21,13 @@ function decodeArg(v: unknown): WitnessArg {
  * Decode a constructor-argument literal. The compiler + interpreter accept
  * bigint | boolean | string(hex), so byte strings become a bare hex string
  * (no 0x prefix) rather than a Uint8Array.
+ *
+ * DIALECT WARNING — stricter than `scalar()` in
+ * witnesses/real-crypto-execution.test.ts. These specs (`witnesses/*.json`)
+ * REQUIRE an explicit `0x` prefix for bytes and throw on a bare string; the
+ * real-crypto specs (`witnesses/real-crypto/*.json`) accept bare hex. The two
+ * directories are disjoint, so no file is decoded both ways — but a spec copied
+ * between them will throw here (or silently decode as bytes there).
  */
 function decodeCtor(v: unknown): bigint | boolean | string {
   if (typeof v === 'boolean') return v;

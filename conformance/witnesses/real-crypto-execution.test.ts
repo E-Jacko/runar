@@ -96,13 +96,25 @@ function placeholder(v: unknown): { tag: string; key: string } | null {
   return null;
 }
 
-/** Decode a scalar literal: "27n"→bigint, "0x.."→hex string, bool passthrough. */
+/**
+ * Decode a scalar literal: "27n"→bigint, "0x.."→hex string, bool passthrough,
+ * bare string→hex byte payload.
+ *
+ * DIALECT WARNING — this is NOT interchangeable with `decodeCtor`/`decodeArg`
+ * in witnesses/differential.test.ts. That harness reads `witnesses/*.json` and
+ * REJECTS a bare (un-prefixed) string; this one reads `witnesses/real-crypto/`
+ * and accepts it as hex, which its specs rely on ("deadbeef", a 20-byte PKH of
+ * zeros, "00"/"01"). The two spec sets are disjoint directories, so no single
+ * file is decoded both ways — but a spec COPIED between the directories will
+ * decode differently (or throw). Keep bare-hex literals in real-crypto/ and
+ * 0x-prefixed literals in witnesses/, or convert on the move.
+ */
 function scalar(v: unknown): bigint | boolean | string {
   if (typeof v === 'boolean') return v;
   if (typeof v === 'string') {
     if (/^-?\d+n$/.test(v)) return BigInt(v.slice(0, -1));
     if (v.startsWith('0x')) return v.slice(2);
-    return v; // bare hex string (byte payload)
+    return v; // bare hex string (byte payload) — see DIALECT WARNING above
   }
   throw new Error(`unencodable scalar ${JSON.stringify(v)}`);
 }
