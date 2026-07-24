@@ -82,7 +82,20 @@ const GOLDEN_MATCHERS = [
   (p) => /^conformance\/source-map\/[^/]+\/[^/]+\/expected-source-map\.json$/.test(p),
   // Decompiler baseline (self-produced coverage/idiom baseline).
   (p) => p === 'packages/decompiler/coverage-baseline.json',
+  // Script-size regression baseline. The size gate compares each fixture's
+  // compiled bytes AGAINST this file, so re-stamping it (`script-size-check
+  // --update`) trivially turns a red size regression green, and nothing else
+  // reads it. Requiring a provenance entry forces the growth to be justified.
+  (p) => p === 'conformance/script-size-baseline.json',
 ];
+
+// NOTE on deliberately-EXCLUDED near-goldens: conformance/sdk-envelope/fixtures.json
+// (validate-fixtures.ts cryptographically re-verifies the committed signature),
+// conformance/sdk-bip143/fixtures.json (`generate-fixtures.ts --check` regenerates
+// and diffs), and packages/decompiler/{templates-data,fingerprints}.json (CI
+// regenerates and git-diffs them) each already carry an independent gate that a
+// silent hand-edit cannot pass. Adding them here would be pure friction, not
+// coverage. Add a matcher above only for goldens with NO such gate.
 
 const VALID_VERIFIED_AGAINST = new Set([
   'official-KAT',

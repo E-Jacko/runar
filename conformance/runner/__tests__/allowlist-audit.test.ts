@@ -181,4 +181,27 @@ describe('conformance allowlist audit', () => {
       `parserSkip:\n${offenders.join('\n')}`,
     ).toEqual([]);
   });
+
+  // Four independent resolvers read source.json (runner.ts, witnesses/
+  // differential.test.ts, witnesses/real-crypto-execution.test.ts,
+  // script_execution_test.go) and they disagree on precedence when a fixture
+  // declares BOTH the legacy `path` and the multi-format `sources` map: the
+  // runner prefers `path`, the other three prefer `sources`. Rather than
+  // duplicate a precedence rule across three languages, forbid the overlap —
+  // then all four are provably equivalent. (The runner throws on this too; this
+  // pin catches it without needing a full conformance run.)
+  it('no fixture declares both "path" and "sources" in source.json', () => {
+    const both = listFixtureDirs()
+      .filter((f) => {
+        const sj = readSourceJson(f);
+        return !!sj && 'path' in sj && 'sources' in sj;
+      })
+      .sort();
+    expect(
+      both,
+      `source.json must declare sources EXACTLY one way; these declare both ` +
+      `"path" and "sources", so different harnesses could compile different ` +
+      `files for the same fixture: ${both.join(', ')}`,
+    ).toEqual([]);
+  });
 });

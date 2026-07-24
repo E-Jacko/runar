@@ -2041,6 +2041,22 @@ function discoverFormats(testDir: string, testName: string): { ext: string; sour
       parserSkip?: string[];
       parserSkipReason?: string;
     };
+    // A fixture must declare its sources EXACTLY ONE way. Four independent
+    // resolvers read source.json (this runner, witnesses/differential.test.ts,
+    // witnesses/real-crypto-execution.test.ts, script_execution_test.go) and
+    // they disagree on precedence when BOTH keys are present — this runner
+    // prefers `path`, the other three prefer `sources`, so the same fixture
+    // would silently be compiled from two different files depending on which
+    // harness ran. Forbidding the overlap makes all four provably equivalent
+    // without duplicating a precedence rule across three languages.
+    if (config.path && config.sources) {
+      throw new Error(
+        `Conformance fixture '${testName}': source.json declares BOTH "path" and ` +
+        `"sources". Use "sources" (the multi-format map) alone — harnesses disagree ` +
+        `on which wins, so the fixture could be compiled from different files by ` +
+        `different gates.`,
+      );
+    }
     parserSkip = Array.isArray(config.parserSkip) ? config.parserSkip : [];
     parserSkipReason = typeof config.parserSkipReason === 'string'
       ? config.parserSkipReason
