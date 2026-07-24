@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -63,25 +64,57 @@ func resolveTSSource(contractName string) (string, error) {
 
 // compileRúnar invokes the TypeScript compiler to produce hex for a conformance
 // contract with baked constructor args.  The args are passed as JSON.
+// compileCache memoizes compileRúnar results across tests in this package.
+// Compilation is a pure function of (contract source, constructor args), and
+// the source is read from the repo working tree which does not change during a
+// test run, so caching on (contractName, argsJSON) is safe.
+var (
+	compileCacheMu sync.Mutex
+	compileCache   = map[string]string{}
+)
+
 func compileRúnar(contractName string, argsJSON string) (string, error) {
 	srcRelPath, err := resolveTSSource(contractName)
 	if err != nil {
 		return "", err
 	}
 	fileName := filepath.Base(srcRelPath)
+
+	// Memoize: many tests compile the same (contract, args) pair — each miss
+	// costs a full `node -e` spawn plus a compile (seconds for the PQ
+	// fixtures). Keyed on the exact inputs, so a hit is byte-identical.
+	cacheKey := contractName + "\x00" + argsJSON
+	compileCacheMu.Lock()
+	if hex, ok := compileCache[cacheKey]; ok {
+		compileCacheMu.Unlock()
+		return hex, nil
+	}
+	compileCacheMu.Unlock()
+
 	// Use node to invoke the compiler from the runar-testing package
 	// (where runar-compiler is a resolved dependency).
 	code := fmt.Sprintf(`
 (async () => {
-const { compile } = await import('./packages/runar-compiler/dist/index.js');
+const { compile, parse } = await import('./packages/runar-compiler/dist/index.js');
 const fs = require('fs');
 const src = fs.readFileSync('%s', 'utf-8');
-const args = JSON.parse('%s', (k,v) => typeof v === 'string' && /^-?\d+$/.test(v) ? BigInt(v) : v);
+// Coerce constructor args by DECLARED property type, never by shape. A hex
+// ByteString whose characters happen to all be decimal digits (e.g. a
+// pubKeyHash) must stay a string; the previous /^-?\d+$/ reviver silently
+// turned such an arg into a BigInt and baked the wrong bytes.
+const declared = new Map();
+for (const p of (parse(src, '%s').contract?.properties ?? [])) {
+  declared.set(p.name, typeof p.type === 'string' ? p.type : p.type?.name);
+}
+const args = {};
+for (const [k, v] of Object.entries(JSON.parse('%s'))) {
+  args[k] = (declared.get(k) === 'bigint' && typeof v === 'string') ? BigInt(v) : v;
+}
 const r = compile(src, { fileName: '%s', constructorArgs: args });
 if (!r.success || !r.scriptHex) { process.exit(1); }
 process.stdout.write(r.scriptHex);
 })();
-`, srcRelPath, argsJSON, fileName)
+`, srcRelPath, fileName, argsJSON, fileName)
 
 	cmd := exec.Command("node", "-e", code)
 	cmd.Dir = ".." // project root
@@ -89,7 +122,11 @@ process.stdout.write(r.scriptHex);
 	if err != nil {
 		return "", fmt.Errorf("compilation failed: %w", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	hexOut := strings.TrimSpace(string(out))
+	compileCacheMu.Lock()
+	compileCache[cacheKey] = hexOut
+	compileCacheMu.Unlock()
+	return hexOut, nil
 }
 
 // buildUnlockingScript builds a simple unlocking script that pushes each
@@ -169,6 +206,28 @@ func encodePushBytes(data []byte) string {
 	}
 	// OP_PUSHDATA4
 	return fmt.Sprintf("4e%02x%02x%02x%02x", n&0xff, (n>>8)&0xff, (n>>16)&0xff, (n>>24)&0xff) + hex.EncodeToString(data)
+}
+
+// TestCompileArgs_AllDigitByteStringStaysBytes pins the constructor-arg typing
+// rule: compileRúnar coerces args by the DECLARED property type, never by the
+// value's shape. A hex ByteString whose characters happen to all be decimal
+// digits (~1-in-10^8 for a 20-byte pubKeyHash) was previously matched by a
+// `/^-?\d+$/` JSON reviver and silently baked as a BigInt, producing a
+// completely different locking script than the caller asked for.
+func TestCompileArgs_AllDigitByteStringStaysBytes(t *testing.T) {
+	// 20 bytes of hex whose characters are all decimal digits.
+	pkhHex := "1234567890123456789012345678901234567890"
+	lockingHex, err := compileRúnar("basic-p2pkh", fmt.Sprintf(`{"pubKeyHash":"%s"}`, pkhHex))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// pubKeyHash is declared `Addr` (a ByteString), so it must be baked as a
+	// 20-byte push (0x14 = push 20 bytes), not as a script number.
+	want := "14" + pkhHex
+	if !strings.Contains(lockingHex, want) {
+		t.Fatalf("all-decimal-digit ByteString arg was not baked as bytes: script does not contain %q "+
+			"(the arg was coerced to a BigInt instead of staying a ByteString)", want)
+	}
 }
 
 // errHarnessSetup marks an error from test-harness setup (e.g. malformed
@@ -2813,9 +2872,17 @@ func compileRúnarInline(source, argsJSON, fileName string) (string, error) {
 	escaped = strings.ReplaceAll(escaped, "$", "\\$")
 	code := fmt.Sprintf(`
 (async () => {
-const { compile } = await import('./packages/runar-compiler/dist/index.js');
+const { compile, parse } = await import('./packages/runar-compiler/dist/index.js');
 const src = `+"`%s`"+`;
-const args = JSON.parse('%s', (k,v) => typeof v === 'string' && /^-?\d+$/.test(v) ? BigInt(v) : v);
+// Coerce by DECLARED property type, never by shape — see compileRúnar.
+const declared = new Map();
+for (const p of (parse(src, '%s').contract?.properties ?? [])) {
+  declared.set(p.name, typeof p.type === 'string' ? p.type : p.type?.name);
+}
+const args = {};
+for (const [k, v] of Object.entries(JSON.parse('%s'))) {
+  args[k] = (declared.get(k) === 'bigint' && typeof v === 'string') ? BigInt(v) : v;
+}
 const r = compile(src, { fileName: '%s', constructorArgs: args });
 if (!r.success || !r.scriptHex) {
   const errs = r.diagnostics.filter(d => d.severity === 'error').map(d => d.message).join('\\n');
@@ -2824,7 +2891,7 @@ if (!r.success || !r.scriptHex) {
 }
 process.stdout.write(r.scriptHex);
 })();
-`, escaped, argsJSON, fileName)
+`, escaped, fileName, argsJSON, fileName)
 
 	cmd := exec.Command("node", "-e", code)
 	cmd.Dir = ".." // project root

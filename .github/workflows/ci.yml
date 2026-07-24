@@ -235,6 +235,13 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target dir. Rust builds dominate this job's
+      # wall clock and the inputs (Cargo.lock + rustc version) are stable
+      # between runs, so a cache hit skips a full dependency rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compilers/rust
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -295,6 +302,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target dir. Rust builds dominate this job's
+      # wall clock and the inputs (Cargo.lock + rustc version) are stable
+      # between runs, so a cache hit skips a full dependency rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compilers/rust
       - run: cd compilers/rust && cargo build --release
       - run: cd compilers/rust && cargo test
       - uses: actions/upload-artifact@v4
@@ -425,6 +439,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target dir. Rust builds dominate this job's
+      # wall clock and the inputs (Cargo.lock + rustc version) are stable
+      # between runs, so a cache hit skips a full dependency rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/runar-rs
+            examples/rust
       - name: SDK tests
         run: cd packages/runar-rs && cargo test
       - name: Example tests
@@ -823,6 +845,13 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target dir. Rust builds dominate this job's
+      # wall clock and the inputs (Cargo.lock + rustc version) are stable
+      # between runs, so a cache hit skips a full dependency rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            conformance/anf-interpreter/drivers/rust
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -1046,6 +1075,13 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: packages/runar-go/go.sum
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target dir. Rust builds dominate this job's
+      # wall clock and the inputs (Cargo.lock + rustc version) are stable
+      # between runs, so a cache hit skips a full dependency rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            conformance/sdk-output/tools/rs-sdk-tool
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -1137,6 +1173,13 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target dir. Rust builds dominate this job's
+      # wall clock and the inputs (Cargo.lock + rustc version) are stable
+      # between runs, so a cache hit skips a full dependency rebuild.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            integration/rust
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

@@ -1354,6 +1354,14 @@ export interface ParserCoverageReport {
   availableCompilers: CompilerId[];
   /** Per-compiler aggregate counts. */
   perCompiler: Record<string, { passed: number; failed: number; skipped: number }>;
+  /**
+   * Fixtures whose formats could not be discovered (`discoverFormats` threw —
+   * e.g. a parser-coverage gap or an orphan source file). These contribute ZERO
+   * (fixture, format) pairs to the matrix, so without this list a fixture could
+   * silently drop out of parser coverage entirely and the report would still
+   * read "all ok". Callers MUST treat a non-empty list as a failure.
+   */
+  skippedFixtures: Array<{ fixture: string; error: string }>;
 }
 
 /**
@@ -1383,14 +1391,21 @@ export async function runAllParserOnlyChecks(
 
   const limit = makeLimiter(defaultConcurrency());
   const allTasks: Promise<ParserCoverageEntry>[] = [];
+  const skippedFixtures: Array<{ fixture: string; error: string }> = [];
   for (const testDir of testDirs) {
     const fixture = basename(testDir);
     let formats: { ext: string; sourceFile: string }[] = [];
     try {
       formats = discoverFormats(testDir, fixture);
-    } catch {
-      // discoverFormats throws on parser-coverage gaps — let the regular
-      // multi-format runner surface those. Skip here to avoid duplicate noise.
+    } catch (err) {
+      // discoverFormats throws on parser-coverage gaps / orphan sources. Such a
+      // fixture contributes NO (fixture, format) pairs, so swallowing this
+      // silently would drop it from the coverage matrix while the report still
+      // said "all ok". Record it — the CLI fails on a non-empty list.
+      skippedFixtures.push({
+        fixture,
+        error: err instanceof Error ? err.message : String(err),
+      });
       continue;
     }
     for (const format of formats) {
@@ -1458,10 +1473,11 @@ export async function runAllParserOnlyChecks(
   }
   return {
     entries: coverage,
-    allOk: failures.length === 0,
+    allOk: failures.length === 0 && skippedFixtures.length === 0,
     failures,
     availableCompilers: Array.from(availableSet),
     perCompiler,
+    skippedFixtures,
   };
 }
 
@@ -1486,6 +1502,17 @@ export function printParserCoverageReport(report: ParserCoverageReport): void {
     for (const f of report.failures) {
       const oneLineError = (f.error || '').split('\n').slice(0, 3).join(' | ').slice(0, 400);
       console.log(`    [${f.compiler}] ${f.fixture} ${f.format}: ${oneLineError}`);
+    }
+  }
+  if (report.skippedFixtures.length > 0) {
+    console.log('');
+    console.log(
+      `  ${report.skippedFixtures.length} fixture(s) contributed NO (fixture, format) pairs — ` +
+      `they are absent from the coverage matrix entirely:`,
+    );
+    for (const s of report.skippedFixtures) {
+      const oneLineError = (s.error || '').split('\n').slice(0, 2).join(' | ').slice(0, 400);
+      console.log(`    ${s.fixture}: ${oneLineError}`);
     }
   }
   console.log('');
