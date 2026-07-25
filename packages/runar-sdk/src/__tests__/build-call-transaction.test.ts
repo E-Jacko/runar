@@ -341,27 +341,37 @@ describe('buildCallTransaction — change and fees', () => {
     expect(parsed.outputs[0]!.satoshis).toBe(50000);
   });
 
-  it('omits change output when change is negative (all funds consumed by fee)', () => {
-    // Fee: 96 bytes at 100 sat/KB = ceil(96 * 100 / 1000) = 10
-    // Set up so totalInput - contractOutput < fee
-    // 50005 - 50000 = 5 < 10 → change = -5, negative
+  it('omits change (no throw) when change is negative but inputs still cover the outputs', () => {
+    // totalInput 50005 >= contract output 50000, but the ~10-sat fee estimate
+    // makes change = -5. This is a valid low-fee tx (actual fee 5): omit the
+    // change output, do NOT throw — finding C3 fails closed only when inputs
+    // cannot cover the non-change outputs, and an exact-/near-cover continuation
+    // (issue #116) legitimately runs change negative.
     const utxo = makeUtxo(50005);
     const newLockingScript = '51';
     const newSatoshis = 50000;
     const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
 
     const { tx } = buildCallTransaction(
-      utxo,
-      '00',
-      newLockingScript,
-      newSatoshis,
-      'changeaddr',
-      changeScript,
+      utxo, '00', newLockingScript, newSatoshis, 'changeaddr', changeScript,
     );
-    const parsed = parseTxHex(tx.toHex());
+    expect(parseTxHex(tx.toHex()).outputCount).toBe(1);
+  });
 
-    // No change output since change <= 0
-    expect(parsed.outputCount).toBe(1);
+  it('throws when inputs cannot cover the contract outputs (underfunded) — finding C3', () => {
+    // The continuation demands 50000 but only 40000 is available: the tx would
+    // spend more than it takes in and can never confirm → fail closed instead
+    // of returning a "successful" tx a covenant would strand funds on.
+    const utxo = makeUtxo(40000);
+    const newLockingScript = '51';
+    const newSatoshis = 50000;
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    expect(() =>
+      buildCallTransaction(
+        utxo, '00', newLockingScript, newSatoshis, 'changeaddr', changeScript,
+      ),
+    ).toThrow(/insufficient funds/);
   });
 
   it('accumulates satoshis from additional UTXOs in fee/change calculation', () => {
@@ -458,9 +468,9 @@ describe('buildCallTransaction — stateless call', () => {
     expect(parsed.outputs[0]!.satoshis).toBe(99991);
   });
 
-  it('produces no outputs when stateless and change is zero or negative', () => {
+  it('produces no outputs when stateless and change is exactly zero', () => {
     // Fee: 86 bytes at 100 sat/KB = ceil(86 * 100 / 1000) = 9
-    // To get exactly 0 change: satoshis = fee = 9
+    // To get exactly 0 change: satoshis = fee = 9 (issue #116 boundary)
     const utxo = makeUtxo(9);
     const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
 
@@ -474,8 +484,22 @@ describe('buildCallTransaction — stateless call', () => {
     );
     const parsed = parseTxHex(tx.toHex());
 
-    // Change = 192 - 0 - 192 = 0 → no change output
+    // Change = 9 - 0 - 9 = 0 → no change output (omit, do NOT throw)
     expect(parsed.outputCount).toBe(0);
+  });
+
+  it('does not throw when stateless and change is negative (all input becomes fee)', () => {
+    // A stateless call has no contract output (contractOutputSats === 0), so the
+    // tx can never "spend more than it takes in" — a small input just becomes a
+    // higher-ratio fee. change < 0 here (5 - 0 - 9 = -4) must NOT fail closed.
+    const utxo = makeUtxo(5);
+    const changeScript = '76a914' + 'ff'.repeat(20) + '88ac';
+
+    const { tx } = buildCallTransaction(
+      utxo, '51', undefined, undefined, 'changeaddr', changeScript,
+    );
+    // No contract output and change omitted → zero outputs, no throw.
+    expect(parseTxHex(tx.toHex()).outputCount).toBe(0);
   });
 });
 

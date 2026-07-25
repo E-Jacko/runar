@@ -101,7 +101,7 @@ impl TokenWallet {
                     Some(&change_script),
                     if additional_utxos.is_empty() { None } else { Some(&additional_utxos) },
                     Some(fee_rate),
-                );
+                )?;
 
                 // Sign input 0 against the contract UTXO's locking script
                 let sig = self.signer.sign(&prelim_tx, 0, &utxo.script, utxo.satoshis, None)?;
@@ -190,7 +190,7 @@ impl TokenWallet {
             Some(&change_script),
             if additional_utxos.is_empty() { None } else { Some(&additional_utxos) },
             Some(fee_rate),
-        );
+        )?;
 
         // Sign input 0 against the first contract UTXO's locking script
         let sig = self.signer.sign(&prelim_tx, 0, &first_utxo.script, first_utxo.satoshis, None)?;

@@ -1037,7 +1037,7 @@ impl RunarContract {
             },
             Some(fee_rate),
             Some(&call_tx_options),
-        );
+        )?;
 
         // Funding inputs are signed by funding_signer when set (issue #134):
         // the method signer may not own the funding coins. The method's own Sig
@@ -1210,7 +1210,7 @@ impl RunarContract {
                 if additional_utxos.is_empty() { None } else { Some(&additional_utxos) },
                 Some(fee_rate),
                 Some(&rebuild_options),
-            );
+            )?;
             signed_tx = rebuilt_tx;
             change_amount = rebuilt_change;
 

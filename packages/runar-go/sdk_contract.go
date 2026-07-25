@@ -948,7 +948,7 @@ func (c *RunarContract) PrepareCall(
 		}
 	}
 
-	callTx, inputCount, changeAmount := BuildCallTransaction(
+	callTx, inputCount, changeAmount, buildErr := BuildCallTransaction(
 		contractUtxo,
 		unlockingScript,
 		newLockingScript,
@@ -959,6 +959,9 @@ func (c *RunarContract) PrepareCall(
 		feeRate,
 		buildOpts,
 	)
+	if buildErr != nil {
+		return nil, fmt.Errorf("RunarContract.PrepareCall: %w", buildErr)
+	}
 
 	// Sign P2PKH funding inputs (after contract inputs) with fundingSigner (issue #134)
 	signedTx := callTx.Hex()
@@ -1100,7 +1103,7 @@ func (c *RunarContract) PrepareCall(
 				}
 			}
 		}
-		rebuildTx, rebuildCount, rebuildChange := BuildCallTransaction(
+		rebuildTx, rebuildCount, rebuildChange, rebuildErr := BuildCallTransaction(
 			contractUtxo,
 			input0Unlock,
 			newLockingScript,
@@ -1111,6 +1114,9 @@ func (c *RunarContract) PrepareCall(
 			feeRate,
 			rebuildOpts,
 		)
+		if rebuildErr != nil {
+			return nil, fmt.Errorf("RunarContract.PrepareCall: %w", rebuildErr)
+		}
 		inputCount = rebuildCount
 		changeAmount = rebuildChange
 		signedTx = rebuildTx.Hex()

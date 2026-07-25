@@ -385,6 +385,20 @@ class TestBuildCallTransactionStructure:
             # If change > 0, there should be 2 outputs
             assert len(parsed['outputs']) == 2
 
+    def test_underfunded_call_raises(self):
+        """When total input cannot cover contract outputs + fee (change < 0),
+        the builder must fail closed rather than silently clamp change to 0
+        (finding C3). A clamped 'success' would strand funds on broadcast."""
+        utxo = _make_utxo(100)  # Way too small to cover a 10_000-sat output
+        with pytest.raises(ValueError, match='insufficient funds'):
+            build_call_transaction(
+                current_utxo=utxo,
+                unlocking_script='51',
+                new_locking_script='51',
+                new_satoshis=10_000,
+                change_address='00' * 20,
+            )
+
     def test_additional_inputs_have_empty_script(self):
         """Additional P2PKH funding inputs should have empty scriptSig in unsigned tx (row 352)."""
         utxo = _make_utxo(10_000, 0)
@@ -446,6 +460,10 @@ class TestBuildCallTransactionStructure:
         satoshis as the output amount (row 355)."""
         utxo = _make_utxo(50_000)
         new_locking_script = '76a914' + 'aa' * 20 + '88ac'
+        # The continuation output claims the full current-utxo value (50_000),
+        # so the fee must come from a funding input — otherwise change < 0 and
+        # the builder now fails closed (finding C3).
+        funding = [_make_utxo(1_000, 1)]
 
         tx_hex, _, _ = build_call_transaction(
             current_utxo=utxo,
@@ -453,6 +471,7 @@ class TestBuildCallTransactionStructure:
             new_locking_script=new_locking_script,
             new_satoshis=0,  # should default to current_utxo.satoshis
             change_address='',
+            additional_utxos=funding,
         )
         parsed = _parse_tx(tx_hex)
         # Output 0 should have satoshis == utxo.satoshis (50_000)

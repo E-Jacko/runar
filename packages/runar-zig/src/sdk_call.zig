@@ -139,6 +139,16 @@ pub fn buildCallTransaction(
 
     const change = total_input - contract_output_sats - fee;
 
+    // Fail closed only when the inputs cannot cover the (non-change) contract +
+    // data outputs — the tx would spend more than it takes in and can never
+    // confirm (finding C3). Do NOT reject merely because change < 0: an
+    // exact-cover continuation (issue #116) keeps the full input value and adds
+    // no funding, so change == -fee (negative) even though the zero-fee tx is
+    // valid and the covenant accepts a no-change spend. contract_output_sats
+    // already includes data outputs; the change output is still omitted below
+    // whenever change is not positive.
+    if (total_input < contract_output_sats) return error.InsufficientFunds;
+
     // Build transaction using bsvz Builder
     var builder = bsvz.transaction.Builder.init(allocator);
     defer builder.deinit();
@@ -370,6 +380,69 @@ test "buildCallTransaction with stateless contract" {
 
     try std.testing.expect(result.tx_hex.len > 0);
     try std.testing.expectEqual(@as(usize, 1), result.input_count);
+}
+
+test "buildCallTransaction fails closed on underfunded call (change < 0) — finding C3" {
+    const allocator = std.testing.allocator;
+
+    const contract_utxo = types.UTXO{
+        .txid = "aa" ** 32,
+        .output_index = 0,
+        .satoshis = 1000,
+        .script = "5100",
+    };
+
+    // A continuation output demanding 2000 sats out of a single 1000-sat input
+    // (plus a positive fee) makes change strictly negative. The call MUST fail
+    // closed with InsufficientFunds — not silently clamp change to 0 and return
+    // a "successful" tx that a continuation covenant rejects on broadcast.
+    try std.testing.expectError(error.InsufficientFunds, buildCallTransaction(
+        allocator,
+        contract_utxo,
+        "51", // unlocking: OP_1
+        "51", // new locking script (continuation)
+        2000, // new_satoshis > total_input → underfunded
+        "1BitcoinEaterAddressDontSendf59kuE",
+        &.{}, // no funding inputs
+        100,
+        null,
+    ));
+}
+
+test "buildCallTransaction keeps exact-cover (change == 0) as an omit (issue #116)" {
+    const allocator = std.testing.allocator;
+
+    // Exact-cover: total_input == contract_output_sats + fee, so change is
+    // exactly 0. Fee is deterministic here: one input with a 1-byte unlocking
+    // script "51" → input0_size = 32+4+1+1+4 = 42; one 1-byte continuation
+    // output "51" → 8+1+1 = 10; no change output (null address). estimated_size
+    // = 10 + 42 + 10 = 62; fee = (62*100 + 999) / 1000 = 7. With new_satoshis
+    // 1000 and a 1007-sat input, change = 1007 - 1000 - 7 = 0. The change < 0
+    // guard MUST NOT fire on this path — it stays an omit (change_amount == 0),
+    // matching the continuation covenant that hashes [continuation] only when
+    // change is exactly 0.
+    const contract_utxo = types.UTXO{
+        .txid = "aa" ** 32,
+        .output_index = 0,
+        .satoshis = 1007,
+        .script = "5100",
+    };
+
+    var result = try buildCallTransaction(
+        allocator,
+        contract_utxo,
+        "51", // 1-byte unlocking script
+        "51", // 1-byte continuation locking script
+        1000, // new_satoshis
+        null, // no change address → no change output
+        &.{},
+        100,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.tx_hex.len > 0);
+    try std.testing.expectEqual(@as(i64, 0), result.change_amount);
 }
 
 test "buildCallTransaction locktime override appears in tx (issue #40)" {

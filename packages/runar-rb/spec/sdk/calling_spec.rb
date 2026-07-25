@@ -486,22 +486,40 @@ RSpec.describe 'Runar::SDK calling helpers' do
       expect(tx_hex).to include(CALL_PKH)
     end
 
-    it 'omits the change output when change would be zero or negative' do
-      # Craft a scenario where contract_utxo + tiny_funding == output + fee.
-      # Use exact fee so change = 0. We check omission by comparing output
-      # lengths rather than parsing byte-for-byte.
-      tiny = make_utxo(FUNDING_TXID, 1)
+    it 'omits the change output when change is exactly zero (#116)' do
+      # Craft a scenario where contract_utxo + funding == output + fee exactly,
+      # so change = 0. The #116 continuation covenant hashes [continuation]
+      # only when change is exactly zero — a 0-sat change output must NOT be
+      # emitted here. We check omission by comparing output lengths.
+      fee            = Runar::SDK.estimate_call_fee(CONTRACT_SCRIPT.length / 2, 0, 1)
+      exact_funding  = make_utxo(FUNDING_TXID, fee)
       tx_with_change, = Runar::SDK.build_call_transaction(
         contract_utxo, '', CONTRACT_SCRIPT, 10_000,
         CALL_ADDRESS, '', [large_funding]
       )
-      tx_no_change, _, change_no = Runar::SDK.build_call_transaction(
+      tx_no_change, _, change_zero = Runar::SDK.build_call_transaction(
         contract_utxo, '', CONTRACT_SCRIPT, 10_000,
-        CALL_ADDRESS, '', [tiny]
+        CALL_ADDRESS, '', [exact_funding]
       )
-      expect(change_no).to eq(0)
+      expect(change_zero).to eq(0)
       # Transaction without change output should be shorter (no 34-byte P2PKH output).
       expect(tx_no_change.length).to be < tx_with_change.length
+    end
+
+    it 'raises when the outputs exceed the inputs (insufficient funds)' do
+      # The continuation demands 15_000 but only 10_000 + 1 sat is available:
+      # the tx would spend more than it takes in and can never confirm, so fail
+      # closed rather than silently clamp change to 0 and return a tx a covenant
+      # would reject on broadcast (stranded funds). NOTE: a continuation whose
+      # output merely leaves too little for the fee (output <= input) is a valid
+      # low-/zero-fee tx and must NOT raise — see issue #116.
+      tiny = make_utxo(FUNDING_TXID, 1)
+      expect do
+        Runar::SDK.build_call_transaction(
+          contract_utxo, '', CONTRACT_SCRIPT, 15_000,
+          CALL_ADDRESS, '', [tiny]
+        )
+      end.to raise_error(ArgumentError, /insufficient funds/)
     end
   end
 end

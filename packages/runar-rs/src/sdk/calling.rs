@@ -81,7 +81,7 @@ pub fn build_call_transaction(
     change_script: Option<&str>,
     additional_utxos: Option<&[Utxo]>,
     fee_rate: Option<i64>,
-) -> (String, usize, i64) {
+) -> Result<(String, usize, i64), String> {
     build_call_transaction_ext(
         current_utxo,
         unlocking_script,
@@ -107,7 +107,7 @@ pub fn build_call_transaction_ext(
     additional_utxos: Option<&[Utxo]>,
     fee_rate: Option<i64>,
     options: Option<&CallTxOptions>,
-) -> (String, usize, i64) {
+) -> Result<(String, usize, i64), String> {
     let extra_contract_inputs = options
         .and_then(|o| o.additional_contract_inputs.as_ref())
         .map(|v| v.as_slice())
@@ -175,6 +175,22 @@ pub fn build_call_transaction_ext(
     let fee = (estimated_size * rate + 999) / 1000;
 
     let change = total_input - contract_output_sats - fee;
+
+    // C3: fail closed only when the inputs cannot cover the (non-change)
+    // contract + data outputs — the tx would spend more than it takes in and
+    // can never confirm. Do NOT reject merely because `change < 0`: an
+    // exact-cover continuation (issue #116) keeps the full input value and adds
+    // no funding, so `change == -fee` (negative) even though the zero-fee tx is
+    // valid and the covenant accepts a no-change spend. `contract_output_sats`
+    // already includes data outputs; the change output is still omitted below
+    // whenever `change` is not positive.
+    if total_input < contract_output_sats {
+        return Err(format!(
+            "buildCallTransaction: insufficient funds. Need {} sats, have {}",
+            contract_output_sats + fee,
+            total_input
+        ));
+    }
 
     // Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
     // consensus no-op. When a non-zero locktime is set, default every input to
@@ -265,7 +281,7 @@ pub fn build_call_transaction_ext(
     tx.push_str(&to_little_endian_32(locktime_value));
 
     let change_amount = if change > 0 { change } else { 0 };
-    (tx, all_utxos.len(), change_amount)
+    Ok((tx, all_utxos.len(), change_amount))
 }
 
 fn varint_byte_size(n: usize) -> i64 {
@@ -439,7 +455,7 @@ mod tests {
     #[test]
     fn version_1_locktime_0() {
         let utxo = make_utxo(100_000, 0);
-        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None);
+        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.locktime, 0);
@@ -460,7 +476,7 @@ mod tests {
         };
         let (tx_hex, _, _) = build_call_transaction_ext(
             &utxo, "51", None, None, None, None, None, None, Some(&options),
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.locktime, 800_000);
     }
@@ -478,7 +494,7 @@ mod tests {
         };
         let (tx_hex, _, _) = build_call_transaction_ext(
             &utxo, "51", None, None, None, None, None, None, Some(&options),
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.locktime, 0);
     }
@@ -486,7 +502,7 @@ mod tests {
     #[test]
     fn valid_hex_output() {
         let utxo = make_utxo(100_000, 0);
-        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None);
+        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None).unwrap();
         assert!(!tx_hex.is_empty());
         assert!(tx_hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -494,7 +510,7 @@ mod tests {
     #[test]
     fn embeds_unlocking_script_in_input_0() {
         let utxo = make_utxo(100_000, 0);
-        let (tx_hex, _, _) = build_call_transaction(&utxo, "aabb", None, None, None, None, None, None);
+        let (tx_hex, _, _) = build_call_transaction(&utxo, "aabb", None, None, None, None, None, None).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.inputs[0].script, "aabb");
     }
@@ -506,7 +522,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "51", None, None, Some("changeaddr"), Some(&change_script), Some(&additional), None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         for input in &parsed.inputs {
             assert_eq!(input.sequence, 0xffff_ffff);
@@ -530,7 +546,7 @@ mod tests {
         let (tx_hex, _, _) = build_call_transaction_ext(
             &utxo, "51", None, None, Some("changeaddr"), Some(&change_script),
             Some(&additional), None, Some(&options),
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert!(!parsed.inputs.is_empty());
         for input in &parsed.inputs {
@@ -552,7 +568,7 @@ mod tests {
         };
         let (tx_hex, _, _) = build_call_transaction_ext(
             &utxo, "51", None, None, None, None, None, None, Some(&options),
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.inputs[0].sequence, 0xdead_beef);
     }
@@ -571,7 +587,7 @@ mod tests {
     #[test]
     fn reversed_txid_in_wire_format() {
         let utxo = make_utxo(100_000, 0);
-        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None);
+        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.inputs[0].prev_txid, reverse_hex_helper(&utxo.txid));
     }
@@ -579,7 +595,7 @@ mod tests {
     #[test]
     fn single_input_no_additional() {
         let utxo = make_utxo(100_000, 0);
-        let (tx_hex, input_count, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None);
+        let (tx_hex, input_count, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(input_count, 1);
         assert_eq!(parsed.input_count, 1);
@@ -592,7 +608,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, input_count, _) = build_call_transaction(
             &utxo, "51", None, None, Some("changeaddr"), Some(&change_script), Some(&additional), None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(input_count, 3);
         assert_eq!(parsed.inputs[0].script, "51");
@@ -603,7 +619,7 @@ mod tests {
     #[test]
     fn correct_output_index_reference() {
         let utxo = make_utxo(100_000, 3);
-        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None);
+        let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.inputs[0].prev_index, 3);
     }
@@ -615,7 +631,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "51", Some(&new_ls), Some(50_000), Some("changeaddr"), Some(&change_script), None, None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.outputs[0].script, new_ls);
         assert_eq!(parsed.outputs[0].satoshis, 50_000);
@@ -623,11 +639,16 @@ mod tests {
 
     #[test]
     fn defaults_to_current_utxo_satoshis() {
+        // new_satoshis = None => the contract output defaults to the current
+        // UTXO's satoshis (75_000). A funding input covers the fee so the tx is
+        // actually payable (spending the whole 75_000 into the output with no
+        // headroom would now be rejected as underfunded -- see the C3 guard).
         let utxo = make_utxo(75_000, 0);
+        let funding = vec![make_utxo(1_000, 1)];
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
-            &utxo, "00", Some("51"), None, Some("changeaddr"), Some(&change_script), None, None,
-        );
+            &utxo, "00", Some("51"), None, Some("changeaddr"), Some(&change_script), Some(&funding), None,
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.outputs[0].satoshis, 75_000);
     }
@@ -638,7 +659,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "00", Some("51"), Some(50_000), Some("changeaddr"), Some(&change_script), None, None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         // txSize: input0(32+4+1+1+4=42) + contractOut(8+1+1=10) + changeOut(34) + overhead(10) = 96
         // Fee: ceil(96 * 100 / 1000) = 10
@@ -657,10 +678,30 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "00", Some("51"), Some(50_000), Some("changeaddr"), Some(&change_script), None, None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.output_count, 1);
         assert_eq!(parsed.outputs[0].satoshis, 50_000);
+    }
+
+    #[test]
+    fn underfunded_call_must_return_err() {
+        // C3: input 49_990 with a 50_000-sat contract output => change strictly
+        // negative (there isn't even enough to cover the output, let alone fee).
+        // The builder used to silently clamp and return a tx whose outputs
+        // (50_000) exceed its inputs (49_990) -- an unspendable tx that a covenant
+        // rejects on broadcast (stranded funds). It must now fail closed.
+        let utxo = make_utxo(49_990, 0);
+        let change_script = format!("76a914{}88ac", "ff".repeat(20));
+        let result = build_call_transaction(
+            &utxo, "00", Some("51"), Some(50_000), Some("changeaddr"), Some(&change_script), None, None,
+        );
+        assert!(result.is_err(), "underfunded call must return Err, got Ok");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("insufficient funds"),
+            "error should report insufficient funds, got: {msg}"
+        );
     }
 
     #[test]
@@ -669,7 +710,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "51", None, None, Some("changeaddr"), Some(&change_script), None, None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         // txSize: input0(42) + changeOut(34) + overhead(10) = 86
         // Fee: ceil(86 * 100 / 1000) = 9
@@ -687,7 +728,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "51", None, None, Some("changeaddr"), Some(&change_script), None, None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.output_count, 0);
     }
@@ -752,7 +793,7 @@ mod tests {
         let change_script = format!("76a914{}88ac", "ff".repeat(20));
         let (tx_hex, _, _) = build_call_transaction(
             &utxo, "00", Some("51"), Some(40_000), Some("changeaddr"), Some(&change_script), Some(&additional), None,
-        );
+        ).unwrap();
         let parsed = parse_tx_hex(&tx_hex);
         // txSize: input0(42) + additional(148) + contractOut(10) + changeOut(34) + overhead(10) = 244
         // Fee: ceil(244 * 100 / 1000) = 25

@@ -1006,7 +1006,7 @@ func TestBuildDeployTransaction_SingleOutputWhenZeroChange(t *testing.T) {
 
 func TestBuildCallTransaction_BasicStructure(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if parsed.version != 1 {
@@ -1022,7 +1022,7 @@ func TestBuildCallTransaction_LocktimeOverride(t *testing.T) {
 	// built call tx's nLockTime field.
 	utxo := makeUtxo(100000, 0)
 	lt := uint32(800000)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
 	parsed := parseTxHex(callTxObj.Hex())
 	if parsed.locktime != 800000 {
 		t.Errorf("expected locktime 800000, got %d", parsed.locktime)
@@ -1032,7 +1032,7 @@ func TestBuildCallTransaction_LocktimeOverride(t *testing.T) {
 func TestBuildCallTransaction_LocktimeDefaultZero(t *testing.T) {
 	// Default (unset) must still write 0 — back-compatible.
 	utxo := makeUtxo(100000, 0)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{})
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{})
 	parsed := parseTxHex(callTxObj.Hex())
 	if parsed.locktime != 0 {
 		t.Errorf("expected locktime 0, got %d", parsed.locktime)
@@ -1041,7 +1041,7 @@ func TestBuildCallTransaction_LocktimeDefaultZero(t *testing.T) {
 
 func TestBuildCallTransaction_UnlockingScriptInInput0(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "aabb", "", 0, "", "", nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "aabb", "", 0, "", "", nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if parsed.inputs[0].script != "aabb" {
@@ -1051,7 +1051,7 @@ func TestBuildCallTransaction_UnlockingScriptInInput0(t *testing.T) {
 
 func TestBuildCallTransaction_SingleInput(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
-	callTxObj, inputCount, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
+	callTxObj, inputCount, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if inputCount != 1 {
@@ -1067,7 +1067,7 @@ func TestBuildCallTransaction_AdditionalInputs(t *testing.T) {
 	additional := []UTXO{makeUtxo(50000, 1), makeUtxo(30000, 2)}
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
-	callTxObj, inputCount, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100)
+	callTxObj, inputCount, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if inputCount != 3 {
@@ -1090,7 +1090,7 @@ func TestBuildCallTransaction_StatefulOutput(t *testing.T) {
 	newLockingScript := "76a914" + strings.Repeat("dd", 20) + "88ac"
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", newLockingScript, 50000, "changeaddr", changeScript, nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", newLockingScript, 50000, "changeaddr", changeScript, nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if parsed.outputs[0].script != newLockingScript {
@@ -1103,10 +1103,16 @@ func TestBuildCallTransaction_StatefulOutput(t *testing.T) {
 
 func TestBuildCallTransaction_DefaultSatoshis(t *testing.T) {
 	utxo := makeUtxo(75000, 0)
+	// The continuation reuses the full 75000-sat input, so a small funding
+	// input covers the fee (otherwise change < 0 now fails closed — finding C3).
+	additional := []UTXO{makeUtxo(1000, 1)}
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
 	// newSatoshis = 0 with newLockingScript set => defaults to currentUtxo.Satoshis
-	callTxObj, _, _ := BuildCallTransaction(utxo, "00", "51", 0, "changeaddr", changeScript, nil, 100)
+	callTxObj, _, _, err := BuildCallTransaction(utxo, "00", "51", 0, "changeaddr", changeScript, additional, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if parsed.outputs[0].satoshis != 75000 {
@@ -1118,7 +1124,7 @@ func TestBuildCallTransaction_ChangeCalculation(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
-	callTxObj, _, _ := BuildCallTransaction(utxo, "00", "51", 50000, "changeaddr", changeScript, nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "00", "51", 50000, "changeaddr", changeScript, nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	// Fee: input0(32+4+1+1+4=42) + contractOut(8+1+1=10) + changeOut(34) + overhead(10) = 96 bytes
@@ -1141,7 +1147,15 @@ func TestBuildCallTransaction_NoChangeWhenZero(t *testing.T) {
 	utxo := makeUtxo(50010, 0)
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
-	callTxObj, _, _ := BuildCallTransaction(utxo, "00", "51", 50000, "changeaddr", changeScript, nil, 100)
+	// change == 0 is an exact-cover call: it must NOT error (issue #116 hashes
+	// [continuation] only when change is exactly 0) and must omit the change output.
+	callTxObj, _, changeAmt, err := BuildCallTransaction(utxo, "00", "51", 50000, "changeaddr", changeScript, nil, 100)
+	if err != nil {
+		t.Fatalf("change==0 exact-cover must not error (issue #116): %v", err)
+	}
+	if changeAmt != 0 {
+		t.Errorf("expected changeAmount 0, got %d", changeAmt)
+	}
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if parsed.outputCount != 1 {
@@ -1149,11 +1163,35 @@ func TestBuildCallTransaction_NoChangeWhenZero(t *testing.T) {
 	}
 }
 
+func TestBuildCallTransaction_InsufficientFundsErrors(t *testing.T) {
+	// Finding C3: a genuinely underfunded call (totalInput < contractOutputSats)
+	// must fail closed, mirroring BuildDeployTransaction. Silently clamping
+	// change to 0 previously returned a "successful" tx that a continuation
+	// covenant rejects on broadcast (stranded funds). NOTE: a continuation whose
+	// output equals the input (change == -fee, a valid zero-fee tx) must NOT
+	// throw — see issue #116 — so the output must genuinely EXCEED the input.
+	utxo := makeUtxo(50000, 0)
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+
+	// Continuation demands 60000 out of a 50000-sat input: the tx would spend
+	// more than it takes in and can never confirm => fail closed.
+	tx, _, changeAmt, err := BuildCallTransaction(utxo, "00", "51", 60000, "changeaddr", changeScript, nil, 100)
+	if err == nil {
+		t.Fatalf("expected insufficient-funds error for underfunded call, got nil (tx=%v, change=%d)", tx, changeAmt)
+	}
+	if !strings.Contains(err.Error(), "insufficient funds") {
+		t.Errorf("expected insufficient-funds error, got: %v", err)
+	}
+	if tx != nil {
+		t.Errorf("expected nil tx on insufficient funds, got non-nil")
+	}
+}
+
 func TestBuildCallTransaction_StatelessChangeOnly(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	// Fee: input0(42) + changeOut(34) + overhead(10) = 86 bytes
@@ -1172,7 +1210,7 @@ func TestBuildCallTransaction_StatelessChangeOnly(t *testing.T) {
 
 func TestBuildCallTransaction_ReversedTxid(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	expected := reverseHex(utxo.Txid)
@@ -1183,7 +1221,7 @@ func TestBuildCallTransaction_ReversedTxid(t *testing.T) {
 
 func TestBuildCallTransaction_CorrectOutputIndex(t *testing.T) {
 	utxo := makeUtxo(100000, 3)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	if parsed.inputs[0].prevIndex != 3 {
@@ -2639,7 +2677,7 @@ func TestBuildCallTransaction_AllSequences(t *testing.T) {
 	additional := []UTXO{makeUtxo(50000, 1), makeUtxo(30000, 2)}
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100)
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100)
 	parsed := parseTxHex(callTxObj.Hex())
 
 	for i, inp := range parsed.inputs {
@@ -2660,7 +2698,7 @@ func TestBuildCallTransaction_LocktimeDefaultsNonFinalSequence(t *testing.T) {
 	additional := []UTXO{makeUtxo(50000, 1), makeUtxo(30000, 2)}
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 	lt := uint32(800000)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt})
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt})
 	parsed := parseTxHex(callTxObj.Hex())
 	if parsed.locktime != 800000 {
 		t.Errorf("expected locktime 800000, got %d", parsed.locktime)
@@ -2679,7 +2717,7 @@ func TestBuildCallTransaction_LocktimeZeroKeepsFinalSequence(t *testing.T) {
 	// An explicit locktime of 0 keeps the legacy final 0xffffffff (issue #131).
 	utxo := makeUtxo(100000, 0)
 	lt := uint32(0)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
 	parsed := parseTxHex(callTxObj.Hex())
 	if parsed.inputs[0].sequence != 0xffffffff {
 		t.Errorf("expected sequence 0xffffffff with locktime 0, got %#x", parsed.inputs[0].sequence)
@@ -2693,7 +2731,7 @@ func TestBuildCallTransaction_ExplicitSequenceWins(t *testing.T) {
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 	lt := uint32(800000)
 	seq := uint32(0x12345678)
-	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt, Sequence: &seq})
+	callTxObj, _, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt, Sequence: &seq})
 	parsed := parseTxHex(callTxObj.Hex())
 	for i, inp := range parsed.inputs {
 		if inp.sequence != 0x12345678 {
@@ -3149,7 +3187,7 @@ func TestBuildCallTransaction_DataOutputsOrder(t *testing.T) {
 			{Script: data1, Satoshis: 0},
 		},
 	}
-	callTxObj, _, _ := BuildCallTransaction(
+	callTxObj, _, _, _ := BuildCallTransaction(
 		utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100, opts,
 	)
 	parsed := parseTxHex(callTxObj.Hex())
@@ -3180,7 +3218,7 @@ func TestBuildCallTransaction_DataOutputsFeeEstimate(t *testing.T) {
 		if opts != nil {
 			variadic = []*BuildCallOptions{opts}
 		}
-		_, _, change := BuildCallTransaction(
+		_, _, change, _ := BuildCallTransaction(
 			utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100, variadic...,
 		)
 		return change
@@ -3210,7 +3248,7 @@ func TestBuildCallTransaction_DataOutputsWithNonZeroSats(t *testing.T) {
 	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
 
 	// Same tx without data output for baseline change calc
-	_, _, baselineChange := BuildCallTransaction(
+	_, _, baselineChange, _ := BuildCallTransaction(
 		utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100,
 	)
 
@@ -3218,7 +3256,7 @@ func TestBuildCallTransaction_DataOutputsWithNonZeroSats(t *testing.T) {
 	opts := &BuildCallOptions{
 		DataOutputs: []ContractOutput{{Script: dataScript, Satoshis: 1000}},
 	}
-	callTxObj, _, changeWith := BuildCallTransaction(
+	callTxObj, _, changeWith, _ := BuildCallTransaction(
 		utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100, opts,
 	)
 	parsed := parseTxHex(callTxObj.Hex())

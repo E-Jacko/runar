@@ -115,6 +115,20 @@ module Runar
       fee            = (estimated_size * rate + 999) / 1000
       change         = total_input - contract_output_sats - fee
 
+      # Fail closed only when the inputs cannot cover the (non-change) contract
+      # + data outputs — the tx would spend more than it takes in and can never
+      # confirm (finding C3). Do NOT raise merely because change < 0: an
+      # exact-cover continuation (issue #116) keeps the full input value and
+      # adds no funding, so change == -fee (negative) even though the zero-fee
+      # tx is valid and the covenant accepts a no-change spend.
+      # contract_output_sats already includes data outputs; the change output
+      # is still omitted below whenever change is not positive.
+      if total_input < contract_output_sats
+        raise ArgumentError,
+              "build_call_transaction: insufficient funds. " \
+              "Need #{contract_output_sats + fee} sats, have #{total_input}"
+      end
+
       # Build raw transaction bytes as a hex string.
       tx = +''
 

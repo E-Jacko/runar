@@ -89,7 +89,7 @@ func BuildCallTransaction(
 	additionalUtxos []UTXO,
 	feeRate int64,
 	opts ...*BuildCallOptions,
-) (tx *transaction.Transaction, inputCount int, changeAmount int64) {
+) (tx *transaction.Transaction, inputCount int, changeAmount int64, err error) {
 	var extraContractInputs []AdditionalContractInput
 	var contractOutputs []ContractOutput
 	var dataOutputs []ContractOutput
@@ -171,6 +171,21 @@ func BuildCallTransaction(
 
 	change := totalInput - contractOutputSats - fee
 
+	// Fail closed only when the inputs cannot cover the (non-change) contract +
+	// data outputs — the tx would spend more than it takes in and can never
+	// confirm (finding C3). Do NOT reject merely because change < 0: an
+	// exact-cover continuation (issue #116) keeps the full input value and adds
+	// no funding, so change == -fee (negative) even though the zero-fee tx is
+	// valid and the covenant accepts a no-change spend. contractOutputSats
+	// already includes data outputs; the change output is still omitted below
+	// whenever change is not positive.
+	if totalInput < contractOutputSats {
+		return nil, 0, 0, fmt.Errorf(
+			"buildCallTransaction: insufficient funds. Need %d sats, have %d",
+			contractOutputSats+fee, totalInput,
+		)
+	}
+
 	// Build Transaction object
 	tx = transaction.NewTransaction()
 
@@ -248,7 +263,7 @@ func BuildCallTransaction(
 	if change > 0 {
 		retChange = change
 	}
-	return tx, len(allUtxos), retChange
+	return tx, len(allUtxos), retChange, nil
 }
 
 // ---------------------------------------------------------------------------

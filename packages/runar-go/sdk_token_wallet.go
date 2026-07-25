@@ -100,7 +100,7 @@ func (tw *TokenWallet) Transfer(recipientAddr string, amount int64) (string, err
 			}
 			changeScript := BuildP2PKHScript(changeAddress)
 
-			prelimTx, _, _ := BuildCallTransaction(
+			prelimTx, _, _, prelimErr := BuildCallTransaction(
 				utxo,
 				prelimUnlock,
 				"",  // FungibleToken is stateless (SmartContract base)
@@ -110,6 +110,9 @@ func (tw *TokenWallet) Transfer(recipientAddr string, amount int64) (string, err
 				additionalUtxos,
 				feeRate,
 			)
+			if prelimErr != nil {
+				return "", fmt.Errorf("TokenWallet.transfer: %w", prelimErr)
+			}
 
 			// Sign input 0 against the contract UTXO's locking script
 			sig, err := tw.signer.Sign(prelimTx.Hex(), 0, utxo.Script, utxo.Satoshis, nil)
@@ -187,7 +190,7 @@ func (tw *TokenWallet) Merge() (string, error) {
 	}
 	changeScript := BuildP2PKHScript(changeAddress)
 
-	prelimTx, _, _ := BuildCallTransaction(
+	prelimTx, _, _, prelimErr := BuildCallTransaction(
 		firstUtxo,
 		prelimUnlock,
 		"",
@@ -197,6 +200,9 @@ func (tw *TokenWallet) Merge() (string, error) {
 		additionalUtxos,
 		feeRate,
 	)
+	if prelimErr != nil {
+		return "", fmt.Errorf("TokenWallet.merge: %w", prelimErr)
+	}
 
 	// Sign input 0 against the first contract UTXO's locking script
 	sig, err := tw.signer.Sign(prelimTx.Hex(), 0, firstUtxo.Script, firstUtxo.Satoshis, nil)

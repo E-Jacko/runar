@@ -93,6 +93,23 @@ export function buildCallTransaction(
 
   const change = totalInput - contractOutputSats - fee;
 
+  // Fail closed on a genuinely underfunded call (finding C3): if the inputs
+  // cannot even cover the (non-change) contract + data outputs, the tx spends
+  // more than it takes in — it can never confirm and a covenant would strand
+  // the funds. Do NOT throw merely because `change < 0`: an exact-cover
+  // continuation (issue #116) keeps the full input value in the continuation
+  // output and adds no funding, so `change === -fee` (negative) even though
+  // `totalInput === contractOutputSats` and the resulting zero-fee tx is valid
+  // (the covenant accepts a no-change spend). Guard on the only value-invalid
+  // case — `totalInput < contractOutputSats` (contractOutputSats already
+  // includes data outputs) — and keep the existing clamp (change output
+  // omitted when `change <= 0`). Mirrors Java's fail-closed selection loop.
+  if (totalInput < contractOutputSats) {
+    throw new Error(
+      `buildCallTransaction: insufficient funds. Need ${contractOutputSats + fee} sats, have ${totalInput}`,
+    );
+  }
+
   // Build Transaction object
   const tx = new Transaction();
 
