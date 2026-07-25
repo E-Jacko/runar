@@ -270,7 +270,7 @@ func ComputeNewState(
 	args map[string]interface{},
 	constructorArgs []interface{},
 ) (map[string]interface{}, error) {
-	state, _, _, err := ComputeNewStateAndDataOutputs(anf, methodName, currentState, args, constructorArgs)
+	state, _, _, _, err := ComputeNewStateAndDataOutputs(anf, methodName, currentState, args, constructorArgs)
 	return state, err
 }
 
@@ -292,7 +292,7 @@ func ExecuteStrict(
 	args map[string]interface{},
 	constructorArgs []interface{},
 ) (map[string]interface{}, []ContractOutput, []ContractOutput, error) {
-	return runMethod(anf, methodName, currentState, args, constructorArgs, &strictCtx{methodName: methodName}, nil)
+	return runMethod(anf, methodName, currentState, args, constructorArgs, &strictCtx{methodName: methodName}, nil, nil)
 }
 
 // ExecuteWithFixture is the lenient-mode (asserts skipped) counterpart of
@@ -313,7 +313,7 @@ func ExecuteWithFixture(
 	constructorArgs []interface{},
 	fixture *InterpreterFixture,
 ) (map[string]interface{}, []ContractOutput, []ContractOutput, error) {
-	return runMethod(anf, methodName, currentState, args, constructorArgs, nil, fixture)
+	return runMethod(anf, methodName, currentState, args, constructorArgs, nil, fixture, nil)
 }
 
 // ExecuteStrictWithFixture is ExecuteStrict with an additional
@@ -328,7 +328,7 @@ func ExecuteStrictWithFixture(
 	constructorArgs []interface{},
 	fixture *InterpreterFixture,
 ) (map[string]interface{}, []ContractOutput, []ContractOutput, error) {
-	return runMethod(anf, methodName, currentState, args, constructorArgs, &strictCtx{methodName: methodName}, fixture)
+	return runMethod(anf, methodName, currentState, args, constructorArgs, &strictCtx{methodName: methodName}, fixture, nil)
 }
 
 // ExecuteOnChainAuthoritative is like ExecuteStrict but also performs real
@@ -357,7 +357,29 @@ func ExecuteOnChainAuthoritative(
 	return runMethod(anf, methodName, currentState, args, constructorArgs, &strictCtx{
 		methodName: methodName,
 		realCrypto: ctx,
-	}, nil)
+	}, nil, nil)
+}
+
+// OrderedOutput is a single state-class output in the exact SOURCE order the
+// method body emits it (finding G1). A method may interleave
+// `this.addOutput(...)` state continuations with `this.addRawOutput(...)`
+// caller-supplied outputs on one list, and the compiler folds them into the
+// covenant continuation hashOutputs in this same order (see
+// `compilers/go/frontend/anf_lower.go` — `add_output` and `add_raw_output`
+// share one addOutputRefs list). A transaction builder MUST emit them in this
+// order or the on-chain state-check OP_VERIFY rejects.
+//
+//   - Kind is "state" for a state continuation or "raw" for a caller-supplied
+//     script output.
+//   - Script is populated for "raw" entries only; "state" entries take the
+//     freshly computed continuation locking script from the caller.
+//
+// Data outputs (`add_data_output`) are NOT included here — they always follow
+// every state-class output in their own dataOutputs list.
+type OrderedOutput struct {
+	Kind     string
+	Satoshis int64
+	Script   string
 }
 
 // ComputeNewStateAndDataOutputs is like ComputeNewState but also returns
@@ -376,14 +398,21 @@ func ExecuteOnChainAuthoritative(
 // `this.addRawOutput(satoshis, scriptBytes)`. The simulator forwards the
 // script bytes (hex-encoded) without introspecting them so an off-chain
 // transaction builder can splice them in at the correct index.
+//
+// The fourth return value is the ORDERED state-class output list (state
+// continuation + raw markers) in source order (finding G1). It captures how the
+// two output kinds interleave so the SDK call path can emit them at the correct
+// index; the flat rawOutputs slice above loses that interleaving.
 func ComputeNewStateAndDataOutputs(
 	anf *ANFProgram,
 	methodName string,
 	currentState map[string]interface{},
 	args map[string]interface{},
 	constructorArgs []interface{},
-) (map[string]interface{}, []ContractOutput, []ContractOutput, error) {
-	return runMethod(anf, methodName, currentState, args, constructorArgs, nil, nil)
+) (map[string]interface{}, []ContractOutput, []ContractOutput, []OrderedOutput, error) {
+	var ordered []OrderedOutput
+	state, dataOutputs, rawOutputs, err := runMethod(anf, methodName, currentState, args, constructorArgs, nil, nil, &ordered)
+	return state, dataOutputs, rawOutputs, ordered, err
 }
 
 // runMethod is the shared entry-point for both lenient and strict modes.
@@ -393,6 +422,9 @@ func ComputeNewStateAndDataOutputs(
 // fixture may be nil; when set, the three intent-covenant intrinsics
 // (`extractPrevOutputScript`, `requireOutputP2PKH`, `currentBlockHeight`)
 // read witness bytes / mock-preimage values from it.
+// orderedOutputs, when non-nil, is populated with the state-class outputs
+// (state continuation + raw) in source order (finding G1). Callers that don't
+// need the interleaving pass nil.
 func runMethod(
 	anf *ANFProgram,
 	methodName string,
@@ -401,6 +433,7 @@ func runMethod(
 	constructorArgs []interface{},
 	strict *strictCtx,
 	fixture *InterpreterFixture,
+	orderedOutputs *[]OrderedOutput,
 ) (resultState map[string]interface{}, resultDataOutputs []ContractOutput, resultRawOutputs []ContractOutput, retErr error) {
 	// Find the method
 	var method *ANFMethod
@@ -480,6 +513,9 @@ func runMethod(
 				resultState = nil
 				resultDataOutputs = nil
 				resultRawOutputs = nil
+				if orderedOutputs != nil {
+					*orderedOutputs = nil
+				}
 				retErr = af
 				return
 			}
@@ -487,6 +523,9 @@ func runMethod(
 				resultState = nil
 				resultDataOutputs = nil
 				resultRawOutputs = nil
+				if orderedOutputs != nil {
+					*orderedOutputs = nil
+				}
 				retErr = ie
 				return
 			}
@@ -494,6 +533,9 @@ func runMethod(
 				resultState = nil
 				resultDataOutputs = nil
 				resultRawOutputs = nil
+				if orderedOutputs != nil {
+					*orderedOutputs = nil
+				}
 				retErr = se
 				return
 			}
@@ -510,7 +552,7 @@ func runMethod(
 	// stays pure (decoded *big.Int values) so state serialization is
 	// unaffected. See anfEvalValue's bin_op/unary_op cases.
 	scriptBytes := make(map[string][]byte)
-	anfEvalBindings(anf, method.Body, env, stateDelta, &dataOutputs, &rawOutputs, strict, fixture, scriptBytes)
+	anfEvalBindings(anf, method.Body, env, stateDelta, &dataOutputs, &rawOutputs, orderedOutputs, strict, fixture, scriptBytes)
 
 	// Merge delta into current state
 	result := make(map[string]interface{})
@@ -534,6 +576,9 @@ func anfEvalBindings(
 	stateDelta map[string]interface{},
 	dataOutputs *[]ContractOutput,
 	rawOutputs *[]ContractOutput,
+	// orderedOutputs, when non-nil, accumulates state-class outputs (state
+	// continuation + raw) in source order (finding G1).
+	orderedOutputs *[]OrderedOutput,
 	strict *strictCtx,
 	fixture *InterpreterFixture,
 	// scriptBytes carries raw stack bytes for byte-array-op results (& | ^
@@ -542,7 +587,7 @@ func anfEvalBindings(
 	scriptBytes map[string][]byte,
 ) {
 	for _, binding := range bindings {
-		val := anfEvalValue(anf, binding.Value, env, stateDelta, dataOutputs, rawOutputs, strict, fixture, binding.Name, scriptBytes)
+		val := anfEvalValue(anf, binding.Value, env, stateDelta, dataOutputs, rawOutputs, orderedOutputs, strict, fixture, binding.Name, scriptBytes)
 		env[binding.Name] = val
 	}
 }
@@ -554,6 +599,9 @@ func anfEvalValue(
 	stateDelta map[string]interface{},
 	dataOutputs *[]ContractOutput,
 	rawOutputs *[]ContractOutput,
+	// orderedOutputs, when non-nil, accumulates state-class outputs (state
+	// continuation + raw) in source order (finding G1).
+	orderedOutputs *[]OrderedOutput,
 	strict *strictCtx,
 	fixture *InterpreterFixture,
 	bindingName string,
@@ -690,7 +738,7 @@ func anfEvalValue(
 					// frame, so it starts with an empty side map (matching the
 					// TS reference, which passes no scriptBytes across the
 					// method-call boundary).
-					anfEvalBindings(anf, m.Body, callEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture, make(map[string][]byte))
+					anfEvalBindings(anf, m.Body, callEnv, stateDelta, dataOutputs, rawOutputs, orderedOutputs, strict, fixture, make(map[string][]byte))
 					// Copy updated property values back to caller env
 					for _, prop := range anf.Properties {
 						if v, ok := callEnv[prop.Name]; ok {
@@ -721,7 +769,7 @@ func anfEvalValue(
 		for k, v := range env {
 			childEnv[k] = v
 		}
-		anfEvalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture, scriptBytes)
+		anfEvalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, orderedOutputs, strict, fixture, scriptBytes)
 		// Copy new bindings back
 		for k, v := range childEnv {
 			env[k] = v
@@ -753,7 +801,7 @@ func anfEvalValue(
 			for k, v := range env {
 				loopEnv[k] = v
 			}
-			anfEvalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture, scriptBytes)
+			anfEvalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, orderedOutputs, strict, fixture, scriptBytes)
 			for k, v := range loopEnv {
 				env[k] = v
 			}
@@ -818,6 +866,17 @@ func anfEvalValue(
 				}
 			}
 		}
+		// Record the state continuation output in source order (finding G1): a
+		// method may interleave raw outputs around it, and the on-chain covenant
+		// folds them into hashOutputs in exactly this order. Satoshis is the
+		// add_output node's satoshis operand (e.g. 0 for this.addOutput(0, ...)).
+		if orderedOutputs != nil {
+			satRef, _ := value["satoshis"].(string)
+			*orderedOutputs = append(*orderedOutputs, OrderedOutput{
+				Kind:     "state",
+				Satoshis: anfToBigInt(env[satRef]).Int64(),
+			})
+		}
 		return nil
 
 	case "add_data_output":
@@ -850,6 +909,15 @@ func anfEvalValue(
 			*rawOutputs = append(*rawOutputs, ContractOutput{
 				Script:   scriptHex,
 				Satoshis: sats,
+			})
+		}
+		// Also record in the ordered state-class output list so a transaction
+		// builder can emit it at the correct source-order index (finding G1).
+		if orderedOutputs != nil {
+			*orderedOutputs = append(*orderedOutputs, OrderedOutput{
+				Kind:     "raw",
+				Satoshis: sats,
+				Script:   scriptHex,
 			})
 		}
 		return nil

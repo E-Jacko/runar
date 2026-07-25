@@ -691,13 +691,18 @@ func (c *RunarContract) PrepareCall(
 	// a second interpreter pass, so reuse it below.
 	var resolvedDataOutputs []ContractOutput
 	var autoComputedState map[string]interface{}
+	// State-class outputs (state continuation + raw) in source order, from the
+	// ANF interpreter. Empty for methods that emit no this.addRawOutput(...)
+	// (finding G1) — the raw-output branch below is a no-op in that case.
+	var anfOrderedOutputs []OrderedOutput
 	if isStateful && c.Artifact.ANF != nil {
 		namedArgs := buildNamedArgs(userParams, resolvedArgs)
-		if state, dataOuts, _, err := ComputeNewStateAndDataOutputs(
+		if state, dataOuts, _, ordered, err := ComputeNewStateAndDataOutputs(
 			c.Artifact.ANF, methodName, c.state, namedArgs, c.constructorArgs,
 		); err == nil {
 			autoComputedState = state
 			resolvedDataOutputs = dataOuts
+			anfOrderedOutputs = ordered
 		}
 	}
 	if options != nil && options.DataOutputs != nil {
@@ -738,6 +743,62 @@ func (c *RunarContract) PrepareCall(
 			fmt.Sprintf("%s.Call(%s).continuation", c.Artifact.ContractName, methodName),
 		); guardErr != nil {
 			return nil, guardErr
+		}
+	}
+
+	// Finding G1: a method that calls this.addRawOutput(...) folds the raw
+	// output(s) into the covenant continuation hashOutputs IN SOURCE ORDER,
+	// interleaved with the state continuation this.addOutput(...). The single-
+	// stateful branch above only builds the state continuation, so the built
+	// tx's outputs would mismatch hashOutputs and input 0's OP_VERIFY would
+	// reject. Rebuild an ORDERED contractOutputs from the interpreter's source-
+	// ordered list. Purely additive: with no raw outputs this is a no-op and
+	// existing behaviour is untouched (BuildCallTransaction already emits
+	// contractOutputs -> dataOutputs -> change in order and fee-sizes them).
+	hasRawOutput := false
+	for _, o := range anfOrderedOutputs {
+		if o.Kind == "raw" {
+			hasRawOutput = true
+			break
+		}
+	}
+	if isStateful && hasRawOutput {
+		stateCount := 0
+		for _, o := range anfOrderedOutputs {
+			if o.Kind == "state" {
+				stateCount++
+			}
+		}
+		// Fail closed. The covenant machinery below threads exactly one
+		// continuation (newLockingScript/newSatoshis). Multi-output mode,
+		// multiple continuations, or a missing continuation script are not
+		// representable — error rather than silently drop outputs and strand
+		// the funds.
+		if hasMultiOutput || stateCount >= 2 || (stateCount == 1 && newLockingScript == "") {
+			return nil, fmt.Errorf(
+				"RunarContract.Call(%s): cannot build a transaction that interleaves raw "+
+					"outputs with %d state continuations; the SDK currently supports raw outputs "+
+					"alongside a single state continuation only (finding G1)",
+				methodName, stateCount)
+		}
+		contractOutputs = make([]ContractOutput, 0, len(anfOrderedOutputs))
+		for _, o := range anfOrderedOutputs {
+			if o.Kind == "raw" {
+				contractOutputs = append(contractOutputs, ContractOutput{Script: o.Script, Satoshis: o.Satoshis})
+			} else {
+				contractOutputs = append(contractOutputs, ContractOutput{Script: newLockingScript, Satoshis: o.Satoshis})
+			}
+		}
+		// Keep the OP_PUSH_TX preimage's new-amount in step with the
+		// continuation output's sats — this.addOutput(0, ...) makes it 0, not
+		// the input value the single-stateful branch defaulted newSatoshis to.
+		if stateCount == 1 {
+			for _, o := range anfOrderedOutputs {
+				if o.Kind == "state" {
+					newSatoshis = o.Satoshis
+					break
+				}
+			}
 		}
 	}
 
@@ -1267,11 +1328,34 @@ func (c *RunarContract) FinalizeCall(
 			Script:      prepared.contractOutputs[0].Script,
 		}
 	} else if prepared.isStateful && prepared.newLockingScript != "" {
-		c.currentUtxo = &UTXO{
-			Txid:        txid,
-			OutputIndex: 0,
-			Satoshis:    prepared.newSatoshis,
-			Script:      prepared.newLockingScript,
+		// The state continuation is normally output 0, but a method that also
+		// calls this.addRawOutput(...) (finding G1) can push raw outputs ahead
+		// of it. When contractOutputs is populated (the raw-output path), it
+		// records the real source order and each output's sats — so track the
+		// continuation at its actual index and value (which may legitimately be
+		// 0). Empty contractOutputs (the common case) keeps the legacy index-0 /
+		// newSatoshis-fallback behaviour byte-for-byte unchanged.
+		contIdx := -1
+		for i, o := range prepared.contractOutputs {
+			if o.Script == prepared.newLockingScript {
+				contIdx = i
+				break
+			}
+		}
+		if contIdx >= 0 {
+			c.currentUtxo = &UTXO{
+				Txid:        txid,
+				OutputIndex: contIdx,
+				Satoshis:    prepared.contractOutputs[contIdx].Satoshis,
+				Script:      prepared.newLockingScript,
+			}
+		} else {
+			c.currentUtxo = &UTXO{
+				Txid:        txid,
+				OutputIndex: 0,
+				Satoshis:    prepared.newSatoshis,
+				Script:      prepared.newLockingScript,
+			}
 		}
 	} else if prepared.isTerminal {
 		c.currentUtxo = nil

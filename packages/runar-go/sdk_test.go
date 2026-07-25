@@ -3281,7 +3281,7 @@ func TestComputeDataOutputs_FromANF(t *testing.T) {
 	}
 
 	currentState := map[string]interface{}{"counter": big.NewInt(0)}
-	newState, dataOutputs, _, err := ComputeNewStateAndDataOutputs(
+	newState, dataOutputs, _, _, err := ComputeNewStateAndDataOutputs(
 		anf, "emit", currentState, nil, nil,
 	)
 	if err != nil {

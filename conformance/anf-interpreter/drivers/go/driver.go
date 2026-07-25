@@ -279,7 +279,7 @@ func run() error {
 			&anf, methodName, currentState, args, constructorArgs,
 		)
 	default:
-		state, dataOutputs, rawOutputs, interpErr = runar.ComputeNewStateAndDataOutputs(
+		state, dataOutputs, rawOutputs, _, interpErr = runar.ComputeNewStateAndDataOutputs(
 			&anf, methodName, currentState, args, constructorArgs,
 		)
 	}
