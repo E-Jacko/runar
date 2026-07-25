@@ -442,9 +442,13 @@ module Runar
             entry
           end
         end
+        # State-class outputs (state continuation + raw) in source order, from
+        # the ANF interpreter. Empty for methods that emit no add_raw_output(...)
+        # (finding G1) — the raw-output rebuild below is a no-op in that case.
+        anf_ordered_outputs = []
         if is_stateful && @artifact.anf
           named_args = build_named_args(user_params, resolved_args)
-          computed_state, anf_data_outputs, _anf_raw_outputs =
+          computed_state, anf_data_outputs, _anf_raw_outputs, anf_ordered_outputs =
             ANFInterpreter.compute_new_state_and_data_outputs(
               @artifact.anf, method_name, @state, named_args,
               constructor_args: @constructor_args
@@ -488,6 +492,41 @@ module Runar
           end
         else
           new_locking_script, new_satoshis = build_continuation(is_stateful, opts)
+        end
+
+        # Finding G1: a method that calls add_raw_output(...) folds the raw
+        # output(s) into the covenant continuation hashOutputs IN SOURCE ORDER,
+        # interleaved with the state continuation add_output(...). The single
+        # continuation branch above only builds the state output, so the built
+        # tx's outputs would mismatch hashOutputs and input 0's OP_VERIFY would
+        # reject. Rebuild an ORDERED contract_outputs from the interpreter's
+        # source-ordered output list. Purely additive: absent raw outputs this
+        # is a no-op and existing behaviour is byte-for-byte untouched.
+        if is_stateful && anf_ordered_outputs.any? { |o| o[:kind] == :raw }
+          state_entries = anf_ordered_outputs.select { |o| o[:kind] == :state }
+          # Fail closed. The SDK only threads a SINGLE continuation
+          # (new_locking_script / new_satoshis). Multi-output calls, multiple
+          # continuations, or a missing continuation script are not
+          # representable — raise rather than silently drop outputs and strand
+          # the funds.
+          if has_multi_output || state_entries.length >= 2 ||
+             (state_entries.length == 1 && new_locking_script.to_s.empty?)
+            raise "RunarContract.call(#{method_name}): cannot build a transaction that " \
+                  "interleaves raw outputs with #{state_entries.length} state continuation(s); " \
+                  'the SDK currently supports raw outputs alongside a single state ' \
+                  'continuation only (finding G1).'
+          end
+          contract_outputs = anf_ordered_outputs.map do |o|
+            if o[:kind] == :raw
+              { script: o[:script], satoshis: o[:satoshis] }
+            else
+              { script: new_locking_script, satoshis: o[:satoshis] }
+            end
+          end
+          # Keep the preimage's newAmount (build_stateful_unlock) in step with
+          # the continuation output's sats — add_output(0, ...) makes it 0, not
+          # the input value the single-continuation branch defaulted to.
+          new_satoshis = state_entries.first[:satoshis] if state_entries.length == 1
         end
 
         # DoS-bound: also reject pathological continuation scripts BEFORE broadcast.
@@ -1569,11 +1608,29 @@ module Runar
             script: first[:script]
           )
         elsif prepared.is_stateful && !prepared.new_locking_script.empty?
-          @current_utxo = Utxo.new(
-            txid: txid, output_index: 0,
-            satoshis: prepared.new_satoshis.positive? ? prepared.new_satoshis : prepared.contract_utxo.satoshis,
-            script: prepared.new_locking_script
-          )
+          # The state continuation is normally output 0, but a method that also
+          # calls add_raw_output(...) (finding G1) can push raw outputs ahead of
+          # it. When contract_outputs is populated (the raw-output path) it
+          # records the real source order and each output's satoshis — so track
+          # the continuation at its actual index and value (which may
+          # legitimately be 0). An empty contract_outputs (the common case)
+          # keeps the legacy index-0 / new_satoshis-fallback behaviour
+          # byte-for-byte unchanged.
+          cont_idx = Array(prepared.contract_outputs).index { |o| o[:script] == prepared.new_locking_script }
+          @current_utxo =
+            if cont_idx
+              co = prepared.contract_outputs[cont_idx]
+              Utxo.new(
+                txid: txid, output_index: cont_idx,
+                satoshis: co[:satoshis], script: prepared.new_locking_script
+              )
+            else
+              Utxo.new(
+                txid: txid, output_index: 0,
+                satoshis: prepared.new_satoshis.positive? ? prepared.new_satoshis : prepared.contract_utxo.satoshis,
+                script: prepared.new_locking_script
+              )
+            end
         else
           @current_utxo = nil
         end

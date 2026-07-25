@@ -124,6 +124,11 @@ pub const ANFNode = union(enum) {
         value: []const u8 = "",
     },
     add_output: struct {
+        // Reference to the binding holding the state continuation's satoshis
+        // operand. Recorded in the source-ordered output list (finding G1) so
+        // the SDK call path can emit the continuation at the right index and
+        // sync the OP_PUSH_TX preimage's new-amount to it.
+        satoshis: []const u8 = "",
         state_values: []const []const u8 = &.{},
     },
     // On-chain-only operations — skip in simulation
@@ -209,6 +214,15 @@ const EvalCtx = struct {
     /// arena (freed at arena.deinit); a FRESH map is used per private-method
     /// body (see evalMethodCall), matching the TS reference.
     script_bytes: *std.StringHashMap([]const u8),
+    /// Source-ordered state-class outputs (state continuation + raw), finding
+    /// G1. Appended to in the `add_output` / `add_raw_output` arms and shared
+    /// across every recursive walk site (if / loop / private method_call) so a
+    /// method that interleaves `this.addOutput(...)` and
+    /// `this.addRawOutput(...)` records them in source order — the same order
+    /// the compiler folds into the covenant `hashOutputs`. Arena-backed during
+    /// interpretation; runMethod dupes the raw scripts into the caller
+    /// allocator before returning.
+    ordered_outputs: *std.ArrayList(OrderedOutputEntry),
 };
 
 /// Real-crypto context for `executeOnChainAuthoritative`. The 32-byte
@@ -340,6 +354,27 @@ pub const DataOutputEntry = struct {
     script: []u8,
 };
 
+/// Discriminates a source-ordered state-class output (finding G1).
+pub const OrderedOutputKind = enum { state, raw };
+
+/// A single state-class output in the exact SOURCE order the method body emits
+/// it, capturing the interleaving of `this.addOutput(...)` (state continuation)
+/// and `this.addRawOutput(...)` (caller-supplied script). The compiler folds
+/// these into the continuation `hashOutputs` in this same order (see
+/// `compilers/zig/src/passes/anf_lower.zig` — `add_output` and `add_raw_output`
+/// share one output ref list), so a transaction builder MUST emit them in this
+/// order or the on-chain state-check OP_VERIFY rejects (finding G1). `script`
+/// is populated for `.raw` entries only (caller-owned dupe); `.state` entries
+/// take the freshly computed continuation locking script from the caller and
+/// carry an empty `script`. Data outputs (`add_data_output`) are NOT included
+/// here — they are always emitted after every state-class output in their own
+/// `data_outputs` list.
+pub const OrderedOutputEntry = struct {
+    kind: OrderedOutputKind,
+    satoshis: i64,
+    script: []const u8 = "",
+};
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -358,6 +393,11 @@ pub const NewStateResult = struct {
     state: std.StringHashMap(ANFValue),
     data_outputs: []DataOutputEntry,
     raw_outputs: []DataOutputEntry,
+    /// State-class outputs (state continuation + raw) in SOURCE order
+    /// (finding G1). Each `.raw` entry's `script` is duped into the caller
+    /// allocator (same lifetime as `data_outputs`); `.state` entries carry an
+    /// empty `script`. Caller owns the slice.
+    outputs: []OrderedOutputEntry,
 };
 
 /// Compute the new state after executing a contract method.
@@ -374,11 +414,13 @@ pub fn computeNewState(
     const result = try computeNewStateAndDataOutputs(
         allocator, anf, method_name, current_state, args, constructor_args,
     );
-    // Discard data + raw outputs — free their script allocations.
+    // Discard data + raw + ordered outputs — free their script allocations.
     for (result.data_outputs) |d| allocator.free(d.script);
     allocator.free(result.data_outputs);
     for (result.raw_outputs) |d| allocator.free(d.script);
     allocator.free(result.raw_outputs);
+    for (result.outputs) |o| if (o.kind == .raw and o.script.len > 0) allocator.free(@constCast(o.script));
+    allocator.free(result.outputs);
     return result.state;
 }
 
@@ -615,6 +657,11 @@ fn runMethod(
     var state_delta = std.StringHashMap(ANFValue).init(arena_alloc);
     var data_outputs_arena = std.ArrayList(DataOutputEntry).empty;
     var raw_outputs_arena = std.ArrayList(DataOutputEntry).empty;
+    // Source-ordered state-class outputs (state continuation + raw), finding
+    // G1. Arena-backed during interpretation (raw scripts reference env-held
+    // arena slices); duped into the caller allocator below so they survive the
+    // arena deinit.
+    var ordered_outputs_arena = std.ArrayList(OrderedOutputEntry).empty;
 
     // Walk bindings — strict-mode context (or null for lenient). When
     // `real_crypto` is non-null we wire it into StrictCtx so crypto
@@ -625,7 +672,7 @@ fn runMethod(
     // Side map for numeric byte-array-op results (see EvalCtx.script_bytes).
     // Arena-backed — freed with everything else at arena.deinit.
     var script_bytes_map = std.StringHashMap([]const u8).init(arena_alloc);
-    const eval_ctx: EvalCtx = .{ .strict = strict_ctx_ptr, .mock_env = mock_env, .script_bytes = &script_bytes_map };
+    const eval_ctx: EvalCtx = .{ .strict = strict_ctx_ptr, .mock_env = mock_env, .script_bytes = &script_bytes_map, .ordered_outputs = &ordered_outputs_arena };
     evalBindings(arena_alloc, meth.body, &env, &state_delta, &data_outputs_arena, &raw_outputs_arena, anf, eval_ctx) catch |err| {
         // On strict-mode AssertionFailure, populate the caller-supplied
         // out_failure_info (if any) so the driver can emit a structured
@@ -668,7 +715,18 @@ fn runMethod(
         ro_out[i] = .{ .satoshis = d.satoshis, .script = try allocator.dupe(u8, d.script) };
     }
 
-    return .{ .state = result, .data_outputs = do_out, .raw_outputs = ro_out };
+    // Dupe the source-ordered outputs (finding G1). `.raw` entries carry a
+    // caller-owned script dupe; `.state` entries carry an empty script.
+    const oo_out = try allocator.alloc(OrderedOutputEntry, ordered_outputs_arena.items.len);
+    for (ordered_outputs_arena.items, 0..) |o, i| {
+        oo_out[i] = .{
+            .kind = o.kind,
+            .satoshis = o.satoshis,
+            .script = if (o.kind == .raw) try allocator.dupe(u8, o.script) else "",
+        };
+    }
+
+    return .{ .state = result, .data_outputs = do_out, .raw_outputs = ro_out, .outputs = oo_out };
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +946,11 @@ fn evalNode(
                     }
                 }
             }
+            // Record the state continuation in SOURCE order (finding G1): a
+            // method may interleave raw outputs around it, and the on-chain
+            // covenant folds them into hashOutputs in exactly this order.
+            const sat_val = env.get(ao.satoshis) orelse anf_none;
+            try eval_ctx.ordered_outputs.append(allocator, .{ .kind = .state, .satoshis = toInt(sat_val) });
             return anf_none;
         },
         .add_data_output => |ado| {
@@ -924,6 +987,11 @@ fn evalNode(
                 .satoshis = sats,
                 .script = try allocator.dupe(u8, script_bytes),
             });
+            // Also record in the SOURCE-ordered state-class output list so a
+            // transaction builder can emit it at the correct source-order index
+            // (finding G1). The script slice references env-held arena storage;
+            // runMethod dupes it into the caller allocator before returning.
+            try eval_ctx.ordered_outputs.append(allocator, .{ .kind = .raw, .satoshis = sats, .script = script_bytes });
             return anf_none;
         },
         // On-chain-only operations — skip
@@ -1593,6 +1661,10 @@ fn evalMethodCall(
                 .strict = eval_ctx.strict,
                 .mock_env = eval_ctx.mock_env,
                 .script_bytes = &method_script_bytes,
+                // Share the caller's source-ordered output list (finding G1) so
+                // add_output / add_raw_output inside a private method append in
+                // the same interleaved source order the compiler folds.
+                .ordered_outputs = eval_ctx.ordered_outputs,
             };
             try evalBindings(allocator, m.body, &method_env, state_delta, data_outputs, raw_outputs, anf, method_ctx);
 
@@ -2187,7 +2259,8 @@ fn parseANFNode(allocator: std.mem.Allocator, val: std.json.Value) error{OutOfMe
                 }
             }
         }
-        return .{ .add_output = .{ .state_values = try state_values.toOwnedSlice(allocator) } };
+        const satoshis = if (obj.get("satoshis")) |v| (if (v == .string) try allocator.dupe(u8, v.string) else "") else "";
+        return .{ .add_output = .{ .satoshis = satoshis, .state_values = try state_values.toOwnedSlice(allocator) } };
     }
     if (std.mem.eql(u8, kind, "array_literal")) {
         var elements: std.ArrayListUnmanaged([]const u8) = .empty;

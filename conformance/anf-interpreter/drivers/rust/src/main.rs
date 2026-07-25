@@ -141,7 +141,9 @@ fn run(input_path: &str, mode: Mode) -> Result<String, String> {
             encode_strict_result(result)
         }
         Mode::Lenient => {
-            let (new_state, data_outputs, raw_outputs) = compute_new_state_and_data_outputs(
+            // The 4th tuple element (ordered source-order outputs, finding G1) is
+            // consumed only by the SDK call path, not this conformance driver.
+            let (new_state, data_outputs, raw_outputs, _ordered_outputs) = compute_new_state_and_data_outputs(
                 &anf,
                 &method_name,
                 &current_state,

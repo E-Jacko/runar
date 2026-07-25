@@ -228,8 +228,20 @@ def compute_new_state_and_data_outputs(
     current_state: dict,
     args: dict,
     constructor_args: list = None,
+    ordered_outputs: Optional[List[dict]] = None,
 ) -> Tuple[dict, list, list]:
     """Like :func:`compute_new_state` but also returns data + raw outputs.
+
+    ``ordered_outputs``, when a caller passes a fresh list, is populated with
+    the state-class outputs in SOURCE order (finding G1): one entry per
+    ``this.addOutput(...)`` (``{'kind': 'state', 'satoshis': int}``) and per
+    ``this.addRawOutput(...)`` (``{'kind': 'raw', 'satoshis': int, 'script':
+    hex}``), interleaved exactly as the method body emits them. The compiler
+    folds these into the covenant continuation ``hashOutputs`` in this same
+    order, so the SDK call path emits them at the right indices instead of
+    dropping raw outputs. Data outputs (``add_data_output``) are NOT included —
+    they always follow every state-class output in their own list. ``None``
+    (the default) keeps the historical behaviour untouched.
 
     Data outputs come from ``this.addDataOutput(...)`` calls in the method
     body, in declaration order. Each entry is a
@@ -252,6 +264,7 @@ def compute_new_state_and_data_outputs(
     """
     return _run_method(
         anf, method_name, current_state, args, constructor_args, strict=None,
+        ordered_outputs=ordered_outputs,
     )
 
 
@@ -516,6 +529,7 @@ def _run_method(
     strict: Optional[_StrictCtx],
     intent: Optional[_IntentCtx] = None,
     state_outputs: Optional[List[dict]] = None,
+    ordered_outputs: Optional[List[dict]] = None,
 ) -> Tuple[dict, list, list]:
     """Shared entry-point for both lenient and strict modes.
 
@@ -593,7 +607,7 @@ def _run_method(
     # to the caller — there is no special unwind logic needed in Python.
     _eval_bindings(
         method.get('body', []), env, state_delta, data_outputs, raw_outputs,
-        anf, strict, intent, state_outputs,
+        anf, strict, intent, state_outputs, ordered_outputs=ordered_outputs,
     )
 
     return {**current_state, **state_delta}, data_outputs, raw_outputs
@@ -621,6 +635,9 @@ def _eval_bindings(
     # is unaffected. Threaded through nested if/loop branches (shared map);
     # private-method bodies get a fresh map (see ``_eval_method_call``).
     script_bytes: Optional[Dict[str, bytes]] = None,
+    # Source-ordered state-class outputs (state continuation + raw), finding G1.
+    # Threaded through every recursive walk site alongside ``raw_outputs``.
+    ordered_outputs: Optional[List[dict]] = None,
 ) -> None:
     if continuation_taint is None:
         continuation_taint = set()
@@ -633,6 +650,7 @@ def _eval_bindings(
             intent=intent, state_outputs=state_outputs,
             continuation_taint=continuation_taint,
             script_bytes=script_bytes,
+            ordered_outputs=ordered_outputs,
         )
         env[binding['name']] = val
         # Track lineage through ``computeStateOutput`` -- the synthetic call
@@ -732,6 +750,7 @@ def _eval_value(
     state_outputs: Optional[List[dict]] = None,
     continuation_taint: Optional[set] = None,
     script_bytes: Optional[Dict[str, bytes]] = None,
+    ordered_outputs: Optional[List[dict]] = None,
 ) -> Any:
     if continuation_taint is None:
         continuation_taint = set()
@@ -844,6 +863,7 @@ def _eval_value(
             env, state_delta, data_outputs, raw_outputs, anf, strict=strict,
             intent=intent, state_outputs=state_outputs,
             continuation_taint=continuation_taint,
+            ordered_outputs=ordered_outputs,
         )
 
     if kind == 'if':
@@ -853,6 +873,7 @@ def _eval_value(
         _eval_bindings(
             branch, child_env, state_delta, data_outputs, raw_outputs, anf, strict,
             intent, state_outputs, continuation_taint, script_bytes,
+            ordered_outputs=ordered_outputs,
         )
         env.update(child_env)
         if branch:
@@ -876,6 +897,7 @@ def _eval_value(
             _eval_bindings(
                 body, loop_env, state_delta, data_outputs, raw_outputs, anf, strict,
                 intent, state_outputs, continuation_taint, script_bytes,
+                ordered_outputs=ordered_outputs,
             )
             env.update(loop_env)
             if body:
@@ -935,6 +957,12 @@ def _eval_value(
             sat_ref = value.get('satoshis', '')
             sats = _to_int(env.get(sat_ref)) if sat_ref else 0
             state_outputs.append({'satoshis': sats, 'stateValues': resolved_state})
+        # Finding G1: record the state continuation in SOURCE order so the SDK
+        # call path can emit it at the right index relative to raw outputs.
+        if ordered_outputs is not None:
+            sat_ref = value.get('satoshis', '')
+            sats = _to_int(env.get(sat_ref)) if sat_ref else 0
+            ordered_outputs.append({'kind': 'state', 'satoshis': sats})
         return None
 
     if kind == 'add_data_output':
@@ -958,6 +986,11 @@ def _eval_value(
         script_val = env.get(script_ref)
         script_hex = script_val if isinstance(script_val, str) else ''
         raw_outputs.append({'satoshis': sats, 'script': script_hex})
+        # Finding G1: also record in the SOURCE-ordered state-class output list
+        # so the SDK call path emits it at the correct index (interleaved with
+        # the state continuation), matching the covenant's hashOutputs folding.
+        if ordered_outputs is not None:
+            ordered_outputs.append({'kind': 'raw', 'satoshis': sats, 'script': script_hex})
         return None
 
     # On-chain-only operations -- skip in simulation. ``check_preimage`` can
@@ -1262,6 +1295,7 @@ def _eval_method_call(
     intent: Optional[_IntentCtx] = None,
     state_outputs: Optional[List[dict]] = None,
     continuation_taint: Optional[set] = None,
+    ordered_outputs: Optional[List[dict]] = None,
 ) -> Any:
     if data_outputs is None:
         data_outputs = []
@@ -1289,6 +1323,7 @@ def _eval_method_call(
                 _eval_bindings(
                     body, new_env, child_delta, data_outputs, raw_outputs,
                     anf, strict, intent, state_outputs, continuation_taint,
+                    ordered_outputs=ordered_outputs,
                 )
                 # Propagate state delta back
                 if state_delta is not None:

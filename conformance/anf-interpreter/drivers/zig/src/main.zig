@@ -191,6 +191,10 @@ fn runDriver(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, m
         allocator.free(result.data_outputs);
         for (result.raw_outputs) |d| allocator.free(d.script);
         allocator.free(result.raw_outputs);
+        // Source-ordered state-class outputs (finding G1): `.raw` entries own a
+        // script dupe; `.state` entries carry an empty script.
+        for (result.outputs) |o| if (o.kind == .raw and o.script.len > 0) allocator.free(@constCast(o.script));
+        allocator.free(result.outputs);
     }
 
     // Emit JSON to stdout.

@@ -430,6 +430,11 @@ public final class RunarContract {
         // Go/Python SDKs. Skip ANF auto-compute for terminal calls — the
         // contract is fully spent so there's no continuation to update.
         List<TransactionBuilder.DataOutput> resolvedDataOutputs = new ArrayList<>();
+        // State-class outputs (state continuation + raw) in source order from
+        // the ANF interpreter (finding G1). Empty for methods that emit no
+        // this.addRawOutput(...) — the raw-output branch in callWithPushTx is a
+        // no-op in that case, so the common path is byte-for-byte unchanged.
+        List<AnfInterpreter.OrderedOutput> orderedOutputs = new ArrayList<>();
         if (isStateful && terminalOutputs == null) {
             if (stateUpdates != null) {
                 state.putAll(stateUpdates);
@@ -445,6 +450,7 @@ public final class RunarContract {
                             new TransactionBuilder.DataOutput(d.satoshis(), d.script())
                         );
                     }
+                    orderedOutputs = new ArrayList<>(execResult.outputs);
                 } catch (RuntimeException ignore) {
                     // Best-effort — caller can pre-supply stateUpdates if
                     // the body uses primitives the interpreter can't run.
@@ -510,7 +516,7 @@ public final class RunarContract {
         return callWithPushTx(
             m, methodName, resolved, sigIndices,
             methodNeedsChange, methodNeedsNewAmount,
-            isStateful, parentStateful, resolvedDataOutputs, provider, signer, pushTxLocktime,
+            isStateful, parentStateful, resolvedDataOutputs, orderedOutputs, provider, signer, pushTxLocktime,
             options
         );
     }
@@ -577,6 +583,7 @@ public final class RunarContract {
         boolean isStateful,
         boolean parentStateful,
         List<TransactionBuilder.DataOutput> dataOutputs,
+        List<AnfInterpreter.OrderedOutput> orderedOutputs,
         Provider provider,
         Signer signer,
         int locktime,
@@ -606,6 +613,58 @@ public final class RunarContract {
             String stateHex = StateSerializer.serialize(artifact.stateFields(), state);
             newLockingScript = codePart + "6a" + stateHex;
             newSats = currentUtxo.satoshis();
+        }
+
+        // Finding G1: a method that calls this.addRawOutput(...) folds the raw
+        // output(s) into the covenant's continuation hashOutputs IN SOURCE
+        // ORDER, interleaved with the state continuation this.addOutput(...).
+        // The single-continuation path below only builds the state continuation
+        // at output 0, so the built tx's outputs would mismatch hashOutputs and
+        // input 0's OP_VERIFY would reject. Rebuild an ORDERED contract-outputs
+        // list from the interpreter's source-ordered output list. Purely
+        // additive: absent raw outputs this is a no-op and existing behaviour
+        // is byte-for-byte untouched.
+        List<TransactionBuilder.ContractOutput> orderedContractOutputs = null;
+        int continuationIndex = 0;
+        boolean hasRawOutput = false;
+        for (AnfInterpreter.OrderedOutput o : orderedOutputs) {
+            if ("raw".equals(o.kind())) { hasRawOutput = true; break; }
+        }
+        if (isStateful && hasRawOutput) {
+            long stateCount = orderedOutputs.stream()
+                .filter(o -> "state".equals(o.kind())).count();
+            // Fail closed. The OP_PUSH_TX machinery below threads exactly one
+            // newLockingScript / newSats, so multiple continuations interleaved
+            // with raw outputs — or a missing continuation script — are not
+            // representable. Throw rather than silently drop outputs and strand
+            // the funds.
+            if (stateCount >= 2 || (stateCount == 1 && newLockingScript == null)) {
+                throw new IllegalStateException(
+                    "RunarContract.call('" + methodName + "'): cannot build a transaction "
+                        + "that interleaves raw outputs with " + stateCount + " state "
+                        + "continuations; the SDK currently supports raw outputs alongside "
+                        + "a single state continuation only (finding G1)."
+                );
+            }
+            orderedContractOutputs = new ArrayList<>(orderedOutputs.size());
+            int idx = 0;
+            for (AnfInterpreter.OrderedOutput o : orderedOutputs) {
+                if ("raw".equals(o.kind())) {
+                    orderedContractOutputs.add(
+                        new TransactionBuilder.ContractOutput(o.satoshis(), o.script())
+                    );
+                } else { // state continuation — use the fresh continuation script
+                    orderedContractOutputs.add(
+                        new TransactionBuilder.ContractOutput(o.satoshis(), newLockingScript)
+                    );
+                    continuationIndex = idx;
+                    // Sync the preimage's newAmount to the continuation output's
+                    // sats — this.addOutput(0L, ...) makes it 0, not the input
+                    // value the single-continuation path defaulted to.
+                    newSats = o.satoshis();
+                }
+                idx++;
+            }
         }
 
         // Funding from the signer's P2PKH UTXOs (largest-first selection).
@@ -655,8 +714,12 @@ public final class RunarContract {
         // extractLocktime(preimage) can succeed. 0 → legacy. The rebuild path
         // below must honor the same value or its preimage would mismatch the
         // final on-chain tx.
-        TransactionBuilder.CallTxResult firstPass =
-            TransactionBuilder.buildCallTransactionFull(
+        TransactionBuilder.CallTxResult firstPass = orderedContractOutputs != null
+            ? TransactionBuilder.buildCallTransactionFullOrdered(
+                currentUtxo, placeholderUnlock, orderedContractOutputs,
+                dataOutputs, additional, funderAddress, feeRate, locktime
+            )
+            : TransactionBuilder.buildCallTransactionFull(
                 currentUtxo, placeholderUnlock, newLockingScript, newSats,
                 dataOutputs, additional, funderAddress, feeRate, locktime
             );
@@ -674,8 +737,12 @@ public final class RunarContract {
             /*preimageHex*/ "00".repeat(181),
             intentWitnessHex
         );
-        TransactionBuilder.CallTxResult secondPass =
-            TransactionBuilder.buildCallTransactionFull(
+        TransactionBuilder.CallTxResult secondPass = orderedContractOutputs != null
+            ? TransactionBuilder.buildCallTransactionFullOrdered(
+                currentUtxo, secondPassUnlock, orderedContractOutputs,
+                dataOutputs, additional, funderAddress, feeRate, locktime
+            )
+            : TransactionBuilder.buildCallTransactionFull(
                 currentUtxo, secondPassUnlock, newLockingScript, newSats,
                 dataOutputs, additional, funderAddress, feeRate, locktime
             );
@@ -771,7 +838,13 @@ public final class RunarContract {
 
         UTXO nextUtxo = null;
         if (isStateful && newLockingScript != null) {
-            nextUtxo = new UTXO(txid, 0, newSats, newLockingScript);
+            // The state continuation is normally output 0, but a method that
+            // also calls this.addRawOutput(...) (finding G1) can push raw
+            // outputs ahead of it — track it at its real source-order index and
+            // its real sats (which may legitimately be 0). The no-raw path
+            // keeps index 0 / newSats unchanged.
+            int contIdx = orderedContractOutputs != null ? continuationIndex : 0;
+            nextUtxo = new UTXO(txid, contIdx, newSats, newLockingScript);
             this.currentUtxo = nextUtxo;
         } else {
             this.currentUtxo = null;

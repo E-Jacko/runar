@@ -654,6 +654,10 @@ class RunarContract:
         # run even when the caller pre-supplied opts.new_state. Reference:
         # packages/runar-go/sdk_contract.go (ComputeNewStateAndDataOutputs).
         anf_computed_state: dict | None = None
+        # State-class outputs (state continuation + raw) in SOURCE order, from
+        # the ANF interpreter. Empty for methods that emit no add_raw_output(...)
+        # (finding G1) — the raw-output rebuild below is then a no-op.
+        anf_ordered_outputs: list[dict] = []
         if is_stateful and self.artifact.anf:
             named_args = _build_named_args(user_params, resolved_args)
             flat_state = _flatten_fixed_array_state(
@@ -664,10 +668,12 @@ class RunarContract:
                 self.artifact.abi.constructor_params,
             )
             try:
+                ordered: list[dict] = []
                 computed, data_outs, _raw_outs = compute_new_state_and_data_outputs(
                     self.artifact.anf, method_name, flat_state, named_args,
-                    flat_ctor_args,
+                    flat_ctor_args, ordered_outputs=ordered,
                 )
+                anf_ordered_outputs = ordered
             except Exception:
                 computed, data_outs = None, []
             if computed is not None:
@@ -711,6 +717,45 @@ class RunarContract:
                 new_locking_script, MAX_SCRIPT_BYTES,
                 f"{self.artifact.contract_name}.call({method_name}).continuation",
             )
+
+        # Finding G1: a method that calls self.add_raw_output(...) folds the raw
+        # output(s) into the covenant's continuation hashOutputs IN SOURCE ORDER,
+        # interleaved with the state continuation self.add_output(...). The
+        # single-stateful branch above builds only the state continuation, so the
+        # built tx would emit it alone and mismatch hashOutputs — input 0's
+        # auto-injected OP_VERIFY would reject. Rebuild an ORDERED contract_outputs
+        # from the interpreter's source-ordered output list. Purely additive:
+        # absent raw outputs this is a no-op and existing behaviour is untouched.
+        if is_stateful and any(o['kind'] == 'raw' for o in anf_ordered_outputs):
+            state_entries = [o for o in anf_ordered_outputs if o['kind'] == 'state']
+            # Fail closed. The covenant machinery below threads exactly one
+            # continuation script/amount, so multi-output calls, >=2 state
+            # continuations, or a missing continuation script are not
+            # representable — raise rather than silently drop outputs and strand
+            # the funds.
+            if (
+                has_multi_output
+                or len(state_entries) >= 2
+                or (len(state_entries) == 1 and not new_locking_script)
+            ):
+                raise ValueError(
+                    f"RunarContract.call({method_name}): cannot build a transaction that "
+                    f"interleaves raw outputs with {len(state_entries)} state continuation(s); "
+                    f"the SDK currently supports raw outputs alongside a single state "
+                    f"continuation only (finding G1)."
+                )
+            contract_outputs = [
+                {'script': o['script'], 'satoshis': int(o['satoshis'])}
+                if o['kind'] == 'raw'
+                else {'script': new_locking_script, 'satoshis': int(o['satoshis'])}
+                for o in anf_ordered_outputs
+            ]
+            # Keep the preimage's new-amount (built in _build_stateful_unlock) in
+            # step with the continuation output's sats — self.addOutput(0, ...)
+            # makes it 0, not the input value the single-stateful branch defaulted
+            # to.
+            if len(state_entries) == 1:
+                new_satoshis = int(state_entries[0]['satoshis'])
 
         # Fetch fee rate and funding UTXOs for all contract types.
         # For stateful contracts with change output support, the change output
@@ -1078,11 +1123,31 @@ class RunarContract:
                 script=prepared.contract_outputs[0]['script'],
             )
         elif prepared.is_stateful and prepared.new_locking_script:
-            self._current_utxo = Utxo(
-                txid=txid, output_index=0,
-                satoshis=prepared.new_satoshis or prepared.contract_utxo.satoshis,
-                script=prepared.new_locking_script,
-            )
+            # The state continuation is normally output 0, but a method that also
+            # calls self.add_raw_output(...) (finding G1) can push raw outputs
+            # ahead of it. When contract_outputs is populated (the raw-output
+            # path) it records the real source order and each output's satoshis,
+            # so track the continuation at its actual index and value (which may
+            # legitimately be 0). Empty contract_outputs (the common case) keeps
+            # the legacy index-0 / new_satoshis-fallback behaviour unchanged.
+            cont_idx = -1
+            if prepared.contract_outputs:
+                for i, o in enumerate(prepared.contract_outputs):
+                    if o['script'] == prepared.new_locking_script:
+                        cont_idx = i
+                        break
+            if cont_idx >= 0:
+                self._current_utxo = Utxo(
+                    txid=txid, output_index=cont_idx,
+                    satoshis=prepared.contract_outputs[cont_idx]['satoshis'],
+                    script=prepared.new_locking_script,
+                )
+            else:
+                self._current_utxo = Utxo(
+                    txid=txid, output_index=0,
+                    satoshis=prepared.new_satoshis or prepared.contract_utxo.satoshis,
+                    script=prepared.new_locking_script,
+                )
         elif prepared.is_terminal:
             self._current_utxo = None
         else:

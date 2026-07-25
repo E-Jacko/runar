@@ -360,12 +360,120 @@ public final class TransactionBuilder {
     }
 
     /**
+     * Finding G1 variant: emits an ORDERED list of contract (state-class)
+     * outputs — the state continuation interleaved with
+     * {@code this.addRawOutput(...)} raw outputs — in the exact SOURCE order
+     * the on-chain covenant folds them into {@code hashOutputs}, followed by
+     * {@code dataOutputs} and then change.
+     *
+     * <p>Used only when a stateful method calls {@code this.addRawOutput(...)}:
+     * the single-continuation {@link #buildCallTransactionFull} overloads emit
+     * the state output alone, so the built tx would mismatch {@code hashOutputs}
+     * and input 0's state-check OP_VERIFY would reject (funds stranded).
+     * {@code contractOutputs} must contain exactly the state-class outputs the
+     * ANF interpreter surfaced, in order (raw entries carry their own script;
+     * the state entry carries the freshly computed continuation locking script).
+     *
+     * <p>Layout mirrors the single-continuation path
+     * ({@code [contractOutputs...][dataOutputs][change]}) and reuses the same
+     * two-pass fee/coin-selection logic, so a 1-element (state-only) list would
+     * be byte-identical to the legacy path.
+     */
+    public static CallTxResult buildCallTransactionFullOrdered(
+        UTXO currentUtxo,
+        String unlockingScriptHex,
+        List<ContractOutput> contractOutputs,
+        List<DataOutput> dataOutputs,
+        List<UTXO> additionalUtxos,
+        String changeAddress,
+        long feeRate,
+        int locktime
+    ) {
+        long rate = feeRate > 0 ? feeRate : FeeEstimator.DEFAULT_FEE_RATE;
+        if (dataOutputs == null) dataOutputs = List.of();
+        if (contractOutputs == null) contractOutputs = List.of();
+
+        List<UTXO> sortedFunding = new ArrayList<>(additionalUtxos);
+        sortedFunding.sort((a, b) -> Long.compare(b.satoshis(), a.satoshis()));
+
+        long contractIn = currentUtxo.satoshis();
+        long contractOutSats = 0;
+        for (ContractOutput c : contractOutputs) contractOutSats += c.satoshis();
+        long dataOutSats = 0;
+        for (DataOutput d : dataOutputs) dataOutSats += d.satoshis();
+
+        String changeScript = ScriptUtils.buildP2PKHScript(changeAddress);
+        int contractInputScriptLen = unlockingScriptHex.length() / 2;
+        // Fee estimation must account for every contract output + data output.
+        int[] contractOutputLens = new int[contractOutputs.size() + dataOutputs.size()];
+        for (int j = 0; j < contractOutputs.size(); j++) {
+            contractOutputLens[j] = contractOutputs.get(j).scriptHex().length() / 2;
+        }
+        for (int j = 0; j < dataOutputs.size(); j++) {
+            contractOutputLens[contractOutputs.size() + j] = dataOutputs.get(j).scriptHex().length() / 2;
+        }
+
+        List<UTXO> selected = new ArrayList<>();
+        long totalFunding = 0;
+        long fee;
+        long change;
+        int i = 0;
+        while (true) {
+            fee = FeeEstimator.estimateCallFee(
+                contractInputScriptLen, 0, selected.size(),
+                contractOutputLens, /*withChange*/ true, rate
+            );
+            change = contractIn + totalFunding - contractOutSats - dataOutSats - fee;
+            if (change >= 0 || i >= sortedFunding.size()) break;
+            UTXO next = sortedFunding.get(i++);
+            selected.add(next);
+            totalFunding += next.satoshis();
+        }
+        if (change < 0) {
+            throw new IllegalStateException(
+                "TransactionBuilder.buildCallTransactionFullOrdered: insufficient funds: "
+                    + "need fee " + fee + " + contract outputs " + contractOutSats
+                    + " + data outputs " + dataOutSats
+                    + ", have contract " + contractIn + " + funding " + totalFunding
+            );
+        }
+
+        RawTx tx = new RawTx();
+        tx.locktime = locktime;
+        tx.addInput(currentUtxo.txid(), currentUtxo.outputIndex(), unlockingScriptHex);
+        for (UTXO f : selected) {
+            tx.addInput(f.txid(), f.outputIndex(), "");
+        }
+        // Contract (state-class) outputs in source order (finding G1).
+        for (ContractOutput c : contractOutputs) {
+            tx.addOutput(c.satoshis(), c.scriptHex());
+        }
+        // Data outputs after all state-class outputs, then change.
+        for (DataOutput d : dataOutputs) {
+            tx.addOutput(d.satoshis(), d.scriptHex());
+        }
+        if (change > 0) {
+            tx.addOutput(change, changeScript);
+        }
+        return new CallTxResult(tx, change, selected);
+    }
+
+    /**
      * One transaction output emitted from {@code this.addDataOutput(...)}.
      * {@code scriptHex} is the raw hex-encoded scriptPubKey bytes (caller
      * already includes any {@code OP_RETURN} / {@code OP_FALSE OP_RETURN}
      * prefix it wants).
      */
     public record DataOutput(long satoshis, String scriptHex) {}
+
+    /**
+     * One state-class contract output for the ordered call path (finding G1):
+     * either the state continuation ({@code scriptHex} = the fresh continuation
+     * locking script) or a {@code this.addRawOutput(...)} raw output
+     * ({@code scriptHex} = the caller-supplied raw locking script). Emitted in
+     * source order by {@link #buildCallTransactionFullOrdered}.
+     */
+    public record ContractOutput(long satoshis, String scriptHex) {}
 
     /**
      * Result of {@link #buildCallTransactionFull}. {@link #tx()} is

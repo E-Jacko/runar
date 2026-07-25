@@ -360,9 +360,21 @@ module Runar
         # is caller-supplied); it surfaces them so an off-chain transaction
         # builder can emit the output at the correct index.
         raw_outputs = []
-        eval_bindings(Array(method['body']), env, state_delta, data_outputs, raw_outputs, anf)
+        # +ordered_outputs+ records the state-class outputs (+add_output+
+        # continuation + +add_raw_output+) in SOURCE order (finding G1). The
+        # compiler folds both into the covenant continuation +hashOutputs+ in
+        # exactly this order (see 04-anf-lower's shared +addOutputRefs+ list),
+        # so an off-chain transaction builder MUST emit them in this order or
+        # the on-chain state-check OP_VERIFY rejects. Each entry is
+        # +{kind: :state | :raw, satoshis: Integer, script: String?}+ (+script+
+        # for +:raw+ only; +:state+ entries take the freshly computed
+        # continuation script from the caller). +add_data_output+ is NOT
+        # recorded here — data outputs are always emitted after every
+        # state-class output, in their own +data_outputs+ list.
+        ordered_outputs = []
+        eval_bindings(Array(method['body']), env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf)
 
-        [current_state.merge(state_delta), data_outputs, raw_outputs]
+        [current_state.merge(state_delta), data_outputs, raw_outputs, ordered_outputs]
       ensure
         Thread.current[:runar_max_loop_iterations] = nil
         Thread.current[:runar_strict_method] = nil
@@ -377,8 +389,10 @@ module Runar
       # @param state_delta [Hash]        accumulated state mutations (mutated in place)
       # @param data_outputs [Array<Hash>] accumulated +add_data_output+ entries
       # @param raw_outputs  [Array<Hash>] accumulated +add_raw_output+ entries
+      # @param ordered_outputs [Array<Hash>] state-class outputs (state + raw)
+      #   in source order (finding G1)
       # @param anf         [Hash, nil]   full ANF IR (for method lookup)
-      def eval_bindings(bindings, env, state_delta, data_outputs, raw_outputs, anf = nil)
+      def eval_bindings(bindings, env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf = nil)
         # Maintain a name → value-hash index so the assert error-message
         # synthesis can walk the desugar chain (only populated under
         # {execute_strict_with_witness}; lenient + plain strict modes leave
@@ -388,7 +402,7 @@ module Runar
           bindings.each { |b| index[b['name']] = b['value'] }
         end
         bindings.each do |binding|
-          val = eval_value(binding['value'], env, state_delta, data_outputs, raw_outputs, anf, binding['name'])
+          val = eval_value(binding['value'], env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf, binding['name'])
           env[binding['name']] = val
         end
       end
@@ -400,10 +414,12 @@ module Runar
       # @param state_delta  [Hash]
       # @param data_outputs [Array<Hash>]
       # @param raw_outputs  [Array<Hash>]
+      # @param ordered_outputs [Array<Hash>] state-class outputs (state + raw)
+      #   in source order (finding G1)
       # @param anf          [Hash, nil]
       # @return [Object]
       # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/MethodLength, Metrics/PerceivedComplexity
-      def eval_value(value, env, state_delta, data_outputs, raw_outputs, anf = nil, binding_name = nil)
+      def eval_value(value, env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf = nil, binding_name = nil)
         kind = value['kind'].to_s
 
         case kind
@@ -499,13 +515,13 @@ module Runar
 
         when 'method_call'
           call_args = Array(value['args']).map { |a| env[a] }
-          eval_method_call(env[value['object']], value['method'], call_args, env, state_delta, data_outputs, raw_outputs, anf)
+          eval_method_call(env[value['object']], value['method'], call_args, env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf)
 
         when 'if'
           cond   = env[value['cond']]
           branch = is_truthy(cond) ? value['then'] : value['else']
           child_env = env.dup
-          eval_bindings(Array(branch), child_env, state_delta, data_outputs, raw_outputs, anf)
+          eval_bindings(Array(branch), child_env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf)
           env.merge!(child_env)
           branch && !branch.empty? ? child_env[branch.last['name']] : nil
 
@@ -526,7 +542,7 @@ module Runar
           count.times do |i|
             env[iter_var] = start + i * step
             loop_env = env.dup
-            eval_bindings(body, loop_env, state_delta, data_outputs, raw_outputs, anf)
+            eval_bindings(body, loop_env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf)
             env.merge!(loop_env)
             last_val = body.empty? ? nil : loop_env[body.last['name']]
           end
@@ -607,6 +623,11 @@ module Runar
             sats = sats.to_i if sats
             state_outs << { satoshis: sats || 0 }
           end
+          # Record the state continuation output in SOURCE order (finding G1): a
+          # method may interleave raw outputs around it, and the on-chain
+          # covenant folds them into hashOutputs in exactly this order.
+          state_sats = env[value['satoshis']]
+          ordered_outputs << { kind: :state, satoshis: (state_sats ? state_sats.to_i : 0) }
           nil
 
         when 'add_data_output'
@@ -634,6 +655,9 @@ module Runar
           script_val = env[script_ref]
           script_hex = script_val.is_a?(String) ? script_val : ''
           raw_outputs << { satoshis: sats || 0, script: script_hex }
+          # Also record in the ordered state-class output list so a transaction
+          # builder can emit it at the correct SOURCE-order index (finding G1).
+          ordered_outputs << { kind: :raw, satoshis: sats || 0, script: script_hex }
           nil
 
         when 'check_preimage', 'deserialize_state', 'get_state_script'
@@ -975,9 +999,11 @@ module Runar
       # @param state_delta  [Hash, nil]
       # @param data_outputs [Array<Hash>]
       # @param raw_outputs  [Array<Hash>]
+      # @param ordered_outputs [Array<Hash>] state-class outputs (state + raw)
+      #   in source order (finding G1)
       # @param anf          [Hash, nil]
       # @return [Object]
-      def eval_method_call(_obj, method_name, args, caller_env = nil, state_delta = nil, data_outputs = [], raw_outputs = [], anf = nil)
+      def eval_method_call(_obj, method_name, args, caller_env = nil, state_delta = nil, data_outputs = [], raw_outputs = [], ordered_outputs = [], anf = nil)
         return nil unless anf && method_name
 
         private_method = Array(anf['methods']).find do |m|
@@ -1016,7 +1042,7 @@ module Runar
         saved_script_bytes = Thread.current[:runar_script_bytes]
         Thread.current[:runar_script_bytes] = {}
         begin
-          eval_bindings(body, new_env, child_delta, data_outputs, raw_outputs, anf)
+          eval_bindings(body, new_env, child_delta, data_outputs, raw_outputs, ordered_outputs, anf)
         ensure
           Thread.current[:runar_method_body_index] = saved_index
           Thread.current[:runar_script_bytes] = saved_script_bytes

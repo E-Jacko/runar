@@ -198,6 +198,33 @@ pub struct RawOutputEntry {
     pub script: String,
 }
 
+/// Discriminates a state-class output as either the auto-generated state
+/// continuation (`this.addOutput(...)`) or a caller-supplied raw output
+/// (`this.addRawOutput(...)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedOutputKind {
+    State,
+    Raw,
+}
+
+/// A single state-class output in the exact SOURCE order the method body emits
+/// it, capturing the interleaving of `this.addOutput(...)` (state continuation)
+/// and `this.addRawOutput(...)` (caller-supplied script). The compiler folds
+/// these into the continuation `hashOutputs` in this same order (see
+/// `04-anf-lower.ts` — `add_output` and `add_raw_output` share one
+/// `addOutputRefs` list), so a transaction builder MUST emit them in this order
+/// or the on-chain state-check OP_VERIFY rejects (finding G1). `script` is
+/// populated for `Raw` entries only; `State` entries take the freshly computed
+/// continuation locking script from the caller. Data outputs
+/// (`add_data_output`) are NOT included here — they are always emitted after
+/// every state-class output, in their own `data_outputs` list.
+#[derive(Debug, Clone)]
+pub struct OrderedOutputEntry {
+    pub kind: OrderedOutputKind,
+    pub satoshis: i64,
+    pub script: Option<String>,
+}
+
 /// Returned by [`execute_strict`] when an `assert(...)` predicate evaluates
 /// to a falsy value during strict-mode interpretation.
 ///
@@ -402,20 +429,27 @@ pub fn compute_new_state(
     constructor_args: &[SdkValue],
 ) -> Result<HashMap<String, SdkValue>, String> {
     compute_new_state_and_data_outputs(anf, method_name, current_state, args, constructor_args)
-        .map(|(state, _, _)| state)
+        .map(|(state, _, _, _)| state)
 }
 
 /// Compute the new state AND resolved data / raw outputs after executing a
 /// contract method. See [`compute_new_state`] for state semantics; data
 /// outputs come from `this.addDataOutput(...)` calls and raw outputs come
 /// from `this.addRawOutput(...)` calls, both in declaration order.
+///
+/// The fourth tuple element is the ordered state-class output list (state
+/// continuation + raw markers) in SOURCE order — see [`OrderedOutputEntry`]
+/// (finding G1). The SDK call path uses it to emit `this.addRawOutput(...)`
+/// outputs at the correct index so the built tx matches the covenant
+/// `hashOutputs`. The strict/on-chain wrappers below drop it (they never build
+/// a transaction).
 pub fn compute_new_state_and_data_outputs(
     anf: &ANFProgram,
     method_name: &str,
     current_state: &HashMap<String, SdkValue>,
     args: &HashMap<String, SdkValue>,
     constructor_args: &[SdkValue],
-) -> Result<(HashMap<String, SdkValue>, Vec<DataOutputEntry>, Vec<RawOutputEntry>), String> {
+) -> Result<(HashMap<String, SdkValue>, Vec<DataOutputEntry>, Vec<RawOutputEntry>, Vec<OrderedOutputEntry>), String> {
     // Lenient mode: any assert() in the body is skipped — the on-chain
     // script handles enforcement, and `run_method` cannot return an
     // AssertionFailureError when `strict = None`.
@@ -460,7 +494,7 @@ pub fn execute_strict(
         constructor_args,
         Some(&strict),
     ) {
-        Ok(Ok(out)) => Ok(out),
+        Ok(Ok((state, data_outputs, raw_outputs, _ordered))) => Ok((state, data_outputs, raw_outputs)),
         Ok(Err(s)) => panic!("execute_strict: interpreter error: {}", s),
         Err(af) => Err(af),
     }
@@ -499,7 +533,7 @@ pub fn execute_on_chain_authoritative(
         constructor_args,
         Some(&strict),
     ) {
-        Ok(Ok(out)) => Ok(out),
+        Ok(Ok((state, data_outputs, raw_outputs, _ordered))) => Ok((state, data_outputs, raw_outputs)),
         Ok(Err(s)) => panic!("execute_on_chain_authoritative: interpreter error: {}", s),
         Err(af) => Err(af),
     }
@@ -643,7 +677,7 @@ pub fn execute_with_witness(
         constructor_args,
         Some(&strict),
     ) {
-        Ok(Ok(out)) => Ok(out),
+        Ok(Ok((state, data_outputs, raw_outputs, _ordered))) => Ok((state, data_outputs, raw_outputs)),
         Ok(Err(s)) => Err(IntentInterpreterError::Driver(s)),
         Err(af) => Err(IntentInterpreterError::Assertion(af)),
     }
@@ -662,7 +696,7 @@ fn run_method(
     constructor_args: &[SdkValue],
     strict: Option<&StrictCtx>,
 ) -> Result<
-    Result<(HashMap<String, SdkValue>, Vec<DataOutputEntry>, Vec<RawOutputEntry>), String>,
+    Result<(HashMap<String, SdkValue>, Vec<DataOutputEntry>, Vec<RawOutputEntry>, Vec<OrderedOutputEntry>), String>,
     AssertionFailureError,
 > {
     // Find the public method
@@ -727,6 +761,10 @@ fn run_method(
     let mut state_delta: HashMap<String, Val> = HashMap::new();
     let mut data_outputs: Vec<DataOutputEntry> = Vec::new();
     let mut raw_outputs: Vec<RawOutputEntry> = Vec::new();
+    // State-class outputs (state continuation + raw) in SOURCE order (finding
+    // G1). Threaded alongside `raw_outputs` so an off-chain tx builder can emit
+    // them at the covenant-required index.
+    let mut ordered_outputs: Vec<OrderedOutputEntry> = Vec::new();
 
     // Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~).
     // Keyed by binding name; lets a chained op read the real (possibly
@@ -742,6 +780,7 @@ fn run_method(
         &mut state_delta,
         &mut data_outputs,
         &mut raw_outputs,
+        &mut ordered_outputs,
         anf,
         strict,
         &mut script_bytes,
@@ -752,7 +791,7 @@ fn run_method(
     for (k, v) in state_delta {
         result.insert(k, v.to_sdk());
     }
-    Ok(Ok((result, data_outputs, raw_outputs)))
+    Ok(Ok((result, data_outputs, raw_outputs, ordered_outputs)))
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +804,7 @@ fn eval_bindings(
     state_delta: &mut HashMap<String, Val>,
     data_outputs: &mut Vec<DataOutputEntry>,
     raw_outputs: &mut Vec<RawOutputEntry>,
+    ordered_outputs: &mut Vec<OrderedOutputEntry>,
     anf: &ANFProgram,
     strict: Option<&StrictCtx>,
     script_bytes: &mut HashMap<String, Vec<u8>>,
@@ -776,6 +816,7 @@ fn eval_bindings(
             state_delta,
             data_outputs,
             raw_outputs,
+            ordered_outputs,
             anf,
             strict,
             &binding.name,
@@ -792,6 +833,7 @@ fn eval_value(
     state_delta: &mut HashMap<String, Val>,
     data_outputs: &mut Vec<DataOutputEntry>,
     raw_outputs: &mut Vec<RawOutputEntry>,
+    ordered_outputs: &mut Vec<OrderedOutputEntry>,
     anf: &ANFProgram,
     strict: Option<&StrictCtx>,
     binding_name: &str,
@@ -957,7 +999,7 @@ fn eval_value(
                 // byte-array-op results get a fresh side map (mirrors the TS
                 // reference, which calls evalBindings with a default `{}`).
                 let mut child_script_bytes: HashMap<String, Vec<u8>> = HashMap::new();
-                eval_bindings(&method.body, &mut child_env, state_delta, data_outputs, raw_outputs, anf, strict, &mut child_script_bytes)?;
+                eval_bindings(&method.body, &mut child_env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf, strict, &mut child_script_bytes)?;
                 // Copy property updates back to caller env
                 for prop in &anf.properties {
                     if let Some(v) = child_env.get(&prop.name) {
@@ -985,7 +1027,7 @@ fn eval_value(
                     .collect();
                 // Create child env for the branch
                 let mut child_env = env.clone();
-                eval_bindings(&bindings, &mut child_env, state_delta, data_outputs, raw_outputs, anf, strict, script_bytes)?;
+                eval_bindings(&bindings, &mut child_env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf, strict, script_bytes)?;
                 // Copy new bindings back
                 for (k, v) in &child_env {
                     env.insert(k.clone(), v.clone());
@@ -1018,7 +1060,7 @@ fn eval_value(
                 for i in 0..count {
                     env.insert(iter_var.clone(), Val::Int(start + i * step));
                     let mut loop_env = env.clone();
-                    eval_bindings(&bindings, &mut loop_env, state_delta, data_outputs, raw_outputs, anf, strict, script_bytes)?;
+                    eval_bindings(&bindings, &mut loop_env, state_delta, data_outputs, raw_outputs, ordered_outputs, anf, strict, script_bytes)?;
                     // Copy loop bindings back
                     for (k, v) in &loop_env {
                         env.insert(k.clone(), v.clone());
@@ -1072,6 +1114,16 @@ fn eval_value(
                     }
                 }
             }
+            // Record the state continuation output in SOURCE order (finding G1):
+            // a method may interleave raw outputs around it, and the on-chain
+            // covenant folds them into hashOutputs in exactly this order.
+            let sat_ref = str_field(value, "satoshis");
+            let sats = env.get(&sat_ref).map(|v| v.to_i64()).unwrap_or(0);
+            ordered_outputs.push(OrderedOutputEntry {
+                kind: OrderedOutputKind::State,
+                satoshis: sats,
+                script: None,
+            });
             Val::Undefined
         }
 
@@ -1095,7 +1147,14 @@ fn eval_value(
             let script_ref = str_field(value, "scriptBytes");
             let sats = env.get(&sat_ref).map(|v| v.to_i64()).unwrap_or(0);
             let script_hex = env.get(&script_ref).map(|v| v.as_hex()).unwrap_or_default();
-            raw_outputs.push(RawOutputEntry { satoshis: sats, script: script_hex });
+            raw_outputs.push(RawOutputEntry { satoshis: sats, script: script_hex.clone() });
+            // Also record in the ordered state-class output list so a tx builder
+            // can emit it at the correct source-order index (finding G1).
+            ordered_outputs.push(OrderedOutputEntry {
+                kind: OrderedOutputKind::Raw,
+                satoshis: sats,
+                script: Some(script_hex),
+            });
             Val::Undefined
         }
 

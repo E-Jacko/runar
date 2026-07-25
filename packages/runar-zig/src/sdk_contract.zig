@@ -28,6 +28,12 @@ pub const ContractError = error{
     /// Number of signatures supplied to `finalizeCall` does not match the
     /// number of `Sig` placeholders recorded in the `PreparedCall`.
     SignatureCountMismatch,
+    /// A method interleaves `this.addRawOutput(...)` with a layout the SDK
+    /// cannot represent alongside raw outputs — multi-output mode, two or more
+    /// state continuations, or a missing continuation script (finding G1). The
+    /// SDK fails closed rather than silently dropping outputs and stranding the
+    /// funds (the built tx would mismatch the covenant's hashOutputs).
+    RawOutputLayoutUnsupported,
 };
 
 /// RunarContract is a runtime wrapper for a compiled Runar contract. It handles
@@ -549,6 +555,18 @@ pub const RunarContract = struct {
             if (anf_data_outputs.len > 0) self.allocator.free(anf_data_outputs);
         }
 
+        // Finding G1: state-class outputs (state continuation + raw) in SOURCE
+        // order, surfaced from the ANF interpreter. Empty for methods with no
+        // `this.addRawOutput(...)` — the raw-output rebuild below is then a
+        // no-op. Owned; each `.raw` entry's script + the slice are freed here.
+        var anf_ordered_outputs: std.ArrayListUnmanaged(anf_interp.OrderedOutputEntry) = .empty;
+        defer {
+            for (anf_ordered_outputs.items) |o| {
+                if (o.kind == .raw and o.script.len > 0) self.allocator.free(@constCast(o.script));
+            }
+            anf_ordered_outputs.deinit(self.allocator);
+        }
+
         // Multi-output continuation: methods like `transfer` on a fungible
         // token emit N continuation outputs (each with the same code part +
         // a different state push). Caller supplies one OutputSpec per
@@ -599,7 +617,7 @@ pub const RunarContract = struct {
             const has_explicit_state = if (options) |o| o.new_state != null else false;
             if (has_multi_output) {
                 if (needs_change and self.artifact.anf_json != null) {
-                    anf_data_outputs = self.autoComputeDataOutputs(method_name, user_params, resolved_args) catch &.{};
+                    anf_data_outputs = self.autoComputeDataOutputs(method_name, user_params, resolved_args, &anf_ordered_outputs) catch &.{};
                 }
                 const code_part = try self.getCodePartHex();
                 defer self.allocator.free(code_part);
@@ -633,7 +651,7 @@ pub const RunarContract = struct {
                 // tx builder via stateful_contract_outputs below.
             } else if (has_explicit_state) {
                 if (needs_change and self.artifact.anf_json != null) {
-                    anf_data_outputs = self.autoComputeDataOutputs(method_name, user_params, resolved_args) catch &.{};
+                    anf_data_outputs = self.autoComputeDataOutputs(method_name, user_params, resolved_args, &anf_ordered_outputs) catch &.{};
                 }
                 const ns = options.?.new_state.?;
                 for (self.state) |*s| s.deinit(self.allocator);
@@ -646,7 +664,7 @@ pub const RunarContract = struct {
                 new_locking_script = try self.getLockingScript();
             } else if (needs_change and self.artifact.anf_json != null) {
                 // Auto-compute new state + data outputs from ANF IR
-                anf_data_outputs = self.autoComputeState(method_name, user_params, resolved_args) catch &.{};
+                anf_data_outputs = self.autoComputeState(method_name, user_params, resolved_args, &anf_ordered_outputs) catch &.{};
                 new_locking_script = try self.getLockingScript();
             } else {
                 new_locking_script = try self.getLockingScript();
@@ -656,6 +674,62 @@ pub const RunarContract = struct {
                 var ctx_buf: [256]u8 = undefined;
                 const ctx = std.fmt.bufPrint(&ctx_buf, "{s}.call({s}).continuation", .{ self.artifact.contract_name, method_name }) catch "RunarContract.call.continuation";
                 try errors_mod.assertScriptHexUnderLimit(new_locking_script, errors_mod.MAX_SCRIPT_BYTES, ctx);
+            }
+        }
+
+        // Finding G1: a method that calls `this.addRawOutput(...)` folds the raw
+        // output(s) into the covenant's continuation hashOutputs IN SOURCE ORDER,
+        // interleaved with the state continuation `this.addOutput(...)`. The
+        // single-continuation path above builds only the state output, so the
+        // built tx would emit it alone at output 0 and mismatch hashOutputs —
+        // input 0's auto-injected state-check OP_VERIFY would reject and the
+        // funds would be stranded. Rebuild an ORDERED contract-output list from
+        // the interpreter's source-ordered outputs. Purely additive: with no raw
+        // outputs `has_raw_ordered` stays false and every path below is
+        // byte-for-byte unchanged. Owned; scripts + slice freed at call exit.
+        var raw_ordered_hex: std.ArrayListUnmanaged(types.ContractOutput) = .empty;
+        defer {
+            for (raw_ordered_hex.items) |co| self.allocator.free(@constCast(co.script));
+            raw_ordered_hex.deinit(self.allocator);
+        }
+        var has_raw_ordered = false;
+        if (is_stateful and !is_terminal_call) {
+            var any_raw = false;
+            var state_count: usize = 0;
+            for (anf_ordered_outputs.items) |o| {
+                switch (o.kind) {
+                    .raw => any_raw = true,
+                    .state => state_count += 1,
+                }
+            }
+            if (any_raw) {
+                // Fail closed. The covenant machinery below threads exactly one
+                // continuation script/amount, so multi-output mode, two or more
+                // continuations, or a missing continuation script are not
+                // representable — error rather than silently drop outputs.
+                if (has_multi_output or state_count >= 2 or (state_count == 1 and new_locking_script.len == 0)) {
+                    return ContractError.RawOutputLayoutUnsupported;
+                }
+                for (anf_ordered_outputs.items) |o| {
+                    const script_dup = if (o.kind == .raw)
+                        try self.allocator.dupe(u8, o.script)
+                    else
+                        try self.allocator.dupe(u8, new_locking_script);
+                    try raw_ordered_hex.append(self.allocator, .{ .script = script_dup, .satoshis = o.satoshis });
+                }
+                // Keep the preimage's new-amount (buildStatefulUnlockScript) in
+                // step with the continuation output's sats — `this.addOutput(0,
+                // ...)` makes it 0, not the input value the single-continuation
+                // path defaulted to.
+                if (state_count == 1) {
+                    for (anf_ordered_outputs.items) |o| {
+                        if (o.kind == .state) {
+                            new_satoshis = o.satoshis;
+                            break;
+                        }
+                    }
+                }
+                has_raw_ordered = true;
             }
         }
 
@@ -817,6 +891,10 @@ pub const RunarContract = struct {
             var contract_output_sats: i64 = 0;
             if (has_multi_output) {
                 for (multi_outputs_hex.items) |co| contract_output_sats += co.satoshis;
+            } else if (has_raw_ordered) {
+                // Raw + state continuation in source order (finding G1): sum
+                // every ordered contract output (raw sats + continuation sats).
+                for (raw_ordered_hex.items) |co| contract_output_sats += co.satoshis;
             } else if (new_locking_script.len > 0) {
                 contract_output_sats += new_satoshis;
             }
@@ -1006,16 +1084,23 @@ pub const RunarContract = struct {
         const stateful_contract_outputs: []const types.ContractOutput = blk: {
             if (is_terminal_call) break :blk terminal_outputs;
             if (has_multi_output) break :blk multi_outputs_hex.items;
+            // Finding G1: raw outputs interleaved with the state continuation,
+            // in source order. The continuation lives inside this list (not the
+            // single new_locking_script slot below).
+            if (has_raw_ordered) break :blk raw_ordered_hex.items;
             break :blk &.{};
         };
         const stateful_data_outputs: []const types.ContractOutput =
             if (suppress_continuation) &.{} else data_outputs_hex.items;
         const stateful_change_address: ?[]const u8 =
             if (is_terminal_call) null else change_address;
+        // When raw outputs are present the continuation is emitted via
+        // contract_outputs (raw_ordered_hex), so the single new_locking_script
+        // slot must be empty to avoid double-emitting it (finding G1).
         const stateful_new_locking_script: []const u8 =
-            if (suppress_continuation or has_multi_output) "" else new_locking_script;
+            if (suppress_continuation or has_multi_output or has_raw_ordered) "" else new_locking_script;
         const stateful_new_satoshis: i64 =
-            if (suppress_continuation or has_multi_output) 0 else new_satoshis;
+            if (suppress_continuation or has_multi_output or has_raw_ordered) 0 else new_satoshis;
 
         const build_opts: call_mod.CallBuildOptions = .{
             .contract_outputs = stateful_contract_outputs,
@@ -1027,7 +1112,7 @@ pub const RunarContract = struct {
                 .sequence = if (options) |o| o.sequence else null,
         };
         const build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or has_multi_output or data_outputs_hex.items.len > 0 or extra_call_inputs.items.len > 0 or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &build_opts else null;
+            if (is_terminal_call or has_multi_output or has_raw_ordered or data_outputs_hex.items.len > 0 or extra_call_inputs.items.len > 0 or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &build_opts else null;
 
         var call_result = call_mod.buildCallTransaction(
             self.allocator,
@@ -1341,6 +1426,26 @@ pub const RunarContract = struct {
             // Terminal call or zero-mutable stateful spend: fully spent, no
             // continuation UTXO to track.
             self.current_utxo = null;
+        } else if (has_raw_ordered) {
+            // Finding G1: raw outputs pushed ahead of the state continuation, so
+            // it is no longer output 0. Track it at its REAL index and value
+            // (which may legitimately be 0) by finding the ordered contract
+            // output whose script is the continuation locking script.
+            var cont_idx: i32 = 0;
+            var cont_sats: i64 = new_satoshis;
+            for (raw_ordered_hex.items, 0..) |co, i| {
+                if (std.mem.eql(u8, co.script, new_locking_script)) {
+                    cont_idx = @intCast(i);
+                    cont_sats = co.satoshis;
+                    break;
+                }
+            }
+            self.current_utxo = .{
+                .txid = try self.allocator.dupe(u8, txid),
+                .output_index = cont_idx,
+                .satoshis = cont_sats,
+                .script = try self.allocator.dupe(u8, new_locking_script),
+            };
         } else {
             self.current_utxo = .{
                 .txid = try self.allocator.dupe(u8, txid),
@@ -2478,11 +2583,18 @@ pub const RunarContract = struct {
     /// the method body, allocated from `self.allocator`. Caller owns both the
     /// returned slice and each entry's `script`. Returns an empty slice if the
     /// artifact has no ANF IR or the interpreter fails.
+    ///
+    /// `ordered_out`, when non-null, is appended with the interpreter's
+    /// source-ordered state-class outputs (state continuation + raw), finding
+    /// G1. Each `.raw` entry's `script` is duped into `self.allocator` and its
+    /// ownership transfers to `ordered_out` (the caller frees it); `.state`
+    /// entries carry an empty script. Passing `null` discards them.
     fn autoComputeState(
         self: *RunarContract,
         method_name: []const u8,
         user_params: []types.ABIParam,
         resolved_args: []const types.StateValue,
+        ordered_out: ?*std.ArrayListUnmanaged(anf_interp.OrderedOutputEntry),
     ) ![]anf_interp.DataOutputEntry {
         const empty: []anf_interp.DataOutputEntry = &.{};
         const anf_json = self.artifact.anf_json orelse return empty;
@@ -2565,6 +2677,20 @@ pub const RunarContract = struct {
             }
         }
 
+        // Surface (or discard) the source-ordered state-class outputs, finding
+        // G1. Moving each entry into `ordered_out` transfers ownership of the
+        // `.raw` script dupe; discarding frees it. Either way the outer slice
+        // is freed here (previously leaked alongside `raw_outputs`).
+        if (ordered_out) |oo| {
+            try oo.appendSlice(self.allocator, result.outputs);
+        } else {
+            for (result.outputs) |o| if (o.kind == .raw and o.script.len > 0) self.allocator.free(@constCast(o.script));
+        }
+        if (result.outputs.len > 0) self.allocator.free(result.outputs);
+        // Free the raw outputs (unused here) — previously leaked.
+        for (result.raw_outputs) |d| self.allocator.free(d.script);
+        if (result.raw_outputs.len > 0) self.allocator.free(result.raw_outputs);
+
         return result.data_outputs;
     }
 
@@ -2580,6 +2706,7 @@ pub const RunarContract = struct {
         method_name: []const u8,
         user_params: []types.ABIParam,
         resolved_args: []const types.StateValue,
+        ordered_out: ?*std.ArrayListUnmanaged(anf_interp.OrderedOutputEntry),
     ) ![]anf_interp.DataOutputEntry {
         const empty: []anf_interp.DataOutputEntry = &.{};
         const anf_json = self.artifact.anf_json orelse return empty;
@@ -2639,6 +2766,18 @@ pub const RunarContract = struct {
             }
         }
         state_map.deinit();
+
+        // Surface (or discard) the source-ordered state-class outputs, finding
+        // G1 — same ownership transfer as autoComputeState. Also free the raw
+        // outputs (unused here) and the outer ordered slice, previously leaked.
+        if (ordered_out) |oo| {
+            try oo.appendSlice(self.allocator, result.outputs);
+        } else {
+            for (result.outputs) |o| if (o.kind == .raw and o.script.len > 0) self.allocator.free(@constCast(o.script));
+        }
+        if (result.outputs.len > 0) self.allocator.free(result.outputs);
+        for (result.raw_outputs) |d| self.allocator.free(d.script);
+        if (result.raw_outputs.len > 0) self.allocator.free(result.raw_outputs);
 
         return result.data_outputs;
     }

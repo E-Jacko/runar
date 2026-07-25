@@ -740,14 +740,20 @@ impl RunarContract {
         // the block below doesn't have to re-run the interpreter.
         let mut resolved_data_outputs: Vec<ContractOutput> = Vec::new();
         let mut auto_computed_state: Option<HashMap<String, SdkValue>> = None;
+        // State-class outputs (state continuation + raw) in SOURCE order, from
+        // the ANF interpreter. Empty for methods that emit no
+        // `this.addRawOutput(...)` (finding G1) — the raw-output branch below is
+        // a no-op in that case.
+        let mut anf_ordered_outputs: Vec<anf_interpreter::OrderedOutputEntry> = Vec::new();
         if is_stateful {
             if let Some(ref anf) = self.artifact.anf {
                 let named_args = build_named_args(&user_params, &resolved_args);
-                if let Ok((state, data_outs, _raw_outs)) = anf_interpreter::compute_new_state_and_data_outputs(
+                if let Ok((state, data_outs, _raw_outs, ordered_outs)) = anf_interpreter::compute_new_state_and_data_outputs(
                     anf, method_name, &self.state, &named_args,
                     &self.constructor_args,
                 ) {
                     auto_computed_state = Some(state);
+                    anf_ordered_outputs = ordered_outs;
                     resolved_data_outputs = data_outs.into_iter().map(|d| ContractOutput {
                         script: d.script,
                         satoshis: d.satoshis,
@@ -825,6 +831,68 @@ impl RunarContract {
                     nls, MAX_SCRIPT_BYTES,
                     &format!("{}.call({}).continuation", self.artifact.contract_name, method_name),
                 )?;
+            }
+        }
+
+        // Finding G1: a method that calls `this.addRawOutput(...)` folds the raw
+        // output(s) into the covenant's continuation hashOutputs IN SOURCE ORDER,
+        // interleaved with the state continuation `this.addOutput(...)`. The
+        // single-continuation branch above only builds the state continuation, so
+        // the built tx's outputs would mismatch hashOutputs and input 0's
+        // OP_VERIFY would reject. Rebuild an ORDERED `contract_outputs` from the
+        // interpreter's source-ordered output list. Purely additive: absent raw
+        // outputs this branch is a no-op and existing behavior is untouched.
+        if is_stateful
+            && anf_ordered_outputs
+                .iter()
+                .any(|o| o.kind == anf_interpreter::OrderedOutputKind::Raw)
+        {
+            let state_count = anf_ordered_outputs
+                .iter()
+                .filter(|o| o.kind == anf_interpreter::OrderedOutputKind::State)
+                .count();
+            // Fail closed. The covenant machinery below threads exactly one
+            // continuation script/amount, so multi-output calls, multiple
+            // continuations, or a missing continuation script are not
+            // representable — throw rather than silently drop outputs and strand
+            // the funds.
+            if has_multi_output
+                || state_count >= 2
+                || (state_count == 1 && new_locking_script.is_none())
+            {
+                return Err(format!(
+                    "RunarContract.call('{}'): cannot build a transaction that interleaves \
+                     raw outputs with {} state continuations; the SDK currently supports raw \
+                     outputs alongside a single state continuation only (finding G1).",
+                    method_name, state_count,
+                ));
+            }
+            let nls = new_locking_script.clone();
+            contract_outputs = Some(
+                anf_ordered_outputs
+                    .iter()
+                    .map(|o| match o.kind {
+                        anf_interpreter::OrderedOutputKind::Raw => ContractOutput {
+                            script: o.script.clone().unwrap_or_default(),
+                            satoshis: o.satoshis,
+                        },
+                        anf_interpreter::OrderedOutputKind::State => ContractOutput {
+                            script: nls.clone().unwrap_or_default(),
+                            satoshis: o.satoshis,
+                        },
+                    })
+                    .collect(),
+            );
+            // Keep the preimage's newAmount (build_stateful_unlock) in step with
+            // the continuation output's sats — `this.addOutput(0, ...)` makes it
+            // 0, not the input value the single-continuation branch defaulted to.
+            if state_count == 1 {
+                if let Some(state_entry) = anf_ordered_outputs
+                    .iter()
+                    .find(|o| o.kind == anf_interpreter::OrderedOutputKind::State)
+                {
+                    new_satoshis = Some(state_entry.satoshis);
+                }
             }
         }
 
@@ -1345,11 +1413,35 @@ impl RunarContract {
                 script: prepared.contract_outputs[0].script.clone(),
             });
         } else if prepared.is_stateful && !prepared.new_locking_script.is_empty() {
-            self.current_utxo = Some(Utxo {
-                txid: txid.clone(),
-                output_index: 0,
-                satoshis: if prepared.new_satoshis > 0 { prepared.new_satoshis } else { prepared.contract_utxo.satoshis },
-                script: prepared.new_locking_script.clone(),
+            // The state continuation is normally output 0, but a method that also
+            // calls `this.addRawOutput(...)` (finding G1) can push raw outputs
+            // ahead of it. `contract_outputs`, when populated (the raw-output
+            // path), records the real source order and each output's satoshis —
+            // so track the continuation at its actual index and value (which may
+            // legitimately be 0). Empty `contract_outputs` (the common no-raw
+            // case) keeps the legacy index-0 / `new_satoshis`-fallback behavior
+            // byte-for-byte unchanged.
+            let cont_idx = if !prepared.contract_outputs.is_empty() {
+                prepared
+                    .contract_outputs
+                    .iter()
+                    .position(|o| o.script == prepared.new_locking_script)
+            } else {
+                None
+            };
+            self.current_utxo = Some(match cont_idx {
+                Some(idx) => Utxo {
+                    txid: txid.clone(),
+                    output_index: idx as u32,
+                    satoshis: prepared.contract_outputs[idx].satoshis,
+                    script: prepared.new_locking_script.clone(),
+                },
+                None => Utxo {
+                    txid: txid.clone(),
+                    output_index: 0,
+                    satoshis: if prepared.new_satoshis > 0 { prepared.new_satoshis } else { prepared.contract_utxo.satoshis },
+                    script: prepared.new_locking_script.clone(),
+                },
             });
         } else if prepared.is_terminal {
             self.current_utxo = None;

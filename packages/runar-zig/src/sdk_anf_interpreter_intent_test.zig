@@ -48,6 +48,10 @@ fn freeResult(allocator: std.mem.Allocator, result: *NewStateResult) void {
     allocator.free(result.data_outputs);
     for (result.raw_outputs) |d| allocator.free(d.script);
     allocator.free(result.raw_outputs);
+    // Source-ordered state-class outputs (finding G1): `.raw` entries own a
+    // script dupe; `.state` entries carry an empty script.
+    for (result.outputs) |o| if (o.kind == .raw and o.script.len > 0) allocator.free(@constCast(o.script));
+    allocator.free(result.outputs);
 }
 
 fn hexEncode(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
