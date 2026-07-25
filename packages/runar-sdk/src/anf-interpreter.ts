@@ -83,6 +83,25 @@ export interface RawOutputEntry {
 }
 
 /**
+ * A single state-class output in the exact SOURCE order the method body emits
+ * it, capturing the interleaving of `this.addOutput(...)` (state continuation)
+ * and `this.addRawOutput(...)` (caller-supplied script). The compiler folds
+ * these into the continuation `hashOutputs` in this same order (see
+ * `packages/runar-compiler/src/passes/04-anf-lower.ts` — `add_output` and
+ * `add_raw_output` share one `addOutputRefs` list), so a transaction builder
+ * MUST emit them in this order or the on-chain state-check OP_VERIFY rejects
+ * (finding G1). `script` is populated for `raw` entries only; `state` entries
+ * take the freshly computed continuation locking script from the caller.
+ * Data outputs (`add_data_output`) are NOT included here — they are always
+ * emitted after every state-class output, in their own `dataOutputs` list.
+ */
+export interface OrderedOutputEntry {
+  kind: 'state' | 'raw';
+  satoshis: bigint;
+  script?: string;
+}
+
+/**
  * The full result envelope produced by
  * {@link computeNewStateAndDataOutputs}, {@link executeStrict}, and
  * {@link executeOnChainAuthoritative}. All three modes return the same
@@ -93,6 +112,8 @@ export interface ExecutionResult {
   state: Record<string, unknown>;
   dataOutputs: DataOutputEntry[];
   rawOutputs: RawOutputEntry[];
+  /** State-class outputs (state continuation + raw) in source order. */
+  outputs: OrderedOutputEntry[];
 }
 
 export function computeNewState(
@@ -295,11 +316,13 @@ function runMethod(
   const stateDelta: Record<string, unknown> = {};
   const dataOutputs: DataOutputEntry[] = [];
   const rawOutputs: RawOutputEntry[] = [];
+  // Ordered state-class outputs (state continuation + raw) in source order.
+  const outputs: OrderedOutputEntry[] = [];
 
   // Walk bindings
-  evalBindings(method.body, env, stateDelta, dataOutputs, rawOutputs, anf, strict);
+  evalBindings(method.body, env, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict);
 
-  return { state: { ...currentState, ...stateDelta }, dataOutputs, rawOutputs };
+  return { state: { ...currentState, ...stateDelta }, dataOutputs, rawOutputs, outputs };
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +335,7 @@ function evalBindings(
   stateDelta: Record<string, unknown>,
   dataOutputs: DataOutputEntry[],
   rawOutputs: RawOutputEntry[],
+  outputs: OrderedOutputEntry[],
   anf?: ANFProgram,
   strict: StrictCtx | null = null,
   // Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~). Keyed
@@ -322,7 +346,7 @@ function evalBindings(
 ): void {
   for (const binding of bindings) {
     const val = evalValue(
-      binding.value, env, stateDelta, dataOutputs, rawOutputs, anf, strict, binding.name, scriptBytes,
+      binding.value, env, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, binding.name, scriptBytes,
     );
     env[binding.name] = val;
   }
@@ -334,6 +358,7 @@ function evalValue(
   stateDelta: Record<string, unknown>,
   dataOutputs: DataOutputEntry[],
   rawOutputs: RawOutputEntry[],
+  outputs: OrderedOutputEntry[],
   anf?: ANFProgram,
   strict: StrictCtx | null = null,
   bindingName: string = '<anonymous>',
@@ -423,6 +448,7 @@ function evalValue(
         stateDelta,
         dataOutputs,
         rawOutputs,
+        outputs,
         anf,
       );
 
@@ -431,7 +457,7 @@ function evalValue(
       const branch = isTruthy(cond) ? value.then : value.else;
       // Create a child env for the branch
       const childEnv = { ...env };
-      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, anf, strict, scriptBytes);
+      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, scriptBytes);
       // Copy any new bindings back (the last binding is typically the branch result)
       Object.assign(env, childEnv);
       // Return the last binding's value from the branch
@@ -451,7 +477,7 @@ function evalValue(
       for (let i = 0; i < count; i++) {
         env[iterVar] = start + BigInt(i) * step;
         const loopEnv = { ...env };
-        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, anf, strict, scriptBytes);
+        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, scriptBytes);
         // Copy loop bindings back
         Object.assign(env, loopEnv);
         if (body.length > 0) {
@@ -503,6 +529,10 @@ function evalValue(
           stateDelta[propName] = newVal;
         }
       }
+      // Record the state continuation output in source order (finding G1): a
+      // method may interleave raw outputs around it, and the on-chain covenant
+      // folds them into hashOutputs in exactly this order.
+      outputs.push({ kind: 'state', satoshis: toBigInt(env[value.satoshis]) });
       return undefined;
     }
 
@@ -526,6 +556,13 @@ function evalValue(
       const sats = toBigInt(env[value.satoshis]);
       const script = env[value.scriptBytes];
       rawOutputs.push({
+        satoshis: sats,
+        script: typeof script === 'string' ? script : '',
+      });
+      // Also record in the ordered state-class output list so a transaction
+      // builder can emit it at the correct source-order index (finding G1).
+      outputs.push({
+        kind: 'raw',
         satoshis: sats,
         script: typeof script === 'string' ? script : '',
       });
@@ -884,6 +921,7 @@ function evalMethodCall(
   stateDelta: Record<string, unknown>,
   dataOutputs: DataOutputEntry[],
   rawOutputs: RawOutputEntry[],
+  outputs: OrderedOutputEntry[],
   anf?: ANFProgram,
 ): unknown {
   // Private method calls appear in the ANF with their bodies available
@@ -908,7 +946,7 @@ function evalMethodCall(
 
       // Execute the method body — pass real stateDelta so update_prop
       // mutations in private methods are captured
-      evalBindings(method.body, methodEnv, stateDelta, dataOutputs, rawOutputs, anf);
+      evalBindings(method.body, methodEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf);
 
       // Propagate property changes back to the caller's env
       for (const prop of anf.properties) {

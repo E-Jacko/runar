@@ -15,6 +15,7 @@ import { serializeState, extractStateFromScript, findLastOpReturn } from './stat
 import { computeOpPushTx } from './oppushtx.js';
 import { buildP2PKHScript, extractConstructorArgs } from './script-utils.js';
 import { computeNewStateAndDataOutputs } from './anf-interpreter.js';
+import type { OrderedOutputEntry } from './anf-interpreter.js';
 import { buildInscriptionEnvelope, parseInscriptionEnvelope } from './ordinals/envelope.js';
 import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript } from '@bsv/sdk';
 import { WalletProvider } from './providers/wallet-provider.js';
@@ -980,17 +981,22 @@ export class RunarContract {
     // at spend time if they're omitted. Mirrors Go SDK + Ruby SDK.
     let autoComputedState: Record<string, unknown> | undefined;
     let autoFlatState: Record<string, unknown> | undefined;
+    // State-class outputs (state continuation + raw) in source order, from the
+    // ANF interpreter. Empty for methods that emit no `this.addRawOutput(...)`
+    // (finding G1) — the raw-output branch below is a no-op in that case.
+    let anfOrderedOutputs: OrderedOutputEntry[] = [];
     if (isStateful && this.artifact.anf) {
       const namedArgs = buildNamedArgs(userParams, resolvedArgs);
       const flatState = flattenFixedArrayState(this._state, this.artifact.stateFields);
       const flatCtorArgs = flattenFixedArrayArgs(this.constructorArgs, this.artifact.abi.constructor.params);
       try {
-        const { state: computed, dataOutputs: anfDataOutputs } = computeNewStateAndDataOutputs(
+        const { state: computed, dataOutputs: anfDataOutputs, outputs: anfOutputs } = computeNewStateAndDataOutputs(
           this.artifact.anf, methodName, flatState, namedArgs,
           flatCtorArgs,
         );
         autoComputedState = computed;
         autoFlatState = flatState;
+        anfOrderedOutputs = anfOutputs;
         if (anfDataOutputs.length > 0 && resolvedDataOutputs.length === 0) {
           resolvedDataOutputs = anfDataOutputs.map((d) => ({
             script: d.script,
@@ -1025,6 +1031,39 @@ export class RunarContract {
         InputLimits.MAX_SCRIPT_BYTES,
         `${this.artifact.contractName}.call(${methodName}).continuation`,
       );
+    }
+
+    // Finding G1: a method that calls `this.addRawOutput(...)` folds the raw
+    // output(s) into the covenant's continuation hashOutputs IN SOURCE ORDER,
+    // interleaved with the state continuation `this.addOutput(...)`. The
+    // single-stateful branch above only builds the state continuation, so the
+    // built tx's outputs would mismatch hashOutputs and input 0's OP_VERIFY
+    // would reject. Rebuild an ORDERED `contractOutputs` from the interpreter's
+    // source-ordered output list. Purely additive: absent raw outputs this is a
+    // no-op and existing behaviour is untouched.
+    if (isStateful && anfOrderedOutputs.some((o) => o.kind === 'raw')) {
+      const stateEntries = anfOrderedOutputs.filter((o) => o.kind === 'state');
+      // Fail closed. The current SDK only builds raw outputs alongside a SINGLE
+      // state continuation (the covenant machinery below threads exactly one
+      // newLockingScript/newAmount). Multi-output calls, multiple continuations,
+      // or a missing continuation script are not representable — throw rather
+      // than silently drop outputs and strand the funds.
+      if (hasMultiOutput || stateEntries.length >= 2 || (stateEntries.length === 1 && !newLockingScript)) {
+        throw new Error(
+          `RunarContract.call('${methodName}'): cannot build a transaction that interleaves ` +
+            `raw outputs with ${stateEntries.length} state continuations; the SDK currently ` +
+            `supports raw outputs alongside a single state continuation only (finding G1).`,
+        );
+      }
+      contractOutputs = anfOrderedOutputs.map((o) =>
+        o.kind === 'raw'
+          ? { script: o.script!, satoshis: Number(o.satoshis) }
+          : { script: newLockingScript!, satoshis: Number(o.satoshis) },
+      );
+      // Keep the preimage's newAmount (buildStatefulUnlock) in step with the
+      // continuation output's sats — `this.addOutput(0n, ...)` makes it 0, not
+      // the input value the single-stateful branch defaulted to.
+      newSatoshis = stateEntries.length === 1 ? Number(stateEntries[0]!.satoshis) : newSatoshis;
     }
 
     const feeRate = await provider.getFeeRate();
@@ -1455,12 +1494,29 @@ export class RunarContract {
         script: prepared._contractOutputs[0]!.script,
       };
     } else if (prepared._isStateful && prepared._newLockingScript) {
-      this.currentUtxo = {
-        txid,
-        outputIndex: 0,
-        satoshis: prepared._newSatoshis || prepared._contractUtxo.satoshis,
-        script: prepared._newLockingScript,
-      };
+      // The state continuation is normally output 0, but a method that also
+      // calls `this.addRawOutput(...)` (finding G1) can push raw outputs ahead
+      // of it. `_contractOutputs`, when populated (the raw-output path),
+      // records the real source order and each output's satoshis — so track the
+      // continuation at its actual index and value (which may legitimately be
+      // 0). Empty `_contractOutputs` (the common case) keeps the legacy
+      // index-0 / `_newSatoshis`-fallback behaviour byte-for-byte unchanged.
+      const contIdx = prepared._contractOutputs.length > 0
+        ? prepared._contractOutputs.findIndex((o) => o.script === prepared._newLockingScript)
+        : -1;
+      this.currentUtxo = contIdx >= 0
+        ? {
+            txid,
+            outputIndex: contIdx,
+            satoshis: prepared._contractOutputs[contIdx]!.satoshis,
+            script: prepared._newLockingScript,
+          }
+        : {
+            txid,
+            outputIndex: 0,
+            satoshis: prepared._newSatoshis || prepared._contractUtxo.satoshis,
+            script: prepared._newLockingScript,
+          };
     } else if (prepared._isTerminal) {
       this.currentUtxo = null;
     } else {
