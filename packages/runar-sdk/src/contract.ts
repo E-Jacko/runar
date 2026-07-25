@@ -1157,9 +1157,31 @@ export class RunarContract {
       perInputBytes(unlockingScript)
       + extraUnlockPlaceholders.reduce((sum, u) => sum + perInputBytes(u), 0)
       + numContractInputs * perContractInputOverhead;
+    // C15: size the funding fee against ALL outputs, not just the single
+    // continuation that `fundingLockLen` already covers. estimateDeployFee counts
+    // one output of `fundingLockLen` bytes; add the framing (8 + varint +
+    // scriptLen) of every OTHER contract output (extra multi-outputs + raw
+    // outputs, finding G1) and every data output so selection does not stop one
+    // UTXO short on multi-output / large-dataOutput calls. Single-output calls
+    // net 0 (estimate unchanged). Over-estimating only pulls slightly more
+    // funding (bigger change) — always safe.
+    const outputFraming = (byteLen: number): number => {
+      const vi = byteLen < 0xfd ? 1 : byteLen <= 0xffff ? 3 : byteLen <= 0xffffffff ? 5 : 9;
+      return 8 + vi + byteLen;
+    };
+    const allOutputByteLens = [
+      ...(contractOutputs
+        ? contractOutputs.map((o) => o.script.length / 2)
+        : newLockingScript ? [newLockingScript.length / 2] : []),
+      ...resolvedDataOutputs.map((o) => o.script.length / 2),
+    ];
+    const totalOutputFraming = allOutputByteLens.reduce((s, n) => s + outputFraming(n), 0);
+    const extraOutputBytes = Math.max(
+      0, totalOutputFraming - outputFraming(Math.ceil(fundingLockLen)),
+    );
     const additionalUtxos =
       candidateFundingUtxos.length > 0
-        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate, contractInputBytes)
+        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate, contractInputBytes, extraOutputBytes)
         : [];
 
     // Cap funding inputs when the caller sets maxFundingInputs. selectUtxos

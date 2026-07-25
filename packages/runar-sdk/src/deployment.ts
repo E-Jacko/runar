@@ -104,12 +104,20 @@ export function estimateDeployFee(
   lockingScriptByteLen: number,
   feeRate: number = 100,
   extraInputBytes: number = 0,
+  extraOutputBytes: number = 0,
 ): number {
   const inputsSize = numInputs * P2PKH_INPUT_SIZE + extraInputBytes;
   const contractOutputSize =
     8 + varIntByteSize(lockingScriptByteLen) + lockingScriptByteLen;
+  // extraOutputBytes carries the serialized framing (8 + varint + scriptLen) of
+  // every output BEYOND the single `lockingScriptByteLen` one counted above —
+  // additional multi-outputs, raw outputs (finding G1), and data outputs. A
+  // call-path selection that ignored them under-provisioned funding on
+  // multi-output / large-dataOutput calls, so it would stop one UTXO short and
+  // the built tx's change would go negative (finding C15). Deploy passes 0.
   const changeOutputSize = P2PKH_OUTPUT_SIZE;
-  const txSize = TX_OVERHEAD + inputsSize + contractOutputSize + changeOutputSize;
+  const txSize =
+    TX_OVERHEAD + inputsSize + contractOutputSize + extraOutputBytes + changeOutputSize;
   return Math.ceil(txSize * feeRate / 1000);
 }
 
@@ -124,6 +132,7 @@ export function selectUtxos(
   lockingScriptByteLen: number,
   feeRate: number = 100,
   extraInputBytes: number = 0,
+  extraOutputBytes: number = 0,
 ): UTXO[] {
   const sorted = [...utxos].sort((a, b) => b.satoshis - a.satoshis);
   const selected: UTXO[] = [];
@@ -134,9 +143,13 @@ export function selectUtxos(
     total += utxo.satoshis;
 
     // extraInputBytes carries the serialized size of any non-P2PKH inputs the
-    // same tx spends (the contract/covenant input) so the fee — and therefore
-    // the amount of funding we must select — is not under-provisioned.
-    const fee = estimateDeployFee(selected.length, lockingScriptByteLen, feeRate, extraInputBytes);
+    // same tx spends (the contract/covenant input); extraOutputBytes carries the
+    // framing of any outputs beyond the single continuation (multi-output / raw /
+    // data outputs). Both keep the fee — and therefore how much funding we
+    // select — from being under-provisioned (findings C2 / C15).
+    const fee = estimateDeployFee(
+      selected.length, lockingScriptByteLen, feeRate, extraInputBytes, extraOutputBytes,
+    );
     if (total >= targetSatoshis + fee) {
       return selected;
     }
