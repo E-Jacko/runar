@@ -371,7 +371,7 @@ impl RunarContract {
                 address
             ));
         }
-        let utxos = select_utxos(&all_utxos, options.satoshis, locking_script.len() / 2, Some(fee_rate));
+        let utxos = select_utxos(&all_utxos, options.satoshis, locking_script.len() / 2, Some(fee_rate), 0, 0);
 
         // Build the deploy transaction
         let change_script = build_p2pkh_script_from_address(change_address);
@@ -908,50 +908,6 @@ impl RunarContract {
             .filter(|u| !(u.txid == current_utxo.txid && u.output_index == current_utxo.output_index))
             .collect();
 
-        // Coin selection for funding inputs (issue #133): don't sweep the whole
-        // wallet. Compute how much the funding must cover — the contract's own
-        // input value already offsets the contract/data outputs — and pick the
-        // smallest largest-first set via select_utxos (the strategy deploy uses).
-        let contract_output_base: i64 = match &contract_outputs {
-            Some(cos) => cos.iter().map(|o| o.satoshis).sum(),
-            None => new_satoshis.unwrap_or(0),
-        };
-        let contract_output_sats =
-            contract_output_base + resolved_data_outputs.iter().map(|o| o.satoshis).sum::<i64>();
-        let contract_input_sats =
-            current_utxo.satoshis + extra_contract_utxos.iter().map(|u| u.satoshis).sum::<i64>();
-        let funding_target = (contract_output_sats - contract_input_sats).max(0);
-        // Fee sizing hint for select_utxos: the continuation script length
-        // (falls back to the first multi-output script, else 0 for stateless).
-        let funding_lock_len = new_locking_script
-            .as_ref()
-            .map(|s| s.len())
-            .or_else(|| contract_outputs.as_ref().and_then(|c| c.first()).map(|o| o.script.len()))
-            .unwrap_or(0)
-            / 2;
-        let additional_utxos: Vec<Utxo> = if candidate_funding_utxos.is_empty() {
-            Vec::new()
-        } else {
-            select_utxos(&candidate_funding_utxos, funding_target, funding_lock_len, Some(fee_rate))
-        };
-
-        // Cap funding inputs when the caller sets max_funding_inputs.
-        // select_utxos returns the minimal largest-first set; if that still
-        // exceeds the cap the funding can't cover outputs + fee within the
-        // budget, so fail loudly instead of broadcasting an underfunded tx.
-        if let Some(cap) = options.and_then(|o| o.max_funding_inputs) {
-            if additional_utxos.len() > cap {
-                return Err(format!(
-                    "RunarContract.call({}): funding requires {} input(s) but \
-                     max_funding_inputs={}. Increase max_funding_inputs, use \
-                     larger UTXOs, or consolidate.",
-                    method_name,
-                    additional_utxos.len(),
-                    cap
-                ));
-            }
-        }
-
         // Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling as primary args)
         let resolved_per_input_args: Option<Vec<Vec<SdkValue>>> = options
             .and_then(|o| o.additional_contract_input_args.as_ref())
@@ -977,6 +933,8 @@ impl RunarContract {
 
         // Build placeholder unlocking scripts for merge inputs (witness_hex
         // suffixed for sizing — build_stateful_unlock builds the real scripts).
+        // Computed BEFORE funding coin-selection so their byte sizes feed the
+        // funding fee estimate (findings C2 / C15 below).
         let extra_unlock_placeholders: Vec<String> = extra_contract_utxos.iter().enumerate().map(|(i, _)| {
             let args_for_placeholder = resolved_per_input_args.as_ref()
                 .and_then(|v| v.get(i))
@@ -988,6 +946,119 @@ impl RunarContract {
                 witness_hex,
             )
         }).collect();
+
+        // Coin selection for funding inputs (issue #133): don't sweep the whole
+        // wallet. Compute how much the funding must cover — the contract's own
+        // input value already offsets the contract/data outputs — and pick the
+        // smallest largest-first set via select_utxos (the strategy deploy uses).
+        let contract_output_base: i64 = match &contract_outputs {
+            Some(cos) => cos.iter().map(|o| o.satoshis).sum(),
+            None => new_satoshis.unwrap_or(0),
+        };
+        let contract_output_sats =
+            contract_output_base + resolved_data_outputs.iter().map(|o| o.satoshis).sum::<i64>();
+        let contract_input_sats =
+            current_utxo.satoshis + extra_contract_utxos.iter().map(|u| u.satoshis).sum::<i64>();
+        let funding_target = (contract_output_sats - contract_input_sats).max(0);
+        // Fee sizing hint for select_utxos: the continuation script length
+        // (falls back to the first multi-output script, else 0 for stateless).
+        let funding_lock_len = new_locking_script
+            .as_ref()
+            .map(|s| s.len())
+            .or_else(|| contract_outputs.as_ref().and_then(|c| c.first()).map(|o| o.script.len()))
+            .unwrap_or(0)
+            / 2;
+        // C2: contract-input unlock bytes. select_utxos / estimate_deploy_fee
+        // otherwise model ONLY the funding inputs (148-byte P2PKH each) +
+        // continuation + change — they are blind to the contract input(s) being
+        // spent. For a MERGE each covenant input embeds both parent txs as method
+        // args (tens of KB), so ignoring them under-provisions the funding;
+        // build_call_transaction then sees change <= 0 and DROPS the change
+        // output, and the merge covenant — which reconstructs
+        // [continuation][P2PKH change] UNCONDITIONALLY — fails its hashOutputs
+        // OP_VERIFY. Size the funding fee against the SAME serialized per-input
+        // bytes build_call_transaction uses (32 outpoint + 4 index + varint +
+        // script + 4 sequence) for the primary contract input plus every extra
+        // one. Over-estimating is safe (a little more funding / higher change);
+        // under-estimating is the bug.
+        let per_input_bytes = |unlock_hex: &str| -> i64 {
+            let len = (unlock_hex.len() / 2) as i64;
+            let vi = if len < 0xfd { 1 } else if len <= 0xffff { 3 } else if len <= 0xffff_ffff { 5 } else { 9 };
+            32 + 4 + vi + len + 4
+        };
+        // The `unlocking_script` / `extra_unlock_placeholders` above are SIZING
+        // placeholders. The REAL unlock build_stateful_unlock emits is larger — it
+        // prepends the opSig codePart prefix and appends the BIP-143 preimage
+        // (whose scriptCode ≈ the locking script), the change + new-amount pushes,
+        // and the method selector. That gap is exactly what would make select_utxos
+        // stop one UTXO short, leaving change <= 0. Add a per-contract-input
+        // overestimate covering those omitted components: codePart (≈ locking
+        // script) + preimage scriptCode (≈ locking script) + a fixed buffer for
+        // sig/amount/selector/varint framing. Over-estimating only pulls slightly
+        // more funding (bigger change) — always safe.
+        let num_contract_inputs = 1 + extra_contract_utxos.len() as i64;
+        let per_contract_input_overhead = 2 * funding_lock_len as i64 + 512;
+        let contract_input_bytes = per_input_bytes(&unlocking_script)
+            + extra_unlock_placeholders.iter().map(|u| per_input_bytes(u)).sum::<i64>()
+            + num_contract_inputs * per_contract_input_overhead;
+        // C15: size the funding fee against ALL outputs, not just the single
+        // continuation that `funding_lock_len` already covers. estimate_deploy_fee
+        // counts one output of `funding_lock_len` bytes; add the framing
+        // (8 + varint + scriptLen) of every OTHER contract output (extra
+        // multi-outputs + raw outputs, finding G1) and every data output so
+        // selection does not stop one UTXO short on multi-output / large-data-
+        // output calls. Single-output calls net 0. Over-estimating is always safe.
+        let output_framing = |byte_len: i64| -> i64 {
+            let vi = if byte_len < 0xfd { 1 } else if byte_len <= 0xffff { 3 } else if byte_len <= 0xffff_ffff { 5 } else { 9 };
+            8 + vi + byte_len
+        };
+        let mut all_output_byte_lens: Vec<i64> = Vec::new();
+        match &contract_outputs {
+            Some(cos) => {
+                for o in cos {
+                    all_output_byte_lens.push((o.script.len() / 2) as i64);
+                }
+            }
+            None => {
+                if let Some(nls) = new_locking_script.as_ref() {
+                    all_output_byte_lens.push((nls.len() / 2) as i64);
+                }
+            }
+        }
+        for o in &resolved_data_outputs {
+            all_output_byte_lens.push((o.script.len() / 2) as i64);
+        }
+        let total_output_framing: i64 = all_output_byte_lens.iter().map(|&n| output_framing(n)).sum();
+        let extra_output_bytes = (total_output_framing - output_framing(funding_lock_len as i64)).max(0);
+        let additional_utxos: Vec<Utxo> = if candidate_funding_utxos.is_empty() {
+            Vec::new()
+        } else {
+            select_utxos(
+                &candidate_funding_utxos,
+                funding_target,
+                funding_lock_len,
+                Some(fee_rate),
+                contract_input_bytes,
+                extra_output_bytes,
+            )
+        };
+
+        // Cap funding inputs when the caller sets max_funding_inputs.
+        // select_utxos returns the minimal largest-first set; if that still
+        // exceeds the cap the funding can't cover outputs + fee within the
+        // budget, so fail loudly instead of broadcasting an underfunded tx.
+        if let Some(cap) = options.and_then(|o| o.max_funding_inputs) {
+            if additional_utxos.len() > cap {
+                return Err(format!(
+                    "RunarContract.call({}): funding requires {} input(s) but \
+                     max_funding_inputs={}. Increase max_funding_inputs, use \
+                     larger UTXOs, or consolidate.",
+                    method_name,
+                    additional_utxos.len(),
+                    cap
+                ));
+            }
+        }
 
         let change_addr_opt: Option<&str> = Some(change_address);
         let change_script_opt: Option<&str> = Some(&change_script_str);

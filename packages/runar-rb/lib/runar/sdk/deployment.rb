@@ -85,8 +85,16 @@ module Runar
     # @param target_satoshis [Integer] amount to place in the contract output
     # @param locking_script_byte_len [Integer] byte length of the locking script
     # @param fee_rate [Integer] satoshis per kilobyte
+    # @param extra_input_bytes [Integer] serialized size of any non-P2PKH inputs
+    #   the same tx spends (the contract/covenant input) — keeps the fee, and
+    #   therefore how much funding is selected, from being under-provisioned
+    #   (finding C2). Defaults to 0.
+    # @param extra_output_bytes [Integer] framing of any outputs beyond the single
+    #   continuation (multi-output / raw / data outputs) — same purpose (finding
+    #   C15). Defaults to 0.
     # @return [Array<Utxo>]
-    def select_utxos(utxos, target_satoshis, locking_script_byte_len, fee_rate: 100)
+    def select_utxos(utxos, target_satoshis, locking_script_byte_len, fee_rate: 100,
+                     extra_input_bytes: 0, extra_output_bytes: 0)
       sorted   = utxos.sort_by { |u| -u.satoshis }
       selected = []
       total    = 0
@@ -94,7 +102,10 @@ module Runar
       sorted.each do |utxo|
         selected << utxo
         total += utxo.satoshis
-        fee = estimate_deploy_fee(selected.length, locking_script_byte_len, fee_rate)
+        fee = estimate_deploy_fee(
+          selected.length, locking_script_byte_len, fee_rate,
+          extra_input_bytes: extra_input_bytes, extra_output_bytes: extra_output_bytes
+        )
         return selected if total >= target_satoshis + fee
       end
 
@@ -111,13 +122,26 @@ module Runar
     # @param num_inputs [Integer] number of inputs
     # @param locking_script_byte_len [Integer] byte length of the locking script
     # @param fee_rate [Integer] satoshis per kilobyte (minimum 1)
+    # @param extra_input_bytes [Integer] serialized byte size of any NON-P2PKH
+    #   inputs this fee must also cover (e.g. a contract/covenant input spent in
+    #   the same tx). Defaults to 0 — pure-deploy and funding-only selection are
+    #   unaffected. Used by +prepare_call+ so funding coin-selection sizes the fee
+    #   against the real contract-input unlock bytes (tens of KB for a MERGE that
+    #   embeds both parent txs) instead of ignoring them (finding C2).
+    # @param extra_output_bytes [Integer] serialized framing (8 + varint +
+    #   scriptLen) of every output BEYOND the single +locking_script_byte_len+
+    #   one — additional multi-outputs, raw outputs (finding G1) and data outputs.
+    #   Defaults to 0. A call-path selection that ignored them under-provisioned
+    #   funding on multi-output / large-dataOutput calls (finding C15). Deploy
+    #   passes 0.
     # @return [Integer] estimated fee in satoshis
-    def estimate_deploy_fee(num_inputs, locking_script_byte_len, fee_rate = 100)
+    def estimate_deploy_fee(num_inputs, locking_script_byte_len, fee_rate = 100,
+                            extra_input_bytes: 0, extra_output_bytes: 0)
       rate               = [1, fee_rate].max
-      inputs_size        = num_inputs * P2PKH_INPUT_SIZE
+      inputs_size        = num_inputs * P2PKH_INPUT_SIZE + extra_input_bytes
       contract_out_size  = 8 + varint_byte_size(locking_script_byte_len) + locking_script_byte_len
       change_output_size = P2PKH_OUTPUT_SIZE
-      tx_size            = TX_OVERHEAD + inputs_size + contract_out_size + change_output_size
+      tx_size            = TX_OVERHEAD + inputs_size + contract_out_size + extra_output_bytes + change_output_size
       (tx_size * rate + 999) / 1000
     end
 

@@ -1263,6 +1263,51 @@ func TestSelectUtxos_MultipleNeeded(t *testing.T) {
 	}
 }
 
+// Findings C2 + C15 — the funding fee must also size the contract input's
+// unlock bytes (C2) and EVERY output (C15), not just the single continuation
+// the deploy estimator models. EstimateDeployFee / SelectUtxos accept trailing
+// optional terms [feeRate, extraInputBytes, extraOutputBytes]; PrepareCall
+// computes and passes them so a merge / multi-output / large-dataOutput call
+// does not stop one UTXO short (which, after finding C3, is then rejected as
+// underfunded rather than silently stranding funds).
+func TestEstimateDeployFee_ExtraOutputBytes(t *testing.T) {
+	base := EstimateDeployFee(1, 100, 1000)             // 1000 sat/KB, no extra
+	withOut := EstimateDeployFee(1, 100, 1000, 0, 5000) // +5000 output bytes
+	if withOut <= base {
+		t.Fatalf("expected higher fee with extraOutputBytes: base=%d withOut=%d", base, withOut)
+	}
+	// 5000 extra bytes at 1000 sat/KB == 5000 sats more.
+	if withOut-base != 5000 {
+		t.Errorf("expected fee delta 5000, got %d (base=%d withOut=%d)", withOut-base, base, withOut)
+	}
+}
+
+func TestEstimateDeployFee_ExtraInputBytes(t *testing.T) {
+	base := EstimateDeployFee(1, 100, 1000)
+	withIn := EstimateDeployFee(1, 100, 1000, 5000) // +5000 contract-input unlock bytes
+	if withIn-base != 5000 {
+		t.Errorf("expected fee delta 5000, got %d (base=%d withIn=%d)", withIn-base, base, withIn)
+	}
+}
+
+func TestSelectUtxos_ExtraOutputBytesTipsToTwoCoins(t *testing.T) {
+	utxos := []UTXO{
+		{Txid: "aa", Satoshis: 10000},
+		{Txid: "bb", Satoshis: 10000},
+	}
+	// Target 9000 at 1000 sat/KB. With no extra output bytes a single 10000 coin
+	// covers 9000 + a ~226-sat fee → 1 coin. Adding 2000 output bytes (2000 sats
+	// of fee) pushes the requirement past 10000 → 2 coins needed.
+	few := SelectUtxos(utxos, 9000, 25, 1000, 0, 0)
+	more := SelectUtxos(utxos, 9000, 25, 1000, 0, 2000)
+	if len(few) != 1 {
+		t.Fatalf("expected 1 coin without extra output bytes, got %d", len(few))
+	}
+	if len(more) != 2 {
+		t.Errorf("expected 2 coins once extra output bytes tip the fee, got %d", len(more))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // buildUnlockingScript — method selector encoding
 // ---------------------------------------------------------------------------

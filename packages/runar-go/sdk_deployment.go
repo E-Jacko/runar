@@ -95,7 +95,13 @@ func BuildDeployTransaction(
 
 // SelectUtxos selects the minimum set of UTXOs needed to fund a deployment,
 // using a largest-first strategy.
-func SelectUtxos(utxos []UTXO, targetSatoshis int64, lockingScriptByteLen int, feeRate ...int64) []UTXO {
+//
+// opts is the same trailing, all-optional [feeRate, extraInputBytes,
+// extraOutputBytes] tuple EstimateDeployFee accepts, forwarded verbatim so the
+// per-step fee reflects the contract input's unlock bytes (C2) and every output
+// (C15). Deploy callers pass only feeRate (or nothing); PrepareCall passes the
+// C2/C15 terms so funding coin-selection does not under-provision.
+func SelectUtxos(utxos []UTXO, targetSatoshis int64, lockingScriptByteLen int, opts ...int64) []UTXO {
 	sorted := make([]UTXO, len(utxos))
 	copy(sorted, utxos)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -109,7 +115,7 @@ func SelectUtxos(utxos []UTXO, targetSatoshis int64, lockingScriptByteLen int, f
 		selected = append(selected, utxo)
 		total += utxo.Satoshis
 
-		fee := EstimateDeployFee(len(selected), lockingScriptByteLen, feeRate...)
+		fee := EstimateDeployFee(len(selected), lockingScriptByteLen, opts...)
 		if total >= targetSatoshis+fee {
 			return selected
 		}
@@ -121,16 +127,43 @@ func SelectUtxos(utxos []UTXO, targetSatoshis int64, lockingScriptByteLen int, f
 
 // EstimateDeployFee estimates the fee for a deploy transaction given the
 // number of P2PKH inputs and the contract locking script byte length.
-// Includes a P2PKH change output. feeRate is in satoshis per KB (0 defaults to 100).
-func EstimateDeployFee(numInputs int, lockingScriptByteLen int, feeRate ...int64) int64 {
+// Includes a P2PKH change output.
+//
+// opts is a trailing, all-optional [feeRate, extraInputBytes, extraOutputBytes]
+// tuple (Go has no default args; the pre-existing variadic feeRate is kept so
+// every existing caller — including the 4-arg examples/go one — compiles
+// unchanged, and the C2/C15 terms are appended as opts[1]/opts[2]):
+//   - opts[0] feeRate          — satoshis per KB (0 or omitted defaults to 100).
+//   - opts[1] extraInputBytes  — serialized byte size of any NON-P2PKH inputs
+//     the same tx also spends (the contract/covenant input). Deploy omits it
+//     (0); PrepareCall passes the real contract-input unlock bytes so funding
+//     coin-selection is not blind to them (tens of KB for a MERGE embedding
+//     both parent txs) and does not under-provision the fee (finding C2).
+//   - opts[2] extraOutputBytes — serialized framing (8 + varint + scriptLen) of
+//     every output BEYOND the single `lockingScriptByteLen` continuation counted
+//     below: additional multi-outputs, raw outputs (finding G1), and data
+//     outputs. Deploy omits it (0); PrepareCall passes it so a multi-output /
+//     large-dataOutput call does not stop one UTXO short (finding C15).
+//
+// Both extra terms default to 0, so deploy and funding-only selection are
+// byte-for-byte unchanged.
+func EstimateDeployFee(numInputs int, lockingScriptByteLen int, opts ...int64) int64 {
 	rate := int64(100)
-	if len(feeRate) > 0 && feeRate[0] > 0 {
-		rate = feeRate[0]
+	if len(opts) > 0 && opts[0] > 0 {
+		rate = opts[0]
+	}
+	var extraInputBytes, extraOutputBytes int64
+	if len(opts) > 1 {
+		extraInputBytes = opts[1]
+	}
+	if len(opts) > 2 {
+		extraOutputBytes = opts[2]
 	}
 	inputsSize := numInputs * p2pkhInputSize
 	contractOutputSize := 8 + varIntByteSize(lockingScriptByteLen) + lockingScriptByteLen
 	changeOutputSize := p2pkhOutputSize
-	txSize := int64(txOverhead + inputsSize + contractOutputSize + changeOutputSize)
+	txSize := int64(txOverhead+inputsSize+contractOutputSize+changeOutputSize) +
+		extraInputBytes + extraOutputBytes
 	return (txSize*rate + 999) / 1000
 }
 

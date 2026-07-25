@@ -48,7 +48,7 @@ pub fn buildDeployTransaction(
     var total_input: i64 = 0;
     for (utxos) |u| total_input += u.satoshis;
 
-    const fee = estimateDeployFee(utxos.len, locking_script_hex.len / 2, fee_rate);
+    const fee = estimateDeployFee(utxos.len, locking_script_hex.len / 2, fee_rate, 0, 0);
     const change = total_input - satoshis - fee;
 
     if (change < 0) return DeployError.InsufficientFunds;
@@ -125,6 +125,8 @@ pub fn selectUtxos(
     target_satoshis: i64,
     locking_script_byte_len: usize,
     fee_rate: i64,
+    extra_input_bytes: i64,
+    extra_output_bytes: i64,
 ) ![]types.UTXO {
     // Sort by satoshis descending
     const indices = try allocator.alloc(usize, utxos.len);
@@ -147,7 +149,7 @@ pub fn selectUtxos(
         try selected.append(allocator, try utxos[idx].clone(allocator));
         total += utxos[idx].satoshis;
 
-        const fee = estimateDeployFee(selected.items.len, locking_script_byte_len, fee_rate);
+        const fee = estimateDeployFee(selected.items.len, locking_script_byte_len, fee_rate, extra_input_bytes, extra_output_bytes);
         if (total >= target_satoshis + fee) {
             return selected.toOwnedSlice(allocator);
         }
@@ -158,13 +160,28 @@ pub fn selectUtxos(
 
 /// EstimateDeployFee estimates the fee for a deploy transaction.
 /// Fee rate is in satoshis per KB (0 defaults to 100).
-pub fn estimateDeployFee(num_inputs: usize, locking_script_byte_len: usize, fee_rate_in: i64) i64 {
+///
+/// `extra_input_bytes` (finding C2) is the serialized byte size of any NON-P2PKH
+/// inputs this fee must also cover — e.g. a contract/covenant input spent in the
+/// same tx (tens of KB for a MERGE that embeds both parent txs). `extra_output_bytes`
+/// (finding C15) is the framing (8 + varint + scriptLen) of every output BEYOND the
+/// single `locking_script_byte_len` one counted here — additional multi-outputs, raw
+/// outputs (finding G1), and data outputs. Both default to 0, so deploy and
+/// funding-only selection are byte-for-byte unchanged; `prepareCall` passes real
+/// values so funding coin-selection is not under-provisioned on the call path.
+pub fn estimateDeployFee(
+    num_inputs: usize,
+    locking_script_byte_len: usize,
+    fee_rate_in: i64,
+    extra_input_bytes: i64,
+    extra_output_bytes: i64,
+) i64 {
     const rate: i64 = if (fee_rate_in > 0) fee_rate_in else 100;
-    const inputs_size: i64 = @intCast(num_inputs * p2pkh_input_size);
+    const inputs_size: i64 = @as(i64, @intCast(num_inputs * p2pkh_input_size)) + extra_input_bytes;
     const contract_output_size: i64 = @intCast(8 + varIntByteSize(locking_script_byte_len) + locking_script_byte_len);
     const change_output_size: i64 = @intCast(p2pkh_output_size);
     const tx_size: i64 = @intCast(tx_overhead);
-    const total = tx_size + inputs_size + contract_output_size + change_output_size;
+    const total = tx_size + inputs_size + contract_output_size + extra_output_bytes + change_output_size;
     return @divTrunc(total * rate + 999, 1000);
 }
 
@@ -210,7 +227,7 @@ fn varIntByteSize(n: usize) usize {
 // ---------------------------------------------------------------------------
 
 test "estimateDeployFee basic calculation" {
-    const fee = estimateDeployFee(1, 50, 100);
+    const fee = estimateDeployFee(1, 50, 100, 0, 0);
     // 10 + 148 + (8+1+50) + 34 = 251 bytes; 251 * 100 / 1000 = 26 (rounded up)
     try std.testing.expect(fee > 0);
     try std.testing.expect(fee < 100);
@@ -231,7 +248,7 @@ test "selectUtxos selects largest first" {
         .{ .txid = "cc" ** 32, .output_index = 0, .satoshis = 200, .script = "5100" },
     };
 
-    const selected = try selectUtxos(allocator, utxos, 400, 25, 100);
+    const selected = try selectUtxos(allocator, utxos, 400, 25, 100, 0, 0);
     defer {
         for (selected) |*u| u.deinit(allocator);
         allocator.free(selected);
@@ -240,4 +257,45 @@ test "selectUtxos selects largest first" {
     // 500 sat UTXO should be selected first; check we get at least the big one
     try std.testing.expect(selected.len >= 1);
     try std.testing.expectEqual(@as(i64, 500), selected[0].satoshis);
+}
+
+// Findings C2 + C15: the call-path funding estimator must size against the
+// contract/covenant INPUT unlock bytes (C2, extra_input_bytes) and against ALL
+// outputs beyond the single continuation the deploy estimator counts (C15,
+// extra_output_bytes). Both are trailing params defaulting to 0 for deploy.
+// Mirrors packages/runar-sdk/src/__tests__/c15-funding-output-sizing.test.ts.
+test "estimateDeployFee adds extra input/output bytes to the fee (C2/C15)" {
+    // 1000 sat/KB makes each extra byte cost exactly 1 sat, so the delta is
+    // the extra byte count with no rounding slack.
+    const base = estimateDeployFee(1, 100, 1000, 0, 0);
+    const with_out = estimateDeployFee(1, 100, 1000, 0, 5000); // +5000 output bytes
+    const with_in = estimateDeployFee(1, 100, 1000, 5000, 0); // +5000 input bytes
+    try std.testing.expect(with_out > base);
+    try std.testing.expect(with_in > base);
+    try std.testing.expectEqual(@as(i64, 5000), with_out - base);
+    try std.testing.expectEqual(@as(i64, 5000), with_in - base);
+}
+
+test "selectUtxos picks more coins when extra output bytes tip the fee (C15)" {
+    const allocator = std.testing.allocator;
+    const utxos = &[_]types.UTXO{
+        .{ .txid = "aa" ** 32, .output_index = 0, .satoshis = 10_000, .script = "5100" },
+        .{ .txid = "bb" ** 32, .output_index = 0, .satoshis = 10_000, .script = "5100" },
+    };
+
+    // Target 9_000 at 1000 sat/KB. With no extra output bytes a single 10_000
+    // coin covers 9_000 + a ~226-sat fee → 1 coin. Adding 2_000 output bytes
+    // (2_000 sats of fee) pushes the requirement past 10_000 → 2 coins needed.
+    const few = try selectUtxos(allocator, utxos, 9_000, 25, 1000, 0, 0);
+    defer {
+        for (few) |*u| u.deinit(allocator);
+        allocator.free(few);
+    }
+    const more = try selectUtxos(allocator, utxos, 9_000, 25, 1000, 0, 2_000);
+    defer {
+        for (more) |*u| u.deinit(allocator);
+        allocator.free(more);
+    }
+    try std.testing.expectEqual(@as(usize, 1), few.len);
+    try std.testing.expectEqual(@as(usize, 2), more.len);
 }

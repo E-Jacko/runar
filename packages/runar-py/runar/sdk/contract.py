@@ -769,50 +769,11 @@ class RunarContract:
             if not (u.txid == self._current_utxo.txid and u.output_index == self._current_utxo.output_index)
         ]
 
-        # Coin selection for funding inputs (issue #133): don't sweep the whole
-        # wallet. Compute how much the funding must cover -- the contract's own
-        # input value already offsets the contract/data outputs -- and pick the
-        # smallest largest-first set via select_utxos (the strategy deploy uses).
-        contract_output_sats = (
-            (sum(co['satoshis'] for co in contract_outputs)
-             if contract_outputs else (new_satoshis or 0))
-            + sum(do['satoshis'] for do in resolved_data_outputs)
-        )
-        contract_input_sats = (
-            self._current_utxo.satoshis
-            + sum(u.satoshis for u in extra_contract_utxos)
-        )
-        funding_target = max(0, contract_output_sats - contract_input_sats)
-        # Fee sizing hint for select_utxos: the continuation script length
-        # (falls back to the first multi-output script, else 0 for stateless).
-        if new_locking_script:
-            funding_lock_len = len(new_locking_script) // 2
-        elif contract_outputs:
-            funding_lock_len = len(contract_outputs[0]['script']) // 2
-        else:
-            funding_lock_len = 0
-        additional_utxos: list[Utxo] = (
-            select_utxos(candidate_funding_utxos, funding_target, funding_lock_len, fee_rate)
-            if candidate_funding_utxos else []
-        )
-
-        # Cap funding inputs when the caller sets max_funding_inputs. select_utxos
-        # returns the minimal largest-first set; if that still exceeds the cap the
-        # funding can't cover outputs + fee within the budget, so fail loudly
-        # instead of broadcasting an underfunded tx.
-        if (
-            options is not None
-            and options.max_funding_inputs is not None
-            and len(additional_utxos) > options.max_funding_inputs
-        ):
-            raise ValueError(
-                f"RunarContract.call({method_name}): funding requires "
-                f"{len(additional_utxos)} input(s) but "
-                f"max_funding_inputs={options.max_funding_inputs}. Increase "
-                f"max_funding_inputs, use larger UTXOs, or consolidate."
-            )
-
-        # Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling)
+        # Resolve per-input args for additional contract inputs (same
+        # Sig/PubKey/ByteString handling). Computed BEFORE funding selection so
+        # the merge unlock sizes -- and therefore the contract-input byte size
+        # the funding fee must cover (finding C2) -- are known before we size
+        # the funding. Consumed again later when the real merge unlocks are built.
         resolved_per_input_args: list[list] | None = None
         if opts.additional_contract_input_args:
             resolved_per_input_args = []
@@ -836,6 +797,114 @@ class RunarContract:
             args_for_placeholder = resolved_per_input_args[i] if resolved_per_input_args and i < len(resolved_per_input_args) else resolved_args
             extra_unlock_placeholders.append(
                 self._build_stateful_prefix('00' * 72, method_uses_code_part) + self.build_unlocking_script(method_name, args_for_placeholder) + witness_hex
+            )
+
+        # Coin selection for funding inputs (issue #133): don't sweep the whole
+        # wallet. Compute how much the funding must cover -- the contract's own
+        # input value already offsets the contract/data outputs -- and pick the
+        # smallest largest-first set via select_utxos (the strategy deploy uses).
+        contract_output_sats = (
+            (sum(co['satoshis'] for co in contract_outputs)
+             if contract_outputs else (new_satoshis or 0))
+            + sum(do['satoshis'] for do in resolved_data_outputs)
+        )
+        contract_input_sats = (
+            self._current_utxo.satoshis
+            + sum(u.satoshis for u in extra_contract_utxos)
+        )
+        funding_target = max(0, contract_output_sats - contract_input_sats)
+        # Fee sizing hint for select_utxos: the continuation script length
+        # (falls back to the first multi-output script, else 0 for stateless).
+        if new_locking_script:
+            funding_lock_len = len(new_locking_script) // 2
+        elif contract_outputs:
+            funding_lock_len = len(contract_outputs[0]['script']) // 2
+        else:
+            funding_lock_len = 0
+
+        # C2: contract-input unlock bytes. select_utxos / estimate_deploy_fee
+        # otherwise model ONLY the funding inputs (148-byte P2PKH each) +
+        # continuation + change -- they are blind to the contract input(s) being
+        # spent. For a MERGE each covenant input embeds both parent txs as method
+        # args (tens of KB), so ignoring them under-provisions the funding;
+        # build_call_transaction then sees change <= 0 and DROPS the change
+        # output, and the merge covenant -- which reconstructs [continuation]
+        # [P2PKH change] UNCONDITIONALLY -- fails its hashOutputs OP_VERIFY. Size
+        # the funding fee against the SAME serialized per-input bytes
+        # build_call_transaction uses (32 outpoint + 4 index + varint + script +
+        # 4 sequence) for the primary contract input plus every extra one.
+        # Over-estimating is safe (a little more funding / higher change);
+        # under-estimating is the bug.
+        def _per_input_bytes(unlock_hex: str) -> int:
+            length = len(unlock_hex) // 2
+            vi = 1 if length < 0xFD else 3 if length <= 0xFFFF else 5 if length <= 0xFFFFFFFF else 9
+            return 32 + 4 + vi + length + 4
+
+        # The sizing placeholders above are `prefix(sig72) + unlocking_script +
+        # witness_hex`. The REAL unlock _build_stateful_unlock emits is larger --
+        # it appends the BIP-143 preimage (whose scriptCode ~= the locking
+        # script), the change + new-amount pushes, and the method selector, and
+        # the opSig codePart prefix (~= the locking script). That gap is exactly
+        # what would make select_utxos stop one UTXO short. Add a per-contract-
+        # input overestimate covering those omitted components: codePart (~=
+        # locking script) + preimage scriptCode (~= locking script) + a fixed
+        # buffer for sig/amount/selector/varint framing. Over-estimating only
+        # pulls slightly more funding (bigger change) -- always safe.
+        num_contract_inputs = 1 + len(extra_contract_utxos)
+        per_contract_input_overhead = 2 * funding_lock_len + 512
+        contract_input_bytes = (
+            _per_input_bytes(unlocking_script)
+            + sum(_per_input_bytes(u) for u in extra_unlock_placeholders)
+            + num_contract_inputs * per_contract_input_overhead
+        )
+
+        # C15: size the funding fee against ALL outputs, not just the single
+        # continuation that `funding_lock_len` already covers. estimate_deploy_fee
+        # counts one output of `funding_lock_len` bytes; add the framing (8 +
+        # varint + scriptLen) of every OTHER contract output (extra multi-outputs
+        # + raw outputs, finding G1) and every data output so selection does not
+        # stop one UTXO short on multi-output / large-dataOutput calls. Single-
+        # output calls net 0 (estimate unchanged). Over-estimating only pulls
+        # slightly more funding (bigger change) -- always safe.
+        def _output_framing(byte_len: int) -> int:
+            vi = 1 if byte_len < 0xFD else 3 if byte_len <= 0xFFFF else 5 if byte_len <= 0xFFFFFFFF else 9
+            return 8 + vi + byte_len
+
+        all_output_byte_lens = [
+            *(
+                [len(co['script']) // 2 for co in contract_outputs]
+                if contract_outputs
+                else ([len(new_locking_script) // 2] if new_locking_script else [])
+            ),
+            *[len(do['script']) // 2 for do in resolved_data_outputs],
+        ]
+        total_output_framing = sum(_output_framing(n) for n in all_output_byte_lens)
+        extra_output_bytes = max(
+            0, total_output_framing - _output_framing(funding_lock_len),
+        )
+
+        additional_utxos: list[Utxo] = (
+            select_utxos(
+                candidate_funding_utxos, funding_target, funding_lock_len, fee_rate,
+                contract_input_bytes, extra_output_bytes,
+            )
+            if candidate_funding_utxos else []
+        )
+
+        # Cap funding inputs when the caller sets max_funding_inputs. select_utxos
+        # returns the minimal largest-first set; if that still exceeds the cap the
+        # funding can't cover outputs + fee within the budget, so fail loudly
+        # instead of broadcasting an underfunded tx.
+        if (
+            options is not None
+            and options.max_funding_inputs is not None
+            and len(additional_utxos) > options.max_funding_inputs
+        ):
+            raise ValueError(
+                f"RunarContract.call({method_name}): funding requires "
+                f"{len(additional_utxos)} input(s) but "
+                f"max_funding_inputs={options.max_funding_inputs}. Increase "
+                f"max_funding_inputs, use larger UTXOs, or consolidate."
             )
 
         tx_hex, input_count, change_amount = build_call_transaction(

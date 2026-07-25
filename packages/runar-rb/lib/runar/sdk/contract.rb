@@ -592,27 +592,12 @@ module Runar
           else
             0
           end
-        additional_utxos =
-          if candidate_funding_utxos.empty?
-            []
-          else
-            SDK.select_utxos(candidate_funding_utxos, funding_target, funding_lock_len, fee_rate: fee_rate)
-          end
 
-        # Cap funding inputs when the caller sets max_funding_inputs (#133).
-        # select_utxos returns the minimal largest-first set; if that still
-        # exceeds the cap the funding can't cover outputs + fee within budget,
-        # so fail loudly instead of broadcasting an underfunded tx.
-        if !opts.max_funding_inputs.nil? && additional_utxos.length > opts.max_funding_inputs
-          raise "RunarContract.call(#{method_name}): funding requires #{additional_utxos.length} " \
-                "input(s) but max_funding_inputs=#{opts.max_funding_inputs}. Increase " \
-                'max_funding_inputs, use larger UTXOs, or consolidate.'
-        end
-
-        # Initial unlocking script (with placeholders). Intent-witness hex is
-        # suffixed so size estimation accounts for the witness pushes; the
-        # real ABI-correct unlock is rebuilt by build_stateful_unlock below
-        # for stateful methods.
+        # Placeholder unlocking scripts are built HERE (before funding coin-
+        # selection) so their byte sizes feed the funding fee estimate. Intent-
+        # witness hex is suffixed so size estimation accounts for the witness
+        # pushes; the real ABI-correct unlock is rebuilt by build_stateful_unlock
+        # below for stateful methods.
         unlocking_script = if needs_op_push_tx
                              build_stateful_prefix('00' * 72, method_uses_code_part) +
                                build_unlocking_script(method_name, resolved_args) +
@@ -630,6 +615,83 @@ module Runar
             build_unlocking_script(method_name, args_for_placeholder) +
             intent_witness_hex
         end
+
+        # C2: contract-input unlock bytes. select_utxos/estimate_deploy_fee
+        # otherwise model ONLY the funding inputs (148-byte P2PKH each) +
+        # continuation + change — they are blind to the contract input(s) being
+        # spent. For a MERGE each covenant input embeds both parent txs as method
+        # args (tens of KB), so ignoring them under-provisions the funding;
+        # build_call_transaction then sees change <= 0 and DROPS the change
+        # output, and the merge covenant — which reconstructs
+        # [continuation][P2PKH change] UNCONDITIONALLY — fails its hashOutputs
+        # OP_VERIFY. Size the funding fee against the SAME serialized per-input
+        # bytes build_call_transaction uses (32 outpoint + 4 index + varint +
+        # script + 4 sequence) for the primary contract input plus every extra
+        # one, then add a per-contract-input overestimate covering the components
+        # the real build_stateful_unlock adds that the placeholders omit (opSig
+        # codePart ~= locking script + BIP-143 preimage scriptCode ~= locking
+        # script + a fixed buffer for sig/amount/selector/varint framing).
+        # Over-estimating only pulls slightly more funding (bigger change) — safe.
+        per_input_bytes = lambda do |unlock_hex|
+          len = unlock_hex.length / 2
+          vi  = len < 0xFD ? 1 : len <= 0xFFFF ? 3 : len <= 0xFFFFFFFF ? 5 : 9
+          32 + 4 + vi + len + 4
+        end
+        num_contract_inputs         = 1 + extra_contract_utxos.length
+        per_contract_input_overhead = (2 * funding_lock_len) + 512
+        contract_input_bytes =
+          per_input_bytes.call(unlocking_script) +
+          extra_unlock_placeholders.sum { |u| per_input_bytes.call(u) } +
+          (num_contract_inputs * per_contract_input_overhead)
+
+        # C15: size the funding fee against ALL outputs, not just the single
+        # continuation that funding_lock_len already covers. estimate_deploy_fee
+        # counts one output of funding_lock_len bytes; add the framing (8 +
+        # varint + scriptLen) of every OTHER contract output (extra multi-outputs
+        # + raw outputs, finding G1) and every data output so selection does not
+        # stop one UTXO short on multi-output / large-dataOutput calls. Single-
+        # output calls net 0 (estimate unchanged). Over-estimating is safe.
+        output_framing = lambda do |byte_len|
+          vi = byte_len < 0xFD ? 1 : byte_len <= 0xFFFF ? 3 : byte_len <= 0xFFFFFFFF ? 5 : 9
+          8 + vi + byte_len
+        end
+        all_output_byte_lens =
+          if contract_outputs
+            contract_outputs.map { |o| o[:script].length / 2 }
+          elsif new_locking_script && !new_locking_script.empty?
+            [new_locking_script.length / 2]
+          else
+            []
+          end
+        all_output_byte_lens += resolved_data_outputs.map { |o| o[:script].length / 2 }
+        total_output_framing = all_output_byte_lens.sum { |n| output_framing.call(n) }
+        extra_output_bytes = [0, total_output_framing - output_framing.call(funding_lock_len)].max
+
+        additional_utxos =
+          if candidate_funding_utxos.empty?
+            []
+          else
+            SDK.select_utxos(
+              candidate_funding_utxos, funding_target, funding_lock_len,
+              fee_rate: fee_rate,
+              extra_input_bytes: contract_input_bytes,
+              extra_output_bytes: extra_output_bytes
+            )
+          end
+
+        # Cap funding inputs when the caller sets max_funding_inputs (#133).
+        # select_utxos returns the minimal largest-first set; if that still
+        # exceeds the cap the funding can't cover outputs + fee within budget,
+        # so fail loudly instead of broadcasting an underfunded tx.
+        if !opts.max_funding_inputs.nil? && additional_utxos.length > opts.max_funding_inputs
+          raise "RunarContract.call(#{method_name}): funding requires #{additional_utxos.length} " \
+                "input(s) but max_funding_inputs=#{opts.max_funding_inputs}. Increase " \
+                'max_funding_inputs, use larger UTXOs, or consolidate.'
+        end
+
+        # (unlocking_script + extra_unlock_placeholders are built above, before
+        # funding coin-selection, so their byte sizes feed the funding fee
+        # estimate — findings C2 / C15.)
 
         call_options = {}
         call_options[:contract_outputs] = contract_outputs if contract_outputs

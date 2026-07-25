@@ -819,57 +819,12 @@ func (c *RunarContract) PrepareCall(
 		}
 	}
 
-	// Coin selection for funding inputs (issue #133): don't sweep the whole
-	// wallet. Compute how much the funding must cover — the contract's own input
-	// value already offsets the contract/data outputs — and pick the smallest
-	// largest-first set via SelectUtxos (the strategy deploy uses).
-	var contractOutputSats int64
-	if len(contractOutputs) > 0 {
-		for _, co := range contractOutputs {
-			contractOutputSats += co.Satoshis
-		}
-	} else {
-		contractOutputSats = newSatoshis
-	}
-	for _, do := range resolvedDataOutputs {
-		contractOutputSats += do.Satoshis
-	}
-	contractInputSats := c.currentUtxo.Satoshis
-	for _, u := range extraContractUtxos {
-		contractInputSats += u.Satoshis
-	}
-	fundingTarget := contractOutputSats - contractInputSats
-	if fundingTarget < 0 {
-		fundingTarget = 0
-	}
-	// Fee sizing hint for SelectUtxos: the continuation script length (falls
-	// back to the first multi-output script, else 0 for stateless calls).
-	fundingLockLen := 0
-	if newLockingScript != "" {
-		fundingLockLen = len(newLockingScript) / 2
-	} else if len(contractOutputs) > 0 {
-		fundingLockLen = len(contractOutputs[0].Script) / 2
-	}
-	var additionalUtxos []UTXO
-	if len(candidateFundingUtxos) > 0 {
-		additionalUtxos = SelectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
-	}
-
-	// Cap funding inputs when the caller sets MaxFundingInputs. SelectUtxos
-	// returns the minimal largest-first set; if that still exceeds the cap the
-	// funding can't cover outputs + fee within the budget, so fail loudly
-	// instead of broadcasting an underfunded tx.
-	if options != nil && options.MaxFundingInputs != nil && len(additionalUtxos) > *options.MaxFundingInputs {
-		return nil, fmt.Errorf(
-			"RunarContract.Call(%s): funding requires %d input(s) but maxFundingInputs=%d. "+
-				"Increase maxFundingInputs, use larger UTXOs, or consolidate.",
-			methodName, len(additionalUtxos), *options.MaxFundingInputs)
-	}
-
 	// Initial unlocking script (with placeholders). Intent-witness hex is
 	// suffixed so size estimation accounts for the witness pushes; the real
 	// ABI-correct unlock is rebuilt by buildStatefulUnlock below for stateful
-	// methods.
+	// methods. Built BEFORE funding coin-selection (below) so its byte size — and
+	// the extra contract inputs' — can feed the funding fee estimate (finding C2:
+	// the deploy estimator is otherwise blind to the contract input being spent).
 	var unlockingScript string
 	if needsOpPushTx || isStateful {
 		unlockingScript = c.buildStatefulPrefix(strings.Repeat("00", 72), methodUsesCodePart) +
@@ -920,6 +875,110 @@ func (c *RunarContract) PrepareCall(
 	for i := range extraContractUtxos {
 		extraUnlockPlaceholders[i] = c.buildStatefulPrefix(strings.Repeat("00", 72), methodUsesCodePart) +
 			c.BuildUnlockingScript(methodName, extraResolvedArgs[i]) + witnessHex
+	}
+
+	// Coin selection for funding inputs (issue #133): don't sweep the whole
+	// wallet. Compute how much the funding must cover — the contract's own input
+	// value already offsets the contract/data outputs — and pick the smallest
+	// largest-first set via SelectUtxos (the strategy deploy uses).
+	var contractOutputSats int64
+	if len(contractOutputs) > 0 {
+		for _, co := range contractOutputs {
+			contractOutputSats += co.Satoshis
+		}
+	} else {
+		contractOutputSats = newSatoshis
+	}
+	for _, do := range resolvedDataOutputs {
+		contractOutputSats += do.Satoshis
+	}
+	contractInputSats := c.currentUtxo.Satoshis
+	for _, u := range extraContractUtxos {
+		contractInputSats += u.Satoshis
+	}
+	fundingTarget := contractOutputSats - contractInputSats
+	if fundingTarget < 0 {
+		fundingTarget = 0
+	}
+	// Fee sizing hint for SelectUtxos: the continuation script length (falls
+	// back to the first multi-output script, else 0 for stateless calls).
+	fundingLockLen := 0
+	if newLockingScript != "" {
+		fundingLockLen = len(newLockingScript) / 2
+	} else if len(contractOutputs) > 0 {
+		fundingLockLen = len(contractOutputs[0].Script) / 2
+	}
+	// C2 — contract-input unlock bytes. SelectUtxos/EstimateDeployFee otherwise
+	// model ONLY the funding inputs (148-byte P2PKH each) + continuation + change;
+	// they are blind to the contract input(s) being spent. For a MERGE each
+	// covenant input embeds both parent txs as method args (tens of KB), so
+	// ignoring them under-provisions the funding; BuildCallTransaction then sees
+	// change <= 0, DROPS the change output, and the covenant — which reconstructs
+	// [continuation][P2PKH change] UNCONDITIONALLY — fails its hashOutputs
+	// OP_VERIFY. Size the funding fee against the SAME serialized per-input bytes
+	// BuildCallTransaction uses (32 outpoint + 4 index + varint + script + 4
+	// sequence) for the primary contract input plus every extra one. The
+	// unlockingScript / extraUnlockPlaceholders above are SIZING placeholders; the
+	// REAL stateful unlock buildStatefulUnlock emits is larger (opSig codePart
+	// prefix + BIP-143 preimage scriptCode ~= locking script, change + new-amount
+	// pushes, method selector), so add a per-contract-input overestimate covering
+	// those omitted components: 2*fundingLockLen (codePart + preimage scriptCode)
+	// + 512 fixed framing. Over-estimating only pulls slightly more funding
+	// (bigger change) — always safe; under-estimating is the bug. Mirrors the TS
+	// perInputBytes / contractInputBytes in packages/runar-sdk/src/contract.ts.
+	perInputBytes := func(unlockHex string) int64 {
+		l := len(unlockHex) / 2
+		return int64(32 + 4 + varIntByteSize(l) + l + 4)
+	}
+	numContractInputs := 1 + len(extraContractUtxos)
+	perContractInputOverhead := int64(2*fundingLockLen + 512)
+	contractInputBytes := perInputBytes(unlockingScript) +
+		int64(numContractInputs)*perContractInputOverhead
+	for _, u := range extraUnlockPlaceholders {
+		contractInputBytes += perInputBytes(u)
+	}
+	// C15 — size the funding fee against ALL outputs, not just the single
+	// continuation that fundingLockLen already covers. EstimateDeployFee counts
+	// one output of fundingLockLen bytes; add the framing (8 + varint + scriptLen)
+	// of every OTHER contract output (extra multi-outputs + raw outputs, finding
+	// G1) and every data output so selection does not stop one UTXO short on
+	// multi-output / large-dataOutput calls. Single-output calls net 0 (estimate
+	// unchanged). Clamp >= 0. Over-estimating only pulls slightly more funding.
+	outputFraming := func(byteLen int) int64 {
+		return int64(8 + varIntByteSize(byteLen) + byteLen)
+	}
+	var totalOutputFraming int64
+	if len(contractOutputs) > 0 {
+		for _, co := range contractOutputs {
+			totalOutputFraming += outputFraming(len(co.Script) / 2)
+		}
+	} else if newLockingScript != "" {
+		totalOutputFraming += outputFraming(len(newLockingScript) / 2)
+	}
+	for _, do := range resolvedDataOutputs {
+		totalOutputFraming += outputFraming(len(do.Script) / 2)
+	}
+	extraOutputBytes := totalOutputFraming - outputFraming(fundingLockLen)
+	if extraOutputBytes < 0 {
+		extraOutputBytes = 0
+	}
+	var additionalUtxos []UTXO
+	if len(candidateFundingUtxos) > 0 {
+		additionalUtxos = SelectUtxos(
+			candidateFundingUtxos, fundingTarget, fundingLockLen,
+			feeRate, contractInputBytes, extraOutputBytes,
+		)
+	}
+
+	// Cap funding inputs when the caller sets MaxFundingInputs. SelectUtxos
+	// returns the minimal largest-first set; if that still exceeds the cap the
+	// funding can't cover outputs + fee within the budget, so fail loudly
+	// instead of broadcasting an underfunded tx.
+	if options != nil && options.MaxFundingInputs != nil && len(additionalUtxos) > *options.MaxFundingInputs {
+		return nil, fmt.Errorf(
+			"RunarContract.Call(%s): funding requires %d input(s) but maxFundingInputs=%d. "+
+				"Increase maxFundingInputs, use larger UTXOs, or consolidate.",
+			methodName, len(additionalUtxos), *options.MaxFundingInputs)
 	}
 
 	// Build the BuildCallOptions

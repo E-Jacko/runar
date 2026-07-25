@@ -28,7 +28,7 @@ pub fn build_deploy_transaction(
     }
 
     let total_input: i64 = utxos.iter().map(|u| u.satoshis).sum();
-    let fee = estimate_deploy_fee(utxos.len(), locking_script.len() / 2, fee_rate);
+    let fee = estimate_deploy_fee(utxos.len(), locking_script.len() / 2, fee_rate, 0, 0);
     let change = total_input - satoshis - fee;
 
     if change < 0 {
@@ -86,23 +86,51 @@ pub fn build_deploy_transaction(
 /// inputs and the contract locking script byte length. Fee rate is in
 /// satoshis per KB (default 100, i.e. 0.1 sat/byte). Includes a P2PKH
 /// change output.
-pub fn estimate_deploy_fee(num_inputs: usize, locking_script_byte_len: usize, fee_rate: Option<i64>) -> i64 {
+///
+/// `extra_input_bytes` (finding C2) is the serialized byte size of any
+/// NON-P2PKH inputs this fee must also cover (e.g. a contract/covenant input
+/// being spent in the same tx). `extra_output_bytes` (finding C15) is the
+/// serialized framing (8 + varint + scriptLen) of every output BEYOND the
+/// single `locking_script_byte_len` one — additional multi-outputs, raw
+/// outputs (finding G1), and data outputs. Both default to 0 at the deploy
+/// call sites, leaving pure-deploy / funding-only selection byte-for-byte
+/// unchanged; `prepare_call` passes the real values so funding coin-selection
+/// sizes the fee against the contract-input unlock bytes (tens of KB for a
+/// MERGE that embeds both parent txs) and every output instead of ignoring
+/// them (which under-provisioned funding and, after finding C3, then failed
+/// the call closed).
+pub fn estimate_deploy_fee(
+    num_inputs: usize,
+    locking_script_byte_len: usize,
+    fee_rate: Option<i64>,
+    extra_input_bytes: i64,
+    extra_output_bytes: i64,
+) -> i64 {
     let rate = fee_rate.filter(|&r| r > 0).unwrap_or(100);
-    let inputs_size = num_inputs as i64 * P2PKH_INPUT_SIZE;
+    let inputs_size = num_inputs as i64 * P2PKH_INPUT_SIZE + extra_input_bytes;
     let contract_output_size =
         8 + varint_byte_size(locking_script_byte_len) + locking_script_byte_len as i64;
     let change_output_size = P2PKH_OUTPUT_SIZE;
-    let tx_size = TX_OVERHEAD + inputs_size + contract_output_size + change_output_size;
+    let tx_size =
+        TX_OVERHEAD + inputs_size + contract_output_size + extra_output_bytes + change_output_size;
     (tx_size * rate + 999) / 1000
 }
 
 /// Select the minimum set of UTXOs needed to fund a deployment, using a
 /// largest-first strategy. Returns the selected subset.
+///
+/// `extra_input_bytes` (C2) / `extra_output_bytes` (C15) are forwarded to
+/// `estimate_deploy_fee` so the fee — and therefore how much funding gets
+/// selected — is not under-provisioned on the call path (the contract/covenant
+/// input and any extra outputs the deploy estimator is blind to). Deploy call
+/// sites pass 0/0.
 pub fn select_utxos(
     utxos: &[Utxo],
     target_satoshis: i64,
     locking_script_byte_len: usize,
     fee_rate: Option<i64>,
+    extra_input_bytes: i64,
+    extra_output_bytes: i64,
 ) -> Vec<Utxo> {
     let mut sorted: Vec<Utxo> = utxos.to_vec();
     sorted.sort_by(|a, b| b.satoshis.cmp(&a.satoshis));
@@ -114,7 +142,13 @@ pub fn select_utxos(
         selected.push(utxo);
         total += selected.last().unwrap().satoshis;
 
-        let fee = estimate_deploy_fee(selected.len(), locking_script_byte_len, fee_rate);
+        let fee = estimate_deploy_fee(
+            selected.len(),
+            locking_script_byte_len,
+            fee_rate,
+            extra_input_bytes,
+            extra_output_bytes,
+        );
         if total >= target_satoshis + fee {
             return selected;
         }
@@ -402,7 +436,7 @@ mod tests {
             make_utxo(50_000, 1),
             make_utxo(200_000, 2),
         ];
-        let selected = select_utxos(&utxos, 50_000, 1, None);
+        let selected = select_utxos(&utxos, 50_000, 1, None, 0, 0);
         // Should pick the 200_000 UTXO first (largest), which is enough alone
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].satoshis, 200_000);
@@ -415,8 +449,44 @@ mod tests {
             make_utxo(20_000, 1),
             make_utxo(10_000, 2),
         ];
-        let selected = select_utxos(&utxos, 50_000, 1, None);
+        let selected = select_utxos(&utxos, 50_000, 1, None, 0, 0);
         // 30_000 alone not enough; 30_000 + 20_000 = 50_000, need fee too; may need all 3
         assert!(selected.len() >= 2);
+    }
+
+    // Findings C2 / C15 — call funding selection must size the contract/covenant
+    // INPUT's unlock bytes (C2) and ALL outputs (C15), not just N P2PKH inputs +
+    // one continuation output. `estimate_deploy_fee` / `select_utxos` gained
+    // trailing `extra_input_bytes` (C2) and `extra_output_bytes` (C15) params so a
+    // MERGE / multi-output / large-data-output call does not stop one UTXO short —
+    // which, after finding C3, would then be rejected as underfunded rather than
+    // silently stranding funds. Deploy passes 0/0 → byte-for-byte unchanged.
+    #[test]
+    fn estimate_deploy_fee_adds_extra_output_bytes() {
+        let base = estimate_deploy_fee(1, 100, Some(1000), 0, 0); // 1000 sat/KB, no extra
+        let with_out = estimate_deploy_fee(1, 100, Some(1000), 0, 5000); // +5000 output bytes
+        assert!(with_out > base);
+        // 5000 extra bytes at 1000 sat/KB == 5000 sats more.
+        assert_eq!(with_out - base, 5000);
+    }
+
+    #[test]
+    fn estimate_deploy_fee_adds_extra_input_bytes() {
+        let base = estimate_deploy_fee(1, 100, Some(1000), 0, 0);
+        let with_in = estimate_deploy_fee(1, 100, Some(1000), 3000, 0); // +3000 input bytes
+        assert!(with_in > base);
+        assert_eq!(with_in - base, 3000);
+    }
+
+    #[test]
+    fn select_utxos_picks_more_when_extra_output_bytes_tip_the_edge() {
+        let utxos = vec![make_utxo(10_000, 0), make_utxo(10_000, 1)];
+        // Target 9_000 at 1000 sat/KB. With no extra output bytes a single 10_000
+        // coin covers 9_000 + a ~226-sat fee → 1 coin. Adding 2_000 output bytes
+        // (2_000 sats of fee) pushes the requirement past 10_000 → 2 coins needed.
+        let few = select_utxos(&utxos, 9_000, 25, Some(1000), 0, 0);
+        let more = select_utxos(&utxos, 9_000, 25, Some(1000), 0, 2_000);
+        assert_eq!(few.len(), 1);
+        assert_eq!(more.len(), 2);
     }
 }

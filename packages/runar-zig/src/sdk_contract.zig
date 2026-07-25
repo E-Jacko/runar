@@ -13,6 +13,30 @@ const errors_mod = @import("sdk_errors.zig");
 const script_utils = @import("sdk_script_utils.zig");
 
 // ---------------------------------------------------------------------------
+// Call-path funding fee-sizing helpers (findings C2 + C15)
+// ---------------------------------------------------------------------------
+
+/// Serialized bytes one contract/covenant input adds to the tx (finding C2):
+/// prevout(32) + index(4) + varint(unlockLen) + unlockLen + sequence(4). The
+/// deploy estimator models ONLY 148-byte P2PKH inputs, so a call spending a
+/// contract input (tens of KB for a MERGE that embeds parent txs) under-provisions
+/// funding unless these bytes are added. `unlock_hex_len` is the hex string length
+/// (2 chars/byte). Mirrors TS `perInputBytes`.
+fn contractInputSerializedBytes(unlock_hex_len: usize) i64 {
+    const len: usize = unlock_hex_len / 2;
+    const vi: usize = if (len < 0xfd) 1 else if (len <= 0xffff) 3 else if (len <= 0xffffffff) 5 else 9;
+    return @intCast(32 + 4 + vi + len + 4);
+}
+
+/// Serialized framing one output adds to the tx (finding C15):
+/// satoshis(8) + varint(scriptLen) + scriptLen. `script_byte_len` is in bytes.
+/// Mirrors TS `outputFraming`.
+fn outputFramingBytes(script_byte_len: usize) i64 {
+    const vi: usize = if (script_byte_len < 0xfd) 1 else if (script_byte_len <= 0xffff) 3 else if (script_byte_len <= 0xffffffff) 5 else 9;
+    return @intCast(8 + vi + script_byte_len);
+}
+
+// ---------------------------------------------------------------------------
 // RunarContract — main contract runtime wrapper
 // ---------------------------------------------------------------------------
 
@@ -244,7 +268,7 @@ pub const RunarContract = struct {
 
         if (all_utxos.len == 0) return ContractError.InsufficientFunds;
 
-        const selected = try deploy_mod.selectUtxos(self.allocator, all_utxos, options.satoshis, locking_script.len / 2, fee_rate);
+        const selected = try deploy_mod.selectUtxos(self.allocator, all_utxos, options.satoshis, locking_script.len / 2, fee_rate, 0, 0);
         defer {
             for (selected) |*u| u.deinit(self.allocator);
             self.allocator.free(selected);
@@ -907,6 +931,58 @@ pub const RunarContract = struct {
                 multi_outputs_hex.items[0].script.len / 2
             else
                 0;
+
+            // C2: the deploy estimator is blind to the contract input(s) the call
+            // spends. Size the funding fee against the SAME serialized per-input
+            // bytes buildCallTransaction emits (built here as sizing-only unlocks,
+            // freed immediately — the real unlocks are rebuilt below). For a MERGE
+            // each covenant input embeds parent txs (tens of KB); ignoring them
+            // under-provisions funding and the covenant's [continuation][change]
+            // reconstruction then fails hashOutputs. Add a per-contract-input
+            // overhead of 2*fundingLockLen + 512 covering the codePart + preimage
+            // scriptCode + framing the real unlock carries but the placeholder omits.
+            // Over-estimating only pulls slightly more funding (bigger change) — safe.
+            const num_contract_inputs: usize = 1 + extra_contract_utxos.len;
+            const per_contract_input_overhead: i64 = 2 * @as(i64, @intCast(funding_lock_len)) + 512;
+            var contract_input_bytes: i64 = @as(i64, @intCast(num_contract_inputs)) * per_contract_input_overhead;
+            if (parent_stateful) {
+                const su = try self.buildStatefulUnlockScript(
+                    "00" ** 72, resolved_args, method_uses_code_part, change_pkh_hex,
+                    0, needs_new_amount, new_satoshis, "00" ** 181, method_selector_hex, witness_hex,
+                );
+                contract_input_bytes += contractInputSerializedBytes(su.len);
+                self.allocator.free(su);
+                for (extra_resolved_args) |earg| {
+                    const eu = try self.buildStatefulUnlockScript(
+                        "00" ** 72, earg, method_uses_code_part, change_pkh_hex,
+                        0, needs_new_amount, new_satoshis, "00" ** 181, method_selector_hex, witness_hex,
+                    );
+                    contract_input_bytes += contractInputSerializedBytes(eu.len);
+                    self.allocator.free(eu);
+                }
+            } else {
+                const su = try self.buildUnlockingScript(method_name, resolved_args);
+                contract_input_bytes += contractInputSerializedBytes(su.len);
+                self.allocator.free(su);
+            }
+
+            // C15: size against ALL outputs, not just the single continuation the
+            // estimator counts. Sum the framing (8 + varint + scriptLen) of every
+            // contract output (multi-output + raw, source order, finding G1) and
+            // every data output, then subtract the one output the estimator already
+            // covers (funding_lock_len). Clamp >= 0; single-output calls net 0.
+            var total_output_framing: i64 = 0;
+            if (has_multi_output) {
+                for (multi_outputs_hex.items) |co| total_output_framing += outputFramingBytes(co.script.len / 2);
+            } else if (has_raw_ordered) {
+                for (raw_ordered_hex.items) |co| total_output_framing += outputFramingBytes(co.script.len / 2);
+            } else if (new_locking_script.len > 0) {
+                total_output_framing += outputFramingBytes(new_locking_script.len / 2);
+            }
+            for (data_outputs_hex.items) |do_| total_output_framing += outputFramingBytes(do_.script.len / 2);
+            var extra_output_bytes: i64 = total_output_framing - outputFramingBytes(funding_lock_len);
+            if (extra_output_bytes < 0) extra_output_bytes = 0;
+
             try self.selectCallFunding(
                 &additional_utxos,
                 is_terminal_call,
@@ -914,6 +990,8 @@ pub const RunarContract = struct {
                 contract_input_sats,
                 funding_lock_len,
                 fee_rate,
+                contract_input_bytes,
+                extra_output_bytes,
                 if (options) |o| o.max_funding_inputs else null,
             );
         }
@@ -1581,9 +1659,17 @@ pub const RunarContract = struct {
             }
         }
 
+        // ---- Build placeholder unlock (sized into funding fee below) -----
+        const placeholder_unlock = try self.buildUnlockingScript(method_name, resolved_args);
+        defer self.allocator.free(placeholder_unlock);
+
         // Issue #133: coin-select funding instead of sweeping the wallet. A
         // stateless prepare has no continuation output (build is called with no
-        // new locking script), so contract_output_sats is 0.
+        // new locking script), so contract_output_sats is 0 and there are no
+        // extra outputs (C15 = 0). C2: still size the fee against the single
+        // contract input's unlock bytes the deploy estimator ignores.
+        const contract_input_bytes: i64 =
+            contractInputSerializedBytes(placeholder_unlock.len) + 512;
         try self.selectCallFunding(
             &additional_utxos,
             is_terminal_call,
@@ -1591,12 +1677,10 @@ pub const RunarContract = struct {
             contract_utxo.satoshis,
             0,
             fee_rate,
+            contract_input_bytes,
+            0,
             if (options) |o| o.max_funding_inputs else null,
         );
-
-        // ---- Build placeholder unlock + tx ------------------------------
-        const placeholder_unlock = try self.buildUnlockingScript(method_name, resolved_args);
-        defer self.allocator.free(placeholder_unlock);
 
         const stateless_build_opts: call_mod.CallBuildOptions = .{
             .contract_outputs = terminal_outputs,
@@ -1878,18 +1962,9 @@ pub const RunarContract = struct {
         const stateful_build_opts_ptr: ?*const call_mod.CallBuildOptions =
             if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateful_build_opts else null;
 
-        // Issue #133: coin-select funding instead of sweeping the wallet. The
-        // continuation output value (stateful_new_satoshis) is the only output
-        // this prepare path emits before change; no data/multi outputs here.
-        try self.selectCallFunding(
-            &additional_utxos,
-            is_terminal_call,
-            stateful_new_satoshis,
-            contract_utxo.satoshis,
-            if (new_locking_script.len > 0) new_locking_script.len / 2 else 0,
-            fee_rate,
-            if (options) |o| o.max_funding_inputs else null,
-        );
+        // (Issue #133 funding coin-selection runs AFTER the placeholder unlock is
+        // built, below, so finding C2 can size the fee against that input's real
+        // unlock bytes.)
 
         // ---- Compute change PKH for stateful methods needing it ----------
         var change_pkh_buf: []u8 = &.{};
@@ -1934,6 +2009,30 @@ pub const RunarContract = struct {
             witness_hex,
         );
         defer self.allocator.free(placeholder_unlock);
+
+        // Issue #133: coin-select funding instead of sweeping the wallet. The
+        // continuation output value (stateful_new_satoshis) is the only output
+        // this prepare path emits before change; no data/multi outputs, so C15
+        // extra_output_bytes nets 0. C2: size the fee against the contract input's
+        // real unlock bytes (codePart + args + preimage) the deploy estimator is
+        // blind to, plus the 2*fundingLockLen + 512 per-input overhead.
+        {
+            const funding_lock_len: usize = if (new_locking_script.len > 0) new_locking_script.len / 2 else 0;
+            const contract_input_bytes: i64 =
+                contractInputSerializedBytes(placeholder_unlock.len) +
+                2 * @as(i64, @intCast(funding_lock_len)) + 512;
+            try self.selectCallFunding(
+                &additional_utxos,
+                is_terminal_call,
+                stateful_new_satoshis,
+                contract_utxo.satoshis,
+                funding_lock_len,
+                fee_rate,
+                contract_input_bytes,
+                0,
+                if (options) |o| o.max_funding_inputs else null,
+            );
+        }
 
         var call_result = call_mod.buildCallTransaction(
             self.allocator, contract_utxo, placeholder_unlock,
@@ -2092,6 +2191,13 @@ pub const RunarContract = struct {
         contract_input_sats: i64,
         funding_lock_len: usize,
         fee_rate: i64,
+        // finding C2: serialized bytes of the contract/covenant input(s) the tx
+        // spends (blind to the deploy estimator). finding C15: framing of every
+        // output beyond the single continuation the estimator counts. Both keep
+        // the fee — and therefore how much funding gets selected — from being
+        // under-provisioned on the call path. Deploy passes 0.
+        extra_input_bytes: i64,
+        extra_output_bytes: i64,
         max_funding_inputs: ?usize,
     ) !void {
         if (is_terminal_call or additional_utxos.items.len == 0) return;
@@ -2105,6 +2211,8 @@ pub const RunarContract = struct {
             funding_target,
             funding_lock_len,
             fee_rate,
+            extra_input_bytes,
+            extra_output_bytes,
         );
         defer {
             for (selected) |*u| u.deinit(self.allocator);
@@ -3958,7 +4066,7 @@ test "selectCallFunding trims the wallet sweep to the minimal subset (#133)" {
         var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
         defer au.deinit(allocator);
         for (cands) |c| try au.append(allocator, c);
-        try contract.selectCallFunding(&au, false, 0, 0, 25, 100, null);
+        try contract.selectCallFunding(&au, false, 0, 0, 25, 100, 0, 0, null);
         try std.testing.expectEqual(@as(usize, 1), au.items.len);
         try std.testing.expectEqual(@as(i64, 10000), au.items[0].satoshis);
     }
@@ -3968,7 +4076,7 @@ test "selectCallFunding trims the wallet sweep to the minimal subset (#133)" {
         var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
         defer au.deinit(allocator);
         for (cands) |c| try au.append(allocator, c);
-        try contract.selectCallFunding(&au, true, 0, 0, 25, 100, null);
+        try contract.selectCallFunding(&au, true, 0, 0, 25, 100, 0, 0, null);
         try std.testing.expectEqual(@as(usize, 5), au.items.len);
     }
 
@@ -3980,7 +4088,7 @@ test "selectCallFunding trims the wallet sweep to the minimal subset (#133)" {
         for (cands) |c| try au.append(allocator, c);
         try std.testing.expectError(
             ContractError.InsufficientFunds,
-            contract.selectCallFunding(&au, false, 5000, 0, 25, 100, 0),
+            contract.selectCallFunding(&au, false, 5000, 0, 25, 100, 0, 0, 0),
         );
     }
 }

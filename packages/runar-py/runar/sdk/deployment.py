@@ -75,8 +75,18 @@ def select_utxos(
     target_satoshis: int,
     locking_script_byte_len: int,
     fee_rate: int = 100,
+    extra_input_bytes: int = 0,
+    extra_output_bytes: int = 0,
 ) -> list[Utxo]:
-    """Select the minimum set of UTXOs using largest-first strategy."""
+    """Select the minimum set of UTXOs using largest-first strategy.
+
+    ``extra_input_bytes`` carries the serialized size of any non-P2PKH inputs
+    the same tx spends (the contract/covenant input, finding C2); and
+    ``extra_output_bytes`` carries the framing of any outputs beyond the single
+    continuation (multi-output / raw / data outputs, finding C15). Both keep the
+    fee — and therefore how much funding is selected — from being
+    under-provisioned. Deploy callers pass nothing (defaults 0), unchanged.
+    """
     sorted_utxos = sorted(utxos, key=lambda u: u.satoshis, reverse=True)
     selected: list[Utxo] = []
     total = 0
@@ -84,7 +94,10 @@ def select_utxos(
     for utxo in sorted_utxos:
         selected.append(utxo)
         total += utxo.satoshis
-        fee = estimate_deploy_fee(len(selected), locking_script_byte_len, fee_rate)
+        fee = estimate_deploy_fee(
+            len(selected), locking_script_byte_len, fee_rate,
+            extra_input_bytes, extra_output_bytes,
+        )
         if total >= target_satoshis + fee:
             return selected
 
@@ -95,13 +108,25 @@ def estimate_deploy_fee(
     num_inputs: int,
     locking_script_byte_len: int,
     fee_rate: int = 100,
+    extra_input_bytes: int = 0,
+    extra_output_bytes: int = 0,
 ) -> int:
-    """Estimate the fee for a deploy transaction. Fee rate is in sat/KB."""
+    """Estimate the fee for a deploy transaction. Fee rate is in sat/KB.
+
+    ``extra_input_bytes`` (finding C2) is the serialized byte size of any
+    NON-P2PKH inputs this fee must also cover (a contract/covenant input being
+    spent in the same tx — tens of KB for a MERGE that embeds both parent txs).
+    ``extra_output_bytes`` (finding C15) is the serialized framing (8 + varint +
+    scriptLen) of every output BEYOND the single ``locking_script_byte_len`` one
+    counted here — additional multi-outputs, raw outputs (finding G1), and data
+    outputs. Both default to 0, so pure-deploy and funding-only selection are
+    byte-for-byte unaffected.
+    """
     rate = max(1, fee_rate)
-    inputs_size = num_inputs * _P2PKH_INPUT_SIZE
+    inputs_size = num_inputs * _P2PKH_INPUT_SIZE + extra_input_bytes
     contract_output_size = 8 + _varint_byte_size(locking_script_byte_len) + locking_script_byte_len
     change_output_size = _P2PKH_OUTPUT_SIZE
-    tx_size = _TX_OVERHEAD + inputs_size + contract_output_size + change_output_size
+    tx_size = _TX_OVERHEAD + inputs_size + contract_output_size + extra_output_bytes + change_output_size
     return (tx_size * rate + 999) // 1000
 
 
