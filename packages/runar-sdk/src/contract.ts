@@ -711,7 +711,7 @@ export class RunarContract {
           sourceTXID: contractUtxo.txid,
           sourceOutputIndex: contractUtxo.outputIndex,
           unlockingScript: UnlockingScript.fromHex(unlock),
-          sequence: 0xffffffff,
+          sequence: options?.sequence ?? 0xffffffff,
         });
         for (const out of terminalOutputs) {
           ttx.addOutput({
@@ -1041,6 +1041,7 @@ export class RunarContract {
         // Thread CallOptions.locktime so contracts asserting
         // extractLocktime(preimage) can succeed. Default unset → 0.
         locktime: options?.locktime,
+        sequence: options?.sequence,
       },
     );
 
@@ -1143,6 +1144,7 @@ export class RunarContract {
           // Rebuild path must honor the override too: a preimage computed on a
           // rebuilt tx with locktime 0 would mismatch the final on-chain tx.
           locktime: options?.locktime,
+          sequence: options?.sequence,
         },
       ));
 

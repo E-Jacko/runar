@@ -43,6 +43,11 @@ export function buildCallTransaction(
      * Set to a non-zero value for contracts that assert
      * `extractLocktime(preimage) >= deadline` (e.g. auction close/claim). */
     locktime?: number;
+    /** Override every input's nSequence. Unset → 0xffffffff (final,
+     * legacy). Non-final (e.g. 0xfffffffe) makes consensus enforce
+     * nLockTime — required by contracts asserting a non-final
+     * `extractSequence(preimage)`. */
+    sequence?: number;
   },
 ): { tx: Transaction; inputCount: number; changeAmount: number } {
   const extraContractInputs = options?.additionalContractInputs ?? [];
@@ -95,13 +100,16 @@ export function buildCallTransaction(
   // Locktime: default 0 (legacy); overridable via options.locktime for
   // contracts asserting `extractLocktime(preimage) >= deadline`.
   tx.lockTime = options?.locktime ?? 0;
+  // Sequence: default final (legacy); non-final makes consensus enforce
+  // nLockTime and satisfies contracts asserting extractSequence non-final.
+  const sequence = options?.sequence ?? 0xffffffff;
 
   // Input 0: primary contract UTXO with unlocking script
   tx.addInput({
     sourceTXID: currentUtxo.txid,
     sourceOutputIndex: currentUtxo.outputIndex,
     unlockingScript: UnlockingScript.fromHex(unlockingScript),
-    sequence: 0xffffffff,
+    sequence,
   });
 
   // Additional contract inputs (with their own unlocking scripts)
@@ -110,7 +118,7 @@ export function buildCallTransaction(
       sourceTXID: ci.utxo.txid,
       sourceOutputIndex: ci.utxo.outputIndex,
       unlockingScript: UnlockingScript.fromHex(ci.unlockingScript),
-      sequence: 0xffffffff,
+      sequence,
     });
   }
 
@@ -121,7 +129,7 @@ export function buildCallTransaction(
         sourceTXID: utxo.txid,
         sourceOutputIndex: utxo.outputIndex,
         unlockingScript: new UnlockingScript(),
-        sequence: 0xffffffff,
+        sequence,
       });
     }
   }

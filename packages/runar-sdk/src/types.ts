@@ -173,6 +173,16 @@ export interface CallOptions {
   locktime?: number;
 
   /**
+   * Override the nSequence of every input on the call tx. Defaults to unset
+   * → 0xffffffff (final, legacy). Consensus only enforces nLockTime when at
+   * least one input is NON-final, so contracts that assert
+   * `extractSequence(preimage)` non-final (locktime-window enforcement) need
+   * e.g. 0xfffffffe here. Threaded through the non-terminal and terminal
+   * call-tx build sites alongside `locktime`.
+   */
+  sequence?: number;
+
+  /**
    * Cap the number of P2PKH funding inputs added to a non-terminal call tx
    * (issue #133). Funding is chosen by smallest-sufficient, largest-first
    * selection (the same `selectUtxos` strategy deploy uses). If covering the
