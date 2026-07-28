@@ -200,14 +200,23 @@ class TestPushDataRoundTrip:
 
 # ---------------------------------------------------------------------------
 # MINIMALDATA-correct single-byte push encoding (SCRIPT_VERIFY_MINIMALDATA).
-# A 1-byte payload in {0x00, 0x01..0x10, 0x81} must use the minimal opcode
-# (OP_0 / OP_1..OP_16 / OP_1NEGATE), not a direct push "01 NN". Byte-identical
+# A 1-byte payload in {0x01..0x10, 0x81} must use the minimal opcode
+# (OP_1..OP_16 / OP_1NEGATE), not a direct push "01 NN". Byte-identical
 # with the other six SDKs.
+#
+# 0x00 is deliberately EXCLUDED from that set (C9 / S1): OP_0 pushes the EMPTY
+# byte array, not a 1-byte 0x00, so the minimal encoding of a 1-byte 0x00
+# payload is the direct push "01 00" — exactly what the compiler's
+# `encodePushBytesHex` (packages/runar-compiler/src/passes/push-encoding.ts)
+# emits. The SDK previously special-cased 0x00 -> OP_0, which is not the
+# inverse of any decoder (a real OP_0 decodes to the empty string, not "00")
+# and diverges from the compiler's own byte-for-byte encoding.
 # ---------------------------------------------------------------------------
 
 class TestPushDataMinimalData:
-    def test_op_0(self):
-        assert encode_push_data('00') == '00'
+    def test_single_zero_byte_is_direct_push_not_op_0(self):
+        # NOT '00' (OP_0) — OP_0 pushes [], not [0x00].
+        assert encode_push_data('00') == '0100'
 
     def test_op_1negate(self):
         assert encode_push_data('81') == '4f'

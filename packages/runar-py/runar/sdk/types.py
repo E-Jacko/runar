@@ -277,7 +277,9 @@ class CallOptions:
 class PreparedCall:
     """Result of prepare_call() -- contains everything needed for external signing and finalize_call()."""
     # Public -- callers use these to coordinate external signing
-    sighash: str = ''           # 64-char hex -- BIP-143 hash external signers sign
+    # 64-char hex -- hash256(preimage) = sha256(sha256(preimage)), the BIP-143
+    # digest external signers ECDSA-sign DIRECTLY (no further hashing).
+    sighash: str = ''
     preimage: str = ''          # hex -- full BIP-143 preimage
     op_push_tx_sig: str = ''    # hex -- OP_PUSH_TX DER sig (empty if not needed)
     tx_hex: str = ''            # hex -- built TX (P2PKH funding signed, primary input uses placeholder sigs)

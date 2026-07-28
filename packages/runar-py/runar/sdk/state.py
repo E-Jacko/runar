@@ -258,11 +258,16 @@ def encode_push_data(data_hex: str) -> str:
     """Wrap hex data in a Bitcoin Script push data opcode.
 
     Applies BSV consensus rule ``SCRIPT_VERIFY_MINIMALDATA`` for single-byte
-    pushes: a 1-byte payload whose value is in ``{0x00, 0x01..=0x10, 0x81}``
-    MUST use the corresponding minimal opcode (``OP_0`` / ``OP_1..OP_16`` /
-    ``OP_1NEGATE``) rather than the direct push ``01 NN``. Non-minimal direct
-    pushes are rejected at the relay layer with
+    pushes: a 1-byte payload whose value is in ``{0x01..=0x10, 0x81}`` MUST use
+    the corresponding minimal opcode (``OP_1..OP_16`` / ``OP_1NEGATE``) rather
+    than the direct push ``01 NN``. Non-minimal direct pushes are rejected at
+    the relay layer with
     ``non-mandatory-script-verify-flag (Data push larger than necessary)``.
+
+    NOTE: 0x00 is deliberately NOT in that set. ``OP_0`` pushes the EMPTY byte
+    array, not a 1-byte ``0x00`` — so the minimal encoding of a 1-byte ``0x00``
+    payload is the direct push ``01 00`` (matching the compiler's
+    ``encodePushBytesHex`` in push-encoding.ts), not ``OP_0`` (C9 / S1).
     """
     data_len = len(data_hex) // 2
 
@@ -273,8 +278,6 @@ def encode_push_data(data_hex: str) -> str:
     # a relay-rejected non-minimal direct push.
     if data_len == 1:
         byte = int(data_hex, 16)
-        if byte == 0x00:
-            return '00'  # OP_0
         if 0x01 <= byte <= 0x10:
             return f'{0x50 + byte:02x}'  # OP_1..OP_16
         if byte == 0x81:
@@ -294,13 +297,27 @@ def decode_push_data(hex_str: str, offset: int) -> tuple[str, int]:
     """Decode a Bitcoin Script push data at the given hex offset.
 
     Returns (data_hex, hex_chars_consumed).
+
+    Inverse of ``encode_push_data``'s MINIMALDATA short-circuit:
+    ``OP_1..OP_16`` (0x51..0x60) and ``OP_1NEGATE`` (0x4f) each push a single
+    byte with no separate data bytes in the script — the opcode itself encodes
+    the value (C9). ``OP_0`` (0x00) falls through to the ``opcode <= 75``
+    branch below and correctly decodes as the empty byte array (0-length
+    push), since the encoder no longer emits OP_0 for a 1-byte ``0x00``
+    payload.
     """
     if offset >= len(hex_str):
         return '', 0
 
     opcode = int(hex_str[offset:offset + 2], 16)
 
-    if opcode <= 75:
+    if 0x51 <= opcode <= 0x60:
+        # OP_1..OP_16
+        return f'{opcode - 0x50:02x}', 2
+    elif opcode == 0x4F:
+        # OP_1NEGATE
+        return '81', 2
+    elif opcode <= 75:
         data_len = opcode * 2
         return hex_str[offset + 2:offset + 2 + data_len], 2 + data_len
     elif opcode == 0x4C:

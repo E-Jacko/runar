@@ -376,7 +376,9 @@ prepared = contract.prepare_call(
     provider=provider, signer=signer,
 )
 
-# `prepared.sighash` is the 32-byte digest the external signer must sign.
+# `prepared.sighash` is the 32-byte BIP-143 digest the external signer must sign:
+# hash256(preimage) = sha256(sha256(preimage)), ECDSA-signed DIRECTLY with no
+# further hashing (the same message the on-chain OP_CHECKSIG verifies).
 # `prepared.tx_hex` is the built transaction (P2PKH funding inputs already signed).
 # `prepared.sig_indices` lists which arg positions need external Sig values.
 

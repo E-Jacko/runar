@@ -87,6 +87,18 @@ def _interpret_script_element(opcode: int, data_hex: str, field_type: str) -> ob
             return True
         return data_hex != '00'
     else:
+        # S1: a ByteString (or other non-numeric) ctor arg whose 1-byte value
+        # was MINIMALDATA-encoded as OP_1..OP_16 / OP_1NEGATE carries no
+        # separate data bytes in the script — ``_read_script_element`` reports
+        # an empty ``data_hex`` for these opcodes (they aren't direct pushes or
+        # OP_PUSHDATA*). The opcode itself IS the value; reconstruct it instead
+        # of forwarding the (empty) data_hex. OP_0 correctly falls through to
+        # ``data_hex`` (the empty string), matching OP_0's true semantics
+        # (pushes ``[]``, not a 1-byte ``0x00``).
+        if 0x51 <= opcode <= 0x60:
+            return f'{opcode - 0x50:02x}'
+        if opcode == 0x4F:
+            return '81'
         return data_hex
 
 

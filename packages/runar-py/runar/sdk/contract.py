@@ -62,6 +62,61 @@ def is_empty_sig(value: object) -> bool:
     return isinstance(value, _EmptySig)
 
 
+#: The well-known ByteString parameter the SDK fills in with the transaction's
+#: concatenated outpoints (36 bytes per input) once the input list has
+#: converged. It is the ONLY ByteString slot for which a ``None`` call arg is a
+#: request rather than a mistake.
+AUTO_PREVOUTS_PARAM_NAME = 'allPrevouts'
+
+
+def _is_auto_prevouts_param(param) -> bool:
+    """Is a ``None`` arg for ``param`` the SDK's auto-compute sentinel?
+
+    Mirrors the Zig SDK's name gate (``sdk_contract.zig``): ``None`` for any
+    other ByteString param is a caller error, not a stub request.
+    """
+    return param.name == AUTO_PREVOUTS_PARAM_NAME
+
+
+def _nil_non_sig_arg_error(where: str, param, index: int) -> ValueError:
+    """Build the build-time error for a ``None`` arg with no auto-resolution rule.
+
+    Silently substituting the allPrevouts stub here produces a transaction that
+    broadcasts and then fails at script execution with an opaque error; failing
+    at build time names the offending parameter instead.
+    """
+    return ValueError(
+        f'{where}: None arg for {param.type} param {param.name!r} (index {index}): '
+        'None is only auto-resolved for Sig (auto-signed), PubKey (taken from the '
+        'signer), SigHashPreimage, and the '
+        f'{AUTO_PREVOUTS_PARAM_NAME!r} outpoint slot. Pass an explicit value '
+        "(hex string, or '' for an empty ByteString)"
+    )
+
+
+def _compute_bip143_sighash(preimage_hex: str) -> str:
+    """Compute the BIP-143 sighash digest -- ``hash256(preimage)``, i.e.
+    ``sha256(sha256(preimage))`` -- that is ACTUALLY ECDSA-signed by
+    ``OP_CHECKSIG`` on-chain. Returns ``''`` for an empty preimage.
+
+    Deep-review finding C19: ``PreparedCall.sighash`` previously stored only
+    ``sha256(preimage)`` (a SINGLE hash). The default ``call()`` path never
+    reads that field -- it re-derives the digest inside ``LocalSigner.sign``
+    (``_bip143_sighash`` -> ``_sha256d`` -> ``ecdsa_sign``) -- so the bug stayed
+    invisible there. But the documented multi-signer path hands
+    ``PreparedCall.sighash`` to an EXTERNAL signer (a BRC-100-style
+    ``WalletSigner.sign_hash(digest)`` wallet / hardware device) that
+    ECDSA-signs those 32 bytes DIRECTLY with no further hashing. Handed the
+    single-hashed value, such a signer signs the wrong message and the node's
+    real ``OP_CHECKSIG`` rejects the spend. Mirrors ``computeBip143Sighash`` in
+    ``packages/runar-sdk/src/contract.ts``.
+    """
+    if not preimage_hex:
+        return ''
+    preimage_bytes = bytes.fromhex(preimage_hex)
+    return hashlib.sha256(hashlib.sha256(preimage_bytes).digest()).hexdigest()
+
+
 class RunarContract:
     """Runtime wrapper for a compiled Runar contract.
 
@@ -521,6 +576,8 @@ class RunarContract:
                 # Placeholder preimage (will be replaced after tx construction)
                 resolved_args[i] = '00' * 181
             elif param.type == 'ByteString' and args[i] is None:
+                if not _is_auto_prevouts_param(param):
+                    raise _nil_non_sig_arg_error('RunarContract.prepare_call', param, i)
                 prevouts_indices.append(i)
                 # Placeholder: 36 bytes per estimated input
                 resolved_args[i] = '00' * (36 * estimated_inputs)
@@ -810,6 +867,9 @@ class RunarContract:
                     elif param.type == 'PubKey' and resolved[i] is None:
                         resolved[i] = signer.get_public_key()
                     elif param.type == 'ByteString' and resolved[i] is None:
+                        if not _is_auto_prevouts_param(param):
+                            raise _nil_non_sig_arg_error(
+                                'RunarContract.prepare_call (additional contract input)', param, i)
                         resolved[i] = '00' * (36 * estimated_inputs)
                 resolved_per_input_args.append(resolved)
 
@@ -1117,10 +1177,9 @@ class RunarContract:
             if not final_preimage and needs_op_push_tx:
                 final_preimage = resolved_args[preimage_index]
 
-        # Compute sighash from preimage
-        sighash = ''
-        if final_preimage:
-            sighash = hashlib.sha256(bytes.fromhex(final_preimage)).hexdigest()
+        # Compute sighash from preimage (C19: the true BIP-143 digest external
+        # signers must sign -- hash256(preimage), NOT sha256(preimage)).
+        sighash = _compute_bip143_sighash(final_preimage)
 
         return PreparedCall(
             sighash=sighash,
@@ -1578,10 +1637,9 @@ class RunarContract:
             fee_unlock = encode_push_data(fee_sig) + encode_push_data(fee_pub_key)
             term_tx = insert_unlocking_script(term_tx, fee_input_idx, fee_unlock)
 
-        # Compute sighash from preimage
-        sighash = ''
-        if final_preimage:
-            sighash = hashlib.sha256(bytes.fromhex(final_preimage)).hexdigest()
+        # Compute sighash from preimage (C19: the true BIP-143 digest external
+        # signers must sign -- hash256(preimage), NOT sha256(preimage)).
+        sighash = _compute_bip143_sighash(final_preimage)
 
         return PreparedCall(
             sighash=sighash,
