@@ -87,19 +87,32 @@ about the current pipeline. The two legitimate responses (re-derive via
 reviewed re-attest that bumps `modelFingerprintAdopted` and stays
 `.inherited`) are documented in the file header.
 
-Of the 8 live anchors, **6 are `.regenLive`** — sharded live regens on
+All **8 live anchors are `.regenLive`** — sharded live regens on
 2026-07-28 re-derived `babybear`, `babybear-ext4`, `merkle-proof`,
-`p256-primitives`, `p384-primitives` and `state-covenant` at the recorded
-fingerprint and each came back `[fresh]` in under a second (the header's
-"multi-hour regen" warning applies to the SLH-DSA / EC fixtures, not
-these). The remaining **2 stay `.inherited`**: live `compileHex` aborts
-with a Lean stack overflow (SIGABRT, exit 134) on `p256-wallet` and
-`p384-wallet`, so they cannot be re-derived at all today. Their
-constants still byte-match the golden and still count, but the
-`.inherited` tier is printed on every run rather than overclaiming them
-— and it flags a real hole in the anti-paste backstop, since an
-unsharded regen sweep dies on exactly those two fixtures. Fixing the
-overflow is separate work.
+`p256-primitives`, `p256-wallet`, `p384-primitives`, `p384-wallet` and
+`state-covenant` at the recorded fingerprint, and each came back
+`[fresh]` with its live hex byte-exact against `expected-script.hex`
+(slowest: 650 ms — the header's "multi-hour regen" warning applies to
+the SLH-DSA / EC fixtures, not these). No live anchor rests on an
+`.inherited` re-attest, so the run prints `8 regen-live, 0 inherited,
+12 inert`.
+
+`p256-wallet` and `p384-wallet` reached that tier only after a fix.
+Until 2026-07-28 live `compileHex` ABORTED THE PROCESS on both (SIGABRT,
+exit 134, "Stack overflow detected"), which meant the anti-paste regen
+backstop died on exactly the two anchors a paste could hide behind.
+`Stack/Peephole.lean`'s Phase 7.1 `applyPushOneAdd` / `applyPushOneSub`
+rules, plus the `postFoldList` and `applyRollPickFold` traversals, never
+got the tail-recursive runtime twins the other 19 peephole rules carry,
+so `peepholePostFold` recursed once per op. Both wallets are
+single-public-method contracts whose entire ~1.9 MB / ~3.9 MB script
+lives in ONE op list, which overran the 8 MB main-thread stack; the
+`*-primitives` fixtures emit the same total volume split across three
+method bodies and stayed under it. The recursion was deep-but-finite
+rather than wrong — at `ulimit -s 65520` both already compiled in under
+a second to byte-identical output — so the fix was the missing `.tr`
+twins, not a larger stack. The re-derived bytes matched the stored
+constants exactly: the constants had been honest all along.
 
 `pipelineConformance` is the formal-evidence gate. It reports
 **0/63 VERIFIED-direct** and **63/63 VERIFIED-modulo-codegen-axioms**

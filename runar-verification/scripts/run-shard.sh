@@ -79,7 +79,14 @@ cd "$root_dir"
 # (e.g. SLH-DSA's hypertree recursion), and the default 8MB limit
 # overflows on some fixtures. Best-effort — `ulimit` may be a no-op
 # in restricted shells (e.g. CI containers) but never fatal.
-ulimit -s unlimited 2>/dev/null || ulimit -s 65536 2>/dev/null || true
+#
+# The fallback is the shell's own HARD limit, not a literal: on macOS
+# `ulimit -s unlimited` fails AND the old literal `65536` exceeded the
+# 65520 KiB hard limit, so both legs failed and the "best-effort bump"
+# was a silent no-op on every macOS dev machine.
+ulimit -s unlimited 2>/dev/null \
+  || ulimit -s "$(ulimit -Hs)" 2>/dev/null \
+  || true
 
 echo "==> run-shard.sh: building pipelineGolden exe"
 lake build pipelineGolden

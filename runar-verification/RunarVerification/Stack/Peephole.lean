@@ -8436,6 +8436,40 @@ private def applyCheckMultiSigVerifyFuse.tr.go : List StackOp → List StackOp �
 
 attribute [implemented_by applyCheckMultiSigVerifyFuse.tr] applyCheckMultiSigVerifyFuse
 
+/-! The Phase 7.1 `[push N, OP_1ADD]` / `[push N, OP_1SUB]` consolidation
+rules were added after the block above and never got their TR twins, so
+`peepholePostFold` still ran the structural recursion at runtime. That is
+what aborted the process (SIGABRT / exit 134, "Stack overflow detected")
+on the `p256-wallet` and `p384-wallet` fixtures: a single-public-method
+contract puts its whole ~1.9 MB / ~3.9 MB script in ONE op list, so the
+`op :: applyPushOneAdd rest` frames (80 bytes each) exceed the 8 MB main
+thread stack past ~105K ops. The multi-method `p256-primitives` /
+`p384-primitives` fixtures emit the same total volume split across three
+method bodies and stayed under the limit, which is why only the wallets
+crashed. -/
+
+private def applyPushOneAdd.tr.go : List StackOp → List StackOp → List StackOp
+  | [], acc => acc.reverse
+  | .push (.bigint a) :: .opcode "OP_1ADD" :: rest, acc =>
+      applyPushOneAdd.tr.go rest (.push (.bigint (a + 1)) :: acc)
+  | op :: rest, acc => applyPushOneAdd.tr.go rest (op :: acc)
+
+@[inline] private def applyPushOneAdd.tr (ops : List StackOp) : List StackOp :=
+  applyPushOneAdd.tr.go ops []
+
+attribute [implemented_by applyPushOneAdd.tr] applyPushOneAdd
+
+private def applyPushOneSub.tr.go : List StackOp → List StackOp → List StackOp
+  | [], acc => acc.reverse
+  | .push (.bigint a) :: .opcode "OP_1SUB" :: rest, acc =>
+      applyPushOneSub.tr.go rest (.push (.bigint (a - 1)) :: acc)
+  | op :: rest, acc => applyPushOneSub.tr.go rest (op :: acc)
+
+@[inline] private def applyPushOneSub.tr (ops : List StackOp) : List StackOp :=
+  applyPushOneSub.tr.go ops []
+
+attribute [implemented_by applyPushOneSub.tr] applyPushOneSub
+
 /-! ## End of tail-recursive runtime implementations. -/
 
 /-- All 19 proven peephole rules applied in TS-reference order.
@@ -8600,6 +8634,25 @@ private def postFoldList : List StackOp → List StackOp
   | op :: rest => postFoldOp op :: postFoldList rest
 
 end
+
+/-- Tail-recursive runtime twin of `postFoldList` (same rationale as the
+`apply*.tr` block above — the structural definition keeps its `.eq_*` /
+`.induct` lemmas for `postFoldList_eq_of_noIfOp` and friends, while the
+compiled code walks the list with a constant-depth accumulator).
+`postFoldList` is the outermost traversal of `peepholePostFold`, so its
+48-byte frames overflow the same 8 MB stack that `applyPushOneAdd`'s
+80-byte frames did — just ~1.6x further out (past ~175K ops), which is
+why `p256-wallet` happened to die in `applyPushOneAdd` first. Fixing only
+`applyPushOneAdd` would have moved the abort here for `p384-wallet`,
+whose single method body is roughly twice as long. -/
+private def postFoldList.tr.go : List StackOp → List StackOp → List StackOp
+  | [], acc => acc.reverse
+  | op :: rest, acc => postFoldList.tr.go rest (postFoldOp op :: acc)
+
+@[inline] private def postFoldList.tr (ops : List StackOp) : List StackOp :=
+  postFoldList.tr.go ops []
+
+attribute [implemented_by postFoldList.tr] postFoldList
 
 /-- Apply the Phase 7.1 push+1ADD / push+1SUB consolidation pass
 to `ops`, including recursive descent into `.ifOp` branches. -/
@@ -9137,6 +9190,21 @@ defensive against future additions. -/
 private def applyRollPickFold : List StackOp → List StackOp
   | []          => []
   | op :: rest  => rollPickRewriteOne op ++ applyRollPickFold rest
+
+/-- Tail-recursive runtime twin of `applyRollPickFold` (same rationale as
+the `apply*.tr` block above). `reverseAux` prepends each rewrite's output
+in reverse, so the final `acc.reverse` restores the original order for
+rewrites of any length — not just the 0-or-1-element outputs
+`rollPickRewriteOne` produces today. -/
+private def applyRollPickFold.tr.go : List StackOp → List StackOp → List StackOp
+  | [],         acc => acc.reverse
+  | op :: rest, acc =>
+      applyRollPickFold.tr.go rest ((rollPickRewriteOne op).reverseAux acc)
+
+@[inline] private def applyRollPickFold.tr (ops : List StackOp) : List StackOp :=
+  applyRollPickFold.tr.go ops []
+
+attribute [implemented_by applyRollPickFold.tr] applyRollPickFold
 
 /-- Outer driver for `applyRollPickFold`. Since `applyRollPickFold` is
 idempotent (its outputs `[]`, `[.swap]`, `[.rot]`, `[.dup]`, `[.over]`
