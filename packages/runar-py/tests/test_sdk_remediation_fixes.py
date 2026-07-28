@@ -1,4 +1,4 @@
-"""Python-tier ports of the SDK remediation fixes (#118, #119, #131, #133, #134).
+"""Python-tier ports of the SDK remediation fixes (#118, #119, #131, #133, #134, #143, #144).
 
 Mirrors the TypeScript reference tests:
   packages/runar-sdk/src/__tests__/issue-118-terminal-fee.test.ts
@@ -12,12 +12,13 @@ import struct
 import pytest
 
 from runar.sdk.calling import build_call_transaction, resolve_input_sequence
-from runar.sdk.script_utils import restore_constructor_args
+from runar.sdk.deployment import estimate_deploy_fee, select_utxos
+from runar.sdk.script_utils import extract_constructor_args, restore_constructor_args
 from runar.sdk.contract import RunarContract
 from runar.sdk.provider import MockProvider
 from runar.sdk.signer import MockSigner
 from runar.sdk.types import (
-    RunarArtifact, Abi, AbiParam, AbiMethod, Utxo,
+    RunarArtifact, Abi, AbiParam, AbiMethod, StateField, Utxo,
     DeployOptions, CallOptions, TerminalOutput, ConstructorSlot,
 )
 
@@ -160,6 +161,58 @@ class TestIssue119RestoreArgs:
 
 
 # ---------------------------------------------------------------------------
+# #143 — repeated constructor slot references must still shift later offsets
+# ---------------------------------------------------------------------------
+
+class TestIssue143RepeatedSlotReferences:
+    """A param referenced N times in the contract body emits N constructor
+    slots. Every occurrence's encoded width shifts the offsets of everything
+    after it, so the extractor must account for ALL occurrences -- not just the
+    first per param. Regression for a bug where slots were deduplicated by
+    param_index BEFORE the offset walk, mis-reading every later slot whenever
+    an earlier repeated value encoded wider than its 1-byte template
+    placeholder.
+
+    Template: ab <00> 7c <00> 7c <00> ac
+      offset 1: alpha (param_index 0)
+      offset 3: alpha again (param_index 0 -- second reference)
+      offset 5: beta  (param_index 1)
+    """
+
+    ARTIFACT = RunarArtifact(
+        contract_name='Repeated',
+        abi=Abi(constructor_params=[
+            AbiParam(name='alpha', type='bigint'),
+            AbiParam(name='beta', type='bigint'),
+        ]),
+        script='ab' + '00' + '7c' + '00' + '7c' + '00' + 'ac',
+        constructor_slots=[
+            ConstructorSlot(param_index=0, byte_offset=1),
+            ConstructorSlot(param_index=0, byte_offset=3),
+            ConstructorSlot(param_index=1, byte_offset=5),
+        ],
+    )
+
+    def test_reads_slots_after_a_repeated_wide_value_at_correct_offsets(self):
+        # alpha = 500 -> scriptnum push `02f401` (3 bytes), beta = 7 -> OP_7.
+        resolved = 'ab' + '02f401' + '7c' + '02f401' + '7c' + '57' + 'ac'
+        args = extract_constructor_args(self.ARTIFACT, resolved)
+        assert args['alpha'] == 500
+        # Before the fix, the second alpha occurrence's +2 byte shift was
+        # dropped, so beta was read from inside the second alpha push and
+        # decoded as 124 instead of 7.
+        assert args['beta'] == 7
+        assert restore_constructor_args(self.ARTIFACT, resolved) == [500, 7]
+
+    def test_still_extracts_when_repeated_value_fits_placeholder_width(self):
+        # alpha = 5 -> OP_5 (1 byte, same width as the placeholder: zero shift).
+        resolved = 'ab' + '55' + '7c' + '55' + '7c' + '57' + 'ac'
+        args = extract_constructor_args(self.ARTIFACT, resolved)
+        assert args['alpha'] == 5
+        assert args['beta'] == 7
+
+
+# ---------------------------------------------------------------------------
 # Contract-level harness for #118 / #133 / #134
 # ---------------------------------------------------------------------------
 
@@ -285,3 +338,23 @@ class TestIssue134FundingSigner:
         contract, provider = _deploy(50_000, [_make_utxo(200_000)], signer)
         prepared = contract.prepare_call('cancel', [], provider, signer, CallOptions())
         assert '02' + 'dd' * 32 in prepared.tx_hex
+
+
+# ---------------------------------------------------------------------------
+# #144 — call-funding must size the contract/covenant input(s) it spends
+# ---------------------------------------------------------------------------
+
+def _merge_artifact() -> RunarArtifact:
+    """Stateful covenant whose `merge` method takes a large ByteString arg —
+    the shape of a real MERGE, where each covenant input embeds a parent tx."""
+    return RunarArtifact(
+        version='runar-v0.1.0',
+        contract_name='MergeCovenant',
+        parent_class='StatefulSmartContract',
+        abi=Abi(constructor_params=[], methods=[
+            AbiMethod(name='merge', params=[AbiParam(name='parentTx', type='ByteString')],
+                      is_public=True, uses_code_part=False),
+        ]),
+        script='51',
+        state_fields=[StateField(name='count', type='bigint', index=0)],
+    )

@@ -195,20 +195,29 @@ pub fn extract_constructor_args(
         }
     }
 
-    // Deduplicate and sort by byteOffset
-    let mut seen = std::collections::HashSet::new();
+    // Walk EVERY slot in byte order. A constructor param referenced more than
+    // once in the contract body emits one slot per reference, and each
+    // occurrence's encoded width contributes to the cumulative offset shift —
+    // deduplicating before the walk drops those widths and mis-aligns every
+    // later slot on artifacts with repeated references. The VALUE is taken
+    // from the first occurrence per param.
     let mut sorted_slots: Vec<_> = slots.iter().collect();
     sorted_slots.sort_by_key(|s| s.byte_offset);
-    sorted_slots.retain(|s| seen.insert(s.param_index));
 
     let mut result = HashMap::new();
+    let mut assigned = std::collections::HashSet::new();
     let mut cumulative_shift: isize = 0;
 
     for slot in &sorted_slots {
         let adjusted_hex_offset = ((slot.byte_offset as isize) + cumulative_shift) as usize * 2;
         let (data_hex, total_hex_chars, opcode) = read_script_element(&code_hex, adjusted_hex_offset);
+        // Template placeholders are exactly 1 byte, so the shift contributed by
+        // each occurrence is its encoded width minus that byte.
         cumulative_shift += (total_hex_chars as isize) / 2 - 1;
 
+        if !assigned.insert(slot.param_index) {
+            continue;
+        }
         if slot.param_index < artifact.abi.constructor.params.len() {
             let param = &artifact.abi.constructor.params[slot.param_index];
             let value = interpret_script_element(opcode, &data_hex, &param.param_type);
@@ -454,6 +463,60 @@ mod tests {
         let script = format!("21{}93", pubkey_hex); // PUSH(33 bytes)
         let result = extract_constructor_args(&artifact, &script).unwrap();
         assert_eq!(result["pk"], SdkValue::Bytes(pubkey_hex));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_constructor_args — repeated constructor-slot references
+    // -----------------------------------------------------------------------
+
+    /// A param referenced N times in the contract body emits N constructor
+    /// slots. Every occurrence's encoded width shifts the offsets of everything
+    /// after it, so the extractor must account for ALL occurrences — not just
+    /// the first per param. Regression for a bug where slots were deduplicated
+    /// by param_index BEFORE the offset walk, mis-reading every later slot
+    /// whenever an earlier repeated value encoded wider than its 1-byte
+    /// template placeholder.
+    ///
+    /// Template: ab <00> 7c <00> 7c <00> ac
+    ///   offset 1: alpha (param_index 0)
+    ///   offset 3: alpha again (param_index 0 — second reference)
+    ///   offset 5: beta  (param_index 1)
+    fn repeated_slot_artifact() -> RunarArtifact {
+        make_artifact(
+            "ab007c007c00ac",
+            vec![
+                AbiParam { name: "alpha".to_string(), param_type: "bigint".to_string(), fixed_array: None },
+                AbiParam { name: "beta".to_string(), param_type: "bigint".to_string(), fixed_array: None },
+            ],
+            vec![
+                ConstructorSlot { param_index: 0, byte_offset: 1 },
+                ConstructorSlot { param_index: 0, byte_offset: 3 },
+                ConstructorSlot { param_index: 1, byte_offset: 5 },
+            ],
+        )
+    }
+
+    #[test]
+    fn extract_args_reads_slots_after_repeated_wide_value() {
+        // alpha = 500 (scriptnum push `02f401`, 3 bytes), beta = 7 (OP_7, 1 byte)
+        let artifact = repeated_slot_artifact();
+        let resolved = "ab02f4017c02f4017c57ac";
+        let result = extract_constructor_args(&artifact, resolved).unwrap();
+        assert_eq!(result["alpha"], SdkValue::Int(500));
+        // Before the fix, the second alpha occurrence's +2 byte shift was
+        // dropped, so beta was read from inside the second alpha push and
+        // decoded as 124 instead of 7.
+        assert_eq!(result["beta"], SdkValue::Int(7));
+    }
+
+    #[test]
+    fn extract_args_repeated_value_fitting_placeholder_width() {
+        // alpha = 5 → OP_5 (1 byte, same width as the placeholder: zero shift).
+        let artifact = repeated_slot_artifact();
+        let resolved = "ab557c557c57ac";
+        let result = extract_constructor_args(&artifact, resolved).unwrap();
+        assert_eq!(result["alpha"], SdkValue::Int(5));
+        assert_eq!(result["beta"], SdkValue::Int(7));
     }
 
     // -----------------------------------------------------------------------

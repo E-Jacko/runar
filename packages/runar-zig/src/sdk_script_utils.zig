@@ -142,16 +142,12 @@ pub fn extractConstructorArgs(
         }
     }
 
-    // Sort slots by byte offset, deduplicate by param index
-    const Slot = struct { param_index: i32, byte_offset: i32 };
-    var slots: std.ArrayListUnmanaged(Slot) = .empty;
-    defer slots.deinit(allocator);
-
-    // First, collect all unique slots sorted by byte offset
-    var seen_params = std.AutoHashMap(i32, void).init(allocator);
-    defer seen_params.deinit();
-
-    // Build sorted index
+    // Walk EVERY slot in byte order. A constructor param referenced more than
+    // once in the contract body emits one slot per reference, and each
+    // occurrence's encoded width contributes to the cumulative offset shift —
+    // deduplicating before the walk drops those widths and mis-aligns every
+    // later slot on artifacts with repeated references. The VALUE is taken
+    // from the first occurrence per param.
     var indices = try allocator.alloc(usize, artifact.constructor_slots.len);
     defer allocator.free(indices);
     for (0..artifact.constructor_slots.len) |i| indices[i] = i;
@@ -163,29 +159,28 @@ pub fn extractConstructorArgs(
         }
     }.lessThan);
 
-    for (indices) |idx| {
-        const slot = cs[idx];
-        if (!seen_params.contains(slot.param_index)) {
-            try seen_params.put(slot.param_index, {});
-            try slots.append(allocator, .{
-                .param_index = slot.param_index,
-                .byte_offset = slot.byte_offset,
-            });
-        }
-    }
+    var assigned = std.AutoHashMap(i32, void).init(allocator);
+    defer assigned.deinit();
 
-    // Walk through the slots, reading script elements
     var cumulative_shift: i64 = 0;
 
-    for (slots.items) |slot| {
+    for (indices) |idx| {
+        const slot = cs[idx];
         const adjusted_hex_offset: usize = @intCast((@as(i64, slot.byte_offset) + cumulative_shift) * 2);
         if (adjusted_hex_offset >= code_hex.len) continue;
 
         const elem = readScriptElement(code_hex, adjusted_hex_offset);
+        // Template placeholders are exactly 1 byte, so the shift contributed by
+        // each occurrence is its encoded width minus that byte. This must
+        // accumulate for EVERY occurrence, including the ones whose value we
+        // already captured.
         cumulative_shift += @divTrunc(@as(i64, @intCast(elem.total_hex_chars)), 2) - 1;
+
+        if (assigned.contains(slot.param_index)) continue;
 
         const param_idx: usize = @intCast(slot.param_index);
         if (param_idx >= artifact.abi.constructor.params.len) continue;
+        try assigned.put(slot.param_index, {});
 
         const param = artifact.abi.constructor.params[param_idx];
         const value = try interpretScriptElement(allocator, elem.opcode, elem.data_hex, param.type_name);
@@ -385,4 +380,69 @@ test "extractConstructorArgs extracts int param" {
     try std.testing.expectEqual(@as(usize, 1), result.count());
     const val = result.get("x").?;
     try std.testing.expectEqual(@as(i64, 5), val.int);
+}
+
+// A param referenced N times in the contract body emits N constructor slots.
+// Every occurrence's encoded width shifts the offsets of everything after it,
+// so the extractor must account for ALL occurrences — not just the first per
+// param. Regression for a bug where slots were deduplicated by paramIndex
+// BEFORE the offset walk, mis-reading every later slot whenever an earlier
+// repeated value encoded wider than its 1-byte template placeholder.
+//
+// Template: ab <00> 7c <00> 7c <00> ac
+//   offset 1: alpha (paramIndex 0)
+//   offset 3: alpha again (paramIndex 0 — second reference)
+//   offset 5: beta  (paramIndex 1)
+const repeated_slot_artifact_json =
+    \\{"contractName":"Repeat","version":"1","compilerVersion":"1.0","script":"ab007c007c00ac","asm":"",
+    \\"abi":{"constructor":{"params":[{"name":"alpha","type":"int"},{"name":"beta","type":"int"}]},
+    \\"methods":[{"name":"unlock","params":[],"isPublic":true}]},
+    \\"stateFields":[],"constructorSlots":[{"paramIndex":0,"byteOffset":1},{"paramIndex":0,"byteOffset":3},{"paramIndex":1,"byteOffset":5}],
+    \\"buildTimestamp":"2024-01-01"}
+;
+
+test "extractConstructorArgs reads slots AFTER a repeated wide value at the correct offsets" {
+    const allocator = std.testing.allocator;
+    var artifact = try types.RunarArtifact.fromJson(allocator, repeated_slot_artifact_json);
+    defer artifact.deinit();
+
+    // alpha = 500 → scriptnum push `02f401` (3 bytes, 2 wider than the
+    // 1-byte template placeholder); beta = 7 → OP_7 (`57`).
+    const resolved = "ab" ++ "02f401" ++ "7c" ++ "02f401" ++ "7c" ++ "57" ++ "ac";
+    var result = try extractConstructorArgs(&artifact, resolved, allocator);
+    defer {
+        var it = result.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        result.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), result.count());
+    try std.testing.expectEqual(@as(i64, 500), result.get("alpha").?.int);
+    // Before the fix the second alpha occurrence's +2 byte shift was dropped,
+    // so beta was read from inside the second alpha push and decoded as 124.
+    try std.testing.expectEqual(@as(i64, 7), result.get("beta").?.int);
+}
+
+test "extractConstructorArgs still extracts when the repeated value fits its placeholder width" {
+    const allocator = std.testing.allocator;
+    var artifact = try types.RunarArtifact.fromJson(allocator, repeated_slot_artifact_json);
+    defer artifact.deinit();
+
+    // alpha = 5 → OP_5 (1 byte, same width as the placeholder: zero shift).
+    const resolved = "ab" ++ "55" ++ "7c" ++ "55" ++ "7c" ++ "57" ++ "ac";
+    var result = try extractConstructorArgs(&artifact, resolved, allocator);
+    defer {
+        var it = result.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        result.deinit();
+    }
+
+    try std.testing.expectEqual(@as(i64, 5), result.get("alpha").?.int);
+    try std.testing.expectEqual(@as(i64, 7), result.get("beta").?.int);
 }

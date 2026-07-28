@@ -78,6 +78,76 @@ class RunarContractRestoreFixesTest {
     }
 
     // ------------------------------------------------------------------
+    // #143 — repeated constructor-slot references
+    // ------------------------------------------------------------------
+
+    /**
+     * A param referenced N times in the contract body emits N constructor
+     * slots. Every occurrence's encoded width shifts the offsets of
+     * everything after it, so the extractor must account for ALL
+     * occurrences — not just the first per param.
+     *
+     * <p>{@link ContractScript#extractConstructorArgs} walks the template
+     * and the deployed script in parallel, so each occurrence's real push
+     * width is consumed as it is encountered — the Java tier never had the
+     * "dedupe by paramIndex before the offset walk" defect the TS SDK
+     * carried (issue #143). These tests pin that property: an
+     * implementation that deduplicates first, then applies a cumulative
+     * shift, reads {@code beta} from inside the second {@code alpha} push
+     * and decodes 124 instead of 7.
+     *
+     * <p>Template: {@code ab <00> 7c <00> 7c <00> ac}
+     * <ul>
+     *   <li>offset 1: alpha (paramIndex 0)</li>
+     *   <li>offset 3: alpha again (paramIndex 0 — second reference)</li>
+     *   <li>offset 5: beta (paramIndex 1)</li>
+     * </ul>
+     */
+    private static RunarArtifact repeatedSlotArtifact() {
+        RunarArtifact.ABI abi = new RunarArtifact.ABI(
+            new RunarArtifact.ABIConstructor(List.of(
+                new RunarArtifact.ABIParam("alpha", "bigint", null),
+                new RunarArtifact.ABIParam("beta", "bigint", null))),
+            List.of());
+        return new RunarArtifact(
+            "1", "test", "Synthetic", abi,
+            "ab" + "00" + "7c" + "00" + "7c" + "00" + "ac", "", "",
+            List.of(),
+            List.of(new RunarArtifact.ConstructorSlot(0, 1),
+                    new RunarArtifact.ConstructorSlot(0, 3),
+                    new RunarArtifact.ConstructorSlot(1, 5)),
+            List.of(), null, List.of());
+    }
+
+    @Test
+    void extractReadsSlotsAfterARepeatedWideValueAtCorrectOffsets() {
+        RunarArtifact artifact = repeatedSlotArtifact();
+        // alpha = 500 (scriptnum push `02f401`, 3 bytes), beta = 7 (OP_7, 1 byte).
+        String deployed = "ab" + "02f401" + "7c" + "02f401" + "7c" + "57" + "ac";
+        assertEquals(deployed,
+            ContractScript.renderLockingScript(
+                artifact, List.of(BigInteger.valueOf(500), BigInteger.valueOf(7)), null),
+            "renderer substitutes every occurrence of the repeated slot");
+
+        List<Object> recovered = ContractScript.extractConstructorArgs(artifact, deployed);
+        assertEquals(BigInteger.valueOf(500), recovered.get(0));
+        // If the second alpha occurrence's +2 byte shift is dropped, beta is
+        // read from inside the second alpha push and decodes as 124 instead of 7.
+        assertEquals(BigInteger.valueOf(7), recovered.get(1),
+            "slot after a repeated wide value must be read at the shifted offset");
+    }
+
+    @Test
+    void extractStillCorrectWhenRepeatedValueFitsItsPlaceholderWidth() {
+        RunarArtifact artifact = repeatedSlotArtifact();
+        // alpha = 5 → OP_5 (1 byte, same width as the placeholder: zero shift).
+        String deployed = "ab" + "55" + "7c" + "55" + "7c" + "57" + "ac";
+        List<Object> recovered = ContractScript.extractConstructorArgs(artifact, deployed);
+        assertEquals(BigInteger.valueOf(5), recovered.get(0));
+        assertEquals(BigInteger.valueOf(7), recovered.get(1));
+    }
+
+    // ------------------------------------------------------------------
     // #132 — getCodeSepIndex byte-walks the live script, ignoring in-memory args
     // ------------------------------------------------------------------
 

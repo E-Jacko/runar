@@ -145,29 +145,33 @@ func ExtractConstructorArgs(artifact *RunarArtifact, scriptHex string) map[strin
 		}
 	}
 
-	// Deduplicate by paramIndex, sorted by byteOffset
-	seen := make(map[int]bool)
-	allSlots := make([]ConstructorSlot, len(artifact.ConstructorSlots))
-	copy(allSlots, artifact.ConstructorSlots)
-	sort.Slice(allSlots, func(i, j int) bool {
-		return allSlots[i].ByteOffset < allSlots[j].ByteOffset
+	// Walk EVERY slot in byte order. A constructor param referenced more than
+	// once in the contract body emits one slot per reference, and each
+	// occurrence's encoded width contributes to the cumulative offset shift —
+	// deduplicating before the walk drops those widths and mis-aligns every
+	// later slot on artifacts with repeated references. The VALUE is taken from
+	// the first occurrence per param.
+	slots := make([]ConstructorSlot, len(artifact.ConstructorSlots))
+	copy(slots, artifact.ConstructorSlots)
+	sort.Slice(slots, func(i, j int) bool {
+		return slots[i].ByteOffset < slots[j].ByteOffset
 	})
-	var slots []ConstructorSlot
-	for _, slot := range allSlots {
-		if !seen[slot.ParamIndex] {
-			seen[slot.ParamIndex] = true
-			slots = append(slots, slot)
-		}
-	}
 
 	result := make(map[string]interface{})
+	assigned := make(map[int]bool)
 	cumulativeShift := 0
 
 	for _, slot := range slots {
 		adjustedHexOffset := (slot.ByteOffset + cumulativeShift) * 2
 		dataHex, totalHexChars, opcode := readScriptElement(codeHex, adjustedHexOffset)
+		// Template placeholders are exactly 1 byte, so the shift contributed by
+		// each occurrence is its encoded width minus that byte.
 		cumulativeShift += totalHexChars/2 - 1
 
+		if assigned[slot.ParamIndex] {
+			continue
+		}
+		assigned[slot.ParamIndex] = true
 		if slot.ParamIndex >= len(artifact.ABI.Constructor.Params) {
 			continue
 		}

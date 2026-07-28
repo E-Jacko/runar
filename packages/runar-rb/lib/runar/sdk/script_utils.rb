@@ -110,19 +110,27 @@ module Runar
           code_hex = script_hex[0, op_return_pos] if op_return_pos != -1
         end
 
-        # De-duplicate by param_index, keeping the first occurrence per index.
-        seen = {}
-        slots = artifact.constructor_slots
-                        .sort_by(&:byte_offset)
-                        .select { |s| seen[s.param_index] ? false : (seen[s.param_index] = true) }
+        # Walk EVERY slot in byte order. A constructor param referenced more
+        # than once in the contract body emits one slot per reference, and each
+        # occurrence's encoded width contributes to the cumulative offset shift
+        # — deduplicating before the walk drops those widths and mis-aligns
+        # every later slot on artifacts with repeated references. The VALUE is
+        # taken from the first occurrence per param.
+        slots = artifact.constructor_slots.sort_by(&:byte_offset)
 
         result = {}
+        assigned = {}
         cumulative_shift = 0
 
         slots.each do |slot|
           adjusted_hex_offset = (slot.byte_offset + cumulative_shift) * 2
           elem = read_script_element(code_hex, adjusted_hex_offset)
+          # Template placeholders are exactly 1 byte, so the shift contributed
+          # by each occurrence is its encoded width minus that byte.
           cumulative_shift += elem[:total_hex_chars] / 2 - 1
+          next if assigned[slot.param_index]
+
+          assigned[slot.param_index] = true
 
           params = artifact.abi.constructor_params
           param = slot.param_index < params.length ? params[slot.param_index] : nil

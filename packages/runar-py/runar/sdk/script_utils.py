@@ -113,23 +113,28 @@ def extract_constructor_args(
         if op_return_pos != -1:
             code_hex = script_hex[:op_return_pos]
 
-    # Deduplicate by param_index, keeping first occurrence per offset order
-    seen: set[int] = set()
+    # Walk EVERY slot in byte order. A constructor param referenced more than
+    # once in the contract body emits one slot per reference, and each
+    # occurrence's encoded width contributes to the cumulative offset shift --
+    # deduplicating before the walk drops those widths and mis-aligns every
+    # later slot on artifacts with repeated references. The VALUE is taken
+    # from the first occurrence per param.
     slots = sorted(artifact.constructor_slots, key=lambda s: s.byte_offset)
-    unique_slots = []
-    for slot in slots:
-        if slot.param_index not in seen:
-            seen.add(slot.param_index)
-            unique_slots.append(slot)
 
     result: dict = {}
+    assigned: set[int] = set()
     cumulative_shift = 0
 
-    for slot in unique_slots:
+    for slot in slots:
         adjusted_hex_offset = (slot.byte_offset + cumulative_shift) * 2
         data_hex, total_hex_chars, opcode = _read_script_element(code_hex, adjusted_hex_offset)
+        # Template placeholders are exactly 1 byte, so the shift contributed by
+        # each occurrence is its encoded width minus that byte.
         cumulative_shift += total_hex_chars // 2 - 1
 
+        if slot.param_index in assigned:
+            continue
+        assigned.add(slot.param_index)
         if slot.param_index >= len(artifact.abi.constructor_params):
             continue
         param = artifact.abi.constructor_params[slot.param_index]
