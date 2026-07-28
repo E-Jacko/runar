@@ -4271,25 +4271,42 @@ def _method_uses_code_part(bindings: list[ANFBinding]) -> bool:
 def _method_reads_var_len_state(
     bindings: list[ANFBinding],
     var_len_props: set[str],
+    private_methods: dict | None = None,
+    seen: set[str] | None = None,
 ) -> bool:
     """Whether a method READS a mutable variable-length (ByteString) state
     field's value (via load_prop). Issue #100: such a terminal method needs
     _codePart for the preimage-relative state offset. Narrowed to the live
     var-length read so methods that only read readonly fields (baked into the
-    locking script) or fixed-size fields keep their original terminal codegen."""
+    locking script) or fixed-size fields keep their original terminal codegen.
+
+    Deep-review finding C18: private methods are INLINED into the caller's
+    stack context, so a read that happens inside a private helper is a read by
+    the public caller. Recurse through private method_call targets (cycle-
+    guarded via `seen`) exactly like the sibling _method_uses_check_preimage --
+    otherwise _codePart is never pushed and the load_prop falls through to the
+    deploy-time constructor placeholder instead of the live on-chain state."""
+    if seen is None:
+        seen = set()
     for b in bindings:
         if b.value.kind == "load_prop" and getattr(b.value, "name", None) in var_len_props:
             return True
         if b.value.kind == "if":
             then_bindings = getattr(b.value, "then", None) or []
             else_bindings = getattr(b.value, "else_", None) or []
-            if (_method_reads_var_len_state(then_bindings, var_len_props)
-                    or _method_reads_var_len_state(else_bindings, var_len_props)):
+            if (_method_reads_var_len_state(then_bindings, var_len_props, private_methods, seen)
+                    or _method_reads_var_len_state(else_bindings, var_len_props, private_methods, seen)):
                 return True
         if b.value.kind == "loop":
             body_bindings = getattr(b.value, "body", None) or []
-            if _method_reads_var_len_state(body_bindings, var_len_props):
+            if _method_reads_var_len_state(body_bindings, var_len_props, private_methods, seen):
                 return True
+        if b.value.kind == "method_call" and private_methods is not None:
+            target = private_methods.get(b.value.method)
+            if target is not None and target.name not in seen:
+                next_seen = seen | {target.name}
+                if _method_reads_var_len_state(target.body, var_len_props, private_methods, next_seen):
+                    return True
     return False
 
 
@@ -4366,7 +4383,7 @@ def _lower_method_with_private_methods(
     uses_code_part = (
         _method_uses_check_preimage(method.body, private_methods)
         and (_method_uses_code_part(method.body)
-             or _method_reads_var_len_state(method.body, var_len_props))
+             or _method_reads_var_len_state(method.body, var_len_props, private_methods))
     )
     if _method_uses_check_preimage(method.body, private_methods) and uses_code_part:
         param_names = ["_codePart"] + param_names

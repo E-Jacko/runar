@@ -467,16 +467,38 @@ module RunarCompiler::Codegen
   # for the preimage-relative state offset. Narrowed to the live var-length read
   # so methods that only read readonly fields (baked into the locking script) or
   # fixed-size fields keep their original terminal codegen.
-  def self.method_reads_var_len_state?(bindings, var_len_props)
+  #
+  # C18: the read may live entirely inside a private helper reached via a
+  # `method_call`. Private methods are INLINED into the caller's stack context,
+  # so that load_prop really does execute here -- recurse through private method
+  # bodies (cycle-guarded via `seen`) exactly like the sibling
+  # `method_uses_check_preimage?` does. Without it a public method whose only
+  # var-length state read sits behind a helper silently skips `_codePart` and
+  # falls back to the deploy-time constant instead of the live on-chain state.
+  #
+  # @param bindings [Array<IR::ANFBinding>]
+  # @param var_len_props [Array<String>, Set<String>]
+  # @param private_methods [Hash{String => IR::ANFMethod}, nil]
+  # @param seen [Set<String>, nil] private methods currently on the recursion stack
+  # @return [Boolean]
+  def self.method_reads_var_len_state?(bindings, var_len_props, private_methods = nil, seen = nil)
+    seen ||= [].to_set
     bindings.each do |b|
       return true if b.value.kind == "load_prop" && var_len_props.include?(b.value.name)
 
       if b.value.kind == "if"
-        return true if method_reads_var_len_state?(b.value.then || [], var_len_props) ||
-                       method_reads_var_len_state?(b.value.else_ || [], var_len_props)
+        return true if method_reads_var_len_state?(b.value.then || [], var_len_props, private_methods, seen) ||
+                       method_reads_var_len_state?(b.value.else_ || [], var_len_props, private_methods, seen)
       end
       if b.value.kind == "loop"
-        return true if method_reads_var_len_state?(b.value.body || [], var_len_props)
+        return true if method_reads_var_len_state?(b.value.body || [], var_len_props, private_methods, seen)
+      end
+      if b.value.kind == "method_call" && private_methods
+        target = private_methods[b.value.method]
+        if target && !seen.include?(target.name)
+          new_seen = seen.dup.add(target.name)
+          return true if method_reads_var_len_state?(target.body, var_len_props, private_methods, new_seen)
+        end
       end
     end
     false
@@ -534,27 +556,52 @@ module RunarCompiler::Codegen
       "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad"
     CHECK_PREIMAGE_BINDING_BYTES = [CHECK_PREIMAGE_BINDING_HEX].pack("H*")
 
-    # Byte offset (in the 760-byte binding blob) of the appended BIP-143 sighash
-    # flag byte. The blob ends with `...7c7e 01 41 7e 21 02 79be...` — `01` is
-    # OP_DATA_1, `41` is the flag byte (SIGHASH_ALL|FORKID), `7e` is OP_CAT that
-    # appends it to the derived DER signature. Issue #123 rewrites ONLY this one
-    # byte for a non-default @sighash mode; every other byte is byte-identical to
-    # the pinned cross-tier constant (matching the TS reference, whose procedural
-    # blob differs only in this appended flag byte).
-    SIGHASH_FLAG_BYTE_OFFSET = 723
+    # The blob's tail, everything AFTER the appended BIP-143 sighash flag byte:
+    #
+    #   ... 7c7e   01     41     7e     21 <33-byte pubkey>   ad
+    #              ^^     ^^     ^^     ^^^^^^^^^^^^^^^^^^^   ^^
+    #        OP_DATA_1  flag   OP_CAT   PUSH(33) secp256k1 G  OP_CHECKSIGVERIFY
+    #
+    # Issue #123 rewrites ONLY the flag byte for a non-default @sighash mode;
+    # every other byte is byte-identical to the pinned cross-tier constant
+    # (matching the TS reference, whose procedural blob differs only in this
+    # appended flag byte).
+    SIGHASH_FLAG_TAIL_HEX =
+      "7e" \
+      "21" "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" \
+      "ad"
+
+    # Byte offset of the sighash flag inside CHECK_PREIMAGE_BINDING_BYTES.
+    #
+    # DERIVED from the blob itself rather than hardcoded: locate the unique
+    # `OP_CAT || PUSH(G) || OP_CHECKSIGVERIFY` tail and step back one byte. If
+    # the pinned constant is ever regenerated with a different layout this
+    # raises at load time — instead of silently pointing the setbyte below at
+    # an unrelated opcode, which would corrupt every non-default-sighash
+    # contract with no test failure to show for it.
+    SIGHASH_FLAG_BYTE_OFFSET = begin
+      tail = [SIGHASH_FLAG_TAIL_HEX].pack("H*")
+      idx = CHECK_PREIMAGE_BINDING_BYTES.index(tail)
+      raise "check_preimage binding blob changed: sighash-flag tail not found" if idx.nil?
+      unless CHECK_PREIMAGE_BINDING_BYTES.index(tail, idx + 1).nil?
+        raise "check_preimage binding blob changed: sighash-flag tail is not unique"
+      end
+
+      offset = idx - 1
+      unless CHECK_PREIMAGE_BINDING_BYTES.getbyte(offset) == 0x41 &&
+             CHECK_PREIMAGE_BINDING_BYTES.getbyte(offset - 1) == 0x01
+        raise "check_preimage binding blob changed: byte @#{offset} is not an OP_DATA_1-pushed 0x41 sighash flag"
+      end
+      offset
+    end
 
     # Return the check_preimage binding blob for a given BIP-143 sighash flag.
     # For the default 0x41 (or nil) this is the pinned constant unchanged; for a
     # non-default mode only the single appended sighash flag byte differs.
+    # SIGHASH_FLAG_BYTE_OFFSET has already been validated against the blob's
+    # actual layout at load time, so no per-call re-check is needed.
     def self.check_preimage_binding_bytes(sighash_flag = nil)
       return CHECK_PREIMAGE_BINDING_BYTES if sighash_flag.nil? || (sighash_flag & 0xff) == 0x41
-
-      # Fail loudly if the pinned blob ever changes such that the offset no
-      # longer points at the default 0x41 flag byte — otherwise a non-default
-      # mode would silently corrupt an unrelated opcode.
-      unless CHECK_PREIMAGE_BINDING_BYTES.getbyte(SIGHASH_FLAG_BYTE_OFFSET) == 0x41
-        raise "check_preimage binding blob changed: byte @#{SIGHASH_FLAG_BYTE_OFFSET} is not the 0x41 sighash flag"
-      end
 
       bytes = CHECK_PREIMAGE_BINDING_BYTES.dup
       bytes.setbyte(SIGHASH_FLAG_BYTE_OFFSET, sighash_flag & 0xff)
@@ -3789,7 +3836,7 @@ module RunarCompiler::Codegen
     var_len_props = properties.select { |p| !p.readonly && p.type == "ByteString" }.map(&:name)
     uses_code_part = method_uses_check_preimage?(method.body, private_methods) &&
                      (method_uses_code_part?(method.body) ||
-                      method_reads_var_len_state?(method.body, var_len_props))
+                      method_reads_var_len_state?(method.body, var_len_props, private_methods))
     # BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
     # preimage (see _lower_check_preimage), so NO _opPushTxSig witness item is
     # pushed -- the unlocking script provides only the preimage (and _codePart

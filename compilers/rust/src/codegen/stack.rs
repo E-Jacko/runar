@@ -4885,19 +4885,66 @@ fn method_uses_code_part(bindings: &[ANFBinding]) -> bool {
 /// fixed-size mutable fields does NOT need `_codePart` — narrowing to the live
 /// var-length read avoids over-provisioning (e.g. MessageBoard.burn reads only
 /// the readonly owner and must keep its original terminal codegen).
+/// Also recurses into private-method bodies (deep-review finding C18): private
+/// methods are inlined into the caller's stack context, so a read that only
+/// happens inside a private helper still needs `_codePart` in the public entry.
 fn method_reads_var_len_state(
     bindings: &[ANFBinding],
     var_len_props: &std::collections::HashSet<String>,
+    private_methods: Option<&HashMap<String, ANFMethod>>,
 ) -> bool {
-    bindings.iter().any(|b| match &b.value {
-        ANFValue::LoadProp { name } => var_len_props.contains(name),
-        ANFValue::If { then, else_branch, .. } => {
-            method_reads_var_len_state(then, var_len_props)
-                || method_reads_var_len_state(else_branch, var_len_props)
+    let mut seen: HashSet<String> = HashSet::new();
+    method_reads_var_len_state_rec(bindings, var_len_props, private_methods, &mut seen)
+}
+
+fn method_reads_var_len_state_rec(
+    bindings: &[ANFBinding],
+    var_len_props: &std::collections::HashSet<String>,
+    private_methods: Option<&HashMap<String, ANFMethod>>,
+    seen: &mut HashSet<String>,
+) -> bool {
+    for b in bindings {
+        match &b.value {
+            ANFValue::LoadProp { name } => {
+                if var_len_props.contains(name) {
+                    return true;
+                }
+            }
+            ANFValue::If { then, else_branch, .. } => {
+                if method_reads_var_len_state_rec(then, var_len_props, private_methods, seen) {
+                    return true;
+                }
+                if method_reads_var_len_state_rec(else_branch, var_len_props, private_methods, seen)
+                {
+                    return true;
+                }
+            }
+            ANFValue::Loop { body, .. } => {
+                if method_reads_var_len_state_rec(body, var_len_props, private_methods, seen) {
+                    return true;
+                }
+            }
+            ANFValue::MethodCall { method, .. } => {
+                if let Some(privs) = private_methods {
+                    if let Some(target) = privs.get(method) {
+                        if !seen.contains(&target.name) {
+                            seen.insert(target.name.clone());
+                            if method_reads_var_len_state_rec(
+                                &target.body,
+                                var_len_props,
+                                private_methods,
+                                seen,
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
-        ANFValue::Loop { body, .. } => method_reads_var_len_state(body, var_len_props),
-        _ => false,
-    })
+    }
+    false
 }
 
 fn lower_method_with_private_methods(
@@ -4924,7 +4971,7 @@ fn lower_method_with_private_methods(
         .collect();
     let uses_code_part = method_uses_check_preimage(&method.body, Some(private_methods))
         && (method_uses_code_part(&method.body)
-            || method_reads_var_len_state(&method.body, &var_len_props));
+            || method_reads_var_len_state(&method.body, &var_len_props, Some(private_methods)));
     if uses_code_part {
         param_names.insert(0, "_codePart".to_string());
     }

@@ -5067,15 +5067,36 @@ function methodUsesCheckPreimage(
  * for the preimage-relative state offset. Narrowed to the live var-length read
  * so methods that only read readonly fields (baked into the locking script) or
  * fixed-size fields keep their original terminal codegen.
+ *
+ * C18: the read may happen entirely inside a private helper reached via
+ * `method_call` (private methods are inlined by `inlineMethodCall`, so the
+ * load_prop executes in the caller's stack context at runtime). Recurse
+ * through private method bodies exactly like `methodUsesCheckPreimage` does,
+ * with the same cycle guard, or a public method whose only var-len state read
+ * is behind a helper silently skips `_codePart` and falls back to the
+ * deploy-time constant instead of the live on-chain state.
  */
-function methodReadsVarLenState(bindings: ANFBinding[], varLenProps: Set<string>): boolean {
+function methodReadsVarLenState(
+  bindings: ANFBinding[],
+  varLenProps: Set<string>,
+  privateMethods?: Map<string, ANFMethod>,
+  seen: Set<string> = new Set(),
+): boolean {
   for (const b of bindings) {
     if (b.value.kind === 'load_prop' && varLenProps.has(b.value.name)) return true;
     if (b.value.kind === 'if') {
-      if (methodReadsVarLenState(b.value.then, varLenProps) ||
-          methodReadsVarLenState(b.value.else, varLenProps)) return true;
+      if (methodReadsVarLenState(b.value.then, varLenProps, privateMethods, seen) ||
+          methodReadsVarLenState(b.value.else, varLenProps, privateMethods, seen)) return true;
     }
-    if (b.value.kind === 'loop' && methodReadsVarLenState(b.value.body, varLenProps)) return true;
+    if (b.value.kind === 'loop' && methodReadsVarLenState(b.value.body, varLenProps, privateMethods, seen)) return true;
+    if (b.value.kind === 'method_call' && privateMethods) {
+      const target = privateMethods.get(b.value.method);
+      if (target && !seen.has(target.name)) {
+        const nextSeen = new Set(seen);
+        nextSeen.add(target.name);
+        if (methodReadsVarLenState(target.body, varLenProps, privateMethods, nextSeen)) return true;
+      }
+    }
   }
   return false;
 }
@@ -5115,7 +5136,7 @@ function lowerMethod(
   );
   const usesCodePart =
     methodUsesCheckPreimage(method.body, privateMethods) &&
-    (methodUsesCodePart(method.body) || methodReadsVarLenState(method.body, varLenProps));
+    (methodUsesCodePart(method.body) || methodReadsVarLenState(method.body, varLenProps, privateMethods));
   if (methodUsesCheckPreimage(method.body, privateMethods) && usesCodePart) {
     paramNames.unshift('_codePart');
   }

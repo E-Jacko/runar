@@ -476,7 +476,7 @@ public final class StackLower {
                 if (!p.readonly() && "ByteString".equals(p.type())) varLenProps.add(p.name());
             }
             if (methodUsesCodePart(method.body())
-                || methodReadsVarLenState(method.body(), varLenProps)) {
+                || methodReadsVarLenState(method.body(), varLenProps, privateMethods, new java.util.HashSet<>())) {
                 paramNames.add(0, "_codePart");
             }
         }
@@ -561,16 +561,37 @@ public final class StackLower {
      * offset. Narrowed to a live {@code load_prop} of a non-readonly ByteString
      * property: methods that only read readonly fields (baked into the locking
      * script) or fixed-size fields keep their original terminal codegen.
+     *
+     * <p>Deep-review finding C18: private methods are INLINED into the caller's
+     * stack context, so the scan must recurse through private {@code method_call}
+     * targets exactly like the sibling {@link #methodUsesCheckPreimage} does.
+     * Without it a public method whose only read of a mutable ByteString field
+     * happens inside a private helper never gets {@code _codePart}, the
+     * var-length deserialization is skipped, and the {@code load_prop} silently
+     * falls back to the deploy-time constant instead of the live state.
      */
-    private static boolean methodReadsVarLenState(List<AnfBinding> body, java.util.Set<String> varLenProps) {
+    private static boolean methodReadsVarLenState(
+            List<AnfBinding> body,
+            java.util.Set<String> varLenProps,
+            Map<String, AnfMethod> privateMethods,
+            java.util.Set<String> seen) {
         for (AnfBinding b : body) {
             AnfValue v = b.value();
             if (v instanceof LoadProp lp && varLenProps.contains(lp.name())) return true;
             if (v instanceof If iv) {
-                if (methodReadsVarLenState(iv.thenBranch(), varLenProps)
-                    || methodReadsVarLenState(iv.elseBranch(), varLenProps)) return true;
+                if (methodReadsVarLenState(iv.thenBranch(), varLenProps, privateMethods, seen)
+                    || methodReadsVarLenState(iv.elseBranch(), varLenProps, privateMethods, seen)) return true;
             }
-            if (v instanceof Loop l && methodReadsVarLenState(l.body(), varLenProps)) return true;
+            if (v instanceof Loop l
+                && methodReadsVarLenState(l.body(), varLenProps, privateMethods, seen)) return true;
+            if (v instanceof MethodCall mc && privateMethods != null) {
+                AnfMethod target = privateMethods.get(mc.method());
+                if (target != null && !seen.contains(target.name())) {
+                    java.util.Set<String> nextSeen = new java.util.HashSet<>(seen);
+                    nextSeen.add(target.name());
+                    if (methodReadsVarLenState(target.body(), varLenProps, privateMethods, nextSeen)) return true;
+                }
+            }
         }
         return false;
     }

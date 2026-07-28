@@ -633,7 +633,7 @@ pub fn emitArtifact(
             try w.writeAll("],\"isPublic\":");
             try w.writeAll(if (method.is_public) "true" else "false");
             // usesCodePart: unlocking script is prefixed with _codePart (#100).
-            if (stack_lower.methodUsesCodePartFull(stack_lower.methodBindings(method), anf_program.properties)) {
+            if (stack_lower.methodUsesCodePartFull(stack_lower.methodBindings(method), anf_program.properties, anf_program.methods)) {
                 try w.writeAll(",\"usesCodePart\":true");
             }
             // Issue #123: carry a non-default @sighash mode into the ABI so the

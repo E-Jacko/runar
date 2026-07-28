@@ -4222,10 +4222,15 @@ func LowerToStack(program *ir.ANFProgram, opts ...LowerToStackOptions) (result [
 // finding F7 fix — without it, a manual checkPreimage inside an if/for body
 // or a private helper failed to register the implicit param and stack lowering
 // crashed with `Value '_opPushTxSig' not found on stack`.
-func methodUsesCheckPreimage(bindings []ir.ANFBinding) bool {
-	return methodUsesCheckPreimageRec(bindings, nil, map[string]bool{})
-}
-
+//
+// NOTE: there is deliberately NO zero-arg `methodUsesCheckPreimage(bindings)`
+// convenience wrapper here. One used to exist and hard-coded `nil` for
+// privateMethods, which silently disabled the private-helper recursion this
+// function's whole docstring is about. It had no callers, but the identical
+// shape in the Zig tier WAS live and produced a real cross-tier divergence
+// (Zig emitted 786 bytes where the other six emitted 872 for the same ANF
+// input — deep-review C18's sibling bug). Call `...Rec` directly with the real
+// privateMethods map; do not reintroduce a nil-passing wrapper.
 func methodUsesCheckPreimageRec(
 	bindings []ir.ANFBinding,
 	privateMethods map[string]*ir.ANFMethod,
@@ -4398,23 +4403,51 @@ func emitGroth16WAPreamble(ctx *loweringContext, config Groth16Config, useMSM bo
 }
 
 // methodReadsVarLenState reports whether a method READS a mutable variable-length
-// (ByteString) state field's value (via load_prop), recursing into branches and
-// loops. Issue #100: such a terminal method needs _codePart for the
+// (ByteString) state field's value (via load_prop), recursing into branches,
+// loops, and into private-method bodies (deep-review finding C18 — private
+// methods are inlined into the caller's stack context, so a var-length read
+// hidden inside a private helper must still force _codePart for the caller).
+// Issue #100: such a terminal method needs _codePart for the
 // preimage-relative state offset. Narrowed to the live var-length read so
 // methods that only read readonly fields (baked into the locking script) or
 // fixed-size fields keep their original terminal codegen.
-func methodReadsVarLenState(bindings []ir.ANFBinding, varLenProps map[string]bool) bool {
+//
+// NOTE: no nil-passing convenience wrapper — see the note on
+// methodUsesCheckPreimageRec above. Passing nil for privateMethods here
+// silently reinstates the exact C18 bug this recursion fixes.
+
+func methodReadsVarLenStateRec(
+	bindings []ir.ANFBinding,
+	varLenProps map[string]bool,
+	privateMethods map[string]*ir.ANFMethod,
+	seen map[string]bool,
+) bool {
 	for _, b := range bindings {
 		if b.Value.Kind == "load_prop" && varLenProps[b.Value.Name] {
 			return true
 		}
 		if b.Value.Kind == "if" {
-			if methodReadsVarLenState(b.Value.Then, varLenProps) || methodReadsVarLenState(b.Value.Else, varLenProps) {
+			if methodReadsVarLenStateRec(b.Value.Then, varLenProps, privateMethods, seen) ||
+				methodReadsVarLenStateRec(b.Value.Else, varLenProps, privateMethods, seen) {
 				return true
 			}
 		}
-		if b.Value.Kind == "loop" && methodReadsVarLenState(b.Value.Body, varLenProps) {
+		if b.Value.Kind == "loop" && methodReadsVarLenStateRec(b.Value.Body, varLenProps, privateMethods, seen) {
 			return true
+		}
+		if b.Value.Kind == "method_call" && privateMethods != nil {
+			if target, ok := privateMethods[b.Value.Method]; ok {
+				if !seen[target.Name] {
+					nextSeen := make(map[string]bool, len(seen)+1)
+					for k, v := range seen {
+						nextSeen[k] = v
+					}
+					nextSeen[target.Name] = true
+					if methodReadsVarLenStateRec(target.Body, varLenProps, privateMethods, nextSeen) {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false
@@ -4473,7 +4506,7 @@ func lowerMethodWithPrivateMethodsAndOptions(method *ir.ANFMethod, properties []
 	}
 	usesCheckPreimage := methodUsesCheckPreimageRec(method.Body, privateMethods, map[string]bool{})
 	usesCodePart := usesCheckPreimage &&
-		(methodUsesCodePart(method.Body) || methodReadsVarLenState(method.Body, varLenProps))
+		(methodUsesCodePart(method.Body) || methodReadsVarLenStateRec(method.Body, varLenProps, privateMethods, map[string]bool{}))
 	if usesCheckPreimage && usesCodePart {
 		paramNames = append([]string{"_codePart"}, paramNames...)
 	}

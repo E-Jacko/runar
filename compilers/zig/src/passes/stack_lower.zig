@@ -4716,7 +4716,7 @@ fn isStateful(program: types.ANFProgram) bool {
 fn setupMethodStack(ctx: *LowerCtx, program: types.ANFProgram, method: types.ANFMethod) !void {
     const bindings = methodBindings(method);
 
-    if (methodUsesCodePartFull(bindings, program.properties)) {
+    if (methodUsesCodePartFull(bindings, program.properties, program.methods)) {
         try ctx.stack.push(ctx.allocator, "_codePart");
         ctx.trackDepth();
     }
@@ -4794,7 +4794,7 @@ fn endsWithTerminalRawScript(bindings: []const types.ANFBinding) bool {
 
 fn anyMethodUsesCheckPreimage(methods: []const types.ANFMethod) bool {
     for (methods) |method| {
-        if (method.is_public and methodUsesCheckPreimage(methodBindings(method))) return true;
+        if (method.is_public and methodUsesCheckPreimage(methodBindings(method), methods)) return true;
     }
     return false;
 }
@@ -4806,15 +4806,25 @@ fn anyMethodUsesCodePart(methods: []const types.ANFMethod) bool {
     return false;
 }
 
-fn methodUsesCheckPreimage(bindings: []const types.ANFBinding) bool {
-    return methodUsesCheckPreimageRec(bindings, null, 0);
+/// C27: the sole entry point used to hard-code `null` for the private-method
+/// map, so the `method_call` recursion below was dead code — a `checkPreimage`
+/// reachable ONLY through a private helper made this return false while the TS
+/// reference (`methodUsesCheckPreimage(method.body, privateMethods)`,
+/// 05-stack-lower.ts) returned true. Thread the real method list, using the
+/// same `findPrivateMethod` lookup the inliner (`lowerMethodCall`) and the
+/// sibling `methodReadsVarLenStateRec` use.
+fn methodUsesCheckPreimage(
+    bindings: []const types.ANFBinding,
+    methods: []const types.ANFMethod,
+) bool {
+    return methodUsesCheckPreimageRec(bindings, methods, 0);
 }
 
 const MAX_PREIMAGE_RECURSION_DEPTH: u32 = 64;
 
 fn methodUsesCheckPreimageRec(
     bindings: []const types.ANFBinding,
-    private_methods: ?std.StringHashMap(types.ANFMethod),
+    methods: []const types.ANFMethod,
     depth: u32,
 ) bool {
     if (depth > MAX_PREIMAGE_RECURSION_DEPTH) return false;
@@ -4822,17 +4832,15 @@ fn methodUsesCheckPreimageRec(
         switch (binding.value) {
             .check_preimage => return true,
             .@"if" => |ie| {
-                if (methodUsesCheckPreimageRec(ie.then, private_methods, depth)) return true;
-                if (methodUsesCheckPreimageRec(ie.@"else", private_methods, depth)) return true;
+                if (methodUsesCheckPreimageRec(ie.then, methods, depth)) return true;
+                if (methodUsesCheckPreimageRec(ie.@"else", methods, depth)) return true;
             },
             .loop => |loop| {
-                if (methodUsesCheckPreimageRec(loop.body, private_methods, depth)) return true;
+                if (methodUsesCheckPreimageRec(loop.body, methods, depth)) return true;
             },
             .method_call => |mc| {
-                if (private_methods) |privs| {
-                    if (privs.get(mc.method)) |target| {
-                        if (methodUsesCheckPreimageRec(target.body, private_methods, depth + 1)) return true;
-                    }
+                if (findPrivateMethod(methods, mc.method)) |target| {
+                    if (methodUsesCheckPreimageRec(methodBindings(target), methods, depth + 1)) return true;
                 }
             },
             else => {},
@@ -4871,7 +4879,30 @@ fn methodUsesCodePart(bindings: []const types.ANFBinding) bool {
 /// the preimage-relative state offset. Narrowed to the live var-length read so
 /// methods that only read readonly fields (baked into the locking script) or
 /// fixed-size fields keep their original terminal codegen.
-fn methodReadsVarLenState(bindings: []const types.ANFBinding, properties: []const types.ANFProperty) bool {
+///
+/// C18: the read may live entirely inside a private helper reached via
+/// `method_call`. `lowerMethodCall` INLINES private methods into the caller's
+/// stack context, so that load_prop really does execute here — recurse through
+/// private method bodies exactly like `methodUsesCheckPreimageRec` does (same
+/// `findPrivateMethod` lookup the inliner uses, same depth guard against
+/// mutually recursive helpers). Without it a public method whose only
+/// var-length state read sits behind a helper silently skips `_codePart` and
+/// falls back to the deploy-time constant instead of the live on-chain state.
+fn methodReadsVarLenState(
+    bindings: []const types.ANFBinding,
+    properties: []const types.ANFProperty,
+    methods: []const types.ANFMethod,
+) bool {
+    return methodReadsVarLenStateRec(bindings, properties, methods, 0);
+}
+
+fn methodReadsVarLenStateRec(
+    bindings: []const types.ANFBinding,
+    properties: []const types.ANFProperty,
+    methods: []const types.ANFMethod,
+    depth: u32,
+) bool {
+    if (depth > MAX_PREIMAGE_RECURSION_DEPTH) return false;
     for (bindings) |binding| {
         switch (binding.value) {
             .load_prop => |lp| {
@@ -4880,10 +4911,16 @@ fn methodReadsVarLenState(bindings: []const types.ANFBinding, properties: []cons
                 }
             },
             .@"if" => |ie| {
-                if (methodReadsVarLenState(ie.then, properties) or methodReadsVarLenState(ie.@"else", properties)) return true;
+                if (methodReadsVarLenStateRec(ie.then, properties, methods, depth) or
+                    methodReadsVarLenStateRec(ie.@"else", properties, methods, depth)) return true;
             },
             .loop => |loop| {
-                if (methodReadsVarLenState(loop.body, properties)) return true;
+                if (methodReadsVarLenStateRec(loop.body, properties, methods, depth)) return true;
+            },
+            .method_call => |mc| {
+                if (findPrivateMethod(methods, mc.method)) |target| {
+                    if (methodReadsVarLenStateRec(methodBindings(target), properties, methods, depth + 1)) return true;
+                }
             },
             else => {},
         }
@@ -4894,9 +4931,13 @@ fn methodReadsVarLenState(bindings: []const types.ANFBinding, properties: []cons
 /// Combined `_codePart` requirement (issue #100): continuation builders OR
 /// terminal methods that read a mutable variable-length state field. Gated on
 /// checkPreimage so the SDK side (which provisions _codePart) stays in sync.
-pub fn methodUsesCodePartFull(bindings: []const types.ANFBinding, properties: []const types.ANFProperty) bool {
-    return methodUsesCheckPreimage(bindings) and
-        (methodUsesCodePart(bindings) or methodReadsVarLenState(bindings, properties));
+pub fn methodUsesCodePartFull(
+    bindings: []const types.ANFBinding,
+    properties: []const types.ANFProperty,
+    methods: []const types.ANFMethod,
+) bool {
+    return methodUsesCheckPreimage(bindings, methods) and
+        (methodUsesCodePart(bindings) or methodReadsVarLenState(bindings, properties, methods));
 }
 
 fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.ANFMethod {
