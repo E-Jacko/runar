@@ -705,7 +705,30 @@ class RunarContract:
         elif is_stateful:
             # For single-output continuations, the on-chain script uses the input amount
             # (extracted from the preimage). The SDK output must match.
-            new_satoshis = opts.satoshis if opts.satoshis > 0 else self._current_utxo.satoshis
+            #
+            # Honor an explicit `self.add_output(<sats>, ...)` state continuation:
+            # the ANF interpreter records that amount in `anf_ordered_outputs`
+            # (one `kind == 'state'` entry per add_output). A method with a single
+            # explicit add_output and no raw output must build its continuation at
+            # that amount, not default to the spent input's value -- otherwise the
+            # covenant's hashOutputs binding rejects the spend and funds are
+            # stranded. Finding G1 reads the same satoshis but only on the
+            # raw-output-present branch below; this generalizes it to the no-raw
+            # single-continuation path. With no explicit add_output (the
+            # auto-injected continuation) `anf_ordered_outputs` is empty and the
+            # input-value default is kept. An explicit `options.satoshis` still wins.
+            anf_state_entries = [o for o in anf_ordered_outputs if o['kind'] == 'state']
+            single_explicit_state_sats = (
+                int(anf_state_entries[0]['satoshis'])
+                if len(anf_ordered_outputs) == 1 and len(anf_state_entries) == 1
+                else None
+            )
+            if opts.satoshis > 0:
+                new_satoshis = opts.satoshis
+            elif single_explicit_state_sats is not None:
+                new_satoshis = single_explicit_state_sats
+            else:
+                new_satoshis = self._current_utxo.satoshis
             if opts.new_state:
                 for k, v in opts.new_state.items():
                     self._state[k] = v

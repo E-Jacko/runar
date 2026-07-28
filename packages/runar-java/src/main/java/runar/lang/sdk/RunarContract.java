@@ -612,7 +612,20 @@ public final class RunarContract {
             String codePart = ContractScript.extractCodePart(currentUtxo.scriptHex());
             String stateHex = StateSerializer.serialize(artifact.stateFields(), state);
             newLockingScript = codePart + "6a" + stateHex;
-            newSats = currentUtxo.satoshis();
+            // Honor an explicit this.addOutput(<sats>, ...) state continuation: the
+            // ANF interpreter records that amount in orderedOutputs (one "state"
+            // entry per addOutput). A method with a single explicit addOutput and no
+            // raw output must build its continuation at that amount, not default to
+            // the spent input's value — otherwise the covenant's hashOutputs binding
+            // rejects the spend and funds are stranded. Finding G1 (raw-output branch
+            // below) reads the same satoshis; this generalizes it to the no-raw
+            // single-continuation path. With no explicit addOutput (the auto-injected
+            // continuation) orderedOutputs is empty and the input-value default holds.
+            long stateEntryCount = orderedOutputs.stream()
+                .filter(o -> "state".equals(o.kind())).count();
+            newSats = (orderedOutputs.size() == 1 && stateEntryCount == 1)
+                ? orderedOutputs.get(0).satoshis()
+                : currentUtxo.satoshis();
         }
 
         // Finding G1: a method that calls this.addRawOutput(...) folds the raw

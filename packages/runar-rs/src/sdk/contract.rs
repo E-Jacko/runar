@@ -799,15 +799,22 @@ impl RunarContract {
             //   1. `CallOptions.satoshis` (caller override)
             //   2. User's `outputSatoshis` arg at `resolved_args[user_params position]`
             //      when the method declares it as a public param
-            //   3. Legacy fallback to `current_utxo.satoshis`
+            //   3. A single explicit `this.addOutput(<sats>, ...)` recorded by
+            //      the ANF interpreter (`anf_ordered_outputs`) — one State entry,
+            //      no raw output. Generalizes finding G1 (which read the same
+            //      satoshis only on the raw-output-present branch) to the no-raw
+            //      single-continuation path.
+            //   4. Legacy fallback to `current_utxo.satoshis`
             //
-            // Methods that don't declare outputSatoshis keep the legacy fallback.
+            // Methods with no explicit addOutput (auto-injected continuation)
+            // keep the legacy fallback.
             let user_param_names: Vec<&str> =
                 user_params.iter().map(|p| p.name.as_str()).collect();
             new_satoshis = Some(resolve_continuation_satoshis(
                 &user_param_names,
                 &resolved_args,
                 options.and_then(|o| o.satoshis),
+                &anf_ordered_outputs,
                 current_utxo.satoshis,
             ));
             // Apply new state values before building the continuation output.
@@ -2341,7 +2348,21 @@ fn read_varint_bytes(bytes: &[u8], offset: usize) -> (u64, usize) {
 ///   1. `options.satoshis` (caller override via `CallOptions`)
 ///   2. User's `outputSatoshis` arg at the matching position in
 ///      `resolved_args` when the method declares it as a public param
-///   3. Legacy fallback to `current_utxo_satoshis`
+///   3. An explicit single `this.addOutput(<sats>, ...)` recorded by the ANF
+///      interpreter (`ordered_outputs`) — see below
+///   4. Legacy fallback to `current_utxo_satoshis`
+///
+/// Rung 3 honors an explicit `this.addOutput(<sats>, ...)` state continuation:
+/// the ANF interpreter records that amount in `ordered_outputs` (one
+/// `OrderedOutputKind::State` entry per addOutput). A method with a single
+/// explicit addOutput and NO raw output must build its continuation at that
+/// amount, not default to the spent input's value — otherwise the covenant's
+/// hashOutputs binding rejects the spend and funds are stranded. Finding G1
+/// reads the same satoshis but only on the raw-output-present branch; this
+/// generalizes it to the no-raw single-continuation path. With no explicit
+/// addOutput (the auto-injected continuation) `ordered_outputs` is empty and the
+/// input-value default is kept. Multiple outputs, or a lone raw output, also
+/// fall through to the legacy default — those layouts are handled elsewhere.
 ///
 /// This is extracted from `RunarContract::prepare_call_terminal` so external
 /// regression tests can assert the rung priority directly without standing up
@@ -2350,6 +2371,7 @@ pub fn resolve_continuation_satoshis(
     user_param_names: &[&str],
     resolved_args: &[SdkValue],
     options_satoshis: Option<i64>,
+    ordered_outputs: &[anf_interpreter::OrderedOutputEntry],
     current_utxo_satoshis: i64,
 ) -> i64 {
     let user_outputs_satoshis = user_param_names
@@ -2359,8 +2381,21 @@ pub fn resolve_continuation_satoshis(
             Some(SdkValue::Int(v)) => Some(*v),
             _ => None,
         });
+    let state_entry_count = ordered_outputs
+        .iter()
+        .filter(|o| o.kind == anf_interpreter::OrderedOutputKind::State)
+        .count();
+    let single_explicit_state_sats = if ordered_outputs.len() == 1 && state_entry_count == 1 {
+        ordered_outputs
+            .iter()
+            .find(|o| o.kind == anf_interpreter::OrderedOutputKind::State)
+            .map(|o| o.satoshis)
+    } else {
+        None
+    };
     options_satoshis
         .or(user_outputs_satoshis)
+        .or(single_explicit_state_sats)
         .unwrap_or(current_utxo_satoshis)
 }
 

@@ -1015,7 +1015,22 @@ export class RunarContract {
         return { script: codeScript + '6a' + stateHex, satoshis: out.satoshis ?? 1 };
       });
     } else if (isStateful) {
-      newSatoshis = options?.satoshis ?? this.currentUtxo.satoshis;
+      // Honor an explicit `this.addOutput(<sats>, ...)` state continuation: the
+      // ANF interpreter records that amount in `anfOrderedOutputs` (one
+      // `kind:'state'` entry per addOutput). A method with a single explicit
+      // addOutput and no raw output must build its continuation at that amount,
+      // not default to the spent input's value — otherwise the covenant's
+      // hashOutputs binding rejects the spend and funds are stranded. Finding G1
+      // reads the same satoshis but only on the raw-output-present branch below;
+      // this generalizes it to the no-raw single-continuation path. With no
+      // explicit addOutput (the auto-injected continuation) `anfOrderedOutputs`
+      // is empty and the input-value default is kept.
+      const anfStateEntries = anfOrderedOutputs.filter((o) => o.kind === 'state');
+      const singleExplicitStateSats =
+        anfOrderedOutputs.length === 1 && anfStateEntries.length === 1
+          ? Number(anfStateEntries[0]!.satoshis)
+          : undefined;
+      newSatoshis = options?.satoshis ?? singleExplicitStateSats ?? this.currentUtxo.satoshis;
       if (options?.newState) {
         // Explicit newState takes priority (backward compat)
         this._state = { ...this._state, ...options.newState };

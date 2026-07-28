@@ -701,6 +701,30 @@ pub const RunarContract = struct {
             }
         }
 
+        // Finding G1, generalized to the no-raw single-continuation path: when a
+        // method emits EXACTLY ONE ordered output of kind `state` (a single
+        // `this.addOutput(<N>, ...)`, no raw outputs) the ANF interpreter records
+        // that amount in `anf_ordered_outputs`. Honor it for the continuation so
+        // `addOutput(1000, ...)` builds a 1000-sat continuation (matching the
+        // covenant's hashOutputs binding) instead of defaulting to the spent
+        // input's value — otherwise the built tx mismatches hashOutputs and the
+        // funds are stranded. An explicit `options.satoshis` still wins (the
+        // default block above already applied it); a method with NO explicit
+        // addOutput has an EMPTY ordered-outputs list (auto-injected
+        // continuation) so the input-value default is kept. The raw-output
+        // branch below (has_raw_ordered) threads its own amount and is naturally
+        // excluded here — a raw layout's ordered list is never a single
+        // `state` entry. Multi-output is excluded too. Mirrors the single-stateful
+        // branch in packages/runar-sdk/src/contract.ts.
+        if (is_stateful and !is_terminal_call and !has_multi_output) {
+            const explicit_satoshis = if (options) |o| o.satoshis > 0 else false;
+            if (!explicit_satoshis and anf_ordered_outputs.items.len == 1 and
+                anf_ordered_outputs.items[0].kind == .state)
+            {
+                new_satoshis = anf_ordered_outputs.items[0].satoshis;
+            }
+        }
+
         // Finding G1: a method that calls `this.addRawOutput(...)` folds the raw
         // output(s) into the covenant's continuation hashOutputs IN SOURCE ORDER,
         // interleaved with the state continuation `this.addOutput(...)`. The

@@ -491,7 +491,7 @@ module Runar
             { script: "#{code_script}6a#{state_hex}", satoshis: sats }
           end
         else
-          new_locking_script, new_satoshis = build_continuation(is_stateful, opts)
+          new_locking_script, new_satoshis = build_continuation(is_stateful, opts, anf_ordered_outputs)
         end
 
         # Finding G1: a method that calls add_raw_output(...) folds the raw
@@ -1327,10 +1327,30 @@ module Runar
         Digest::RMD160.digest(Digest::SHA256.digest(pub_key_bytes)).unpack1('H*')
       end
 
-      def build_continuation(is_stateful, opts)
+      def build_continuation(is_stateful, opts, anf_ordered_outputs = [])
         return ['', 0] unless is_stateful
 
-        new_satoshis = opts.satoshis.positive? ? opts.satoshis : @current_utxo.satoshis
+        # When the ANF interpreter's ordered outputs are EXACTLY ONE entry of
+        # kind :state (a single add_output, no raw outputs), use its satoshis for
+        # the continuation amount — otherwise the covenant's hashOutputs binding
+        # rejects the spend and the funds strand. Generalizes finding G1's
+        # raw-branch read to the no-raw single-continuation path. An explicit
+        # opts.satoshis (caller override) still wins; a method with NO explicit
+        # add_output has an EMPTY ordered-outputs list (auto-injected
+        # continuation) → keep the current-utxo default. Mirrors the TS reference
+        # (prepareCall single-stateful branch).
+        state_entries = anf_ordered_outputs.select { |o| o[:kind] == :state }
+        single_explicit_state_sats =
+          anf_ordered_outputs.length == 1 && state_entries.length == 1 ? state_entries.first[:satoshis] : nil
+
+        new_satoshis =
+          if opts.satoshis.positive?
+            opts.satoshis
+          elsif !single_explicit_state_sats.nil?
+            single_explicit_state_sats
+          else
+            @current_utxo.satoshis
+          end
         opts.new_state&.each { |k, v| @state[k] = v }
         [get_locking_script, new_satoshis]
       end

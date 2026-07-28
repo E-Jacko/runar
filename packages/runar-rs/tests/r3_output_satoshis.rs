@@ -19,8 +19,13 @@
 //!   2. user's `outputSatoshis` ABI arg
 //!   3. legacy fallback: current_utxo.satoshis
 
+use runar_lang::sdk::anf_interpreter::OrderedOutputEntry;
 use runar_lang::sdk::contract::resolve_continuation_satoshis;
 use runar_lang::sdk::types::SdkValue;
+
+/// These R3 rung tests exercise the `outputSatoshis`-param path with no ANF
+/// addOutput recorded, so the ordered-outputs slice is always empty.
+const NO_ORDERED_OUTPUTS: &[OrderedOutputEntry] = &[];
 
 #[test]
 fn r3_user_output_satoshis_arg_overrides_input_utxo() {
@@ -33,7 +38,7 @@ fn r3_user_output_satoshis_arg_overrides_input_utxo() {
     let current_utxo_satoshis = 5_000;
 
     let resolved =
-        resolve_continuation_satoshis(&names, &args, None, current_utxo_satoshis);
+        resolve_continuation_satoshis(&names, &args, None, NO_ORDERED_OUTPUTS, current_utxo_satoshis);
 
     assert_eq!(
         resolved, 3_000,
@@ -51,7 +56,7 @@ fn r3_call_options_satoshis_beats_user_arg() {
     let args = vec![SdkValue::Int(2_000), SdkValue::Int(3_000)];
 
     let resolved =
-        resolve_continuation_satoshis(&names, &args, Some(7_000), 5_000);
+        resolve_continuation_satoshis(&names, &args, Some(7_000), NO_ORDERED_OUTPUTS, 5_000);
 
     assert_eq!(resolved, 7_000, "CallOptions.satoshis must override user arg");
 }
@@ -63,7 +68,7 @@ fn r3_legacy_no_output_satoshis_param_falls_back_to_input_utxo() {
     let names = ["newBalance"];
     let args = vec![SdkValue::Int(2_000)];
 
-    let resolved = resolve_continuation_satoshis(&names, &args, None, 5_000);
+    let resolved = resolve_continuation_satoshis(&names, &args, None, NO_ORDERED_OUTPUTS, 5_000);
 
     assert_eq!(
         resolved, 5_000,
@@ -80,10 +85,96 @@ fn r3_param_declared_but_arg_not_int_falls_back() {
     let names = ["newBalance", "outputSatoshis"];
     let args = vec![SdkValue::Int(2_000), SdkValue::Auto];
 
-    let resolved = resolve_continuation_satoshis(&names, &args, None, 5_000);
+    let resolved = resolve_continuation_satoshis(&names, &args, None, NO_ORDERED_OUTPUTS, 5_000);
 
     assert_eq!(
         resolved, 5_000,
         "non-Int outputSatoshis arg must fall through to legacy"
     );
+}
+
+// --- New rung: an explicit single `this.addOutput(<sats>, ...)` recorded by the
+// ANF interpreter drives the continuation amount ahead of the input-value
+// fallback (generalizes finding G1 to the no-raw single-continuation path). ---
+
+use runar_lang::sdk::anf_interpreter::OrderedOutputKind;
+
+fn state(satoshis: i64) -> OrderedOutputEntry {
+    OrderedOutputEntry { kind: OrderedOutputKind::State, satoshis, script: None }
+}
+
+fn raw(satoshis: i64) -> OrderedOutputEntry {
+    OrderedOutputEntry {
+        kind: OrderedOutputKind::Raw,
+        satoshis,
+        script: Some("76a914".to_string()),
+    }
+}
+
+#[test]
+fn single_explicit_addoutput_drives_continuation_over_input_value() {
+    // No options.satoshis, no outputSatoshis param, but the method emits a lone
+    // `addOutput(1000, ...)`. Continuation must use 1000, not the 1-sat input.
+    let names: [&str; 0] = [];
+    let args: Vec<SdkValue> = vec![];
+    let ordered = [state(1_000)];
+
+    let resolved = resolve_continuation_satoshis(&names, &args, None, &ordered, 1);
+
+    assert_eq!(
+        resolved, 1_000,
+        "single explicit addOutput must set the continuation amount, not the input value"
+    );
+}
+
+#[test]
+fn call_options_satoshis_beats_explicit_addoutput() {
+    // CallOptions.satoshis still wins over the ANF-recorded addOutput amount.
+    let names: [&str; 0] = [];
+    let args: Vec<SdkValue> = vec![];
+    let ordered = [state(1_000)];
+
+    let resolved = resolve_continuation_satoshis(&names, &args, Some(7_000), &ordered, 1);
+
+    assert_eq!(resolved, 7_000, "options.satoshis must override the addOutput amount");
+}
+
+#[test]
+fn output_satoshis_param_beats_explicit_addoutput() {
+    // The existing outputSatoshis ABI-param rung still outranks the ANF rung.
+    let names = ["newBalance", "outputSatoshis"];
+    let args = vec![SdkValue::Int(2_000), SdkValue::Int(3_000)];
+    let ordered = [state(1_000)];
+
+    let resolved = resolve_continuation_satoshis(&names, &args, None, &ordered, 1);
+
+    assert_eq!(resolved, 3_000, "outputSatoshis ABI arg must outrank the addOutput amount");
+}
+
+#[test]
+fn lone_raw_output_falls_through_to_input_value() {
+    // A single raw output (no state continuation) is not a single-state layout;
+    // it must fall through to the legacy input-value default (the raw-output
+    // branch handles its own amount, finding G1).
+    let names: [&str; 0] = [];
+    let args: Vec<SdkValue> = vec![];
+    let ordered = [raw(1_000)];
+
+    let resolved = resolve_continuation_satoshis(&names, &args, None, &ordered, 42);
+
+    assert_eq!(resolved, 42, "lone raw output must not drive the continuation amount");
+}
+
+#[test]
+fn multiple_ordered_outputs_fall_through_to_input_value() {
+    // More than one ordered output (e.g. raw + state) is not the single-state
+    // case; the ordered-list branch handles that layout, so the resolver falls
+    // back to the legacy input value here.
+    let names: [&str; 0] = [];
+    let args: Vec<SdkValue> = vec![];
+    let ordered = [raw(1_000), state(500)];
+
+    let resolved = resolve_continuation_satoshis(&names, &args, None, &ordered, 42);
+
+    assert_eq!(resolved, 42, "multi-output layout must fall through to the input value");
 }

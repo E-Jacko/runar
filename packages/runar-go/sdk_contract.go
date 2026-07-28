@@ -723,6 +723,14 @@ func (c *RunarContract) PrepareCall(
 		}
 	} else if isStateful {
 		newSatoshis = c.currentUtxo.Satoshis
+		// A method whose body is a single this.addOutput(...) (no raw outputs,
+		// no auto-injected continuation) records its satoshis in the ANF
+		// interpreter's ordered-outputs list. Honor that explicit amount for the
+		// continuation instead of defaulting to the spent input's value; an
+		// explicit options.Satoshis override still wins below.
+		if len(anfOrderedOutputs) == 1 && anfOrderedOutputs[0].Kind == "state" {
+			newSatoshis = anfOrderedOutputs[0].Satoshis
+		}
 		if options != nil && options.Satoshis > 0 {
 			newSatoshis = options.Satoshis
 		}
