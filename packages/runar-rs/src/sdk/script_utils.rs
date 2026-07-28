@@ -168,7 +168,24 @@ fn interpret_script_element(opcode: u8, data_hex: &str, param_type: &str) -> Sdk
             }
             SdkValue::Bool(data_hex != "00")
         }
-        _ => SdkValue::Bytes(data_hex.to_string()),
+        _ => {
+            // S1: a ByteString (or other non-numeric) ctor arg whose 1-byte
+            // value was MINIMALDATA-encoded as OP_1..OP_16 / OP_1NEGATE
+            // carries no separate data bytes in the script —
+            // `read_script_element` reports an empty `data_hex` for these
+            // opcodes (they are neither direct pushes nor OP_PUSHDATA*). The
+            // opcode itself IS the value; reconstruct it instead of
+            // forwarding the (empty) data_hex. OP_0 correctly falls through
+            // to `data_hex` (the empty string), matching OP_0's true
+            // semantics (pushes `[]`, not a 1-byte `0x00`).
+            if (0x51..=0x60).contains(&opcode) {
+                return SdkValue::Bytes(format!("{:02x}", opcode - 0x50));
+            }
+            if opcode == 0x4f {
+                return SdkValue::Bytes("81".to_string());
+            }
+            SdkValue::Bytes(data_hex.to_string())
+        }
     }
 }
 

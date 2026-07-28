@@ -2,11 +2,14 @@
 //! in `encode_push_data`.
 //!
 //! BSV consensus + relay policy (`SCRIPT_VERIFY_MINIMALDATA`) require that
-//! a 1-byte data push whose payload is in `{0x00, 0x01..=0x10, 0x81}` MUST
-//! use the corresponding minimal opcode (`OP_0` / `OP_1..OP_16` /
-//! `OP_1NEGATE`) rather than the direct push `01 NN`. Non-minimal pushes
-//! are rejected by ARC, TAAL ARC, and WhatsOnChain at the relay layer with:
+//! a 1-byte data push whose payload is in `{0x01..=0x10, 0x81}` MUST use the
+//! corresponding minimal opcode (`OP_1..OP_16` / `OP_1NEGATE`) rather than
+//! the direct push `01 NN`. Non-minimal pushes are rejected by ARC, TAAL
+//! ARC, and WhatsOnChain at the relay layer with:
 //!   `non-mandatory-script-verify-flag (Data push larger than necessary)`
+//!
+//! `0x00` is NOT in that set — see `encode_push_data_1_byte_zero_is_not_op_0`
+//! below (deep-review C9 / S1).
 //!
 //! Before the fix, `encode_push_data` always emitted the direct push form
 //! for any payload of length 1, regardless of byte value. This worked for
@@ -23,10 +26,36 @@
 use runar_lang::sdk::state::encode_push_data;
 
 #[test]
-fn encode_push_data_minimaldata_op_0() {
-    // Payload 0x00 (single zero byte) must encode as OP_0 (one byte: 0x00),
-    // not direct push (two bytes: 0x01 0x00).
-    assert_eq!(encode_push_data("00"), "00");
+fn encode_push_data_1_byte_zero_is_not_op_0() {
+    // Deep-review C9 / S1. This assertion previously read
+    //   assert_eq!(encode_push_data("00"), "00");
+    // which was itself the bug: `OP_0` pushes the EMPTY byte array, not a
+    // 1-byte `0x00`, so encoding a 1-byte `0x00` payload as OP_0 CHANGES
+    // THE VALUE (it round-trips back as `""`).
+    //
+    // The authority here is the compiler's canonical encoder,
+    // `encodePushBytesHex` in packages/runar-compiler/src/passes/push-encoding.ts:
+    //
+    //     if (value.length === 0) return '00';               // OP_0 — empty ONLY
+    //     if (value.length === 1) {
+    //       const b = value[0]!;
+    //       if (b >= 1 && b <= 16) return byteToHex(0x50 + b);
+    //       if (b === 0x81) return '4f';
+    //     }
+    //     return bytesToHex(encodePushData(value));          // 00 -> "0100"
+    //
+    // i.e. the compiler short-circuits ONLY on `1..=16` and `0x81`; a 1-byte
+    // `0x00` falls through to the direct push `01 00`. MINIMALDATA neither
+    // requires nor permits OP_0 here.
+    assert_eq!(encode_push_data("00"), "0100");
+}
+
+#[test]
+fn encode_push_data_empty_payload_is_op_0() {
+    // The genuinely-empty payload IS OP_0 — matching `encodePushBytesHex`'s
+    // `value.length === 0` arm. This is the case the old `"00" -> "00"`
+    // assertion was conflating with a 1-byte zero.
+    assert_eq!(encode_push_data(""), "00");
 }
 
 #[test]
@@ -58,10 +87,11 @@ fn encode_push_data_minimaldata_op_1negate() {
 
 #[test]
 fn encode_push_data_single_byte_outside_op_n_range_still_direct_push() {
-    // Bytes outside {0x00, 0x01..=0x10, 0x81} must still use the direct
-    // push form (01 NN). This locks the regression boundary: the fix
-    // should ONLY short-circuit the consensus-required cases.
-    for byte in [0x11u8, 0x4f, 0x50, 0x60, 0x61, 0x80, 0x82, 0xff] {
+    // Bytes outside {0x01..=0x10, 0x81} must still use the direct push form
+    // (01 NN). This locks the regression boundary: the fix should ONLY
+    // short-circuit the consensus-required cases. 0x00 is included here
+    // (C9/S1): OP_0 pushes the empty array, so a 1-byte zero is a direct push.
+    for byte in [0x00u8, 0x11, 0x4f, 0x50, 0x60, 0x61, 0x80, 0x82, 0xff] {
         let hex = format!("{:02x}", byte);
         let expected = format!("01{:02x}", byte);
         let got = encode_push_data(&hex);

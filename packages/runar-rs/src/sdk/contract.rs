@@ -76,6 +76,61 @@ fn normalize_witness_hex(s: &str) -> Result<String, String> {
     Ok(trimmed.to_ascii_lowercase())
 }
 
+/// The well-known ByteString parameter the SDK fills in with the transaction's
+/// concatenated outpoints (36 bytes per input) once the input list has
+/// converged. It is the ONLY ByteString slot for which an [`SdkValue::Auto`]
+/// call arg is a request rather than a mistake.
+pub const AUTO_PREVOUTS_PARAM_NAME: &str = "allPrevouts";
+
+/// Is an [`SdkValue::Auto`] arg for `param` the SDK's auto-compute sentinel?
+///
+/// Mirrors the Zig SDK's name gate (`sdk_contract.zig`): `Auto` for any other
+/// ByteString param is a caller error, not a stub request.
+fn is_auto_prevouts_param(param: &AbiParam) -> bool {
+    param.name == AUTO_PREVOUTS_PARAM_NAME
+}
+
+/// Build-time error for an [`SdkValue::Auto`] arg with no auto-resolution rule.
+///
+/// Silently substituting the allPrevouts stub here produces a transaction that
+/// broadcasts and then fails at script execution with an opaque error; failing
+/// at build time names the offending parameter instead.
+fn auto_non_sig_arg_error(where_: &str, param: &AbiParam, index: usize) -> String {
+    format!(
+        "{}: SdkValue::Auto for {} param '{}' (index {}): Auto is only resolved for \
+         Sig (auto-signed), PubKey (taken from the signer), SigHashPreimage, and the \
+         '{}' outpoint slot. Pass an explicit value (SdkValue::Bytes, or \
+         SdkValue::Bytes(String::new()) for an empty ByteString)",
+        where_, param.param_type, param.name, index, AUTO_PREVOUTS_PARAM_NAME
+    )
+}
+
+/// Compute the BIP-143 sighash digest — `hash256(preimage)`, i.e.
+/// `sha256(sha256(preimage))` — that is ACTUALLY ECDSA-signed by `OP_CHECKSIG`
+/// on-chain. Returns an empty string for an empty preimage.
+///
+/// Deep-review finding C19: `PreparedCall::sighash` previously stored only
+/// `sha256(preimage)` (a SINGLE hash). The default `call()` path never reads
+/// that field — it re-derives the digest inside `LocalSigner::sign`
+/// (`bip143_sighash` -> `sha256d` -> `sign_prehash`) — so the bug stayed
+/// invisible there. But the documented multi-signer path hands
+/// `PreparedCall::sighash` to an EXTERNAL signer (a BRC-100-style
+/// `signHash(digest)` wallet / hardware signer) that ECDSA-signs those 32 bytes
+/// DIRECTLY with no further hashing. Handed the single-hashed value, such a
+/// signer signs the wrong message and the node's real `OP_CHECKSIG` rejects the
+/// spend. Mirrors `computeBip143Sighash` in `packages/runar-sdk/src/contract.ts`.
+fn compute_bip143_sighash(preimage_hex: &str) -> String {
+    if preimage_hex.is_empty() {
+        return String::new();
+    }
+    let preimage_bytes: Vec<u8> = (0..preimage_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&preimage_hex[i..i + 2], 16).unwrap_or(0))
+        .collect();
+    let hash = Sha256::digest(Sha256::digest(&preimage_bytes));
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// Runtime wrapper for a compiled Rúnar contract.
 ///
 /// Handles deployment, method invocation, state tracking, and script
@@ -609,6 +664,9 @@ impl RunarContract {
                     // Placeholder preimage (will be replaced after tx construction)
                     resolved_args[i] = SdkValue::Bytes("00".repeat(181));
                 } else if param.param_type == "ByteString" {
+                    if !is_auto_prevouts_param(param) {
+                        return Err(auto_non_sig_arg_error("RunarContract::prepare_call", param, i));
+                    }
                     prevouts_indices.push(i);
                     // Placeholder sized to estimated input count (1 primary + N extra + 1 funding)
                     let estimated_inputs = 1 + options.and_then(|o| o.additional_contract_inputs.as_ref()).map_or(0, |v| v.len()) + 1;
@@ -916,27 +974,38 @@ impl RunarContract {
             .collect();
 
         // Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling as primary args)
-        let resolved_per_input_args: Option<Vec<Vec<SdkValue>>> = options
-            .and_then(|o| o.additional_contract_input_args.as_ref())
-            .map(|per_input| {
-                per_input.iter().map(|input_args| {
-                    let mut resolved = input_args.clone();
-                    for (i, param) in user_params.iter().enumerate() {
-                        if i < resolved.len() && matches!(resolved[i], SdkValue::Auto) {
-                            if param.param_type == "Sig" {
-                                resolved[i] = SdkValue::Bytes("00".repeat(72));
-                            } else if param.param_type == "PubKey" {
-                                // Use the same resolved pubkey as the primary args
-                                resolved[i] = resolved_args[i].clone();
-                            } else if param.param_type == "ByteString" {
-                                let estimated_inputs = 1 + options.and_then(|o| o.additional_contract_inputs.as_ref()).map_or(0, |v| v.len()) + 1;
-                                resolved[i] = SdkValue::Bytes("00".repeat(36 * estimated_inputs));
+        let resolved_per_input_args: Option<Vec<Vec<SdkValue>>> =
+            match options.and_then(|o| o.additional_contract_input_args.as_ref()) {
+                None => None,
+                Some(per_input) => {
+                    let mut all: Vec<Vec<SdkValue>> = Vec::with_capacity(per_input.len());
+                    for input_args in per_input.iter() {
+                        let mut resolved = input_args.clone();
+                        for (i, param) in user_params.iter().enumerate() {
+                            if i < resolved.len() && matches!(resolved[i], SdkValue::Auto) {
+                                if param.param_type == "Sig" {
+                                    resolved[i] = SdkValue::Bytes("00".repeat(72));
+                                } else if param.param_type == "PubKey" {
+                                    // Use the same resolved pubkey as the primary args
+                                    resolved[i] = resolved_args[i].clone();
+                                } else if param.param_type == "ByteString" {
+                                    if !is_auto_prevouts_param(param) {
+                                        return Err(auto_non_sig_arg_error(
+                                            "RunarContract::prepare_call (additional contract input)",
+                                            param,
+                                            i,
+                                        ));
+                                    }
+                                    let estimated_inputs = 1 + options.and_then(|o| o.additional_contract_inputs.as_ref()).map_or(0, |v| v.len()) + 1;
+                                    resolved[i] = SdkValue::Bytes("00".repeat(36 * estimated_inputs));
+                                }
                             }
                         }
+                        all.push(resolved);
                     }
-                    resolved
-                }).collect()
-            });
+                    Some(all)
+                }
+            };
 
         // Build placeholder unlocking scripts for merge inputs (witness_hex
         // suffixed for sizing — build_stateful_unlock builds the real scripts).
@@ -1366,17 +1435,9 @@ impl RunarContract {
             }
         }
 
-        // Compute sighash from preimage (single SHA-256, matching TS behavior)
-        let sighash = if !final_preimage.is_empty() {
-            let preimage_bytes: Vec<u8> = (0..final_preimage.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&final_preimage[i..i + 2], 16).unwrap_or(0))
-                .collect();
-            let hash = Sha256::digest(&preimage_bytes);
-            hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()
-        } else {
-            String::new()
-        };
+        // Compute sighash from preimage (C19: the true BIP-143 digest external
+        // signers must sign — hash256(preimage), NOT sha256(preimage)).
+        let sighash = compute_bip143_sighash(&final_preimage);
 
         // Convert contract_outputs to ContractOutputEntry for PreparedCall
         let prepared_contract_outputs: Vec<ContractOutputEntry> = contract_outputs
@@ -1738,17 +1799,9 @@ impl RunarContract {
             term_tx = insert_unlocking_script(&term_tx, fee_input_idx, &fee_script_sig)?;
         }
 
-        // Compute sighash from preimage (single SHA-256)
-        let sighash = if !final_preimage.is_empty() {
-            let preimage_bytes: Vec<u8> = (0..final_preimage.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&final_preimage[i..i + 2], 16).unwrap_or(0))
-                .collect();
-            let hash = Sha256::digest(&preimage_bytes);
-            hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()
-        } else {
-            String::new()
-        };
+        // Compute sighash from preimage (C19: the true BIP-143 digest external
+        // signers must sign — hash256(preimage), NOT sha256(preimage)).
+        let sighash = compute_bip143_sighash(&final_preimage);
 
         Ok(PreparedCall {
             sighash,

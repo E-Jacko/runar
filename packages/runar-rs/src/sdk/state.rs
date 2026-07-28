@@ -449,12 +449,16 @@ fn encode_num2bin(n: i64, width: usize) -> String {
 /// Wrap a hex-encoded byte string in a Bitcoin Script push data opcode.
 ///
 /// Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
-/// pushes: a 1-byte payload whose value is in `{0x00, 0x01..=0x10, 0x81}`
-/// MUST use the corresponding minimal opcode (`OP_0` / `OP_1..OP_16` /
-/// `OP_1NEGATE`) rather than the direct push `01 NN`. Non-minimal direct
-/// pushes are rejected by ARC, TAAL ARC, and WhatsOnChain at the relay
-/// layer with the error:
+/// pushes: a 1-byte payload whose value is in `{0x01..=0x10, 0x81}` MUST use
+/// the corresponding minimal opcode (`OP_1..OP_16` / `OP_1NEGATE`) rather
+/// than the direct push `01 NN`. Non-minimal direct pushes are rejected by
+/// ARC, TAAL ARC, and WhatsOnChain at the relay layer with the error:
 ///   `non-mandatory-script-verify-flag (Data push larger than necessary)`
+///
+/// NOTE: 0x00 is deliberately NOT in that set. `OP_0` pushes the EMPTY byte
+/// array, not a 1-byte `0x00` — so the minimal encoding of a 1-byte `0x00`
+/// payload is the direct push `01 00` (matching the compiler's
+/// `encodePushBytesHex` in push-encoding.ts), not `OP_0` (C9 / S1).
 pub fn encode_push_data(data_hex: &str) -> String {
     let len = data_hex.len() / 2;
 
@@ -468,7 +472,6 @@ pub fn encode_push_data(data_hex: &str) -> String {
     if len == 1 {
         if let Ok(byte) = u8::from_str_radix(data_hex, 16) {
             match byte {
-                0x00 => return "00".to_string(),                       // OP_0
                 0x01..=0x10 => return format!("{:02x}", 0x50 + byte),  // OP_1..OP_16
                 0x81 => return "4f".to_string(),                       // OP_1NEGATE
                 _ => {}
@@ -584,6 +587,13 @@ fn decode_num2bin(hex: &str) -> i64 {
 
 /// Decode a Bitcoin Script push data at the given hex offset.
 /// Returns the pushed data (hex) and the total number of hex chars consumed.
+///
+/// Inverse of `encode_push_data`'s MINIMALDATA short-circuit: `OP_1..OP_16`
+/// (0x51..=0x60) and `OP_1NEGATE` (0x4f) each push a single byte with no
+/// separate data bytes in the script — the opcode itself encodes the value
+/// (C9). `OP_0` (0x00) falls through to the `opcode <= 75` branch below and
+/// correctly decodes as the empty byte array (0-length push), since the
+/// encoder no longer emits OP_0 for a 1-byte `0x00` payload.
 pub(crate) fn decode_push_data(hex: &str, offset: usize) -> (String, usize) {
     if offset + 2 > hex.len() {
         return (String::new(), 2);
@@ -591,7 +601,13 @@ pub(crate) fn decode_push_data(hex: &str, offset: usize) -> (String, usize) {
 
     let opcode = u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap_or(0);
 
-    if opcode <= 75 {
+    if (0x51..=0x60).contains(&opcode) {
+        // OP_1..OP_16 — the opcode carries the value; no data bytes follow.
+        (format!("{:02x}", opcode - 0x50), 2)
+    } else if opcode == 0x4f {
+        // OP_1NEGATE — pushes the single byte 0x81.
+        ("81".to_string(), 2)
+    } else if opcode <= 75 {
         let data_len = opcode as usize * 2;
         let data = if offset + 2 + data_len <= hex.len() {
             hex[offset + 2..offset + 2 + data_len].to_string()

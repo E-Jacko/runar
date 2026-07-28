@@ -661,7 +661,9 @@ mod tests {
 /// internals consumed by `finalize_call()`.
 #[derive(Debug, Clone)]
 pub struct PreparedCall {
-    /// BIP-143 sighash (hex) — what external signers ECDSA-sign.
+    /// BIP-143 sighash digest (hex) — `hash256(preimage)`, i.e.
+    /// `sha256(sha256(preimage))`. External signers ECDSA-sign these 32 bytes
+    /// DIRECTLY, with no further hashing.
     pub sighash: String,
     /// Full BIP-143 preimage (hex).
     pub preimage: String,

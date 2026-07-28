@@ -554,6 +554,10 @@ Connected variants exist as well: `prepare_call_connected` and
 signing are `sighash`, `preimage`, `op_push_tx_sig`, `tx_hex`, and
 `sig_indices`. The remaining fields are opaque — `finalize_call` consumes them.
 
+`prepared.sighash` is `hash256(preimage)` — `sha256(sha256(preimage))`, the
+BIP-143 digest `OP_CHECKSIG` verifies against. External signers (including
+`WalletSigner::sign_hash`) ECDSA-sign it **directly**, with no further hashing.
+
 ### 7c. BRC-100 wallet signing (`WalletProvider<W>` + `WalletSigner<W>`)
 
 When the SDK cannot hold raw private keys — browser extension wallets, MetaNet
