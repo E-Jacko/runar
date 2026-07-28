@@ -156,6 +156,36 @@ describe('bytes state encoding/decoding', () => {
 });
 
 // ---------------------------------------------------------------------------
+// C9 — single-byte MINIMALDATA ByteString roundtrip (serializeState /
+// deserializeState). `encodePushDataState` emits OP_0 / OP_1..OP_16 /
+// OP_1NEGATE for single-byte payloads in that range (MINIMALDATA), but
+// `decodePushData` only understood direct pushes and OP_PUSHDATA1/2/4 —
+// every one of these minimal opcodes decoded as a zero-length push (''),
+// corrupting the restored state value.
+// ---------------------------------------------------------------------------
+
+describe('C9 — single-byte ByteString state MINIMALDATA roundtrip', () => {
+  const fields = makeFields({ name: 'b', type: 'bytes', index: 0 });
+  const cases: Array<{ label: string; hex: string }> = [
+    { label: '0x00 (OP_0)', hex: '00' },
+    { label: '0x01 (OP_1)', hex: '01' },
+    { label: '0x05 (OP_5, mid OP_1..OP_16 range)', hex: '05' },
+    { label: '0x10 (OP_16)', hex: '10' },
+    { label: '0x81 (OP_1NEGATE)', hex: '81' },
+    { label: 'multi-byte value', hex: 'aabbccdd' },
+    { label: 'empty', hex: '' },
+  ];
+
+  for (const tc of cases) {
+    it(`roundtrips ${tc.label}`, () => {
+      const encoded = serializeState(fields, { b: tc.hex });
+      const decoded = deserializeState(fields, encoded);
+      expect(decoded.b).toBe(tc.hex);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Mixed field types
 // ---------------------------------------------------------------------------
 

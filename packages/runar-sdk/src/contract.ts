@@ -17,8 +17,61 @@ import { buildP2PKHScript, extractConstructorArgs } from './script-utils.js';
 import { computeNewStateAndDataOutputs } from './anf-interpreter.js';
 import type { OrderedOutputEntry } from './anf-interpreter.js';
 import { buildInscriptionEnvelope, parseInscriptionEnvelope } from './ordinals/envelope.js';
-import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript } from '@bsv/sdk';
+import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript, Spend } from '@bsv/sdk';
 import { WalletProvider } from './providers/wallet-provider.js';
+
+/**
+ * Deep-review finding C8: opt-out for `finalizeCall`'s pre-broadcast local
+ * dry-run, plus the internal field that carries it from `prepareCall` to
+ * `finalizeCall`.
+ *
+ * This augments (does not redeclare) `CallOptions`/`PreparedCall` from
+ * `./types.js` — kept here rather than in types.ts so this change stays
+ * scoped to contract.ts, its only reader/writer, while that file is being
+ * edited concurrently by other work in this tree.
+ */
+declare module './types.js' {
+  interface CallOptions {
+    /**
+     * Run a local pre-broadcast Spend dry-run of the primary contract input
+     * before `finalizeCall` broadcasts (deep-review C8). The dry-run replays
+     * the fully-signed input through @bsv/sdk's production `Spend`
+     * interpreter (real BIP-143, real OP_CHECKSIG) and throws instead of
+     * broadcasting when the input would be rejected on-chain.
+     *
+     * **Default: OFF (opt-in).** C8 asked for this to default ON, and that is
+     * still the goal — but it is not yet safe to. The local harness currently
+     * produces at least one FALSE REJECTION: it rejects `Auction.bid()`
+     * (`codeseparator-signing.test.ts`, a real contract signed by a real
+     * `LocalSigner`) with "OP_CHECKSIGVERIFY requires that a valid signature
+     * is provided", while the independent real-crypto oracle
+     * (`conformance/witnesses/real-crypto/auction.json`, which drives the same
+     * method deploy->call->Spend through `runStatefulSpend`) ACCEPTS it — so
+     * the transaction is valid and the dry-run's tx modelling is wrong, not
+     * the signature. Nine other pre-existing tests fail the same way on
+     * synthetic stub artifacts whose scripts do not consume their pushed args
+     * (clean-stack violations).
+     *
+     * For a FAIL-CLOSED pre-broadcast gate a false rejection is worse than the
+     * hole it closes: it would block legitimate calls and strand funds. So the
+     * capability ships opt-in until its fidelity is proven against the
+     * real-crypto oracle across the fixture corpus. Flip the default to ON
+     * once `dryRunContractInput` agrees with `runStatefulSpend` on every
+     * `witnesses/real-crypto/*.json` accept case.
+     *
+     * Set `true` to opt in. Do not enable it for setups the local harness
+     * cannot model — e.g. a covenant whose correctness depends on OTHER
+     * inputs' final scripts that aren't known yet at `finalizeCall` time
+     * (multi-party assembly finished by a later step), or a
+     * deliberately-invalid tx built for negative testing.
+     */
+    dryRun?: boolean;
+  }
+  interface PreparedCall {
+    /** @internal C8 — carries CallOptions.dryRun into finalizeCall. */
+    _dryRun: boolean;
+  }
+}
 
 /**
  * Producer-side marker (issue #106) for the deliberately-empty branch of an
@@ -37,6 +90,25 @@ import { WalletProvider } from './providers/wallet-provider.js';
  */
 export const EMPTY_SIG: unique symbol = Symbol.for('runar.sdk.emptySig');
 
+/**
+ * Deep-review finding C29: `PreparedCall` hands the caller a live, mutable
+ * `Transaction` (`prepared.tx`) with no consume guard. `finalizeCall`
+ * mutates `prepared.tx.inputs[0].unlockingScript` in place and broadcasts —
+ * nothing stops the SAME `PreparedCall` from being finalized a second time
+ * against a tx that has already been consumed (and, on a real network,
+ * already spent), producing signatures that no longer correspond to a
+ * fresh, still-live UTXO.
+ *
+ * Tracked by object identity (not a field on `PreparedCall` itself) so the
+ * public shape stays untouched — a `WeakSet` also lets consumed entries be
+ * garbage-collected once the caller drops its reference. Full
+ * freezing/defensive-copying of `prepared.tx` was considered but rejected:
+ * `finalizeCall` itself must mutate `prepared.tx` in place to insert the
+ * final unlocking script, so freezing the object would break the one
+ * caller that legitimately needs to write to it.
+ */
+const consumedPreparedCalls = new WeakSet<PreparedCall>();
+
 /** Type guard: is this call arg the {@link EMPTY_SIG} marker (issue #106)? */
 export function isEmptySig(value: unknown): value is typeof EMPTY_SIG {
   return value === EMPTY_SIG;
@@ -52,6 +124,76 @@ function invalidateTxCache(tx: BsvTransaction): void {
   t.hexCache = undefined;
   t.rawBytesCache = undefined;
   t.cachedHash = undefined;
+}
+
+/**
+ * The one ByteString parameter name whose `null` argument is auto-resolved to
+ * the serialized outpoints of every input (deep-review finding G6). Must match
+ * Go's `AutoPrevoutsParamName` and the Rust/Python/Ruby/Zig/Java equivalents —
+ * this name is a cross-tier calling convention, not a per-tier ergonomic.
+ */
+const AUTO_PREVOUTS_PARAM_NAME = 'allPrevouts';
+
+/**
+ * Deep-review finding C8: offline dry-run of ONE input of a fully-assembled
+ * tx through @bsv/sdk's production `Spend` interpreter (real `OP_CHECKSIG`,
+ * real BIP-143). Used by `finalizeCall` to fail closed on a script-invalid
+ * (or, via its caller, underfunded) tx BEFORE it reaches `provider.broadcast`.
+ *
+ * Deliberately self-contained rather than imported from `multi-contract.ts`
+ * (which already has an equivalent `dryRunMultiContractInput`): that module
+ * imports `encodeArg`/`encodePushData`/`encodeScriptNumber` FROM this file,
+ * so importing back from it here would create a contract.ts <-> multi-contract.ts
+ * import cycle. Keep both thin wrappers in sync if `Spend`'s constructor shape
+ * ever changes.
+ */
+function dryRunContractInput(
+  tx: BsvTransaction,
+  inputIndex: number,
+  utxoScriptHex: string,
+  utxoSatoshis: number,
+): { valid: boolean; error?: string } {
+  const input = tx.inputs[inputIndex];
+  if (!input) return { valid: false, error: `no input at index ${inputIndex}` };
+  // `otherInputs` feeds BIP-143's hashPrevouts/hashSequence, so its SHAPE
+  // matters: passing the raw `tx.inputs` objects through yields a different
+  // sighash than the one the signer actually signed, and the input's
+  // OP_CHECKSIG(VERIFY) then fails for a perfectly valid transaction. That is a
+  // false rejection, which for a fail-closed pre-broadcast gate is worse than
+  // the hole C8 closes — it would block legitimate calls. Normalize to exactly
+  // the projection the proven harnesses use (`validateSpend` in the SDK spend
+  // tests and `runStatefulSpend` in runar-testing's real-crypto oracle, both of
+  // which agree with the network): re-index around the removed input and stub
+  // the fields Spend does not read for the other inputs.
+  const otherInputs = tx.inputs
+    .filter((_, i) => i !== inputIndex)
+    .map((inp, idx) => ({
+      inputIndex: idx >= inputIndex ? idx + 1 : idx,
+      sourceOutputIndex: inp.sourceOutputIndex,
+      sourceTXID: inp.sourceTXID!,
+      sequence: inp.sequence,
+      unlockingScript: undefined as never,
+      sourceSatoshis: 0,
+      lockingScript: LockingScript.fromHex(''),
+    }));
+  try {
+    const spend = new Spend({
+      sourceTXID: input.sourceTXID!,
+      sourceOutputIndex: input.sourceOutputIndex,
+      sourceSatoshis: utxoSatoshis,
+      lockingScript: LockingScript.fromHex(utxoScriptHex),
+      transactionVersion: tx.version,
+      otherInputs: otherInputs as unknown as ConstructorParameters<typeof Spend>[0]['otherInputs'],
+      outputs: tx.outputs,
+      inputIndex,
+      unlockingScript: input.unlockingScript!,
+      inputSequence: input.sequence ?? 0xffffffff,
+      lockTime: tx.lockTime,
+    });
+    return { valid: !!spend.validate() };
+  } catch (e) {
+    return { valid: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /**
@@ -679,6 +821,25 @@ export class RunarContract {
         resolvedArgs[i] = '00'.repeat(181);
       }
       if (userParams[i]!.type === 'ByteString' && args[i] === null) {
+        // Finding G6: this stub used to be TYPE-blind — ANY null ByteString got
+        // the allPrevouts outpoint stub, so a caller who passed null for an
+        // ordinary ByteString param (say `memo`) silently got real outpoint
+        // bytes spliced into their own parameter. That builds a tx which
+        // broadcasts and then fails at script execution with an opaque error.
+        // Gate on the documented parameter NAME instead: `allPrevouts` keeps
+        // its auto-compute convention (used by the token-ft integration tests
+        // across tiers), everything else fails loudly at build time naming the
+        // offending parameter. Matches Go `isAutoPrevoutsParam`/`errNilNonSigArg`
+        // and the Rust/Python/Ruby/Zig/Java equivalents.
+        if (userParams[i]!.name !== AUTO_PREVOUTS_PARAM_NAME) {
+          throw new Error(
+            `RunarContract.prepareCall: null arg for ByteString param ` +
+              `'${userParams[i]!.name}' (index ${i}): null is only auto-resolved for ` +
+              `Sig (auto-signed), PubKey (taken from the signer), SigHashPreimage, ` +
+              `and the '${AUTO_PREVOUTS_PARAM_NAME}' outpoint slot. Pass an explicit ` +
+              `value (hex string, or '' for an empty ByteString).`,
+          );
+        }
         prevoutsIndices.push(i);
         const estimatedInputs = 1 + (options?.additionalContractInputs?.length ?? 0) + 1;
         resolvedArgs[i] = '00'.repeat(36 * estimatedInputs);
@@ -906,13 +1067,9 @@ export class RunarContract {
         }
       }
 
-      // Compute sighash from preimage
-      let sighash = '';
-      if (finalPreimage) {
-        const preimageBytes = Utils.toArray(finalPreimage, 'hex');
-        const sighashBytes = Hash.sha256(preimageBytes);
-        sighash = Utils.toHex(sighashBytes);
-      }
+      // Compute sighash from preimage (C19: the true BIP-143 digest external
+      // signers must ECDSA-sign — hash256(preimage), not sha256(preimage)).
+      const sighash = finalPreimage ? computeBip143Sighash(finalPreimage) : '';
 
       return {
         sighash,
@@ -940,6 +1097,7 @@ export class RunarContract {
         _hasMultiOutput: false,
         _contractOutputs: [],
         _intentWitnessHex: witnessHex,
+        _dryRun: options?.dryRun ?? false,
       };
     }
 
@@ -1321,7 +1479,24 @@ export class RunarContract {
         extraUnlocks.push(unlock);
       }
 
-      // Rebuild TX with real unlocking scripts
+      // Rebuild TX with real unlocking scripts.
+      //
+      // Deep-review finding C13: the funding coin-selection above ran against
+      // an ESTIMATE (placeholder unlock + the `perContractInputOverhead`
+      // heuristic), not this REAL unlock — and there is no re-selection pass
+      // here if the real size turns out bigger than estimated. Investigated:
+      // this IS reachable (e.g. a stateful method whose current — spent —
+      // locking script is far larger than its new/continuation one, since the
+      // heuristic only has the NEW script's length to go on; see
+      // `c13-call-funding-fee-bound.test.ts`). It can NEVER produce an
+      // invalid or overspending tx, though: `buildCallTransaction` always
+      // computes fee/change from these REAL bytes (not the estimate), and
+      // finding C3's fail-closed guard guarantees `totalInput >=
+      // contractOutputSats`, so the worst case is a lower-than-intended fee
+      // down to (and never below) 0 — the same zero-fee "exact cover" floor
+      // issue #116 already established as valid/intentional. No re-selection
+      // loop is added here; see the linked test for the invariant this bound
+      // relies on.
       ({ tx, inputCount, changeAmount } = buildCallTransaction(
         this.currentUtxo,
         input0Unlock,
@@ -1423,13 +1598,9 @@ export class RunarContract {
       }
     }
 
-    // Compute sighash from preimage
-    let sighash = '';
-    if (finalPreimage) {
-      const preimageBytes = Utils.toArray(finalPreimage, 'hex');
-      const sighashBytes = Hash.sha256(preimageBytes);
-      sighash = Utils.toHex(sighashBytes);
-    }
+    // Compute sighash from preimage (C19: the true BIP-143 digest external
+    // signers must ECDSA-sign — hash256(preimage), not sha256(preimage)).
+    const sighash = finalPreimage ? computeBip143Sighash(finalPreimage) : '';
 
     return {
       sighash,
@@ -1457,6 +1628,7 @@ export class RunarContract {
       _hasMultiOutput: !!hasMultiOutput,
       _contractOutputs: contractOutputs ?? [],
       _intentWitnessHex: witnessHex,
+      _dryRun: options?.dryRun ?? false,
     };
   }
 
@@ -1471,6 +1643,19 @@ export class RunarContract {
     prepared: PreparedCall,
     signatures: Record<number, string>,
   ): Promise<{ txid: string; tx: TransactionData }> {
+    // C29: one-shot guard. Mark consumed BEFORE any mutation/broadcast work
+    // so a second call fails fast regardless of whether the first attempt
+    // succeeded, was rejected by the C8 dry-run, or threw during broadcast —
+    // `prepared.tx` may already have been mutated by that first attempt in
+    // every one of those cases.
+    if (consumedPreparedCalls.has(prepared)) {
+      throw new Error(
+        'RunarContract.finalizeCall: this PreparedCall has already been finalized (deep-review C29). ' +
+          'A PreparedCall is one-shot — call prepareCall() again to build a fresh one.',
+      );
+    }
+    consumedPreparedCalls.add(prepared);
+
     const { provider } = this.resolveProviderSigner();
 
     // Replace placeholder sigs with real signatures
@@ -1518,6 +1703,26 @@ export class RunarContract {
     const finalTx = prepared.tx;
     finalTx.inputs[0]!.unlockingScript = UnlockingScript.fromHex(primaryUnlock);
     invalidateTxCache(finalTx);
+
+    // C8: local pre-broadcast dry-run. Replay the fully-signed primary
+    // contract input through @bsv/sdk's production Spend interpreter and fail
+    // closed — instead of broadcasting a tx the network would reject — unless
+    // the caller opted IN (CallOptions.dryRun, threaded via prepareCall).
+    // Opt-in rather than default-on: see the CallOptions.dryRun docstring for
+    // the false-rejection evidence that forced this polarity.
+    if (prepared._dryRun) {
+      const dryRun = dryRunContractInput(
+        finalTx, 0, prepared._contractUtxo.script, prepared._contractUtxo.satoshis,
+      );
+      if (!dryRun.valid) {
+        throw new Error(
+          `RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary ` +
+            `contract input (deep-review C8)${dryRun.error ? `: ${dryRun.error}` : ' (script evaluated to false)'}. ` +
+            `Refusing to broadcast a tx the network would reject. Omit { dryRun: true } in ` +
+            `CallOptions to bypass (see PreparedCall docs).`,
+        );
+      }
+    }
 
     // Broadcast
     const txid = await provider.broadcast(finalTx);
@@ -2061,9 +2266,24 @@ export class RunarContract {
 
     if (artifact.stateFields && artifact.stateFields.length > 0) {
       const state = extractStateFromScript(artifact, utxo.script);
-      if (state) {
-        contract._state = state;
+      // Deep-review finding C10: `extractStateFromScript` returns null ONLY
+      // when the script has no recognisable state section at all (no
+      // OP_RETURN found) — i.e. state extraction failed ENTIRELY, distinct
+      // from "this one field has no on-chain slot" (issue #119's deliberate
+      // zero-fill of unslotted CONSTRUCTOR args in `restoreConstructorArgs`,
+      // untouched here). Silently keeping the constructor-initial `_state`
+      // set by the `RunarContract` constructor above would present stale
+      // deploy-time defaults as if they were live on-chain state. Fail
+      // loudly instead of fabricating plausible-looking state.
+      if (state === null) {
+        throw new Error(
+          `RunarContract.fromUtxo: could not extract state for ${artifact.contractName} — ` +
+            `no state section (OP_RETURN) found in the UTXO script, but the artifact declares ` +
+            `${artifact.stateFields.length} state field(s). Refusing to silently present ` +
+            `constructor-initial state as live on-chain state.`,
+        );
       }
+      contract._state = state;
     }
 
     return contract;
@@ -2395,6 +2615,33 @@ function buildNamedArgs(
 // ---------------------------------------------------------------------------
 
 /**
+ * Compute the BIP-143 sighash digest — `hash256(preimage)` i.e.
+ * `sha256(sha256(preimage))` — that is ACTUALLY ECDSA-signed by
+ * `OP_CHECKSIG` on-chain.
+ *
+ * Deep-review finding C19: `PreparedCall.sighash` previously stored only
+ * `sha256(preimage)` (a SINGLE hash). That happened to work for the default
+ * `call()` path only because `LocalSigner.sign()` hands its OWN independently
+ * computed `sha256(preimage)` to `PrivateKey.sign()`, which re-hashes its
+ * input once more internally — so the total ends up correct by accident of
+ * that one call chain. An external wallet / hardware signer wired to the
+ * multi-signer `prepareCall()` / `finalizeCall()` API is handed
+ * `PreparedCall.sighash` and is expected to ECDSA-sign it DIRECTLY (no
+ * further hashing) — e.g. a BRC-100 `signHash`-style API. Handed the
+ * single-hashed value, such a signer signs the wrong digest and the node's
+ * real `OP_CHECKSIG` rejects the spend.
+ *
+ * This is the WIRE-LEVEL digest external signers must sign — the same value
+ * the Java SDK already stores in its `PreparedCall`. Port this exact
+ * `hash256(preimage)` computation (not `sha256(preimage)`) to every other
+ * tier's `PreparedCall.sighash` equivalent (Go/Rust/Python).
+ */
+function computeBip143Sighash(preimageHex: string): string {
+  const preimageBytes = Utils.toArray(preimageHex, 'hex');
+  return Utils.toHex(Hash.hash256(preimageBytes));
+}
+
+/**
  * Encode an argument value as a Bitcoin Script push data element.
  *
  * Exported as part of the low-level assembly surface: downstream tooling
@@ -2492,15 +2739,19 @@ export function encodePushData(dataHex: string): string {
   const len = dataHex.length / 2;
 
   // MINIMALDATA: single-byte payloads in the OP_N range must use the
-  // corresponding minimal opcode (`OP_0` / `OP_1..OP_16` / `OP_1NEGATE`)
-  // rather than the direct push `01 NN`, which is relay-rejected as
-  // "Data push larger than necessary". `encodeScriptNumber` already
-  // short-circuits Int args to OP_N; this brings the ByteString push path
-  // to the same standard. Kept byte-identical with `encodePushDataState`
-  // in state.ts and the shared `encode_push_data` in the other six SDKs.
+  // corresponding minimal opcode (`OP_1..OP_16` / `OP_1NEGATE`) rather than
+  // the direct push `01 NN`, which is relay-rejected as "Data push larger
+  // than necessary". `encodeScriptNumber` already short-circuits Int args to
+  // OP_N; this brings the ByteString push path to the same standard. Kept
+  // byte-identical with `encodePushDataState` in state.ts and the shared
+  // `encode_push_data` in the other six SDKs.
+  //
+  // NOTE: 0x00 is deliberately NOT in that set. `OP_0` pushes the EMPTY byte
+  // array, not a 1-byte `0x00` — so the minimal encoding of a 1-byte `0x00`
+  // payload is the direct push `01 00` (matching the compiler's
+  // `encodePushBytesHex` in push-encoding.ts), not `OP_0` (S1).
   if (len === 1) {
     const byte = parseInt(dataHex, 16);
-    if (byte === 0x00) return '00'; // OP_0
     if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0'); // OP_1..OP_16
     if (byte === 0x81) return '4f'; // OP_1NEGATE
   }

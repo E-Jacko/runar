@@ -2,11 +2,75 @@
 // runar-sdk/providers/mock.ts — Mock provider for testing
 // ---------------------------------------------------------------------------
 
-import type { Transaction } from '@bsv/sdk';
+import { Spend, LockingScript, type Transaction } from '@bsv/sdk';
 import type { Provider } from './provider.js';
 import type { TransactionData, UTXO } from '../types.js';
 import { InputLimits } from 'runar-ir-schema';
 import { assertScriptHexUnderLimit } from '../errors.js';
+
+/**
+ * Deep-review finding C8 (part 2): offline validation of a transaction's
+ * KNOWN inputs (script validity via @bsv/sdk's production `Spend`
+ * interpreter, plus a fee-sanity check when every input is known) before
+ * `MockProvider.broadcast()` acks it.
+ *
+ * Deliberately self-contained rather than imported from `contract.ts`'s
+ * `dryRunContractInput` (same @bsv/sdk `Spend` shape, different call site):
+ * that would create a `providers/mock.ts` <-> `contract.ts` dependency in
+ * the wrong direction (providers are a leaf module). Keep both thin
+ * wrappers in sync if `Spend`'s constructor shape ever changes.
+ */
+function validateBroadcastTx(
+  tx: Transaction,
+  knownOutpoints: ReadonlyMap<string, { script: string; satoshis: number }>,
+): { valid: boolean; error?: string } {
+  let allInputsKnown = true;
+  let totalKnownIn = 0;
+
+  for (let i = 0; i < tx.inputs.length; i++) {
+    const input = tx.inputs[i]!;
+    const known = knownOutpoints.get(`${input.sourceTXID}:${input.sourceOutputIndex}`);
+    if (!known) {
+      allInputsKnown = false;
+      continue;
+    }
+    totalKnownIn += known.satoshis;
+
+    const otherInputs = tx.inputs.filter((_, j) => j !== i);
+    try {
+      const spend = new Spend({
+        sourceTXID: input.sourceTXID!,
+        sourceOutputIndex: input.sourceOutputIndex,
+        sourceSatoshis: known.satoshis,
+        lockingScript: LockingScript.fromHex(known.script),
+        transactionVersion: tx.version,
+        otherInputs,
+        outputs: tx.outputs,
+        inputIndex: i,
+        unlockingScript: input.unlockingScript!,
+        inputSequence: input.sequence ?? 0xffffffff,
+        lockTime: tx.lockTime,
+      });
+      if (!spend.validate()) {
+        return { valid: false, error: `input ${i}: script evaluated to false` };
+      }
+    } catch (e) {
+      return { valid: false, error: `input ${i}: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  if (allInputsKnown) {
+    const totalOut = tx.outputs.reduce((sum, o) => sum + (o.satoshis ?? 0), 0);
+    if (totalOut > totalKnownIn) {
+      return {
+        valid: false,
+        error: `underfunded: outputs (${totalOut} sats) exceed known inputs (${totalKnownIn} sats)`,
+      };
+    }
+  }
+
+  return { valid: true };
+}
 
 /**
  * In-memory mock provider for unit tests and local development.
@@ -24,6 +88,14 @@ export class MockProvider implements Provider {
   private readonly network: 'mainnet' | 'testnet';
   private broadcastCount = 0;
   private feeRate = 100;
+  /** Deep-review C8 (part 2): opt-in broadcast validation, off by default. */
+  private validateBroadcasts = false;
+  /** outpoint ("txid:vout") -> { script, satoshis } for every UTXO this
+   * provider has been told about (via addUtxo/addContractUtxo/addTransaction)
+   * or has itself produced via a prior broadcast(). Used by
+   * `validateBroadcastTx` to check script validity / fee sanity for the
+   * inputs it actually knows the value+script of. */
+  private readonly knownOutpoints: Map<string, { script: string; satoshis: number }> = new Map();
 
   constructor(network: 'mainnet' | 'testnet' = 'testnet') {
     this.network = network;
@@ -38,16 +110,36 @@ export class MockProvider implements Provider {
     if (tx.raw) {
       this.rawTransactions.set(tx.txid, tx.raw);
     }
+    for (let i = 0; i < tx.outputs.length; i++) {
+      const out = tx.outputs[i]!;
+      this.knownOutpoints.set(`${tx.txid}:${i}`, { script: out.script, satoshis: out.satoshis });
+    }
   }
 
   addUtxo(address: string, utxo: UTXO): void {
     const existing = this.utxos.get(address) ?? [];
     existing.push(utxo);
     this.utxos.set(address, existing);
+    this.knownOutpoints.set(`${utxo.txid}:${utxo.outputIndex}`, { script: utxo.script, satoshis: utxo.satoshis });
   }
 
   addContractUtxo(scriptHash: string, utxo: UTXO): void {
     this.contractUtxos.set(scriptHash, utxo);
+    this.knownOutpoints.set(`${utxo.txid}:${utxo.outputIndex}`, { script: utxo.script, satoshis: utxo.satoshis });
+  }
+
+  /**
+   * Opt in to validating `broadcast()`ed transactions (deep-review C8 part
+   * 2): checks script validity (via @bsv/sdk's `Spend`) for every input
+   * whose UTXO this provider knows about, and — when ALL inputs are known —
+   * rejects a tx whose outputs exceed its inputs. `broadcast()` throws
+   * instead of returning a fake txid when validation fails.
+   *
+   * Default is OFF (unchanged legacy always-ack behaviour) so existing
+   * tests that don't care about validity keep passing.
+   */
+  enableBroadcastValidation(enabled = true): void {
+    this.validateBroadcasts = enabled;
   }
 
   /** Get all raw tx hexes that were broadcast through this provider. */
@@ -73,6 +165,15 @@ export class MockProvider implements Provider {
   }
 
   async broadcast(tx: Transaction): Promise<string> {
+    if (this.validateBroadcasts) {
+      const result = validateBroadcastTx(tx, this.knownOutpoints);
+      if (!result.valid) {
+        throw new Error(
+          `MockProvider: refusing to broadcast invalid transaction (C8)${result.error ? `: ${result.error}` : ''}.`,
+        );
+      }
+    }
+
     const rawTx = tx.toHex();
     this.broadcastedTxs.push(rawTx);
     this.broadcastedTxObjects.push(tx);
@@ -84,6 +185,17 @@ export class MockProvider implements Provider {
 
     // Auto-store raw hex for subsequent getRawTransaction lookups
     this.rawTransactions.set(fakeTxid, rawTx);
+
+    // Register this tx's own outputs as known outpoints so a subsequent
+    // chained call (spending the continuation this broadcast just created)
+    // can also be validated.
+    for (let i = 0; i < tx.outputs.length; i++) {
+      const out = tx.outputs[i]!;
+      this.knownOutpoints.set(`${fakeTxid}:${i}`, {
+        script: out.lockingScript.toHex(),
+        satoshis: out.satoshis ?? 0,
+      });
+    }
 
     return fakeTxid;
   }

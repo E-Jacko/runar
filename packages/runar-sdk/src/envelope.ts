@@ -122,17 +122,30 @@ export function verifyEnvelope(opts: VerifyEnvelopeOpts): VerifyEnvelopeResult {
     }
   }
 
-  // 1. Field presence and types.
+  // 1. Field presence and types. An EMPTY string field and a ZERO
+  //    nonce/expiresAt count as absent, not present-but-odd — the other six
+  //    SDK tiers all reject them here as `missing-fields` (Go
+  //    sdk_envelope.go:550, Rust envelope.rs:336, Python envelope.py:310, Zig
+  //    sdk_envelope.zig:483, Ruby envelope.rb:260, Java Envelope.java:368),
+  //    and `verifyEnvelope` must return the SAME VerifyEnvelopeReason on every
+  //    tier for the same rejection case. Without the emptiness checks TS was
+  //    the outlier: `sig: ''` fell through to `expired`/`bad-sig` and a zero
+  //    nonce was ACCEPTED outright.
   if (
     !env ||
     typeof env !== 'object' ||
     typeof env.payload !== 'string' ||
+    env.payload === '' ||
     typeof env.sig !== 'string' ||
+    env.sig === '' ||
     typeof env.pubkey !== 'string' ||
+    env.pubkey === '' ||
     typeof env.nonce !== 'number' ||
     !Number.isFinite(env.nonce) ||
+    env.nonce === 0 ||
     typeof env.expiresAt !== 'number' ||
-    !Number.isFinite(env.expiresAt)
+    !Number.isFinite(env.expiresAt) ||
+    env.expiresAt === 0
   ) {
     return { ok: false, reason: 'missing-fields' };
   }

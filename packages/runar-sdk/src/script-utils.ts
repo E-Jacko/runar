@@ -113,8 +113,19 @@ function interpretScriptElement(opcode: number, dataHex: string, type: string): 
       if (opcode === 0x51) return true;
       return dataHex !== '00';
     }
-    default:
+    default: {
+      // S1: a ByteString (or other non-numeric) ctor arg whose 1-byte value
+      // was MINIMALDATA-encoded as OP_1..OP_16 / OP_1NEGATE carries no
+      // separate data bytes in the script — `readScriptElement` reports an
+      // empty `dataHex` for these opcodes (they aren't direct pushes or
+      // OP_PUSHDATA*). The opcode itself IS the value; reconstruct it
+      // instead of forwarding the (empty) dataHex. OP_0 correctly falls
+      // through to `dataHex` (the empty string), matching OP_0's true
+      // semantics (pushes `[]`, not a 1-byte `0x00`).
+      if (opcode >= 0x51 && opcode <= 0x60) return (opcode - 0x50).toString(16).padStart(2, '0');
+      if (opcode === 0x4f) return '81';
       return dataHex;
+    }
   }
 }
 

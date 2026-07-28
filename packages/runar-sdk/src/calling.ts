@@ -214,25 +214,45 @@ const TX_OVERHEAD = 10;
 
 /**
  * Estimate the fee for a method call transaction.
+ *
+ * @param lockingScriptByteLen   - Byte length of the (single) contract
+ *   continuation output's locking script.
+ * @param unlockingScriptByteLen - Byte length of the primary contract input's
+ *   unlocking script.
+ * @param numFundingInputs       - Number of P2PKH funding inputs (~148 bytes
+ *   each), NOT continuation outputs. Use `extraOutputBytes` to size
+ *   additional continuation/data outputs.
+ * @param feeRate                - Sat/KB (default 100).
+ * @param extraOutputBytes       - Serialized byte size of any outputs BEYOND
+ *   the single `lockingScriptByteLen` one already counted (additional
+ *   continuation outputs, data outputs) — mirrors `estimateDeployFee`'s
+ *   `extraOutputBytes` in deployment.ts (finding C15). Defaults to 0.
  */
 export function estimateCallFee(
   lockingScriptByteLen: number,
   unlockingScriptByteLen: number,
   numFundingInputs: number,
   feeRate: number = 100,
+  extraOutputBytes: number = 0,
 ): number {
   const contractInputSize = 32 + 4 + varIntByteSize(unlockingScriptByteLen) + unlockingScriptByteLen + 4;
   const fundingInputsSize = numFundingInputs * P2PKH_INPUT_SIZE;
   const contractOutputSize = 8 + varIntByteSize(lockingScriptByteLen) + lockingScriptByteLen;
   const changeOutputSize = P2PKH_OUTPUT_SIZE;
-  const txSize = TX_OVERHEAD + contractInputSize + fundingInputsSize + contractOutputSize + changeOutputSize;
+  const txSize =
+    TX_OVERHEAD + contractInputSize + fundingInputsSize + contractOutputSize + extraOutputBytes + changeOutputSize;
   return Math.ceil(txSize * feeRate / 1000);
 }
 
 export interface EstimateFeeForArtifactOpts {
   /** Sat/byte. Default 0.1. */
   feeRate?: number;
-  /** Number of continuation outputs. Default 1. */
+  /** Number of continuation outputs, each assumed the same byte size as the
+   * artifact's own locking script (homogeneous multi-output fan-out).
+   * Default 1. Fixed under finding C4: previously this value was fed
+   * directly into `estimateCallFee`'s `numFundingInputs` slot (each priced
+   * at ~148 bytes, a P2PKH input) instead of sizing extra continuation
+   * OUTPUTS — silently mispricing every caller of this helper. */
   outputCount?: number;
   /** Unlocking-script byte length. Default: ceil(artifact.script.length / 4). */
   unlockingScriptLen?: number;
@@ -252,7 +272,12 @@ export function estimateFeeForArtifact(
   const outputs = opts.outputCount ?? 1;
   const lockingLen = artifact.script.length / 2;
   const unlockingLen = opts.unlockingScriptLen ?? Math.ceil(artifact.script.length / 4);
-  return estimateCallFee(lockingLen, unlockingLen, outputs, satPerByte * 1000);
+  // estimateCallFee already prices ONE continuation output of lockingLen
+  // bytes; extraOutputBytes covers any additional outputs beyond that one
+  // (finding C4 — outputCount used to be smuggled into numFundingInputs).
+  const perOutputSize = 8 + varIntByteSize(lockingLen) + lockingLen;
+  const extraOutputBytes = Math.max(0, outputs - 1) * perOutputSize;
+  return estimateCallFee(lockingLen, unlockingLen, 0, satPerByte * 1000, extraOutputBytes);
 }
 
 // ---------------------------------------------------------------------------

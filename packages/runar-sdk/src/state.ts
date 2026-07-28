@@ -160,11 +160,32 @@ function regroupNested(flat: unknown[], dims: number[], offset = 0): { value: un
  *
  * Fields with a `fixedArray` annotation are returned as a plain JS array on
  * the grouped name, not as N individual scalar fields.
+ *
+ * FAILS CLOSED (C28). The blob is read back out of a locking script that any
+ * third party can construct, so it is untrusted input. A state section that
+ * does not describe EXACTLY the artifact's `stateFields` is rejected:
+ *
+ *  - truncation — a field that runs past the end of the blob throws instead of
+ *    yielding a short slice (which previously decoded as a plausible-but-wrong
+ *    value: a missing `boolean` byte read as `true`, a clipped `bigint` as a
+ *    different number, a clipped `PubKey` as a stub key);
+ *  - overlong tails — bytes left over after the last declared field throw
+ *    instead of being silently dropped.
+ *
+ * Restoring wrong-but-plausible state from a corrupted continuation is worse
+ * than not restoring it at all: the caller then signs a continuation output
+ * committing to that state.
  */
 export function deserializeState(
   fields: StateField[],
   scriptHex: string,
 ): Record<string, unknown> {
+  if (scriptHex.length % 2 !== 0) {
+    throw new Error(
+      `deserializeState: state blob is ${scriptHex.length} hex chars — not a whole number of bytes`,
+    );
+  }
+
   const sorted = [...fields].sort((a, b) => a.index - b.index);
   const result: Record<string, unknown> = {};
   let offset = 0;
@@ -176,16 +197,29 @@ export function deserializeState(
       const total = field.fixedArray.syntheticNames.length;
       const flat: unknown[] = new Array(total);
       for (let i = 0; i < total; i++) {
-        const { value, bytesRead } = decodeStateValue(scriptHex, offset, leafType);
+        const { value, bytesRead } = decodeStateValue(
+          scriptHex,
+          offset,
+          leafType,
+          `${field.name}[${i}]`,
+        );
         flat[i] = value;
         offset += bytesRead;
       }
       result[field.name] = regroupNested(flat, dims).value;
     } else {
-      const { value, bytesRead } = decodeStateValue(scriptHex, offset, field.type);
+      const { value, bytesRead } = decodeStateValue(scriptHex, offset, field.type, field.name);
       result[field.name] = value;
       offset += bytesRead;
     }
+  }
+
+  if (offset !== scriptHex.length) {
+    throw new Error(
+      `deserializeState: ${(scriptHex.length - offset) / 2} unexpected trailing byte(s) after the ` +
+        `last state field (consumed ${offset / 2} of ${scriptHex.length / 2} bytes) — the state ` +
+        `section does not match the artifact's stateFields`,
+    );
   }
 
   return result;
@@ -345,11 +379,16 @@ function encodeNum2Bin(n: bigint, width: number): string {
  * Encode variable-length data as Bitcoin Script push data (with length prefix).
  *
  * Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
- * pushes: a 1-byte payload whose value is in `{0x00, 0x01..=0x10, 0x81}`
- * MUST use the corresponding minimal opcode (`OP_0` / `OP_1..OP_16` /
- * `OP_1NEGATE`) rather than the direct push `01 NN`. Non-minimal direct
- * pushes are rejected by ARC, TAAL ARC, and WhatsOnChain at the relay
- * layer with: `non-mandatory-script-verify-flag (Data push larger than necessary)`.
+ * pushes: a 1-byte payload whose value is in `{0x01..=0x10, 0x81}` MUST use
+ * the corresponding minimal opcode (`OP_1..OP_16` / `OP_1NEGATE`) rather than
+ * the direct push `01 NN`. Non-minimal direct pushes are rejected by ARC,
+ * TAAL ARC, and WhatsOnChain at the relay layer with:
+ * `non-mandatory-script-verify-flag (Data push larger than necessary)`.
+ *
+ * NOTE: 0x00 is deliberately NOT in that set. `OP_0` pushes the EMPTY byte
+ * array, not a 1-byte `0x00` — so the minimal encoding of a 1-byte `0x00`
+ * payload is the direct push `01 00` (matching the compiler's
+ * `encodePushBytesHex` in push-encoding.ts), not `OP_0` (C9 / S1).
  */
 function encodePushDataState(dataHex: string): string {
   const len = dataHex.length / 2;
@@ -360,7 +399,6 @@ function encodePushDataState(dataHex: string): string {
   // relay-rejected non-minimal direct push.
   if (len === 1) {
     const byte = parseInt(dataHex, 16);
-    if (byte === 0x00) return '00'; // OP_0
     if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0'); // OP_1..OP_16
     if (byte === 0x81) return '4f'; // OP_1NEGATE
   }
@@ -388,6 +426,7 @@ function decodeStateValue(
   hex: string,
   offset: number,
   type: string,
+  label: string,
 ): { value: unknown; bytesRead: number } {
   // Fixed-width types read exactly `size` raw bytes; widths come from the
   // shared runar-ir-schema table so the codec, the compiler's stateField
@@ -395,6 +434,12 @@ function decodeStateValue(
   const width = STATE_FIELD_WIDTHS[type];
   if (width) {
     const hexWidth = width.size * 2;
+    if (offset + hexWidth > hex.length) {
+      throw new Error(
+        `deserializeState: truncated state — field "${label}" (${type}) needs ${width.size} byte(s) ` +
+          `at offset ${offset / 2} but only ${(hex.length - offset) / 2} byte(s) remain`,
+      );
+    }
     const data = hex.slice(offset, offset + hexWidth);
     switch (width.encoding) {
       case 'bool1':
@@ -409,7 +454,7 @@ function decodeStateValue(
     }
   }
   // For variable-length / unknown types, fall back to push-data decoding
-  const { data, bytesRead } = decodePushData(hex, offset);
+  const { data, bytesRead } = decodePushData(hex, offset, label);
   return { value: data, bytesRead };
 }
 
@@ -438,53 +483,96 @@ function decodeNum2Bin(hex: string): bigint {
 /**
  * Decode a Bitcoin Script push data at the given hex offset.
  * Returns the pushed data (hex) and the total number of hex chars consumed.
+ *
+ * Inverse of `encodePushDataState`'s MINIMALDATA short-circuit: `OP_1..OP_16`
+ * (0x51..0x60) and `OP_1NEGATE` (0x4f) each push a single byte with no
+ * separate data bytes in the script — the opcode itself encodes the value
+ * (C9). `OP_0` (0x00) falls through to the `opcode <= 75` branch below and
+ * correctly decodes as the empty byte array (0-length push), since the
+ * encoder no longer emits OP_0 for a 1-byte `0x00` payload.
  */
 function decodePushData(
   hex: string,
   offset: number,
+  label: string,
 ): { data: string; bytesRead: number } {
-  const opcode = parseInt(hex.slice(offset, offset + 2), 16);
+  /** Assert `chars` hex chars are available from `offset`, else fail closed. */
+  const need = (chars: number, what: string): void => {
+    if (offset + chars > hex.length) {
+      throw new Error(
+        `deserializeState: truncated state — field "${label}" ${what} runs past the end of the ` +
+          `state section (needs ${chars / 2} byte(s) at offset ${offset / 2}, ` +
+          `only ${(hex.length - offset) / 2} remain)`,
+      );
+    }
+  };
 
-  if (opcode <= 75) {
+  need(2, 'push opcode');
+  const opcode = parseInt(hex.slice(offset, offset + 2), 16);
+  if (Number.isNaN(opcode)) {
+    throw new Error(
+      `deserializeState: field "${label}" — non-hex byte at offset ${offset / 2} in the state section`,
+    );
+  }
+
+  if (opcode >= 0x51 && opcode <= 0x60) {
+    // OP_1..OP_16
+    return { data: (opcode - 0x50).toString(16).padStart(2, '0'), bytesRead: 2 };
+  } else if (opcode === 0x4f) {
+    // OP_1NEGATE
+    return { data: '81', bytesRead: 2 };
+  } else if (opcode <= 75) {
     // Direct push: opcode is the byte length
     const dataLen = opcode * 2;
+    need(2 + dataLen, 'push payload');
     return {
       data: hex.slice(offset + 2, offset + 2 + dataLen),
       bytesRead: 2 + dataLen,
     };
   } else if (opcode === 0x4c) {
     // OP_PUSHDATA1
+    need(4, 'OP_PUSHDATA1 length prefix');
     const len = parseInt(hex.slice(offset + 2, offset + 4), 16);
     const dataLen = len * 2;
+    need(4 + dataLen, 'OP_PUSHDATA1 payload');
     return {
       data: hex.slice(offset + 4, offset + 4 + dataLen),
       bytesRead: 4 + dataLen,
     };
   } else if (opcode === 0x4d) {
     // OP_PUSHDATA2
+    need(6, 'OP_PUSHDATA2 length prefix');
     const lo = parseInt(hex.slice(offset + 2, offset + 4), 16);
     const hi = parseInt(hex.slice(offset + 4, offset + 6), 16);
     const len = lo | (hi << 8);
     const dataLen = len * 2;
+    need(6 + dataLen, 'OP_PUSHDATA2 payload');
     return {
       data: hex.slice(offset + 6, offset + 6 + dataLen),
       bytesRead: 6 + dataLen,
     };
   } else if (opcode === 0x4e) {
     // OP_PUSHDATA4
+    need(10, 'OP_PUSHDATA4 length prefix');
     const b0 = parseInt(hex.slice(offset + 2, offset + 4), 16);
     const b1 = parseInt(hex.slice(offset + 4, offset + 6), 16);
     const b2 = parseInt(hex.slice(offset + 6, offset + 8), 16);
     const b3 = parseInt(hex.slice(offset + 8, offset + 10), 16);
     const len = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
     const dataLen = len * 2;
+    need(10 + dataLen, 'OP_PUSHDATA4 payload');
     return {
       data: hex.slice(offset + 10, offset + 10 + dataLen),
       bytesRead: 10 + dataLen,
     };
   }
 
-  // Unknown opcode -- treat as zero-length
-  return { data: '', bytesRead: 2 };
+  // Not a push opcode at all — `encodePushDataState` can never emit one, so the
+  // state section is malformed. Previously this silently consumed one byte and
+  // returned an empty value, which desynchronised every subsequent field.
+  throw new Error(
+    `deserializeState: field "${label}" — byte 0x${opcode.toString(16).padStart(2, '0')} at offset ` +
+      `${offset / 2} is not a push opcode; the state section is malformed`,
+  );
 }
 

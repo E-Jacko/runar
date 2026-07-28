@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { BigNumber, PrivateKey, Utils } from '@bsv/sdk';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { BigNumber, Hash, PrivateKey, Utils } from '@bsv/sdk';
 import { sign as ecdsaSignRaw } from '@bsv/sdk/primitives/ECDSA';
 import {
   canonicalJson,
@@ -81,14 +84,26 @@ describe('estimateFeeForArtifact', () => {
   // A minimal fixture artifact — only `.script` is consulted.
   const fakeArtifact = { script: 'ab'.repeat(200) } as unknown as RunarArtifact; // 400 hex chars = 200 bytes
 
-  it('matches estimateCallFee with documented defaults', () => {
-    const expected = estimateCallFee(200, Math.ceil(400 / 4), 1, 0.1 * 1000);
+  // Finding C4: `outputCount` must size continuation OUTPUTS (byte cost of
+  // a locking script), never `estimateCallFee`'s `numFundingInputs` slot
+  // (byte cost of a signed P2PKH input, ~148 bytes). The old assertions here
+  // called `estimateCallFee(.., outputCount, ..)` — i.e. asserted on the very
+  // mis-wiring under test — so they passed even though `estimateFeeForArtifact`
+  // was pricing continuation outputs as funding inputs. See
+  // c4-fee-for-artifact-output-sizing.test.ts for the independent, built-tx
+  // derivation of the correct numbers.
+  it('matches estimateCallFee with documented defaults (no funding inputs, 1 output)', () => {
+    const expected = estimateCallFee(200, Math.ceil(400 / 4), 0, 0.1 * 1000);
     expect(estimateFeeForArtifact(fakeArtifact)).toBe(expected);
   });
 
-  it('honors feeRate and unlockingScriptLen overrides', () => {
+  it('honors feeRate and unlockingScriptLen overrides, sizing extra outputs (not funding inputs)', () => {
     const got = estimateFeeForArtifact(fakeArtifact, { feeRate: 0.5, unlockingScriptLen: 80, outputCount: 2 });
-    const expected = estimateCallFee(200, 80, 2, 0.5 * 1000);
+    // 2 continuation outputs: estimateCallFee already prices one 200-byte
+    // output; the second is passed as extraOutputBytes (8 + varint(200) + 200
+    // = 209 bytes), not as a 148-byte funding input.
+    const perOutputSize = 8 + 1 /* varint(200) */ + 200;
+    const expected = estimateCallFee(200, 80, 0, 0.5 * 1000, perOutputSize);
     expect(got).toBe(expected);
   });
 });
@@ -169,5 +184,96 @@ describe('signEnvelope / verifyEnvelope', () => {
     const env = await signEnvelope({ data: { ok: 1 }, signer });
     const r = verifyEnvelope({ envelope: env, expectedKeys: [env.pubkey] });
     expect(r.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C16 — cross-tier VerifyEnvelopeReason parity.
+//
+// `verifyEnvelope` is a wire-protocol primitive: per CLAUDE.md all seven SDKs
+// must return the SAME `VerifyEnvelopeReason` for the same rejection case.
+// The six non-TS tiers all treat an empty payload/sig/pubkey and a zero
+// nonce/expiresAt as `missing-fields` at step 1:
+//   Go     packages/runar-go/sdk_envelope.go:550
+//   Rust   packages/runar-rs/src/sdk/envelope.rs:336
+//   Python packages/runar-py/runar/sdk/envelope.py:310
+//   Zig    packages/runar-zig/src/sdk_envelope.zig:483
+//   Ruby   packages/runar-rb/lib/runar/sdk/envelope.rb:260
+//   Java   packages/runar-java/.../sdk/Envelope.java:368
+// TS was the outlier: its step-1 check was `typeof`-only, so an empty string
+// or a zero nonce slipped through to a LATER reason (or was accepted).
+// ---------------------------------------------------------------------------
+
+describe('verifyEnvelope reason parity with the six non-TS tiers (C16)', () => {
+  const signer = new TestSigner(ALICE);
+
+  it.each([
+    ['payload', (e: SignedEnvelope) => ({ ...e, payload: '' })],
+    ['sig', (e: SignedEnvelope) => ({ ...e, sig: '' })],
+    ['pubkey', (e: SignedEnvelope) => ({ ...e, pubkey: '' })],
+  ])('rejects an empty %s with missing-fields', async (_field, mutate) => {
+    const env = await signEnvelope({ data: { ok: 1 }, signer });
+    const r = verifyEnvelope({ envelope: mutate(env) });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('missing-fields');
+  });
+
+  it('rejects a zero nonce with missing-fields', async () => {
+    // Sign a well-formed envelope whose inner payload also carries nonce 0, so
+    // the only thing distinguishing it from a valid envelope is the zero nonce
+    // itself (it would otherwise reach envelope-mismatch / bad-sig / ok).
+    const nonce = 0;
+    const expiresAt = Date.now() + 30_000;
+    const payload = canonicalJson({ ok: 1, nonce, expiresAt });
+    const digest = Hash.sha256(Utils.toArray(payload, 'utf8'));
+    const env: SignedEnvelope = {
+      payload,
+      sig: await signer.signHash(digest),
+      pubkey: await signer.getPublicKey(),
+      nonce,
+      expiresAt,
+    };
+    const r = verifyEnvelope({ envelope: env });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('missing-fields');
+  });
+
+  it('rejects a zero expiresAt with missing-fields (not expired)', async () => {
+    const nonce = Date.now();
+    const expiresAt = 0;
+    const payload = canonicalJson({ ok: 1, nonce, expiresAt });
+    const digest = Hash.sha256(Utils.toArray(payload, 'utf8'));
+    const env: SignedEnvelope = {
+      payload,
+      sig: await signer.signHash(digest),
+      pubkey: await signer.getPublicKey(),
+      nonce,
+      expiresAt,
+    };
+    const r = verifyEnvelope({ envelope: env });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('missing-fields');
+  });
+
+  it('agrees with the committed cross-tier missing-fields rejection vector', () => {
+    // conformance/sdk-envelope/fixtures.json is the frozen wire fixture the six
+    // non-TS tiers replay. Its `missing-fields` vector carries `sig: ""` — an
+    // EMPTY string, not an absent field — which is exactly the case TS used to
+    // wave through. missing-fields is checked before expiry, so this vector
+    // replays deterministically without an injectable clock.
+    const fixturePath = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '../../../../conformance/sdk-envelope/fixtures.json',
+    );
+    const fixture = JSON.parse(readFileSync(fixturePath, 'utf8')) as {
+      rejection_vectors: Array<{ reason: string; envelope: SignedEnvelope }>;
+    };
+    const vector = fixture.rejection_vectors.find((v) => v.reason === 'missing-fields');
+    expect(vector, 'fixtures.json must carry a missing-fields rejection vector').toBeDefined();
+    expect(vector!.envelope.sig).toBe('');
+
+    const r = verifyEnvelope({ envelope: vector!.envelope });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('missing-fields');
   });
 });
