@@ -713,6 +713,26 @@ const Parser = struct {
         self.errors.append(self.allocator, f) catch {};
     }
 
+    /// Source location of the current token, normalised to the AST's **1-based
+    /// line / 1-based column** convention (the same convention `file:line:col`
+    /// diagnostics use). `codegen/emit.zig#recordSourceMapping` performs the
+    /// single 1-based → 0-based column conversion when it materialises
+    /// SourceMapping entries.
+    ///
+    /// **This tokenizer is the odd one out: it is 0-BASED.** `tokenizeRaw`
+    /// starts each line at `col = 0` and resets to 0 after every newline
+    /// (every other Zig-tier parser's tokenizer starts at 1). Normalise here,
+    /// at the parser boundary, rather than special-casing the shared emission
+    /// point — otherwise the blanket `-1` in emit.zig would shift every
+    /// `.runar.py` anchor one column to the left.
+    fn currentSourceLoc(self: *const Parser) types.SourceLocation {
+        return self.tokenSourceLoc(self.current);
+    }
+
+    fn tokenSourceLoc(self: *const Parser, tok: Token) types.SourceLocation {
+        return .{ .file = self.file_name, .line = tok.line, .column = tok.col + 1 };
+    }
+
     fn bump(self: *Parser) Token {
         const prev = self.current;
         self.current = self.tokenizer.next();
@@ -1011,6 +1031,7 @@ const Parser = struct {
 
     fn parsePyConstructorMethod(self: *Parser, _: []const PropertyNode) MethodNode {
         _ = self.bump(); // consume 'def'
+        const method_loc = self.currentSourceLoc();
         _ = self.bump(); // consume '__init__'
 
         const params = self.parsePyParams();
@@ -1023,7 +1044,7 @@ const Parser = struct {
         _ = self.expect(.colon);
         const body = self.parsePyBlock();
 
-        return .{ .name = "constructor", .is_public = true, .params = params, .body = body };
+        return .{ .name = "constructor", .is_public = true, .params = params, .body = body, .source_loc = method_loc };
     }
 
     /// Convert a constructor MethodNode into a ConstructorNode.
@@ -1150,6 +1171,7 @@ const Parser = struct {
             return .{ .name = "unknown", .is_public = false, .params = &.{}, .body = &.{} };
         }
         const name_tok = self.bump();
+        const method_loc = self.tokenSourceLoc(name_tok);
         const name = pyConvertName(self.allocator, name_tok.text);
 
         const params = self.parsePyParams();
@@ -1164,7 +1186,7 @@ const Parser = struct {
 
         const is_public = std.mem.eql(u8, visibility, "public");
 
-        return .{ .name = name, .is_public = is_public, .params = params, .body = body };
+        return .{ .name = name, .is_public = is_public, .params = params, .body = body, .source_loc = method_loc };
     }
 
     // ---- Parameter parsing: (self, param: Type, ...) ----
@@ -1296,11 +1318,12 @@ const Parser = struct {
     }
 
     fn parsePyIf(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'if'
-        return self.parsePyIfBody();
+        return self.parsePyIfBody(loc);
     }
 
-    fn parsePyIfBody(self: *Parser) ?Statement {
+    fn parsePyIfBody(self: *Parser, loc: types.SourceLocation) ?Statement {
         const cond = self.parseExpression() orelse return null;
         _ = self.expect(.colon);
         const then_body = self.parsePyBlock();
@@ -1308,8 +1331,9 @@ const Parser = struct {
         var else_body: ?[]Statement = null;
         self.skipNewlines();
         if (self.checkIdent("elif")) {
+            const elif_loc = self.currentSourceLoc();
             _ = self.bump(); // consume 'elif'
-            const nested = self.parsePyIfBody() orelse return null;
+            const nested = self.parsePyIfBody(elif_loc) orelse return null;
             const a = self.allocator.alloc(Statement, 1) catch return null;
             a[0] = nested;
             else_body = a;
@@ -1318,10 +1342,11 @@ const Parser = struct {
             else_body = self.parsePyBlock();
         }
 
-        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body, .source_loc = loc } };
     }
 
     fn parsePyFor(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'for'
 
         if (self.current.kind != .ident) {
@@ -1384,6 +1409,7 @@ const Parser = struct {
             .init_value = init_value,
             .bound = bound,
             .body = body,
+            .source_loc = loc,
         } };
     }
 
@@ -1401,6 +1427,7 @@ const Parser = struct {
     }
 
     fn parsePyExprOrAssign(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         // Check for typed variable declaration: name: Type = expr
         if (self.current.kind == .ident) {
             const next_tok = self.tokenizer.peek();
@@ -1416,10 +1443,10 @@ const Parser = struct {
                 if (self.match(.assign)) {
                     const val = self.parseExpression() orelse return null;
                     self.skipNewlines();
-                    return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = val } };
+                    return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = val, .source_loc = loc } };
                 } else {
                     self.skipNewlines();
-                    return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = .{ .literal_int = 0 } } };
+                    return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = .{ .literal_int = 0 }, .source_loc = loc } };
                 }
             }
         }
@@ -1434,7 +1461,7 @@ const Parser = struct {
         if (self.match(.assign)) {
             const value = self.parseExpression() orelse return null;
             self.skipNewlines();
-            return self.buildAssignment(expr, value);
+            return self.buildAssignment(expr, value, loc);
         }
 
         // Compound assignments
@@ -1445,22 +1472,22 @@ const Parser = struct {
             self.skipNewlines();
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, expr, rhs) orelse return null;
-            return self.buildAssignment(expr, compound_rhs);
+            return self.buildAssignment(expr, compound_rhs, loc);
         }
 
         self.skipNewlines();
         return .{ .expr_stmt = expr };
     }
 
-    fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+    fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
             },
             .identifier => |id| {
                 // In Python, bare `name = expr` in method body is a variable declaration
-                return .{ .let_decl = .{ .name = id, .value = value } };
+                return .{ .let_decl = .{ .name = id, .value = value, .source_loc = loc } };
             },
             .index_access => |ia| {
                 // self.arr[idx] = value — carry the full target so
@@ -1474,10 +1501,11 @@ const Parser = struct {
                     .target = base_name,
                     .value = value,
                     .index_target = ia,
+                    .source_loc = loc,
                 } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
             },
         }
     }

@@ -447,6 +447,22 @@ const Parser = struct {
         self.errors.append(self.allocator, f) catch {};
     }
 
+    /// Source location of the current token, in the AST's **1-based line /
+    /// 1-based column** convention (the same convention `file:line:col`
+    /// diagnostics use). `codegen/emit.zig#recordSourceMapping` performs the
+    /// single 1-based → 0-based column conversion when it materialises
+    /// SourceMapping entries, so do NOT subtract here.
+    ///
+    /// This tokenizer is 1-based: `Tokenizer.init` starts at `col = 1` and
+    /// resets to 1 after each newline.
+    fn currentSourceLoc(self: *const Parser) types.SourceLocation {
+        return self.tokenSourceLoc(self.current);
+    }
+
+    fn tokenSourceLoc(self: *const Parser, tok: Token) types.SourceLocation {
+        return .{ .file = self.file_name, .line = tok.line, .column = tok.col };
+    }
+
     fn bump(self: *Parser) Token {
         const prev = self.current;
         self.prev_token_end = prev.end;
@@ -694,7 +710,7 @@ const Parser = struct {
 
         // Method: name(...)
         if (self.current.kind == .lparen) {
-            var m = self.parseMethod(member_name, is_public);
+            var m = self.parseMethod(member_name, is_public, self.tokenSourceLoc(name_tok));
             // Issue #123: honour a `/** @sighash <FLAGS> */` directive in the
             // method's leading comment trivia. Only public methods are spending
             // entry points, so a directive on a private helper is meaningless.
@@ -790,6 +806,7 @@ const Parser = struct {
     // ---- Constructor ----
 
     fn parseConstructorMethod(self: *Parser) MethodNode {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'constructor'
         const params = self.parseParams();
 
@@ -800,7 +817,7 @@ const Parser = struct {
         }
 
         const body = self.parseBlock();
-        return .{ .name = "constructor", .is_public = true, .params = params, .body = body };
+        return .{ .name = "constructor", .is_public = true, .params = params, .body = body, .source_loc = loc };
     }
 
     /// Convert a constructor MethodNode into a ConstructorNode.
@@ -858,7 +875,7 @@ const Parser = struct {
 
     // ---- Methods ----
 
-    fn parseMethod(self: *Parser, name: []const u8, is_public: bool) MethodNode {
+    fn parseMethod(self: *Parser, name: []const u8, is_public: bool, loc: types.SourceLocation) MethodNode {
         const params = self.parseParams();
 
         // Skip optional return type
@@ -868,7 +885,7 @@ const Parser = struct {
         }
 
         const body = self.parseBlock();
-        return .{ .name = name, .is_public = is_public, .params = params, .body = body };
+        return .{ .name = name, .is_public = is_public, .params = params, .body = body, .source_loc = loc };
     }
 
     /// Detect + parse a `/** @sighash <FLAGS> */` (or `// @sighash ...`)
@@ -1079,6 +1096,7 @@ const Parser = struct {
     }
 
     fn parseVarDecl(self: *Parser, mutable: bool) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'const' or 'let'
 
         if (self.current.kind != .ident) {
@@ -1101,13 +1119,14 @@ const Parser = struct {
         self.skipSemicolons();
 
         if (mutable) {
-            return .{ .let_decl = .{ .name = name_tok.text, .type_info = ti, .value = val } };
+            return .{ .let_decl = .{ .name = name_tok.text, .type_info = ti, .value = val, .source_loc = loc } };
         } else {
-            return .{ .const_decl = .{ .name = name_tok.text, .type_info = ti, .value = val } };
+            return .{ .const_decl = .{ .name = name_tok.text, .type_info = ti, .value = val, .source_loc = loc } };
         }
     }
 
     fn parseIfStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'if'
         if (self.expect(.lparen) == null) return null;
         const cond = self.parseExpression() orelse return null;
@@ -1129,7 +1148,7 @@ const Parser = struct {
             }
         }
 
-        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body, .source_loc = loc } };
     }
 
     fn parseBlockOrStatement(self: *Parser) []Statement {
@@ -1143,6 +1162,7 @@ const Parser = struct {
     }
 
     fn parseForStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'for'
         if (self.expect(.lparen) == null) return null;
 
@@ -1215,7 +1235,7 @@ const Parser = struct {
 
         const body = self.parseBlockOrStatement();
 
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .bound_is_const = bound_is_const, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .bound_is_const = bound_is_const, .body = body, .source_loc = loc } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1235,6 +1255,7 @@ const Parser = struct {
     }
 
     fn parseExpressionStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         const expr = self.parseExpression() orelse {
             _ = self.bump();
             return null;
@@ -1246,7 +1267,7 @@ const Parser = struct {
             const rhs = self.parseExpression() orelse return null;
             self.skipSemicolons();
             // Extract assignment target name
-            return self.buildAssignment(expr, rhs);
+            return self.buildAssignment(expr, rhs, loc);
         }
 
         // Compound assignments: +=, -=, *=, /=, %=
@@ -1257,21 +1278,21 @@ const Parser = struct {
             self.skipSemicolons();
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, expr, rhs) orelse return null;
-            return self.buildAssignment(expr, compound_rhs);
+            return self.buildAssignment(expr, compound_rhs, loc);
         }
 
         self.skipSemicolons();
         return .{ .expr_stmt = expr };
     }
 
-    fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+    fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
             },
             .index_access => |ia| {
                 // this.arr[idx] = value — carry the full index-access target on
@@ -1288,11 +1309,12 @@ const Parser = struct {
                     .target = base_name,
                     .value = value,
                     .index_target = ia,
+                    .source_loc = loc,
                 } };
             },
             else => {
                 // For more complex targets, use identifier name if possible
-                return .{ .assign = .{ .target = "unknown", .value = value } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
             },
         }
     }

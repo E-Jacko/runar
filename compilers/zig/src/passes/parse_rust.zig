@@ -484,6 +484,22 @@ const Parser = struct {
         self.errors.append(self.allocator, f) catch {};
     }
 
+    /// Source location of the current token, in the AST's **1-based line /
+    /// 1-based column** convention (the same convention `file:line:col`
+    /// diagnostics use). `codegen/emit.zig#recordSourceMapping` performs the
+    /// single 1-based → 0-based column conversion when it materialises
+    /// SourceMapping entries, so do NOT subtract here.
+    ///
+    /// This tokenizer is 1-based: `Tokenizer.init` starts at `col = 1` and
+    /// resets to 1 after each newline.
+    fn currentSourceLoc(self: *const Parser) types.SourceLocation {
+        return self.tokenSourceLoc(self.current);
+    }
+
+    fn tokenSourceLoc(self: *const Parser, tok: Token) types.SourceLocation {
+        return .{ .file = self.file_name, .line = tok.line, .column = tok.col };
+    }
+
     fn bump(self: *Parser) Token {
         const prev = self.current;
         self.current = self.tokenizer.next();
@@ -833,15 +849,18 @@ const Parser = struct {
         _ = self.bump(); // consume 'fn'
 
         var raw_name: []const u8 = "unknown";
+        var method_loc = self.currentSourceLoc();
         if (self.current.kind == .ident) {
-            raw_name = self.bump().text;
+            const name_tok = self.bump();
+            raw_name = name_tok.text;
+            method_loc = self.tokenSourceLoc(name_tok);
         } else {
             self.addError("expected function name");
         }
         const name = snakeToCamel(self.allocator, raw_name);
 
         if (self.expect(.lparen) == null) {
-            return .{ .name = name, .is_public = is_public, .params = &.{}, .body = &.{} };
+            return .{ .name = name, .is_public = is_public, .params = &.{}, .body = &.{}, .source_loc = method_loc };
         }
 
         var params: std.ArrayListUnmanaged(ParamNode) = .empty;
@@ -896,7 +915,7 @@ const Parser = struct {
         }
         _ = self.expect(.rbrace);
 
-        return .{ .name = name, .is_public = is_public, .params = params.items, .body = body.items };
+        return .{ .name = name, .is_public = is_public, .params = params.items, .body = body.items, .source_loc = method_loc };
     }
 
     fn skipToNextMember(self: *Parser) void {
@@ -958,15 +977,17 @@ const Parser = struct {
     }
 
     fn parseAssertMacro(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'assert!'
         if (self.expect(.lparen) == null) return null;
         const expr = self.parseExpression() orelse return null;
         _ = self.expect(.rparen);
         _ = self.match(.semicolon);
-        return .{ .assert_stmt = .{ .condition = expr } };
+        return .{ .assert_stmt = .{ .condition = expr, .source_loc = loc } };
     }
 
     fn parseAssertEqMacro(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'assert_eq!'
         if (self.expect(.lparen) == null) return null;
         const left = self.parseExpression() orelse return null;
@@ -977,10 +998,11 @@ const Parser = struct {
         // assert_eq!(a, b) -> assert(a === b)
         const bop = self.allocator.create(BinaryOp) catch return null;
         bop.* = .{ .op = .eq, .left = left, .right = right };
-        return .{ .assert_stmt = .{ .condition = .{ .binary_op = bop } } };
+        return .{ .assert_stmt = .{ .condition = .{ .binary_op = bop }, .source_loc = loc } };
     }
 
     fn parseLetDecl(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'let'
         const mutable = self.matchIdent("mut");
 
@@ -1005,13 +1027,14 @@ const Parser = struct {
         _ = self.match(.semicolon);
 
         if (mutable) {
-            return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = val } };
+            return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = val, .source_loc = loc } };
         } else {
-            return .{ .const_decl = .{ .name = var_name, .type_info = ti, .value = val } };
+            return .{ .const_decl = .{ .name = var_name, .type_info = ti, .value = val, .source_loc = loc } };
         }
     }
 
     fn parseIfStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'if'
         // Rust-style: no parens around condition
         const cond = self.parseExpression() orelse return null;
@@ -1045,10 +1068,11 @@ const Parser = struct {
             }
         }
 
-        return .{ .if_stmt = .{ .condition = cond, .then_body = then_stmts.items, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = cond, .then_body = then_stmts.items, .else_body = else_body, .source_loc = loc } };
     }
 
     fn parseForStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'for'
 
         var var_name: []const u8 = "_i";
@@ -1100,7 +1124,7 @@ const Parser = struct {
 
         // Body
         if (self.expect(.lbrace) == null) {
-            return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = &.{} } };
+            return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = &.{}, .source_loc = loc } };
         }
         var body: std.ArrayListUnmanaged(Statement) = .empty;
         while (self.current.kind != .rbrace and self.current.kind != .eof) {
@@ -1108,7 +1132,7 @@ const Parser = struct {
         }
         _ = self.expect(.rbrace);
 
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body.items } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body.items, .source_loc = loc } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1128,6 +1152,7 @@ const Parser = struct {
     }
 
     fn parseExpressionStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         const expr = self.parseExpression() orelse {
             _ = self.bump();
             return null;
@@ -1138,7 +1163,7 @@ const Parser = struct {
             _ = self.bump();
             const rhs = self.parseExpression() orelse return null;
             _ = self.match(.semicolon);
-            return self.buildAssignment(expr, rhs);
+            return self.buildAssignment(expr, rhs, loc);
         }
 
         // Compound assignments: +=, -=, *=, /=, %=
@@ -1149,7 +1174,7 @@ const Parser = struct {
             _ = self.match(.semicolon);
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, expr, rhs) orelse return null;
-            return self.buildAssignment(expr, compound_rhs);
+            return self.buildAssignment(expr, compound_rhs, loc);
         }
 
         const had_semi = self.match(.semicolon);
@@ -1161,17 +1186,17 @@ const Parser = struct {
         return .{ .expr_stmt = expr };
     }
 
-    fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+    fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
             },
         }
     }

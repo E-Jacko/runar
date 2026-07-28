@@ -389,6 +389,22 @@ const Parser = struct {
         self.errors.append(self.allocator, f) catch {};
     }
 
+    /// Source location of the current token, in the AST's **1-based line /
+    /// 1-based column** convention (the same convention `file:line:col`
+    /// diagnostics use). `codegen/emit.zig#recordSourceMapping` performs the
+    /// single 1-based → 0-based column conversion when it materialises
+    /// SourceMapping entries, so do NOT subtract here.
+    ///
+    /// This tokenizer is 1-based: `Tokenizer.init` starts at `col = 1` and
+    /// resets to 1 after each newline.
+    fn currentSourceLoc(self: *const Parser) types.SourceLocation {
+        return self.tokenSourceLoc(self.current);
+    }
+
+    fn tokenSourceLoc(self: *const Parser, tok: Token) types.SourceLocation {
+        return .{ .file = self.file_name, .line = tok.line, .column = tok.col };
+    }
+
     fn bump(self: *Parser) Token {
         const prev = self.current;
         self.current = self.tokenizer.next();
@@ -671,7 +687,7 @@ const Parser = struct {
             _ = self.bump(); // consume class name
             if (self.current.kind == .lparen) {
                 // Constructor
-                const method = self.parseMethodAfterName("constructor", true);
+                const method = self.parseMethodAfterName("constructor", true, self.tokenSourceLoc(save_current));
                 if (constructor_method.* != null) {
                     self.addErrorFmt("{s} has more than one constructor", .{contract_name});
                 } else {
@@ -700,7 +716,7 @@ const Parser = struct {
 
         if (self.current.kind == .lparen) {
             // Method declaration
-            const method = self.parseMethodAfterName(member_name, is_public_annotation);
+            const method = self.parseMethodAfterName(member_name, is_public_annotation, self.tokenSourceLoc(name_tok));
             methods.append(self.allocator, method) catch {};
             return;
         }
@@ -756,9 +772,9 @@ const Parser = struct {
     /// consumed. `name` is the method name ("constructor" for the ctor), and
     /// `is_public` reflects the presence of an `@Public` annotation (always
     /// true for constructors).
-    fn parseMethodAfterName(self: *Parser, name: []const u8, is_public: bool) MethodNode {
+    fn parseMethodAfterName(self: *Parser, name: []const u8, is_public: bool, loc: types.SourceLocation) MethodNode {
         if (self.expect(.lparen) == null) {
-            return .{ .name = name, .is_public = is_public, .params = &.{}, .body = &.{} };
+            return .{ .name = name, .is_public = is_public, .params = &.{}, .body = &.{}, .source_loc = loc };
         }
 
         var params: std.ArrayListUnmanaged(ParamNode) = .empty;
@@ -807,11 +823,11 @@ const Parser = struct {
 
         // Abstract / interface methods: `Type name(params);` with no body
         if (self.match(.semicolon)) {
-            return .{ .name = name, .is_public = is_public, .params = params.items, .body = &.{} };
+            return .{ .name = name, .is_public = is_public, .params = params.items, .body = &.{}, .source_loc = loc };
         }
 
         const body = self.parseBlock();
-        return .{ .name = name, .is_public = is_public, .params = params.items, .body = body };
+        return .{ .name = name, .is_public = is_public, .params = params.items, .body = body, .source_loc = loc };
     }
 
     // ==================================================================
@@ -998,6 +1014,7 @@ const Parser = struct {
     }
 
     fn parseVariableDecl(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         const type_node = self.parseType();
         const ti = types.typeNodeToRunarType(type_node);
         if (self.current.kind != .ident) {
@@ -1014,16 +1031,17 @@ const Parser = struct {
         _ = self.match(.semicolon);
 
         if (value) |v| {
-            return .{ .const_decl = .{ .name = var_name, .type_info = ti, .value = v } };
+            return .{ .const_decl = .{ .name = var_name, .type_info = ti, .value = v, .source_loc = loc } };
         }
         // Uninitialised declaration — Java allows it but the Rúnar subset
         // requires an initialiser. Emit a soft error and fall back to a
         // let_decl so we keep parsing.
         self.addErrorFmt("local variable '{s}' must have an initializer", .{var_name});
-        return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = null } };
+        return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = null, .source_loc = loc } };
     }
 
     fn parseIfStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'if'
         if (self.expect(.lparen) == null) return null;
         const cond = self.parseExpression() orelse return null;
@@ -1044,7 +1062,7 @@ const Parser = struct {
             }
         }
 
-        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body, .source_loc = loc } };
     }
 
     /// Parse either `{ stmts }` or a single statement (Java allows both).
@@ -1059,6 +1077,7 @@ const Parser = struct {
     }
 
     fn parseForStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'for'
         if (self.expect(.lparen) == null) return null;
 
@@ -1138,7 +1157,7 @@ const Parser = struct {
         _ = self.expect(.rparen);
 
         const body = self.parseStmtOrBlock();
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body, .source_loc = loc } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1153,6 +1172,7 @@ const Parser = struct {
     }
 
     fn parseExpressionStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         const expr = self.parseExpression() orelse {
             _ = self.bump();
             return null;
@@ -1163,7 +1183,7 @@ const Parser = struct {
             _ = self.bump();
             const rhs = self.parseExpression() orelse return null;
             _ = self.match(.semicolon);
-            return self.buildAssignment(expr, rhs);
+            return self.buildAssignment(expr, rhs, loc);
         }
 
         // Compound assignments
@@ -1174,7 +1194,7 @@ const Parser = struct {
             _ = self.match(.semicolon);
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, expr, rhs) orelse return null;
-            return self.buildAssignment(expr, compound_rhs);
+            return self.buildAssignment(expr, compound_rhs, loc);
         }
 
         // Postfix ++/-- as a statement
@@ -1197,14 +1217,14 @@ const Parser = struct {
         return .{ .expr_stmt = expr };
     }
 
-    fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+    fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
             },
             .index_access => |ia| {
                 const base = switch (ia.object) {
@@ -1212,10 +1232,10 @@ const Parser = struct {
                     .identifier => |id| id,
                     else => "unknown",
                 };
-                return .{ .assign = .{ .target = base, .value = value, .index_target = ia } };
+                return .{ .assign = .{ .target = base, .value = value, .index_target = ia, .source_loc = loc } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
             },
         }
     }

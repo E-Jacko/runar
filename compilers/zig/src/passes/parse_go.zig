@@ -645,6 +645,22 @@ const Parser = struct {
         self.errors.append(self.allocator, f) catch {};
     }
 
+    /// Source location of the current token, in the AST's **1-based line /
+    /// 1-based column** convention (the same convention `file:line:col`
+    /// diagnostics use). `codegen/emit.zig#recordSourceMapping` performs the
+    /// single 1-based → 0-based column conversion when it materialises
+    /// SourceMapping entries, so do NOT subtract here.
+    ///
+    /// This tokenizer is 1-based: `Tokenizer.init` starts at `col = 1` and
+    /// resets to 1 after each newline.
+    fn currentSourceLoc(self: *const Parser) types.SourceLocation {
+        return self.tokenSourceLoc(self.current);
+    }
+
+    fn tokenSourceLoc(self: *const Parser, tok: Token) types.SourceLocation {
+        return .{ .file = self.file_name, .line = tok.line, .column = tok.col };
+    }
+
     fn bump(self: *Parser) Token {
         const prev = self.current;
         self.current = self.tokenizer.next();
@@ -1083,7 +1099,9 @@ const Parser = struct {
             self.skipToEndOfDecl();
             return null;
         }
-        const raw_name = self.bump().text;
+        const name_tok = self.bump();
+        const raw_name = name_tok.text;
+        const method_loc = self.tokenSourceLoc(name_tok);
         const method_name = goToCamelCase(self.allocator, raw_name);
         const is_public = isExported(raw_name);
 
@@ -1109,10 +1127,10 @@ const Parser = struct {
             }
             // Private standalone helper function
             self.receiver_name = "";
-            return .{ .name = method_name, .is_public = false, .params = params, .body = body };
+            return .{ .name = method_name, .is_public = false, .params = params, .body = body, .source_loc = method_loc };
         }
 
-        return .{ .name = method_name, .is_public = is_public, .params = params, .body = body };
+        return .{ .name = method_name, .is_public = is_public, .params = params, .body = body, .source_loc = method_loc };
     }
 
     fn parseGoParams(self: *Parser) []ParamNode {
@@ -1262,6 +1280,7 @@ const Parser = struct {
     }
 
     fn parseVarDecl(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'var'
 
         if (self.current.kind != .ident) {
@@ -1284,14 +1303,15 @@ const Parser = struct {
         if (self.current.kind == .assign) {
             _ = self.bump(); // consume '='
             const val = self.parseExpression() orelse return null;
-            return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = val } };
+            return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = val, .source_loc = loc } };
         }
 
         // var with no initializer
-        return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = null } };
+        return .{ .let_decl = .{ .name = var_name, .type_info = ti, .value = null, .source_loc = loc } };
     }
 
     fn parseIfStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'if'
 
         // Go: condition without parens, body in braces
@@ -1313,10 +1333,11 @@ const Parser = struct {
             }
         }
 
-        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = cond, .then_body = then_body, .else_body = else_body, .source_loc = loc } };
     }
 
     fn parseForStmt(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'for'
 
         // Go for loop: for i := 0; i < n; i++ { ... }
@@ -1399,7 +1420,7 @@ const Parser = struct {
         }
 
         const body = self.parseBlock();
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body, .source_loc = loc } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1415,6 +1436,7 @@ const Parser = struct {
     }
 
     fn parseExpressionStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         const expr = self.parseExpression() orelse {
             _ = self.bump();
             return null;
@@ -1428,7 +1450,7 @@ const Parser = struct {
             // Extract the variable name from the LHS identifier
             switch (expr) {
                 .identifier => |id| {
-                    return .{ .let_decl = .{ .name = id, .type_info = null, .value = rhs } };
+                    return .{ .let_decl = .{ .name = id, .type_info = null, .value = rhs, .source_loc = loc } };
                 },
                 else => {
                     self.addError("left side of := must be an identifier");
@@ -1441,7 +1463,7 @@ const Parser = struct {
         if (self.current.kind == .assign) {
             _ = self.bump();
             const rhs = self.parseExpression() orelse return null;
-            return self.buildAssignment(expr, rhs);
+            return self.buildAssignment(expr, rhs, loc);
         }
 
         // Compound assignments: +=, -=, *=, /=, %=
@@ -1451,7 +1473,7 @@ const Parser = struct {
             const rhs = self.parseExpression() orelse return null;
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, expr, rhs) orelse return null;
-            return self.buildAssignment(expr, compound_rhs);
+            return self.buildAssignment(expr, compound_rhs, loc);
         }
 
         // Postfix ++ / -- as statement (Go: i++ is a statement, not expression)
@@ -1471,14 +1493,14 @@ const Parser = struct {
         return .{ .expr_stmt = expr };
     }
 
-    fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+    fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
             },
             .index_access => |ia| {
                 // `c.Board[i] = v` — extract the base property name and
@@ -1491,10 +1513,10 @@ const Parser = struct {
                     .identifier => |id| id,
                     else => "unknown",
                 };
-                return .{ .assign = .{ .target = base, .value = value, .index_target = ia } };
+                return .{ .assign = .{ .target = base, .value = value, .index_target = ia, .source_loc = loc } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
             },
         }
     }

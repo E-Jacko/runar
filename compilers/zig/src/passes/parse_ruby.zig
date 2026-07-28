@@ -781,6 +781,22 @@ const Parser = struct {
         while (self.check(.newline)) _ = self.bump();
     }
 
+    /// Source location of the current token, in the AST's **1-based line /
+    /// 1-based column** convention (the same convention `file:line:col`
+    /// diagnostics use). `codegen/emit.zig#recordSourceMapping` performs the
+    /// single 1-based → 0-based column conversion when it materialises
+    /// SourceMapping entries, so do NOT subtract here.
+    ///
+    /// This tokenizer is 1-based: `Tokenizer.tokenize` records `col = pos + 1`
+    /// where `pos` is the 0-based byte offset within the current line.
+    fn currentSourceLoc(self: *const Parser) types.SourceLocation {
+        return self.tokenSourceLoc(self.peek());
+    }
+
+    fn tokenSourceLoc(self: *const Parser, tok: Token) types.SourceLocation {
+        return .{ .file = self.file_name, .line = tok.line, .column = tok.col };
+    }
+
     fn heapExpr(self: *Parser, expr: Expression) ?*Expression {
         const ptr = self.allocator.create(Expression) catch return null;
         ptr.* = expr;
@@ -1114,6 +1130,7 @@ const Parser = struct {
 
         const name_tok = self.bump();
         const raw_name = name_tok.text;
+        const method_loc = self.tokenSourceLoc(name_tok);
 
         // Reset local variable tracking for this method scope
         self.declared_locals = .empty;
@@ -1140,6 +1157,7 @@ const Parser = struct {
                 .params = params,
                 .body = body,
                 .is_public = true,
+                .source_loc = method_loc,
             };
         }
 
@@ -1148,6 +1166,7 @@ const Parser = struct {
             .is_public = is_public,
             .params = params,
             .body = body,
+            .source_loc = method_loc,
         };
     }
 
@@ -1378,6 +1397,7 @@ const Parser = struct {
     }
 
     fn parseAssertStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // 'assert'
 
         // Support both `assert expr` and `assert(expr)`
@@ -1391,12 +1411,13 @@ const Parser = struct {
         }
 
         if (cond) |c| {
-            return .{ .assert_stmt = .{ .condition = c } };
+            return .{ .assert_stmt = .{ .condition = c, .source_loc = loc } };
         }
         return null;
     }
 
     fn parseIfStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // 'if'
         const condition = self.parseExpression() orelse return null;
         self.skipNewlines();
@@ -1427,10 +1448,11 @@ const Parser = struct {
 
         _ = self.expect(.kw_end);
 
-        return .{ .if_stmt = .{ .condition = condition, .then_body = then_body, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = condition, .then_body = then_body, .else_body = else_body, .source_loc = loc } };
     }
 
     fn parseElsifStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // 'elsif'
         const condition = self.parseExpression() orelse return null;
         self.skipNewlines();
@@ -1457,10 +1479,11 @@ const Parser = struct {
         // Note: the outer `end` is consumed by the parent parseIfStatement;
         // elsif branches do not consume their own `end`.
 
-        return .{ .if_stmt = .{ .condition = condition, .then_body = then_body, .else_body = else_body } };
+        return .{ .if_stmt = .{ .condition = condition, .then_body = then_body, .else_body = else_body, .source_loc = loc } };
     }
 
     fn parseUnlessStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // 'unless'
         const raw_cond = self.parseExpression() orelse return null;
         self.skipNewlines();
@@ -1473,10 +1496,11 @@ const Parser = struct {
         uop.* = .{ .op = .not, .operand = raw_cond };
         const negated: Expression = .{ .unary_op = uop };
 
-        return .{ .if_stmt = .{ .condition = negated, .then_body = body } };
+        return .{ .if_stmt = .{ .condition = negated, .then_body = body, .source_loc = loc } };
     }
 
     fn parseForStatement(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // 'for'
 
         // Loop variable
@@ -1528,7 +1552,7 @@ const Parser = struct {
             else => {},
         }
 
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body, .source_loc = loc } };
     }
 
     fn parseReturnStatement(self: *Parser) ?Statement {
@@ -1558,6 +1582,7 @@ const Parser = struct {
 
     fn parseIvarStatement(self: *Parser) ?Statement {
         const ivar_tok = self.bump(); // ivar token
+        const loc = self.tokenSourceLoc(ivar_tok);
         const prop_name = rbConvertName(self.allocator, ivar_tok.text);
 
         // Build the LHS target, consuming `[index]` postfixes so that
@@ -1579,7 +1604,7 @@ const Parser = struct {
         // Simple assignment: @var = expr  |  @var[i] = expr
         if (self.match(.assign)) {
             const value = self.parseExpression() orelse return null;
-            return self.buildAssignment(target_expr, value);
+            return self.buildAssignment(target_expr, value, loc);
         }
 
         // Compound assignments: @var += expr, etc.
@@ -1589,7 +1614,7 @@ const Parser = struct {
             const rhs = self.parseExpression() orelse return null;
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, target_expr, rhs) orelse return null;
-            return self.buildAssignment(target_expr, compound_rhs);
+            return self.buildAssignment(target_expr, compound_rhs, loc);
         }
 
         // Expression statement (e.g. @var.method(...))
@@ -1599,6 +1624,7 @@ const Parser = struct {
 
     fn parseIdentStatement(self: *Parser) ?Statement {
         const tok = self.peek();
+        const loc = self.tokenSourceLoc(tok);
 
         // Check for `self.` prefix -> property access/assignment
         if (tok.kind == .kw_self and self.peekAhead(1).kind == .dot) {
@@ -1623,7 +1649,7 @@ const Parser = struct {
             // Assignment: self.field = expr
             if (self.match(.assign)) {
                 const value = self.parseExpression() orelse return null;
-                return .{ .assign = .{ .target = prop_name, .value = value } };
+                return .{ .assign = .{ .target = prop_name, .value = value, .source_loc = loc } };
             }
 
             // Compound assignment: self.field += expr
@@ -1634,7 +1660,7 @@ const Parser = struct {
                 const bin_op = binOpFromCompoundAssign(op_kind);
                 const target_expr: Expression = .{ .property_access = .{ .object = "this", .property = prop_name } };
                 const compound_rhs = self.makeBinaryExpr(bin_op, target_expr, rhs) orelse return null;
-                return .{ .assign = .{ .target = prop_name, .value = compound_rhs } };
+                return .{ .assign = .{ .target = prop_name, .value = compound_rhs, .source_loc = loc } };
             }
 
             // Expression statement (property access)
@@ -1651,11 +1677,11 @@ const Parser = struct {
 
             if (self.declared_locals.contains(camel_name)) {
                 // Already declared: this is an assignment
-                return .{ .assign = .{ .target = camel_name, .value = value } };
+                return .{ .assign = .{ .target = camel_name, .value = value, .source_loc = loc } };
             }
             // First assignment: variable declaration (let)
             self.declared_locals.put(self.allocator, camel_name, {}) catch {};
-            return .{ .let_decl = .{ .name = camel_name, .value = value } };
+            return .{ .let_decl = .{ .name = camel_name, .value = value, .source_loc = loc } };
         }
 
         // Parse as expression first
@@ -1667,7 +1693,7 @@ const Parser = struct {
         // Simple assignment (e.g. a.b = expr)
         if (self.match(.assign)) {
             const value = self.parseExpression() orelse return null;
-            return self.buildAssignment(expr, value);
+            return self.buildAssignment(expr, value, loc);
         }
 
         // Compound assignment
@@ -1677,21 +1703,21 @@ const Parser = struct {
             const rhs = self.parseExpression() orelse return null;
             const bin_op = binOpFromCompoundAssign(op_kind);
             const compound_rhs = self.makeBinaryExpr(bin_op, expr, rhs) orelse return null;
-            return self.buildAssignment(expr, compound_rhs);
+            return self.buildAssignment(expr, compound_rhs, loc);
         }
 
         // Expression statement
         return .{ .expr_stmt = expr };
     }
 
-    fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+    fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
             },
             .index_access => |ia| {
                 // @arr[idx] = value — carry the full index-access target on
@@ -1708,10 +1734,11 @@ const Parser = struct {
                     .target = base_name,
                     .value = value,
                     .index_target = ia,
+                    .source_loc = loc,
                 } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
             },
         }
     }
