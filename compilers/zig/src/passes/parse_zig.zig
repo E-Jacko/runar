@@ -963,9 +963,10 @@ const Parser = struct {
             return Statement{ .assign = .{ .target = target_name, .value = rhs, .source_loc = loc, .index_target = index_tgt } };
         }
         _ = self.expect(.semicolon);
-        // Expression statements (including assert calls) — attach source location
-        // by wrapping in assert_stmt if it's an assert call, otherwise use expr_stmt
-        return Statement{ .expr_stmt = expr };
+        // Expression statements (including assert calls) carry their own source
+        // location so an `assert(...)` anchors to its own line rather than the
+        // enclosing method.
+        return Statement{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     /// Extract a string target name from an expression for Assign.target.
@@ -1555,7 +1556,7 @@ test "method calls and property access" {
     defer arena2.deinit();
     const res = parseZig(arena2.allocator(), source, "MC.runar.zig");
     try std.testing.expectEqual(@as(usize, 0), res.errors.len);
-    const outer = res.contract.?.methods[0].body[0].expr_stmt;
+    const outer = res.contract.?.methods[0].body[0].expr_stmt.expr;
     switch (outer) {
         .call => |c| {
             try std.testing.expectEqualStrings("assert", c.callee);
@@ -1700,7 +1701,7 @@ test "logical or operator" {
     defer arena2.deinit();
     const res = parseZig(arena2.allocator(), source, "L.runar.zig");
     try std.testing.expectEqual(@as(usize, 0), res.errors.len);
-    switch (res.contract.?.methods[0].body[0].expr_stmt) {
+    switch (res.contract.?.methods[0].body[0].expr_stmt.expr) {
         .call => |c| { try std.testing.expectEqualStrings("assert", c.callee); switch (c.args[0]) { .binary_op => |b| try std.testing.expectEqual(BinOperator.or_op, b.op), else => return error.UnexpectedVariant } },
         else => return error.UnexpectedVariant,
     }
@@ -1723,7 +1724,7 @@ test "parse runar.bytesEq as binary equality" {
     const res = parseZig(arena.allocator(), source, "B.runar.zig");
     try std.testing.expectEqual(@as(usize, 0), res.errors.len);
     const stmt = res.contract.?.methods[0].body[0];
-    switch (stmt.expr_stmt) {
+    switch (stmt.expr_stmt.expr) {
         .call => |c| {
             try std.testing.expectEqualStrings("assert", c.callee);
             try std.testing.expectEqual(@as(usize, 1), c.args.len);

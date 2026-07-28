@@ -1072,7 +1072,7 @@ const Parser = struct {
             const last = &body[body.len - 1];
             switch (last.*) {
                 .expr_stmt => |e| {
-                    last.* = .{ .return_stmt = e };
+                    last.* = .{ .return_stmt = e.expr };
                 },
                 else => {},
             }
@@ -1266,6 +1266,7 @@ const Parser = struct {
 
     fn parseMoveAssert(self: *Parser) ?Statement {
         const tok = self.bump(); // consume 'assert!' or 'assert_eq!'
+        const loc = self.tokenSourceLoc(tok);
 
         if (self.expect(.lparen) == null) return null;
 
@@ -1286,7 +1287,7 @@ const Parser = struct {
             const eq_expr = self.makeBinaryExpr(.eq, left, right) orelse return null;
             const call = self.allocator.create(CallExpr) catch return null;
             call.* = .{ .callee = "assert", .args = self.makeExprSlice(eq_expr) };
-            return .{ .expr_stmt = .{ .call = call } };
+            return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
         }
 
         // assert!(expr, code)
@@ -1302,7 +1303,7 @@ const Parser = struct {
         // Build assert(expr)
         const call = self.allocator.create(CallExpr) catch return null;
         call.* = .{ .callee = "assert", .args = self.makeExprSlice(expr) };
-        return .{ .expr_stmt = .{ .call = call } };
+        return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
     }
 
     fn parseMoveIf(self: *Parser) ?Statement {
@@ -1420,6 +1421,7 @@ const Parser = struct {
     }
 
     fn parseMoveAbort(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // consume 'abort'
         // Skip the error code
         _ = self.parseExpression();
@@ -1428,7 +1430,7 @@ const Parser = struct {
         // abort maps to assert(false)
         const call = self.allocator.create(CallExpr) catch return null;
         call.* = .{ .callee = "assert", .args = self.makeExprSlice(.{ .literal_bool = false }) };
-        return .{ .expr_stmt = .{ .call = call } };
+        return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
     }
 
     fn parseMoveExprStatement(self: *Parser) ?Statement {
@@ -1458,7 +1460,7 @@ const Parser = struct {
         }
 
         self.skipSemicolons();
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {

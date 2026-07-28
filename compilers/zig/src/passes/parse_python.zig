@@ -1055,9 +1055,10 @@ const Parser = struct {
 
         for (m.body) |stmt| {
             switch (stmt) {
-                .expr_stmt => |expr| {
+                .expr_stmt => |stmt_expr| {
                     // super().__init__(...) becomes a method_call with object="super" method="__init__"
                     // or after conversion: object="super" method="constructor"
+                    const expr = stmt_expr.expr;
                     if (self.isSuperInitCall(expr)) {
                         if (self.extractSuperInitArgs(expr)) |args| {
                             for (args) |arg| super_args.append(self.allocator, arg) catch {};
@@ -1271,6 +1272,7 @@ const Parser = struct {
 
     fn parsePyAssert(self: *Parser) ?Statement {
         const tok = self.bump(); // consume 'assert' or 'assert_'
+        const loc = self.tokenSourceLoc(tok);
 
         if (std.mem.eql(u8, tok.text, "assert_")) {
             // assert_(expr) — function-call style
@@ -1284,7 +1286,7 @@ const Parser = struct {
                 .callee = "assert",
                 .args = self.wrapSingleExpr(expr),
             };
-            return .{ .expr_stmt = .{ .call = call } };
+            return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
         }
 
         // assert expr or assert(expr) — keyword style
@@ -1298,7 +1300,7 @@ const Parser = struct {
                 .callee = "assert",
                 .args = self.wrapSingleExpr(expr),
             };
-            return .{ .expr_stmt = .{ .call = call } };
+            return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
         }
 
         const expr = self.parseExpression() orelse return null;
@@ -1308,7 +1310,7 @@ const Parser = struct {
             .callee = "assert",
             .args = self.wrapSingleExpr(expr),
         };
-        return .{ .expr_stmt = .{ .call = call } };
+        return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
     }
 
     fn wrapSingleExpr(self: *Parser, expr: Expression) []Expression {
@@ -1476,7 +1478,7 @@ const Parser = struct {
         }
 
         self.skipNewlines();
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {

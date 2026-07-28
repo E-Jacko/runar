@@ -714,7 +714,7 @@ const Parser = struct {
                 },
                 .expr_stmt => |expr| {
                     // Check if it's a call to assert/require (skip)
-                    switch (expr) {
+                    switch (expr.expr) {
                         .call => {},
                         else => {},
                     }
@@ -1167,7 +1167,7 @@ const Parser = struct {
         }
 
         self.skipSemicolons();
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {

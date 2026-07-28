@@ -438,9 +438,9 @@ const Ctx = struct {
             },
             .expr_stmt => |e| {
                 var prelude: std.ArrayListUnmanaged(Statement) = .empty;
-                const new_e = try self.rewriteExpression(&prelude, e);
+                const new_e = try self.rewriteExpression(&prelude, e.expr);
                 try out.appendSlice(self.allocator, prelude.items);
-                try out.append(self.allocator, .{ .expr_stmt = new_e });
+                try out.append(self.allocator, .{ .expr_stmt = .{ .expr = new_e, .source_loc = e.source_loc } });
             },
             .assert_stmt => |a| {
                 var prelude: std.ArrayListUnmanaged(Statement) = .empty;
@@ -790,7 +790,7 @@ const Ctx = struct {
             .property_access => |pa| return .{ .assign = .{ .target = pa.property, .value = value } },
             else => {
                 try self.pushError("unsupported assignment target in FixedArray rewrite");
-                return .{ .expr_stmt = .{ .literal_int = 0 } };
+                return .{ .expr_stmt = .{ .expr = .{ .literal_int = 0 } } };
             },
         }
     }

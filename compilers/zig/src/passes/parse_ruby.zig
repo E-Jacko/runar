@@ -953,7 +953,7 @@ const Parser = struct {
                 const last = &m.body[m.body.len - 1];
                 switch (last.*) {
                     .expr_stmt => |e| {
-                        last.* = .{ .return_stmt = e };
+                        last.* = .{ .return_stmt = e.expr };
                     },
                     else => {},
                 }
@@ -1247,7 +1247,7 @@ const Parser = struct {
             switch (stmt) {
                 .expr_stmt => |expr| {
                     // super(...) call
-                    switch (expr) {
+                    switch (expr.expr) {
                         .call => |call| {
                             if (std.mem.eql(u8, call.callee, "super")) {
                                 for (call.args) |arg| super_args.append(self.allocator, arg) catch {};
@@ -1292,7 +1292,7 @@ const Parser = struct {
         for (body) |*stmt| {
             switch (stmt.*) {
                 .expr_stmt => |*expr| {
-                    self.rewriteExprMethodCalls(expr, method_names);
+                    self.rewriteExprMethodCalls(&expr.expr, method_names);
                 },
                 .assign => |*a| {
                     self.rewriteExprMethodCalls(&a.value, method_names);
@@ -1565,6 +1565,7 @@ const Parser = struct {
     }
 
     fn parseSuperCall(self: *Parser) ?Statement {
+        const loc = self.currentSourceLoc();
         _ = self.bump(); // 'super'
         _ = self.expect(.lparen);
         var args: std.ArrayListUnmanaged(Expression) = .empty;
@@ -1577,7 +1578,7 @@ const Parser = struct {
 
         const call = self.allocator.create(CallExpr) catch return null;
         call.* = .{ .callee = "super", .args = args.items };
-        return .{ .expr_stmt = .{ .call = call } };
+        return .{ .expr_stmt = .{ .expr = .{ .call = call }, .source_loc = loc } };
     }
 
     fn parseIvarStatement(self: *Parser) ?Statement {
@@ -1619,7 +1620,7 @@ const Parser = struct {
 
         // Expression statement (e.g. @var.method(...))
         const expr = self.parsePostfixFrom(target_expr);
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn parseIdentStatement(self: *Parser) ?Statement {
@@ -1643,7 +1644,7 @@ const Parser = struct {
                 const args = self.parseArgList();
                 const mc = self.allocator.create(MethodCall) catch return null;
                 mc.* = .{ .object = "this", .method = prop_name, .args = args };
-                return .{ .expr_stmt = .{ .method_call = mc } };
+                return .{ .expr_stmt = .{ .expr = .{ .method_call = mc }, .source_loc = loc } };
             }
 
             // Assignment: self.field = expr
@@ -1665,7 +1666,7 @@ const Parser = struct {
 
             // Expression statement (property access)
             const expr: Expression = .{ .property_access = .{ .object = "this", .property = prop_name } };
-            return .{ .expr_stmt = expr };
+            return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
         }
 
         // Check for simple name = expr pattern (variable declaration or assignment)
@@ -1707,7 +1708,7 @@ const Parser = struct {
         }
 
         // Expression statement
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {

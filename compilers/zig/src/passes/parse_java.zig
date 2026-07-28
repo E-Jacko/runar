@@ -1203,18 +1203,18 @@ const Parser = struct {
             _ = self.match(.semicolon);
             const inc = self.allocator.create(IncrementExpr) catch return null;
             inc.* = .{ .operand = expr, .prefix = false };
-            return .{ .expr_stmt = .{ .increment = inc } };
+            return .{ .expr_stmt = .{ .expr = .{ .increment = inc }, .source_loc = loc } };
         }
         if (self.current.kind == .minus_minus) {
             _ = self.bump();
             _ = self.match(.semicolon);
             const dec = self.allocator.create(DecrementExpr) catch return null;
             dec.* = .{ .operand = expr, .prefix = false };
-            return .{ .expr_stmt = .{ .decrement = dec } };
+            return .{ .expr_stmt = .{ .expr = .{ .decrement = dec }, .source_loc = loc } };
         }
 
         _ = self.match(.semicolon);
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
@@ -1907,7 +1907,7 @@ const Parser = struct {
 
         for (m.body) |stmt| {
             switch (stmt) {
-                .expr_stmt => |expr| switch (expr) {
+                .expr_stmt => |expr| switch (expr.expr) {
                     .call => |call| {
                         if (std.mem.eql(u8, call.callee, "super")) {
                             for (call.args) |arg| super_args.append(self.allocator, arg) catch {};
@@ -2309,7 +2309,7 @@ test "ByteString.fromHex literal (Java)" {
     // assertThat(magic.equals(ByteString.fromHex("deadbeef"))) — the parser
     // lowers `<a>.equals(<b>)` to BinaryExpr(eq, <a>, <b>) and rewrites
     // `ByteString.fromHex("...")` into a bytes literal.
-    const outer = body[0].expr_stmt;
+    const outer = body[0].expr_stmt.expr;
     const outer_call = outer.call.*; // assertThat(...) → call("assert", [arg])
     try std.testing.expectEqualStrings("assert", outer_call.callee);
     const eq_op = outer_call.args[0].binary_op.*;
@@ -2339,7 +2339,7 @@ test "BigInteger.valueOf literal (Java)" {
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     const c = r.contract.?;
     const body = c.methods[0].body;
-    const outer = body[0].expr_stmt;
+    const outer = body[0].expr_stmt.expr;
     // assertThat(x == BigInteger.valueOf(7)) → call("assert", [x == 7])
     const outer_call = outer.call.*;
     try std.testing.expectEqualStrings("assert", outer_call.callee);

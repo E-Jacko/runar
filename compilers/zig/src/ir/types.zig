@@ -184,7 +184,17 @@ pub const ParamNode = struct { name: []const u8, type_info: RunarType = .unknown
 pub const ANFParam = ParamNode;
 pub const AssignmentNode = struct { target: []const u8, value: Expression };
 
-pub const Statement = union(enum) { const_decl: ConstDecl, let_decl: LetDecl, assign: Assign, if_stmt: IfStmt, for_stmt: ForStmt, expr_stmt: Expression, assert_stmt: AssertStmt, return_stmt: ?Expression };
+pub const Statement = union(enum) { const_decl: ConstDecl, let_decl: LetDecl, assign: Assign, if_stmt: IfStmt, for_stmt: ForStmt, expr_stmt: ExprStmt, assert_stmt: AssertStmt, return_stmt: ?Expression };
+// Mirrors the canonical AST's `ExpressionStatement.sourceLocation`
+// (`packages/runar-ir-schema/src/runar-ast.ts`). `source_loc` is populated by
+// every frontend parser at the statement's FIRST token, in the AST-wide
+// **1-based line / 1-based column** convention — `codegen/emit.zig` performs the
+// single 1→0 column conversion when it materialises source-map entries, so no
+// parser may subtract here. Without this field, statement-expressions (notably
+// `assert(...)` on the ts/go/move/python/java/zig surfaces, which lower to an
+// expr_stmt rather than a dedicated assert_stmt) anchored to the enclosing
+// method instead of their own line.
+pub const ExprStmt = struct { expr: Expression, source_loc: ?SourceLocation = null };
 pub const ConstDecl = struct { name: []const u8, type_info: ?RunarType = null, value: Expression, source_loc: ?SourceLocation = null };
 pub const LetDecl = struct { name: []const u8, type_info: ?RunarType = null, value: ?Expression = null, source_loc: ?SourceLocation = null };
 pub const Assign = struct {

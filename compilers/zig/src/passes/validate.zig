@@ -342,7 +342,7 @@ fn endsWithTerminalAsm(body: []const Statement) bool {
     if (body.len == 0) return false;
     const last = body[body.len - 1];
     return switch (last) {
-        .expr_stmt => |expr| switch (expr) {
+        .expr_stmt => |expr| switch (expr.expr) {
             .call => |c| blk: {
                 if (!std.mem.eql(u8, c.callee, "asm")) break :blk false;
                 if (c.args.len != 3) break :blk false;
@@ -388,7 +388,7 @@ fn walkStatementForAsm(
     errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
 ) !void {
     switch (stmt) {
-        .expr_stmt => |e| try walkExprForAsm(allocator, e, contract, errors),
+        .expr_stmt => |e| try walkExprForAsm(allocator, e.expr, contract, errors),
         .const_decl => |cd| try walkExprForAsm(allocator, cd.value, contract, errors),
         .let_decl => |ld| {
             if (ld.value) |v| try walkExprForAsm(allocator, v, contract, errors);
@@ -557,7 +557,7 @@ fn endsWithAssert(body: []const Statement) bool {
 
     return switch (last) {
         .assert_stmt => true,
-        .expr_stmt => |expr| isAssertCall(expr),
+        .expr_stmt => |expr| isAssertCall(expr.expr),
         .if_stmt => |if_s| {
             const then_ok = endsWithAssert(if_s.then_body);
             const else_ok = if (if_s.else_body) |eb| endsWithAssert(eb) else false;
@@ -628,7 +628,7 @@ fn walkStatementsForPreimage(
     warnings: *std.ArrayListUnmanaged(CompilerDiagnostic),
 ) !void {
     switch (stmt) {
-        .expr_stmt => |expr| try walkExprForPreimage(allocator, expr, method_name, warnings),
+        .expr_stmt => |expr| try walkExprForPreimage(allocator, expr.expr, method_name, warnings),
         .const_decl => |cd| try walkExprForPreimage(allocator, cd.value, method_name, warnings),
         .let_decl => |ld| {
             if (ld.value) |v| try walkExprForPreimage(allocator, v, method_name, warnings);
@@ -800,7 +800,7 @@ fn scanExprForLocktime(expr: Expression, reads_locktime: *bool, has_guard: *bool
 /// Statement walker feeding `scanExprForLocktime`.
 fn scanStmtForLocktime(stmt: Statement, reads_locktime: *bool, has_guard: *bool) void {
     switch (stmt) {
-        .expr_stmt => |expr| scanExprForLocktime(expr, reads_locktime, has_guard),
+        .expr_stmt => |expr| scanExprForLocktime(expr.expr, reads_locktime, has_guard),
         .const_decl => |cd| scanExprForLocktime(cd.value, reads_locktime, has_guard),
         .let_decl => |ld| {
             if (ld.value) |v| scanExprForLocktime(v, reads_locktime, has_guard);
@@ -973,7 +973,7 @@ fn hasCycle(
 /// Collect method calls from statements.
 fn collectMethodCalls(allocator: Allocator, stmt: Statement, calls: *StringSet) !void {
     switch (stmt) {
-        .expr_stmt => |expr| try collectMethodCallsInExpr(allocator, expr, calls),
+        .expr_stmt => |expr| try collectMethodCallsInExpr(allocator, expr.expr, calls),
         .const_decl => |cd| try collectMethodCallsInExpr(allocator, cd.value, calls),
         .let_decl => |ld| {
             if (ld.value) |v| try collectMethodCallsInExpr(allocator, v, calls);
@@ -1338,7 +1338,7 @@ test "public method without assert reports error for SmartContract" {
     const props = [_]PropertyNode{
         makeProperty("pk", .pub_key, true),
     };
-    var body = [_]Statement{.{ .expr_stmt = .{ .literal_bool = true } }};
+    var body = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .literal_bool = true } } }};
     var methods = [_]MethodNode{
         .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
     };
@@ -1443,7 +1443,7 @@ test "StatefulSmartContract public method without assert is OK" {
     const props = [_]PropertyNode{
         makeProperty("counter", .bigint, false),
     };
-    var body = [_]Statement{.{ .expr_stmt = .{ .literal_bool = true } }};
+    var body = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .literal_bool = true } } }};
     var methods = [_]MethodNode{
         .{ .name = "increment", .is_public = true, .params = &.{}, .body = &body },
     };
@@ -1477,7 +1477,7 @@ test "direct recursion detected" {
 
     // Method "foo" calls this.foo() -> direct recursion
     var call_expr = types.MethodCall{ .object = "this", .method = "foo", .args = &.{} };
-    var body = [_]Statement{.{ .expr_stmt = .{ .method_call = &call_expr } }};
+    var body = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .method_call = &call_expr } } }};
     var assert_body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
     var methods = [_]MethodNode{
         .{ .name = "foo", .is_public = false, .params = &.{}, .body = &body },
@@ -1514,9 +1514,9 @@ test "indirect recursion detected" {
 
     // Method "a" calls this.b(), method "b" calls this.a() -> indirect recursion
     var call_b = types.MethodCall{ .object = "this", .method = "b", .args = &.{} };
-    var body_a = [_]Statement{.{ .expr_stmt = .{ .method_call = &call_b } }};
+    var body_a = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .method_call = &call_b } } }};
     var call_a = types.MethodCall{ .object = "this", .method = "a", .args = &.{} };
-    var body_b = [_]Statement{.{ .expr_stmt = .{ .method_call = &call_a } }};
+    var body_b = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .method_call = &call_a } } }};
     var assert_body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
     var methods = [_]MethodNode{
         .{ .name = "a", .is_public = false, .params = &.{}, .body = &body_a },
@@ -1554,7 +1554,7 @@ test "no recursion in acyclic call graph" {
 
     // Method "a" calls this.b(), method "b" does not call anything -> no cycle
     var call_b = types.MethodCall{ .object = "this", .method = "b", .args = &.{} };
-    var body_a = [_]Statement{.{ .expr_stmt = .{ .method_call = &call_b } }};
+    var body_a = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .method_call = &call_b } } }};
     var body_b = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
     var assert_body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
     var methods = [_]MethodNode{
@@ -1590,7 +1590,7 @@ test "StatefulSmartContract warns on manual checkPreimage call" {
         makeProperty("counter", .bigint, false),
     };
     var check_call = types.CallExpr{ .callee = "checkPreimage", .args = &.{} };
-    var body = [_]Statement{.{ .expr_stmt = .{ .call = &check_call } }};
+    var body = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .call = &check_call } } }};
     var methods = [_]MethodNode{
         .{ .name = "increment", .is_public = true, .params = &.{}, .body = &body },
     };
@@ -1623,7 +1623,7 @@ test "StatefulSmartContract warns on manual getStateScript call" {
         makeProperty("counter", .bigint, false),
     };
     var mc = types.MethodCall{ .object = "this", .method = "getStateScript", .args = &.{} };
-    var body = [_]Statement{.{ .expr_stmt = .{ .method_call = &mc } }};
+    var body = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .method_call = &mc } } }};
     var methods = [_]MethodNode{
         .{ .name = "increment", .is_public = true, .params = &.{}, .body = &body },
     };
@@ -1857,7 +1857,7 @@ test "H2: warns when a public method reads extractLocktime without a sequence gu
     var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
     var body = [_]Statement{
         .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
-        .{ .expr_stmt = .{ .increment = &inc } },
+        .{ .expr_stmt = .{ .expr = .{ .increment = &inc } } },
     };
     var methods = [_]MethodNode{
         .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
@@ -1905,7 +1905,7 @@ test "H2: does NOT warn when the method also asserts extractSequence < final" {
     var body = [_]Statement{
         .{ .assert_stmt = .{ .condition = .{ .binary_op = &seq_cmp } } },
         .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
-        .{ .expr_stmt = .{ .increment = &inc } },
+        .{ .expr_stmt = .{ .expr = .{ .increment = &inc } } },
     };
     var methods = [_]MethodNode{
         .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
@@ -1935,7 +1935,7 @@ test "H2: does NOT warn for a method that never reads extractLocktime" {
 
     var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
     var body = [_]Statement{
-        .{ .expr_stmt = .{ .increment = &inc } },
+        .{ .expr_stmt = .{ .expr = .{ .increment = &inc } } },
     };
     var methods = [_]MethodNode{
         .{ .name = "increment", .is_public = true, .params = &.{}, .body = &body },
@@ -1981,9 +1981,9 @@ test "H2: sees a sequence guard supplied transitively through a private helper" 
     };
     var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
     var unlock_body = [_]Statement{
-        .{ .expr_stmt = .{ .method_call = &req_call } },
+        .{ .expr_stmt = .{ .expr = .{ .method_call = &req_call } } },
         .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
-        .{ .expr_stmt = .{ .increment = &inc } },
+        .{ .expr_stmt = .{ .expr = .{ .increment = &inc } } },
     };
 
     var methods = [_]MethodNode{
@@ -2029,8 +2029,8 @@ test "H2: warns when the locktime read is in a private helper but no sequence gu
     var check_call = types.MethodCall{ .object = "this", .method = "checkDeadline", .args = &.{} };
     var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
     var unlock_body = [_]Statement{
-        .{ .expr_stmt = .{ .method_call = &check_call } },
-        .{ .expr_stmt = .{ .increment = &inc } },
+        .{ .expr_stmt = .{ .expr = .{ .method_call = &check_call } } },
+        .{ .expr_stmt = .{ .expr = .{ .increment = &inc } } },
     };
 
     var methods = [_]MethodNode{

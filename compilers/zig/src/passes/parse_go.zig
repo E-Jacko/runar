@@ -1481,16 +1481,16 @@ const Parser = struct {
             _ = self.bump();
             const inc = self.allocator.create(IncrementExpr) catch return null;
             inc.* = .{ .operand = expr, .prefix = false };
-            return .{ .expr_stmt = .{ .increment = inc } };
+            return .{ .expr_stmt = .{ .expr = .{ .increment = inc }, .source_loc = loc } };
         }
         if (self.current.kind == .minus_minus) {
             _ = self.bump();
             const dec = self.allocator.create(DecrementExpr) catch return null;
             dec.* = .{ .operand = expr, .prefix = false };
-            return .{ .expr_stmt = .{ .decrement = dec } };
+            return .{ .expr_stmt = .{ .expr = .{ .decrement = dec }, .source_loc = loc } };
         }
 
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
@@ -2356,13 +2356,13 @@ test "parse ByteString literal and variable (Go)" {
 
     const stmt_0 = c.methods[0].body[0];
     try std.testing.expect(stmt_0 == .expr_stmt);
-    const lit = Finder.find(stmt_0.expr_stmt);
+    const lit = Finder.find(stmt_0.expr_stmt.expr);
     try std.testing.expect(lit != null);
     try std.testing.expectEqualStrings("006a", lit.?);
 
     const stmt_1 = c.methods[0].body[1];
     try std.testing.expect(stmt_1 == .expr_stmt);
-    try std.testing.expect(Finder.findIdent(stmt_1.expr_stmt, "data"));
+    try std.testing.expect(Finder.findIdent(stmt_1.expr_stmt.expr, "data"));
 }
 
 test "parse IfElse contract (Go)" {

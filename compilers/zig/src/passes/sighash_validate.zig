@@ -196,7 +196,7 @@ fn scanStmt(contract: ContractNode, stmt: Statement, scan: *Scan, visiting: *std
             }
             try scanExpr(contract, a.value, scan, visiting, depth);
         },
-        .expr_stmt => |e| try scanExpr(contract, e, scan, visiting, depth),
+        .expr_stmt => |e| try scanExpr(contract, e.expr, scan, visiting, depth),
         .const_decl => |d| try scanExpr(contract, d.value, scan, visiting, depth),
         .let_decl => |d| {
             if (d.value) |v| try scanExpr(contract, v, scan, visiting, depth);

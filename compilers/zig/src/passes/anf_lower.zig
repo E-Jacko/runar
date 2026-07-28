@@ -910,7 +910,8 @@ fn lowerStatement(ctx: *LowerCtx, stmt: Statement) LowerError!void {
         .if_stmt => |i| i.source_loc,
         .for_stmt => |f| f.source_loc,
         .assert_stmt => |a| a.source_loc,
-        .expr_stmt, .return_stmt => null,
+        .expr_stmt => |e| e.source_loc,
+        .return_stmt => null,
     } orelse ctx.current_source_loc;
 
     switch (stmt) {
@@ -958,7 +959,7 @@ fn lowerStatement(ctx: *LowerCtx, stmt: Statement) LowerError!void {
             try lowerForStatement(ctx, for_s);
         },
         .expr_stmt => |expr| {
-            _ = try lowerExprToRef(ctx, expr);
+            _ = try lowerExprToRef(ctx, expr.expr);
         },
         .assert_stmt => |assert_s| {
             const cond_ref = try lowerExprToRef(ctx, assert_s.condition);
@@ -1872,7 +1873,7 @@ fn stmtMutatesStateRec(stmt: Statement, contract: ContractNode, depth: u32) bool
             }
             return false;
         },
-        .expr_stmt => |expr| return exprMutatesStateRec(expr, contract, depth),
+        .expr_stmt => |expr| return exprMutatesStateRec(expr.expr, contract, depth),
         .if_stmt => |if_s| {
             if (bodyMutatesStateRec(if_s.then_body, contract, depth)) return true;
             if (if_s.else_body) |eb| {
@@ -1979,7 +1980,7 @@ fn stmtHasIntrinsicCallRec(
     depth: u32,
 ) bool {
     switch (stmt) {
-        .expr_stmt => |expr| return exprHasIntrinsicCallRec(expr, params, contract, names, depth),
+        .expr_stmt => |expr| return exprHasIntrinsicCallRec(expr.expr, params, contract, names, depth),
         .if_stmt => |if_s| {
             if (bodyHasIntrinsicCallRec(if_s.then_body, params, contract, names, depth)) return true;
             if (if_s.else_body) |eb| {
@@ -2933,8 +2934,8 @@ test "P2PKH contract full lowering" {
     // Build method body as statement slice
     const body = try allocator.alloc(Statement, 2);
     defer allocator.free(body);
-    body[0] = .{ .expr_stmt = .{ .call = assert1_call } };
-    body[1] = .{ .expr_stmt = .{ .call = assert2_call } };
+    body[0] = .{ .expr_stmt = .{ .expr = .{ .call = assert1_call } } };
+    body[1] = .{ .expr_stmt = .{ .expr = .{ .call = assert2_call } } };
 
     // Method params
     const method_params = try allocator.alloc(ParamNode, 2);
@@ -3091,7 +3092,7 @@ test "stateful contract injects checkPreimage at public method entry" {
 
     const body = try allocator.alloc(Statement, 1);
     defer allocator.free(body);
-    body[0] = .{ .expr_stmt = .{ .call = assert_call } };
+    body[0] = .{ .expr_stmt = .{ .expr = .{ .call = assert_call } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -3239,7 +3240,7 @@ test "branchEndsWithReturn" {
     try std.testing.expect(branchEndsWithReturn(&stmts_ret));
 
     // Body ending with non-return
-    const stmts_no_ret = [_]Statement{.{ .expr_stmt = .{ .literal_int = 1 } }};
+    const stmts_no_ret = [_]Statement{.{ .expr_stmt = .{ .expr = .{ .literal_int = 1 } } }};
     try std.testing.expect(!branchEndsWithReturn(&stmts_no_ret));
 }
 

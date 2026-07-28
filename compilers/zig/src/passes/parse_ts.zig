@@ -828,8 +828,9 @@ const Parser = struct {
 
         for (m.body) |stmt| {
             switch (stmt) {
-                .expr_stmt => |expr| {
+                .expr_stmt => |stmt_expr| {
                     // super(...) call
+                    const expr = stmt_expr.expr;
                     if (self.isSuperCall(expr)) {
                         if (self.extractSuperArgs(expr)) |args| {
                             for (args) |arg| super_args.append(self.allocator, arg) catch {};
@@ -1282,7 +1283,7 @@ const Parser = struct {
         }
 
         self.skipSemicolons();
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
@@ -2340,7 +2341,7 @@ test "method calls and property access (TS)" {
     // assert(checkSig(sig, this.owner)) is an expression statement
     switch (stmt) {
         .expr_stmt => |expr| {
-            switch (expr) {
+            switch (expr.expr) {
                 .call => |call| {
                     try std.testing.expectEqualStrings("assert", call.callee);
                     try std.testing.expectEqual(@as(usize, 1), call.args.len);
@@ -2481,7 +2482,7 @@ test "logical or operator (TS)" {
     const stmt = res.contract.?.methods[0].body[0];
     switch (stmt) {
         .expr_stmt => |expr| {
-            switch (expr) {
+            switch (expr.expr) {
                 .call => |call| {
                     switch (call.args[0]) {
                         .binary_op => |b| try std.testing.expectEqual(BinOperator.or_op, b.op),
@@ -2511,7 +2512,7 @@ test "triple equals parsed as equality (TS)" {
     const body = res.contract.?.methods[0].body;
     try std.testing.expectEqual(@as(usize, 2), body.len);
     // First assert: x === this.val -> eq
-    switch (body[0].expr_stmt) {
+    switch (body[0].expr_stmt.expr) {
         .call => |call| {
             switch (call.args[0]) {
                 .binary_op => |b| try std.testing.expectEqual(BinOperator.eq, b.op),
@@ -2521,7 +2522,7 @@ test "triple equals parsed as equality (TS)" {
         else => return error.UnexpectedVariant,
     }
     // Second assert: x !== 0n -> neq
-    switch (body[1].expr_stmt) {
+    switch (body[1].expr_stmt.expr) {
         .call => |call| {
             switch (call.args[0]) {
                 .binary_op => |b| try std.testing.expectEqual(BinOperator.neq, b.op),
@@ -2621,7 +2622,7 @@ test "this.method() call (TS)" {
     try std.testing.expectEqual(@as(usize, 0), res.errors.len);
     const body = res.contract.?.methods[0].body;
     // Second statement: this.addOutput(1n, this.count)
-    switch (body[1].expr_stmt) {
+    switch (body[1].expr_stmt.expr) {
         .method_call => |mc| {
             try std.testing.expectEqualStrings("this", mc.object);
             try std.testing.expectEqualStrings("addOutput", mc.method);

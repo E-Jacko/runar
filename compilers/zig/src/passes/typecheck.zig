@@ -584,7 +584,7 @@ const TypeChecker = struct {
                 env.popScope();
             },
             .expr_stmt => |expr| {
-                _ = self.inferExprType(expr, env);
+                _ = self.inferExprType(expr.expr, env);
             },
             .assert_stmt => |assert_s| {
                 const cond_type = self.inferExprType(assert_s.condition, env);
@@ -1179,7 +1179,7 @@ fn stmtContainsCallTo(stmt: Statement, name: []const u8) bool {
             }
             break :blk false;
         },
-        .expr_stmt => |e| exprContainsCallTo(e, name),
+        .expr_stmt => |e| exprContainsCallTo(e.expr, name),
         .assert_stmt => |s| exprContainsCallTo(s.condition, name),
         .return_stmt => |rv| if (rv) |v| exprContainsCallTo(v, name) else false,
     };
@@ -1241,7 +1241,7 @@ fn stmtContainsAddDataOutput(stmt: Statement) bool {
             }
             break :blk false;
         },
-        .expr_stmt => |e| exprContainsAddDataOutput(e),
+        .expr_stmt => |e| exprContainsAddDataOutput(e.expr),
         .assert_stmt => |s| exprContainsAddDataOutput(s.condition),
         .return_stmt => |rv| if (rv) |v| exprContainsAddDataOutput(v) else false,
     };
@@ -1337,7 +1337,7 @@ fn walkStmtForOutputSignals(stmt: Statement, properties: []const types.PropertyN
         .for_stmt => |s| {
             for (s.body) |b| walkStmtForOutputSignals(b, properties, signals);
         },
-        .expr_stmt => |e| walkExprForOutputSignals(e, properties, signals),
+        .expr_stmt => |e| walkExprForOutputSignals(e.expr, properties, signals),
         .assert_stmt => |s| walkExprForOutputSignals(s.condition, properties, signals),
         .return_stmt => |rv| {
             if (rv) |v| walkExprForOutputSignals(v, properties, signals);
@@ -1792,7 +1792,7 @@ test "typeCheck: unknown function error" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .call = call } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .call = call } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -1855,7 +1855,7 @@ test "typeCheck: wrong arg type for builtin" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .call = call } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .call = call } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -1888,7 +1888,7 @@ test "typeCheck: wrong arity for builtin" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .call = call } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .call = call } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -1934,8 +1934,8 @@ test "typeCheck: affine value consumed twice" {
 
     const stmts = try allocator.alloc(Statement, 2);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .call = call1 } };
-    stmts[1] = .{ .expr_stmt = .{ .call = call2 } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .call = call1 } } };
+    stmts[1] = .{ .expr_stmt = .{ .expr = .{ .call = call2 } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -1972,7 +1972,7 @@ test "typeCheck: affine value single use is fine" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .call = call } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .call = call } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -2000,7 +2000,7 @@ test "typeCheck: logical operator requires boolean" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .binary_op = bin } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .binary_op = bin } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -2029,7 +2029,7 @@ test "typeCheck: unary not requires boolean" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .unary_op = un } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .unary_op = un } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -2119,7 +2119,7 @@ test "typeCheck: comparison operator types" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .binary_op = bin } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .binary_op = bin } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -2183,7 +2183,7 @@ test "typeCheck: assert special case with 2 args" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .call = call } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .call = call } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -2216,7 +2216,7 @@ test "typeCheck: equality across ByteString subtypes is fine" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .binary_op = bin } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .binary_op = bin } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);
@@ -2244,7 +2244,7 @@ test "typeCheck: incompatible equality comparison" {
 
     const stmts = try allocator.alloc(Statement, 1);
     defer allocator.free(stmts);
-    stmts[0] = .{ .expr_stmt = .{ .binary_op = bin } };
+    stmts[0] = .{ .expr_stmt = .{ .expr = .{ .binary_op = bin } } };
 
     const methods = try allocator.alloc(MethodNode, 1);
     defer allocator.free(methods);

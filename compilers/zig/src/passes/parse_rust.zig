@@ -1183,7 +1183,7 @@ const Parser = struct {
             return .{ .return_stmt = expr };
         }
 
-        return .{ .expr_stmt = expr };
+        return .{ .expr_stmt = .{ .expr = expr, .source_loc = loc } };
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
