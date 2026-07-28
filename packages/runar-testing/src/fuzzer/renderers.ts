@@ -777,6 +777,14 @@ const JAVA_BIGINT_BIN_METHOD: Partial<Record<string, string>> = {
   '>=': 'ge',
   '===': 'eq',
   '!==': 'neq',
+  // Shift/bitwise (C6): JavaParser.java's BIGINT_BINARY_METHODS table maps
+  // these exact method names back to Expression.BinaryOp.SHL/SHR/BIT_AND/
+  // BIT_OR/BIT_XOR.
+  '<<': 'shl',
+  '>>': 'shr',
+  '&': 'and',
+  '|': 'or',
+  '^': 'xor',
 };
 
 /** Java has no `2n` literal; surface via Bigint.of(N). */
@@ -805,6 +813,7 @@ function isBigintExpr(expr: Expr): boolean {
     case 'binary': {
       switch (expr.op) {
         case '+': case '-': case '*': case '/': case '%':
+        case '<<': case '>>': case '&': case '|': case '^':
           return true;
         default:
           return false; // comparisons / logical ops → boolean

@@ -44,6 +44,7 @@ import {
 import { runExecuteDifferential } from './execute-differential.js';
 import { runTriModalDifferential } from './tri-modal-differential.js';
 import { runReplayAndReport } from '../fuzz-regressions/replay.js';
+import { shouldFailRun } from './run-policy.js';
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -458,8 +459,20 @@ async function main(): Promise<void> {
       console.log(`\nResults written to: ${opts.output}`);
     }
     // A divergence is a real shared-design bug; a throw is a distinct anomaly.
-    // Either fails the run so the gate catches it.
-    if (report.divergenceCount > 0 || report.errorCount > 0) process.exit(1);
+    // Either fails the run so the gate catches it. An early-stopped run that
+    // didn't finish the whole generated corpus is ALSO a failure (C5): an
+    // incomplete execution-oracle run must never report an unqualified PASS.
+    const incompleteExecuteRun = shouldFailRun({
+      earlyStop: report.earlyStop,
+      completed: report.contractsRun,
+      total: report.totalContracts,
+    });
+    if (incompleteExecuteRun) {
+      console.error(
+        `INCOMPLETE RUN: time budget reached after ${report.contractsRun}/${report.totalContracts} contracts — treating as a failure.`,
+      );
+    }
+    if (report.divergenceCount > 0 || report.errorCount > 0 || incompleteExecuteRun) process.exit(1);
     return;
   }
 
@@ -534,7 +547,19 @@ async function main(): Promise<void> {
       });
       console.log(`\nResults written to: ${opts.output}`);
     }
-    if (report.mismatchCount > 0) process.exit(1);
+    // An early-stopped run that didn't finish the whole generated corpus is a
+    // failure (C5): an incomplete run must never report an unqualified PASS.
+    const incompleteAnfRun = shouldFailRun({
+      earlyStop: report.earlyStop,
+      completed: report.programsRun,
+      total: report.totalPrograms,
+    });
+    if (incompleteAnfRun) {
+      console.error(
+        `INCOMPLETE RUN: time budget reached after ${report.programsRun}/${report.totalPrograms} programs — treating as a failure.`,
+      );
+    }
+    if (report.mismatchCount > 0 || incompleteAnfRun) process.exit(1);
     return;
   }
 

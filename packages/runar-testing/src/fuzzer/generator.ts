@@ -670,6 +670,40 @@ function arbNonZeroDivisorLiteralIR(): fc.Arbitrary<Expr> {
   );
 }
 
+/**
+ * Non-negative bounded shift count (0..16), IR form. Mirrors
+ * `arbSmallShiftLiteral` above: OP_LSHIFT/OP_RSHIFT abort on a negative
+ * shift, so the RHS of a generated shift is always a small non-negative
+ * literal — the shift then reaches the execution oracle with a defined
+ * result.
+ */
+function arbSmallShiftLiteralIR(): fc.Arbitrary<Expr> {
+  return fc.integer({ min: 0, max: 16 }).map(
+    (n): Expr => ({ kind: 'bigint_literal', value: BigInt(n) }),
+  );
+}
+
+/**
+ * Multi-byte-magnitude literal, used ONLY inside the shift/bitwise arms of
+ * `arbBigintExprIR` below (C6 / deep-review finding). `arbBigintLiteralIR`'s
+ * [-100, 100] range never needs more than one Bitcoin script-number byte, so
+ * a corpus built only from that range could never re-catch a #141-shaped
+ * regression: #141 was a byte-array-truncation bug (OP_LSHIFT/OP_RSHIFT/
+ * OP_AND/OP_OR/OP_XOR operate on the operands' raw script-number bytes, not
+ * their numeric value) that only manifests once an operand's minimal
+ * script-number encoding needs a second byte (e.g. 255 needs one — the sign
+ * bit doesn't fit in a single byte). 70000 stays inside the magnitude already
+ * regression-tested against the real VM (see
+ * `packages/runar-testing/src/__tests__/script-number-bitwise.test.ts`,
+ * which fuzzes |value| < 70000 against ScriptVM) while reliably producing
+ * 2-3 byte operands.
+ */
+function arbWideBigintLiteralIR(): fc.Arbitrary<Expr> {
+  return fc.bigInt({ min: -70000n, max: 70000n }).map(
+    (v): Expr => ({ kind: 'bigint_literal', value: v }),
+  );
+}
+
 /** Generate a bigint-typed expression using available vars. */
 function arbBigintExprIR(
   bigintVars: string[],
@@ -716,6 +750,40 @@ function arbBigintExprIR(
       arbBigintExprIR(bigintVars, depth - 1),
       arbBigintExprIR(bigintVars, depth - 1),
     ).map(([fn, a, b]): Expr => ({ kind: 'call', fn, args: [a, b] })),
+    // Shifts (bounded non-negative literal count) and bitwise ops (C6 —
+    // these lower to byte-array Script opcodes OP_LSHIFT/OP_RSHIFT/OP_AND/
+    // OP_OR/OP_XOR; the interpreter models the same byte semantics since
+    // #141, so they reach the execution oracle in agreement — a
+    // length-mismatch `& | ^` aborts on BOTH the interpreter and the script).
+    // `arbWideBigintLiteralIR` keeps at least one operand able to cross the
+    // single-byte scriptnum boundary instead of confining the corpus to
+    // `arbBigintLiteralIR`'s [-100, 100] range.
+    fc.tuple(
+      fc.oneof(arbBigintExprIR(bigintVars, depth - 1), arbWideBigintLiteralIR()),
+      fc.constantFrom('<<' as const, '>>' as const),
+      arbSmallShiftLiteralIR(),
+    ).map(([left, op, right]): Expr => ({ kind: 'binary', op, left, right })),
+    fc.tuple(
+      fc.oneof(arbBigintExprIR(bigintVars, depth - 1), arbWideBigintLiteralIR()),
+      fc.constantFrom('&' as const, '|' as const, '^' as const),
+      fc.oneof(arbBigintExprIR(bigintVars, depth - 1), arbWideBigintLiteralIR()),
+    ).map(([left, op, right]): Expr => ({ kind: 'binary', op, left, right })),
+    // Chained byte-op: a shift RESULT (fixed-length, possibly NON-minimal on
+    // chain — e.g. `2 << 8` leaves a 1-byte 0x00) feeding a length-sensitive
+    // `& | ^`. This is the exact shape #141's fix (chained byte-op length)
+    // targets — a dedicated arm keeps the corpus sampling it reliably rather
+    // than relying on the generic oneof to nest a shift under a bitwise op.
+    fc.tuple(
+      fc.oneof(arbBigintExprIR(bigintVars, depth - 1), arbWideBigintLiteralIR()),
+      arbSmallShiftLiteralIR(),
+      fc.constantFrom('&' as const, '|' as const, '^' as const),
+      fc.oneof(arbBigintExprIR(bigintVars, depth - 1), arbWideBigintLiteralIR()),
+    ).map(([l, k, op, r]): Expr => ({
+      kind: 'binary',
+      op,
+      left: { kind: 'binary', op: '<<', left: l, right: k },
+      right: r,
+    })),
   );
 }
 

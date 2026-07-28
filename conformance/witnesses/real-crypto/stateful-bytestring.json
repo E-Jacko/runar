@@ -34,9 +34,9 @@
       ],
       "signerKey": "alice",
       "expect": "accept",
-      "note": "owner burn: real checkSig(alice) passes",
+      "note": "owner burn: real checkSig(alice) passes. burn(sig) only asserts checkSig — it does NOT touch `message` — so the continuation must PRESERVE the constructor value 0x00. This expectation used to read \"0x\" (empty), which was the deep-review C9 bug recorded as if it were correct behaviour: the SDK encoded a 1-byte 0x00 ByteString as OP_0, and OP_0 pushes the EMPTY array, so the state round-tripped 0x00 -> '' and a byte of on-chain state was silently destroyed. With C9/S1 fixed (1-byte 0x00 now encodes as the direct push 01 00, matching the compiler's encodePushBytesHex) the value survives, and this witness records the true on-chain state.",
       "expectedState": {
-        "message": "0x"
+        "message": "0x00"
       }
     },
     {

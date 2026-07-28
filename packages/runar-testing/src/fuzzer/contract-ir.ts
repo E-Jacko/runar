@@ -63,7 +63,8 @@ export interface PropertyRef {
 export type BinaryOp =
   | '+' | '-' | '*' | '/' | '%'
   | '===' | '!==' | '<' | '>' | '<=' | '>='
-  | '&&' | '||';
+  | '&&' | '||'
+  | '<<' | '>>' | '&' | '|' | '^';
 
 export interface BinaryExpr {
   kind: 'binary';

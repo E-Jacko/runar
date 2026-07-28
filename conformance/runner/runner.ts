@@ -917,9 +917,82 @@ export async function shutdownJavaDaemon(): Promise<void> {
 }
 
 /**
+ * Reject an "empty success": a Java invocation that reported OK but handed
+ * back no IR and/or no script hex. Returns an error message, or null when
+ * both artifacts are non-empty.
+ *
+ * Empty-but-successful is a defect, never a legitimate result — and it is
+ * WORSE than an outright failure downstream, because the golden-file gate is
+ * written as `javaResult?.success && javaResult.scriptHex` (runner.ts:1940):
+ * an empty hex makes that condition falsy, so Java silently drops out of the
+ * golden comparison while the tier still counts as "tested". `compareScript`
+ * / `compareIR` do fail closed on it, but only with an anonymous "a compiler
+ * reported success but produced empty hex" warning that never names Java.
+ */
+function javaEmptyOutputError(irOutput: string, scriptHex: string): string | null {
+  const irEmpty = irOutput.trim() === '';
+  const hexEmpty = scriptHex.replace(/\s/g, '') === '';
+  if (irEmpty && hexEmpty) return 'java compiler reported success but produced no IR and no script hex';
+  if (irEmpty) return 'java compiler reported success but produced empty IR';
+  if (hexEmpty) return 'java compiler reported success but produced empty script hex';
+  return null;
+}
+
+/**
+ * Assemble the one-shot Java `CompilerOutput` from the raw `--emit-ir` and
+ * `--hex` process results. This is exactly what `runJavaCompiler` returns in
+ * one-shot mode (`RUNAR_JAVA_DAEMON=0`); it is exported so the failure ladder
+ * can be unit-tested without a JVM.
+ *
+ * Fails closed on three cases the previous inline code let through:
+ *   1. a non-zero `--hex` exit (was silently downgraded to `scriptHex = ''`
+ *      while still reporting `success: true`),
+ *   2. exit 0 with empty `--hex` stdout,
+ *   3. exit 0 with empty `--emit-ir` stdout.
+ * The Go / Rust / Python / Zig / Ruby one-shot paths already throw on (1).
+ */
+export function buildJavaOneShotOutput(
+  irRes: { stdout: string; stderr: string; code: number },
+  hexRes: { stdout: string; stderr: string; code: number },
+  durationMs: number,
+): CompilerOutput {
+  const fail = (error: string): CompilerOutput => ({
+    irJson: '',
+    scriptHex: '',
+    scriptAsm: '',
+    success: false,
+    error,
+    durationMs,
+  });
+
+  if (irRes.code !== 0) {
+    return fail(`java --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
+  }
+  if (hexRes.code !== 0) {
+    return fail(`java --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
+  }
+
+  const irOutput = irRes.stdout.trim();
+  const scriptHex = hexRes.stdout.trim();
+  const emptyErr = javaEmptyOutputError(irOutput, scriptHex);
+  if (emptyErr) {
+    return fail(`${emptyErr} (exit 0, empty stdout)`);
+  }
+
+  return {
+    irJson: canonicalizeJson(irOutput),
+    scriptHex,
+    scriptAsm: '',
+    success: true,
+    durationMs,
+  };
+}
+
+/**
  * Run the Java compiler on the given source. Returns undefined if the
- * Java compiler jar is not available. A failing --hex invocation is
- * captured gracefully with scriptHex = ''.
+ * Java compiler jar is not available. Both the daemon and one-shot paths
+ * fail closed on an empty-but-"successful" result (see
+ * `javaEmptyOutputError` / `buildJavaOneShotOutput`).
  */
 async function runJavaCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
   const start = performance.now();
@@ -944,9 +1017,22 @@ async function runJavaCompiler(source: string, sourceFile: string): Promise<Comp
           durationMs,
         };
       }
+      const daemonIr = resp.ir ?? '';
+      const daemonHex = resp.hex ?? '';
+      const emptyErr = javaEmptyOutputError(daemonIr, daemonHex);
+      if (emptyErr) {
+        return {
+          irJson: '',
+          scriptHex: '',
+          scriptAsm: '',
+          success: false,
+          error: `${emptyErr} (daemon replied ok)`,
+          durationMs,
+        };
+      }
       return {
-        irJson: canonicalizeJson(resp.ir ?? ''),
-        scriptHex: resp.hex ?? '',
+        irJson: canonicalizeJson(daemonIr),
+        scriptHex: daemonHex,
         scriptAsm: '',
         success: true,
         durationMs,

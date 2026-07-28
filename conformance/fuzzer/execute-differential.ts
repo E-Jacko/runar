@@ -78,13 +78,24 @@ function mulberry32(a: number): () => number {
 }
 
 /**
- * Bigint magnitude for synthesized inputs. Matches the generator's own literal
- * range (`arbBigintLiteralIR` draws in [-100, 100]) so inputs stay in the same
- * numeric domain the contracts were built for — this oracle probes accept/reject
- * LOGIC agreement, not integer-width edge cases (those are TS-GAP-010's boundary
- * corpus). Both ACCEPT and REJECT paths are exercised at this range.
+ * Bigint magnitude for synthesized inputs (constructor args + method params).
+ *
+ * C6 (deep-review finding): this used to be 100 — matching
+ * `arbBigintLiteralIR`'s own [-100, 100] literal range — which keeps every
+ * witnessed value inside the single-byte Bitcoin script-number encoding
+ * (|value| <= 127). Now that `arbBigintExprIR` emits shift/bitwise ops
+ * (`<< >> & | ^`, which lower to OP_LSHIFT/OP_RSHIFT/OP_AND/OP_OR/OP_XOR —
+ * byte-array opcodes, and the exact site of the #141 truncation bug), a
+ * witness domain confined to single-byte magnitudes could never drive those
+ * opcodes with a multi-byte-encoded VARIABLE operand. 70000 stays inside the
+ * magnitude already regression-tested against the real VM (see
+ * `packages/runar-testing/src/__tests__/script-number-bitwise.test.ts`,
+ * which fuzzes |value| < 70000 against ScriptVM) while reliably crossing the
+ * single-byte boundary. This oracle still probes accept/reject LOGIC
+ * agreement, not integer-width edge cases (those are TS-GAP-010's boundary
+ * corpus); both ACCEPT and REJECT paths are exercised at this range.
  */
-const INPUT_MAG = 100;
+const INPUT_MAG = 70000;
 
 function makeSynthesizer(rng: () => number): {
   bigint: () => bigint;

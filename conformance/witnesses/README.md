@@ -190,3 +190,56 @@ lifecycle, and is enforced by a different gate. Do not fold them in:
 - **`conformance/script-size-baseline.json`**, **`conformance/mutation/baseline.json`**
   — measurements, not exemptions. They record what IS, and a diff against them
   is the signal; they never assert that something is covered.
+## Known architectural residual — non-executed goldens (deep-review C24)
+
+Everything above makes coverage *claims* machine-checked. It does not make every
+golden *executed*. Deep-review finding C24 names the leftover risk explicitly, and
+this section is its acknowledgement rather than a fix, because closing it needs
+capability the harness does not have (see "What would actually close it").
+
+**The shape of the risk (the BUG-101 class).** A golden is produced by the very
+implementation under test. Cross-tier parity proves the seven compilers *agree*;
+it does not prove they are *right*. When no engine ever executes a fixture's
+bytes, seven tiers can agree on a wrong answer indefinitely — which is exactly
+what happened in BUG-101 (BLAKE3 was byte-identical across all tiers and wrong in
+all of them, because nothing ever ran it against a KAT). "Parity-green-but-wrong"
+is a real, observed failure mode in this repo, not a hypothetical.
+
+**Current exposure — 15 fixtures.** Both categories are legitimate opt-outs, both
+are machine-verified as *claims* by `coverage-claims.test.ts`, and neither is
+execution:
+
+- `codegen-golden` (11) — byte-golden only, executed by no engine:
+  `convergence-proof`, `ec-demo`, `ec-unit`, `oracle-price`,
+  `p256-primitives`, `p256-wallet`, `p384-primitives`, `p384-wallet`,
+  `post-quantum-wallet`, `schnorr-zkp`, `sphincs-wallet`.
+  Mostly EC / NIST-P / post-quantum verification scripts. They are unexecuted
+  because the accept path needs a real cryptographic witness the in-process
+  oracle cannot synthesise from plain args, and several compile to 200-900 KB of
+  script. Their PRIMITIVES are covered elsewhere (`real-crypto/`, the Go
+  `go-family-exec` markers, KAT vector tests) — it is these fixtures' own
+  composed bytes that nothing runs.
+- `go-only-nocodegen` (4) — `compilers:["go"]` proof-system fixtures:
+  `babybear`, `babybear-ext4`, `merkle-proof`, `state-covenant`. Single-tier by
+  project policy (see the EVM/STARK note in the root `CLAUDE.md`), so they have
+  no cross-tier agreement signal at all — a Go-only bug in these has neither an
+  execution check nor a parity check standing behind it.
+
+**What is actually guaranteed today.** For these 15: the bytes are stable
+(a silent regeneration fails the golden-provenance gate), the fixture parses in
+all seven frontends (the parser-only matrix ignores the `compilers` allowlist),
+and for the 11 non-single-tier ones the seven compilers agree byte-for-byte.
+That is meaningful but it is *consistency*, not *correctness*.
+
+**What would actually close it.** Per family, one of: (a) an official KAT
+executed against the compiled bytes (this is what fixed BUG-101 — SLH-DSA and
+BLAKE3 now carry real KATs); (b) a real-crypto witness under
+`witnesses/real-crypto/` once the harness can synthesise the needed signature or
+proof; or (c) an on-chain regtest integration spend under `integration/`. Prefer
+(a) — it is the only one that catches an all-tiers-agree-and-all-are-wrong bug,
+because its expected values come from outside this codebase entirely.
+
+**Do not "fix" this by relabelling.** Moving a fixture from `codegen-golden` to a
+stronger-sounding `coveredBy.kind` without adding real execution makes the gate
+report better coverage than exists — the precise over-claim
+`coverage-claims.test.ts` was written to prevent.
