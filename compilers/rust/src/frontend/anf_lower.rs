@@ -2718,6 +2718,55 @@ fn lift_branch_update_props(bindings: Vec<ANFBinding>) -> Vec<ANFBinding> {
             }
         }
 
+        // 2b. C20 — preserve a dropped terminal `assert(false)` else.
+        //
+        // `collect_update_branches` transforms a dispatch chain whose branches
+        // each end in a single `update_prop` into this flat conditional-assignment
+        // form. When the chain's terminal else is `assert(false)` it returns the
+        // branches WITHOUT a catch-all final branch (every branch keeps a non-null
+        // cond_ref), dropping the abort. But that assert(false) is the ONLY thing
+        // rejecting a selector value that matches no branch: without it, an
+        // unmatched selector leaves every property at its old value — a spendable
+        // NO-OP state continuation instead of a failed script (a funds-safety bug).
+        //
+        // A real final else (`else { prop = ... }`) instead yields a catch-all
+        // branch with cond_ref === None, and needs no guard because every selector
+        // value maps to some branch. So the presence of a None-cond_ref terminal
+        // branch exactly distinguishes the two cases.
+        //
+        // Re-introduce the abort as `assert(cond0 || cond1 || ... || cond_{N-1})`:
+        // if no branch condition held, the OR is false and the script aborts —
+        // byte-identical to the original `assert(false)` semantics for the
+        // unmatched position, and a no-op (`assert(true)`) whenever a branch runs.
+        let has_catch_all_else = branches[branches.len() - 1].cond_ref.is_none();
+        if !has_catch_all_else {
+            // Every branch here has a non-null cond_ref (only a catch-all final
+            // else is None, and there is none), so the OR fully covers selectors.
+            let mut or_ref = cond_refs[0].clone().unwrap();
+            for i in 1..cond_refs.len() {
+                let or_name = fresh();
+                result.push(ANFBinding {
+                    name: or_name.clone(),
+                    value: ANFValue::BinOp {
+                        op: "||".to_string(),
+                        left: or_ref,
+                        right: cond_refs[i].clone().unwrap(),
+                        result_type: None,
+                    },
+                    source_loc: None,
+                });
+                or_ref = or_name;
+            }
+            result.push(ANFBinding {
+                name: fresh(),
+                value: ANFValue::Assert {
+                    value: or_ref,
+                    is_auto_injected_state_check: false,
+                },
+                source_loc: None,
+            });
+        }
+
         // 3. For each branch, emit: load_old, conditional if-expression, update_prop
         for (i, branch) in branches.iter().enumerate() {
             // Load old property value

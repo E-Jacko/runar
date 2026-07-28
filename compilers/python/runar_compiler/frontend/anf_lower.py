@@ -2233,6 +2233,49 @@ def _lift_branch_update_props(bindings: list[ANFBinding]) -> list[ANFBinding]:
                 # Final else: just the AND of negations
                 effective_conds.append(and_ref)
 
+        # 2b. C20 — preserve a dropped terminal `assert(false)` else.
+        #
+        # `_collect_update_branches` transforms a dispatch chain whose branches
+        # each end in a single `update_prop` into this flat conditional-assignment
+        # form. When the chain's terminal else is `assert(false)` it returns the
+        # branches WITHOUT a catch-all final branch (every branch keeps a non-null
+        # cond_ref), dropping the abort. But that assert(false) is the ONLY thing
+        # rejecting a selector value that matches no branch: without it, an
+        # unmatched selector leaves every property at its old value — a spendable
+        # NO-OP state continuation instead of a failed script (a funds-safety bug).
+        #
+        # A real final else (`else { prop = ... }`) instead yields a catch-all
+        # branch with cond_ref is None, and needs no guard because every selector
+        # value maps to some branch. So the presence of a None-cond_ref terminal
+        # branch exactly distinguishes the two cases.
+        #
+        # Re-introduce the abort as `assert(cond0 || cond1 || ... || cond_{N-1})`:
+        # if no branch condition held, the OR is false and the script aborts —
+        # byte-identical to the original `assert(false)` semantics for the
+        # unmatched position, and a no-op (`assert(true)`) whenever a branch runs.
+        has_catch_all_else = branches[-1].cond_ref is None
+        if not has_catch_all_else:
+            # Every branch here has a non-null cond_ref (only a catch-all final
+            # else is None, and there is none), so the OR fully covers the
+            # selector space.
+            or_ref = cond_refs[0]
+            for i in range(1, len(cond_refs)):
+                or_name = fresh()
+                result.append(ANFBinding(
+                    name=or_name,
+                    value=ANFValue(
+                        kind="bin_op",
+                        op="||",
+                        left=or_ref,
+                        right=cond_refs[i],
+                    ),
+                ))
+                or_ref = or_name
+            result.append(ANFBinding(
+                name=fresh(),
+                value=_make_assert(or_ref),
+            ))
+
         # 3. For each branch, emit: load_old, conditional if-expression, update_prop
         for i, branch in enumerate(branches):
             # Load old property value

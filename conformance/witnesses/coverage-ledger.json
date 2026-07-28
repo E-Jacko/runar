@@ -132,16 +132,6 @@
       }
     },
     {
-      "fixture": "branched-readonly-len",
-      "cause": "stateful-harness-gap",
-      "reason": "spend(): branched mutation of count + a fixed-width ByteString state field re-encodes state via OP_NUM2BIN. Driven through the SDK call() path the recomputed continuation width does not match (OP_NUM2BIN 'size not large enough') — the harness cannot reconstruct the exact branched serialisation. FOLLOW-UP: port the Go witness construction.",
-      "coveredBy": {
-        "kind": "interpreter-witness-exec",
-        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
-        "note": "both branches (then/else of the len(scratch)-driven conditional) executed via the ANF interpreter with realistic args; TS tier only, not a full Bitcoin Script byte execution, and this particular fixture's spec is accept-only by design (both arms succeed — the branching logic itself is what's under test, not a checkSig/checkPreimage guard)."
-      }
-    },
-    {
       "fixture": "convergence-proof",
       "cause": "crypto-witness-infeasible",
       "reason": "secp256k1 EC ops (ecAdd/ecMulGen/ecNegate) — EC point witness, not a checkSig",

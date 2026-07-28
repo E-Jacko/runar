@@ -2146,10 +2146,34 @@ class LoweringContext {
       }
     }
 
+    // C27: the N>=2 result reconcile below also applies when the else-branch is
+    // PRESENT and BOTH arms wrote the same N mutable fields (e.g. each branch
+    // runs `this.a = ...; this.b = ...`). This is the else-present twin of the
+    // empty-else fix (#99 Bug 1). Without it, lowerIf falls through to
+    // `push(bindingName)` further down — registering ONE stackMap name for N
+    // physical results — so the state serialization emits against the wrong
+    // slot (OP_NUM2BIN on a byte string) and the continuation is unspendable (a
+    // funds-safety bug). Only fire when both arms leave the identical top-N
+    // property names in the identical order, so a single post-ENDIF reconcile
+    // is valid regardless of which branch the spender takes. The single-field
+    // same-property case (N==1, "turn flip") is unaffected — it still takes the
+    // dedicated path below.
+    const nResults = thenCtx.stackMap.depth - this.stackMap.depth;
+    const elseMatchesThenNResultLayout =
+      elseBindings.length > 0 &&
+      nResults >= 2 &&
+      elseCtx.stackMap.depth - this.stackMap.depth === nResults &&
+      Array.from({ length: nResults }).every((_unused, i) => {
+        const tn = thenCtx.stackMap.peekAtDepth(i);
+        return tn !== null &&
+          tn === elseCtx.stackMap.peekAtDepth(i) &&
+          this._properties.some(p => p.name === tn);
+      });
+
     // The if expression may produce a result value on top.
-    if (elseBindings.length === 0 &&
-        thenCtx.stackMap.depth > this.stackMap.depth &&
-        thenCtx.stackMap.depth - this.stackMap.depth >= 2) {
+    if (thenCtx.stackMap.depth > this.stackMap.depth &&
+        nResults >= 2 &&
+        (elseBindings.length === 0 || elseMatchesThenNResultLayout)) {
       // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
       // values on top (new values if taken, preserved old values if skipped).
       // Record the N results in their on-stack order, then physically remove

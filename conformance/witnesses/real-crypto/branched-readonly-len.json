@@ -1,0 +1,49 @@
+{
+  "fixture": "branched-readonly-len",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "deep-review C27: else-present multi-field write (count:bigint + tag:ByteString, OP_NUM2BIN re-encode). Both arms of the len(scratch)-driven if/else must produce a spendable continuation encoding the correct branched state. The continuation is an explicit this.addOutput(1000, count, tag), so each spend pins satoshis:1000. Promoted out of harness-inapplicable (stateful-harness-gap) once the C27 stack-lowering fix made the branched serialisation spendable — proven here on @bsv/sdk Spend.",
+  "constructorArgs": [
+    "5n",
+    "3030"
+  ],
+  "spends": [
+    {
+      "method": "spend",
+      "args": [
+        "0x4142"
+      ],
+      "expect": "accept",
+      "satoshis": 1000,
+      "note": "len(scratch)>0 then-branch: count 5->6, tag->4142",
+      "expectedState": {
+        "count": "6n",
+        "tag": "0x4142"
+      }
+    },
+    {
+      "method": "spend",
+      "args": [
+        "0x"
+      ],
+      "expect": "accept",
+      "satoshis": 1000,
+      "note": "len(scratch)==0 else-branch: count 5->4, tag->3030",
+      "expectedState": {
+        "count": "4n",
+        "tag": "0x3030"
+      }
+    },
+    {
+      "method": "spend",
+      "args": [
+        "0x4142"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "satoshis": 1000,
+      "note": "tampered continuation output: recomputed sighash no longer matches the on-stack preimage"
+    }
+  ]
+}

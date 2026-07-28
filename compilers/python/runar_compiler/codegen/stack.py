@@ -1702,10 +1702,36 @@ class _LoweringContext:
                 depth = self.sm.find_depth(name)
                 self.sm.remove_at_depth(depth)
 
+        # C27: the N>=2 result reconcile below also applies when the else-branch
+        # is PRESENT and BOTH arms wrote the same N mutable fields (e.g. each
+        # branch runs `this.a = ...; this.b = ...`). This is the else-present
+        # twin of the empty-else fix (#99 Bug 1). Without it, lower_if falls
+        # through to `push(binding_name)` further down — registering ONE stackMap
+        # name for N physical results — so the state serialization emits against
+        # the wrong slot (OP_NUM2BIN on a byte string) and the continuation is
+        # unspendable (a funds-safety bug). Only fire when both arms leave the
+        # identical top-N property names in the identical order, so a single
+        # post-ENDIF reconcile is valid regardless of which branch the spender
+        # takes. The single-field same-property case (N==1, "turn flip") is
+        # unaffected — it still takes the dedicated path below. An empty slot
+        # name ("") is treated as "not a match".
+        n_results = then_ctx.sm.depth() - self.sm.depth()
+        else_matches_then_n_result_layout = (
+            len(else_bindings) > 0
+            and n_results >= 2
+            and else_ctx.sm.depth() - self.sm.depth() == n_results
+            and all(
+                then_ctx.sm.peek_at_depth(i) != ""
+                and then_ctx.sm.peek_at_depth(i) == else_ctx.sm.peek_at_depth(i)
+                and any(p.name == then_ctx.sm.peek_at_depth(i) for p in self.properties)
+                for i in range(n_results)
+            )
+        )
+
         # The if expression may produce a result value on top.
-        if (not else_bindings
-                and then_ctx.sm.depth() > self.sm.depth()
-                and then_ctx.sm.depth() - self.sm.depth() >= 2):
+        if (then_ctx.sm.depth() > self.sm.depth()
+                and n_results >= 2
+                and (not else_bindings or else_matches_then_n_result_layout)):
             # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
             # values on top (new values if taken, preserved old values if
             # skipped). Record the N results in their on-stack order, then

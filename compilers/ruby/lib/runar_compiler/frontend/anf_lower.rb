@@ -2431,6 +2431,41 @@ module RunarCompiler
           end
         end
 
+        # 2b. C20 -- preserve a dropped terminal `assert(false)` else.
+        #
+        # `_collect_update_branches` flattens a dispatch chain whose branches
+        # each end in a single `update_prop` into this conditional-assignment
+        # form. When the chain's terminal else is `assert(false)` it returns the
+        # branches WITHOUT a catch-all final branch (every branch keeps a
+        # non-nil cond_ref), dropping the abort. That assert(false) is the only
+        # thing rejecting a selector value matching no branch: without it, an
+        # unmatched selector leaves every property at its old value -- a
+        # spendable NO-OP state continuation instead of a failed script (a
+        # funds-safety bug). A real final else (`else { prop = ... }`) instead
+        # yields a catch-all branch with a nil cond_ref and needs no guard. So
+        # re-introduce the abort as `assert(cond0 || cond1 || ... || cond_{N-1})`
+        # iff there is no catch-all (the last branch keeps a non-nil cond_ref).
+        has_catch_all_else = branches.last[:cond_ref].nil?
+        unless has_catch_all_else
+          or_ref = cond_refs[0]
+          (1...cond_refs.length).each do |i|
+            or_name = fresh.call
+            result << IR::ANFBinding.new(
+              name: or_name,
+              value: IR::ANFValue.new(kind: "bin_op").tap do |v|
+                v.op = "||"
+                v.left = or_ref
+                v.right = cond_refs[i]
+              end
+            )
+            or_ref = or_name
+          end
+          result << IR::ANFBinding.new(
+            name: fresh.call,
+            value: _make_assert(or_ref)
+          )
+        end
+
         # 3. For each branch, emit: load_old, conditional if-expression, update_prop
         branches.each_with_index do |branch, i|
           # Load old property value
@@ -2479,9 +2514,7 @@ module RunarCompiler
           else_bindings = [
             IR::ANFBinding.new(
               name: keep_name,
-              value: IR::ANFValue.new(kind: "load_const").tap do |v|
-                v.raw_value = "@ref:#{old_prop_ref}"
-              end
+              value: _make_load_const_string("@ref:#{old_prop_ref}")
             )
           ]
 

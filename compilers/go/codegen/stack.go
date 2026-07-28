@@ -1928,8 +1928,43 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
+	// C27: the N>=2 result reconcile below also applies when the else-branch is
+	// PRESENT and BOTH arms wrote the same N mutable fields (e.g. each branch
+	// runs `this.a = ...; this.b = ...`). This is the else-present twin of the
+	// empty-else fix (#99 Bug 1). Without it, lowerIf falls through to
+	// `push(bindingName)` further down — registering ONE stackMap name for N
+	// physical results — so the state serialization emits against the wrong
+	// slot (OP_NUM2BIN on a byte string) and the continuation is unspendable (a
+	// funds-safety bug). Only fire when both arms leave the identical top-N
+	// property names in the identical order, so a single post-ENDIF reconcile
+	// is valid regardless of which branch the spender takes. The single-field
+	// same-property case (N==1, "turn flip") is unaffected — it still takes the
+	// dedicated path below.
+	nResults := thenCtx.sm.depth() - ctx.sm.depth()
+	elseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults
+	if elseMatchesThenNResultLayout {
+		for i := 0; i < nResults; i++ {
+			tn := thenCtx.sm.peekAtDepth(i)
+			if tn == "" || tn != elseCtx.sm.peekAtDepth(i) {
+				elseMatchesThenNResultLayout = false
+				break
+			}
+			isProperty := false
+			for _, p := range ctx.properties {
+				if p.Name == tn {
+					isProperty = true
+					break
+				}
+			}
+			if !isProperty {
+				elseMatchesThenNResultLayout = false
+				break
+			}
+		}
+	}
+
 	// The if expression may produce a result value on top.
-	if len(elseBindings) == 0 && thenCtx.sm.depth() > ctx.sm.depth() && thenCtx.sm.depth()-ctx.sm.depth() >= 2 {
+	if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {
 		// #99 Bug 1: a conditional write of N>=2 state fields leaves N result
 		// values on top (new values if taken, preserved old values if skipped).
 		// Record the N results in their on-stack order, then physically remove

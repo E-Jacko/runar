@@ -2536,6 +2536,52 @@ fn liftBranchUpdateProps(
             }
         }
 
+        // 2b. C20 — preserve a dropped terminal `assert(false)` else.
+        //
+        // `collectUpdateBranches` transforms a dispatch chain whose branches each
+        // end in a single `update_prop` into this flat conditional-assignment form.
+        // When the chain's terminal else is `assert(false)` it returns the branches
+        // WITHOUT a catch-all final branch (every branch keeps a non-null cond_ref),
+        // dropping the abort. But that assert(false) is the ONLY thing rejecting a
+        // selector value that matches no branch: without it, an unmatched selector
+        // leaves every property at its old value — a spendable NO-OP state
+        // continuation instead of a failed script (a funds-safety bug).
+        //
+        // A real final else (`else { prop = ... }`) instead yields a catch-all
+        // branch with cond_ref == null, and needs no guard because every selector
+        // value maps to some branch. So the presence of a null-condRef terminal
+        // branch exactly distinguishes the two cases.
+        //
+        // Re-introduce the abort as `assert(cond0 || cond1 || ... || cond_{N-1})`:
+        // if no branch condition held, the OR is false and the script aborts —
+        // byte-identical to the original `assert(false)` semantics for the
+        // unmatched position, and a no-op (`assert(true)`) whenever a branch runs.
+        const has_catch_all_else = cond_refs.items[cond_refs.items.len - 1] == null;
+        if (!has_catch_all_else) {
+            // Every branch here has a non-null cond_ref (only a catch-all final
+            // else is null, and there is none), so the OR fully covers the
+            // selector space.
+            var or_ref: []const u8 = cond_refs.items[0].?;
+            var i: usize = 1;
+            while (i < cond_refs.items.len) : (i += 1) {
+                const or_name = try fctx.fresh();
+                try result.append(allocator, .{
+                    .name = or_name,
+                    .value = .{ .bin_op = .{
+                        .op = "||",
+                        .left = or_ref,
+                        .right = cond_refs.items[i].?,
+                        .result_type = null,
+                    } },
+                });
+                or_ref = or_name;
+            }
+            try result.append(allocator, .{
+                .name = try fctx.fresh(),
+                .value = .{ .assert = .{ .value = or_ref } },
+            });
+        }
+
         // 3. For each branch, emit: load_old, conditional if-expression, update_prop.
         for (branches, 0..) |branch, i| {
             // Load old property value.

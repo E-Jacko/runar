@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "../../../examples/ts/selector/Selector.runar.ts",
+    ".runar.sol": "../../../examples/sol/selector/Selector.runar.sol",
+    ".runar.move": "../../../examples/move/selector/Selector.runar.move",
+    ".runar.go": "../../../examples/go/selector/Selector.runar.go",
+    ".runar.rs": "../../../examples/rust/selector/Selector.runar.rs",
+    ".runar.py": "../../../examples/python/selector/Selector.runar.py",
+    ".runar.zig": "../../../examples/zig/selector/Selector.runar.zig",
+    ".runar.rb": "../../../examples/ruby/selector/Selector.runar.rb",
+    ".runar.java": "../../../examples/java/src/main/java/runar/examples/selector/Selector.runar.java"
+  }
+}

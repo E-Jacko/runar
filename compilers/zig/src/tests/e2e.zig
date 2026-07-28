@@ -667,14 +667,17 @@ test "e2e FixedArray: TicTacToe v2 is byte-identical to v1" {
 
     try std.testing.expectEqualStrings(v1_hex, v2_hex);
 
-    // Byte-count lock-in: the canonical TS compiler produces 9449 bytes for
+    // Byte-count lock-in: the canonical TS compiler produces 9476 bytes for
     // both TicTacToe variants. Any divergence from this length indicates a
     // regression in Zig's stack lowering or branch-reconciliation logic.
     // (BUG-100 fix: checkPreimage now emits the 760-byte on-chain OP_PUSH_TX
     // binding blob per call site, so the canonical size grew from 5087.)
     // (#116: the change-output segment is now gated behind a runtime
     // `if (_changeAmount != 0)` guard, growing the canonical size from 9425.)
-    const expected_bytes: usize = 9449;
+    // (C20 fix: placeMove's `position == n` dispatch chain ends in
+    // `else { assert(false) }`; anf-lower now re-emits that dropped abort as
+    // `assert(cond0 || ... || cond8)`, growing the canonical size from 9449.)
+    const expected_bytes: usize = 9476;
     const actual_bytes = v1_hex.len / 2;
     try std.testing.expectEqual(expected_bytes, actual_bytes);
 

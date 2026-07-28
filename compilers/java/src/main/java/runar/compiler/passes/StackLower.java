@@ -2168,9 +2168,42 @@ public final class StackLower {
                 sm.removeAtDepth(d);
             }
 
+            // C27: the N>=2 result reconcile below also applies when the else-
+            // branch is PRESENT and BOTH arms wrote the same N mutable fields
+            // (e.g. each branch runs `this.a = ...; this.b = ...`). This is the
+            // else-present twin of the empty-else fix (#99 Bug 1). Without it,
+            // lowerIf falls through to `push(bindingName)` further down —
+            // registering ONE stackMap name for N physical results — so the
+            // state serialization emits against the wrong slot (OP_NUM2BIN on a
+            // byte string) and the continuation is unspendable (a funds-safety
+            // bug). Only fire when both arms leave the identical top-N property
+            // names in the identical order, so a single post-ENDIF reconcile is
+            // valid regardless of which branch the spender takes. The single-
+            // field same-property case (N==1, "turn flip") is unaffected — it
+            // still takes the dedicated path below.
+            int nResults = thenCtx.sm.depth() - sm.depth();
+            boolean elseMatchesThenNResultLayout =
+                !elseB.isEmpty()
+                && nResults >= 2
+                && elseCtx.sm.depth() - sm.depth() == nResults;
+            if (elseMatchesThenNResultLayout) {
+                for (int i = 0; i < nResults; i++) {
+                    String tn = thenCtx.sm.peekAtDepth(i);
+                    boolean isProp = false;
+                    if (tn != null && !tn.isEmpty()) {
+                        for (AnfProperty p : properties) if (p.name().equals(tn)) { isProp = true; break; }
+                    }
+                    if (tn == null || tn.isEmpty() || !tn.equals(elseCtx.sm.peekAtDepth(i)) || !isProp) {
+                        elseMatchesThenNResultLayout = false;
+                        break;
+                    }
+                }
+            }
+
             // If expression may produce a result value on top
-            if (elseB.isEmpty() && thenCtx.sm.depth() > sm.depth()
-                && thenCtx.sm.depth() - sm.depth() >= 2) {
+            if (thenCtx.sm.depth() > sm.depth()
+                && nResults >= 2
+                && (elseB.isEmpty() || elseMatchesThenNResultLayout)) {
                 // #99 Bug 1: a conditional write of N>=2 state fields leaves N
                 // result values on top (new values if taken, preserved old
                 // values if skipped). Record the N results in their on-stack

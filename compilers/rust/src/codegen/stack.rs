@@ -1994,10 +1994,33 @@ impl LoweringContext {
             }
         }
 
+        // C27: the N>=2 result reconcile below also applies when the else-branch
+        // is PRESENT and BOTH arms wrote the same N mutable fields (e.g. each
+        // branch runs `this.a = ...; this.b = ...`). This is the else-present twin
+        // of the empty-else fix (#99 Bug 1). Without it, lower_if falls through to
+        // `push(binding_name)` further down — registering ONE stackMap name for N
+        // physical results — so the state serialization emits against the wrong
+        // slot (OP_NUM2BIN on a byte string) and the continuation is unspendable (a
+        // funds-safety bug). Only fire when both arms leave the identical top-N
+        // property names in the identical order, so a single post-ENDIF reconcile
+        // is valid regardless of which branch the spender takes. The single-field
+        // same-property case (N==1, "turn flip") is unaffected — it still takes the
+        // dedicated path below. Empty slot names ("") are treated as "not a match".
+        let n_results = then_ctx.sm.depth() as isize - self.sm.depth() as isize;
+        let else_matches_then_n_result_layout = !else_bindings.is_empty()
+            && n_results >= 2
+            && (else_ctx.sm.depth() as isize - self.sm.depth() as isize) == n_results
+            && (0..n_results as usize).all(|i| {
+                let tn = then_ctx.sm.peek_at_depth(i);
+                !tn.is_empty()
+                    && tn == else_ctx.sm.peek_at_depth(i)
+                    && self.properties.iter().any(|p| p.name == tn)
+            });
+
         // The if expression may produce a result value on top.
-        if else_bindings.is_empty()
-            && then_ctx.sm.depth() > self.sm.depth()
-            && then_ctx.sm.depth() - self.sm.depth() >= 2
+        if then_ctx.sm.depth() > self.sm.depth()
+            && n_results >= 2
+            && (else_bindings.is_empty() || else_matches_then_n_result_layout)
         {
             // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
             // values on top (new values if taken, preserved old values if

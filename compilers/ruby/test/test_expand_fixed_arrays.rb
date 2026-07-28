@@ -324,9 +324,12 @@ class TestExpandFixedArrays < Minitest::Test
     # v2 uses FixedArray<bigint, 9> which the expand pass must desugar into
     # the same hand-rolled 9 scalar fields + 9-way dispatch as v1.
     # Byte count updated for #116 (change-output guard adds an OP_IF/ELSE/ENDIF
-    # wrapper, +24 bytes) — matches the TS reference fold-ON output.
-    assert_equal 9449, v1.script.length / 2, "v1 script must be 9449 bytes"
-    assert_equal 9449, v2.script.length / 2, "v2 script must be 9449 bytes"
+    # wrapper, +24 bytes). Re-updated for the C20 fix: the 9-way move dispatch
+    # ends in `assert(false)`, which the flattening pass previously dropped; the
+    # fix re-emits it as `assert(cond0 || ... || cond8)` (+27 bytes). Matches the
+    # fixed TS reference fold-ON output (verified: 9476 bytes for v1 and v2).
+    assert_equal 9476, v1.script.length / 2, "v1 script must be 9476 bytes"
+    assert_equal 9476, v2.script.length / 2, "v2 script must be 9476 bytes"
     assert_equal v1.script, v2.script, "TicTacToe v1 and v2 scripts must be byte-identical"
   end
 

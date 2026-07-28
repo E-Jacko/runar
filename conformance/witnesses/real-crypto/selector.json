@@ -1,0 +1,48 @@
+{
+  "fixture": "selector",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "deep-review C20: a dispatch method whose branches each end in a single update_prop and whose terminal else is assert(false). In-range selectors update one field; an out-of-range selector matches NO branch and MUST abort on-chain (the re-emitted assert(cond0||cond1)), not produce a spendable no-op state continuation. The post-state ANF interpreter is permissive (skips asserts) so it silently builds a no-op continuation; only the real Bitcoin Script rejects — hence cryptoNearMiss on the reject.",
+  "constructorArgs": [
+    "5n",
+    "7n"
+  ],
+  "spends": [
+    {
+      "method": "set",
+      "args": [
+        "0n",
+        "99n"
+      ],
+      "expect": "accept",
+      "note": "i==0: a->99, b unchanged",
+      "expectedState": {
+        "a": "99n",
+        "b": "7n"
+      }
+    },
+    {
+      "method": "set",
+      "args": [
+        "1n",
+        "99n"
+      ],
+      "expect": "accept",
+      "note": "i==1: b->99, a unchanged",
+      "expectedState": {
+        "a": "5n",
+        "b": "99n"
+      }
+    },
+    {
+      "method": "set",
+      "args": [
+        "2n",
+        "99n"
+      ],
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "C20: out-of-range selector i=2 matches no branch -> re-emitted assert(cond0||cond1) aborts on-chain"
+    }
+  ]
+}

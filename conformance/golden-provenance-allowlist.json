@@ -131,11 +131,35 @@
     },
     {
       "path": "conformance/tests/branched-readonly-len/expected-script.hex",
-      "sha256": "36ee6eb0fce597392e831f55ec2e6056b716b6c2fb54a20148df67bd7af9068e",
-      "verified-against": "intentional-spec-change",
-      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "sha256": "0554576be0abe18bd269f1c922ba9a340532b6c954183c0b11e3235a3cc4724e",
+      "verified-against": "differential-oracle",
+      "reason": "Regenerated for deep-review finding C27 (else-present N-field stack reconcile). spend()'s len(scratch)-driven if/else writes BOTH state fields (count:bigint + tag:ByteString) on each arm; the pre-fix 05-stack-lower N-result reconcile was gated on empty-else, so this else-present multi-field write fell through to a single stackMap name for N results and emitted an unspendable OP_NUM2BIN continuation (silently uniform across all 7 tiers — parity-green-but-wrong). The fix broadens the reconcile to the else-present path, growing the script +5 bytes (1081->1086). Verified against the differential-execution oracle: conformance/witnesses/real-crypto/branched-readonly-len.json drives deploy->call->@bsv/sdk Spend for BOTH branches (count 5->6/tag->4142 and count 5->4/tag->3030) plus a tampered-output reject — all validate. Also corroborated by 7-tier cross-compiler byte-identical parity (fold-off and fold-on).",
       "reviewer": "gh:icellan",
-      "date": "2026-07-09"
+      "date": "2026-07-26"
+    },
+    {
+      "path": "conformance/tests/selector/expected-script.hex",
+      "sha256": "1f7280b9baf0884360ed5d70071128dc37aa946fbd44fabcab9d36d295762ac1",
+      "verified-against": "differential-oracle",
+      "reason": "New fixture for deep-review finding C20 (dropped terminal assert(false) else). set()'s if(i==0)/elif(i==1)/else{assert(false)} dispatch is exactly the shape whose abort the pre-fix 04-anf-lower liftBranchUpdateProps silently dropped, letting an out-of-range selector produce a spendable no-op state continuation. No existing conformance fixture exercised this shape, so C20 had zero cross-tier codegen coverage; this fixture is that gate. The compiled script encodes the re-emitted assert(cond0 || cond1). Verified against the differential-execution oracle: conformance/witnesses/real-crypto/selector.json drives set(0,99)/set(1,99) accept plus the out-of-range set(2,99) reject through @bsv/sdk Spend (the abort fires on-chain). Corroborated by 7-tier cross-compiler byte-identical parity (fold-off and fold-on) across all 9 input formats.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-26"
+    },
+    {
+      "path": "conformance/tests/selector/expected-ir.json",
+      "sha256": "219ac1e28f82135f60bd3fdeaa81be47e104c1f64177ac623791c58b3e007a1d",
+      "verified-against": "differential-oracle",
+      "reason": "New fixture for deep-review finding C20 (see the expected-script.hex entry above). The ANF IR carries the re-emitted assert(cond0 || cond1) guard binding that the pre-fix liftBranchUpdateProps dropped for a terminal assert(false) else. Verified against conformance/witnesses/real-crypto/selector.json (deploy->call->@bsv/sdk Spend: two accepts + an out-of-range reject) and corroborated by 7-tier cross-compiler byte-identical Stack-IR + hex parity, fold-off and fold-on.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-26"
+    },
+    {
+      "path": "conformance/script-size-baseline.json",
+      "sha256": "30483d020e66d411b8b5bd7209e12cdd2b40cc39bf8bab00533591d3a9f398ee",
+      "verified-against": "intentional-spec-change",
+      "reason": "Re-stamped for the deep-review C20/C27 cluster: branched-readonly-len grew +5 bytes (1081->1086, C27 else-present N-field reconcile) and the new selector fixture was added at 985 bytes (C20 dispatch regression fixture). No other fixture's size moved (the C20/C27 codegen changes only affect the assert-false-else dispatch and else-present multi-field-write shapes). Both size changes are the intended, execution-verified consequence of the cluster — see the branched-readonly-len and selector golden entries above.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-26"
     },
     {
       "path": "conformance/tests/cond-write-multi-field/expected-ir.json",

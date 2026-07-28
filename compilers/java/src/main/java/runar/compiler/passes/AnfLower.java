@@ -2037,6 +2037,35 @@ public final class AnfLower {
                 }
             }
 
+            // 2b. C20 — preserve a dropped terminal `assert(false)` else.
+            //
+            // collectUpdateBranches transforms a dispatch chain whose branches
+            // each end in a single update_prop into this flat conditional-
+            // assignment form. When the chain's terminal else is assert(false)
+            // it returns the branches WITHOUT a catch-all final branch (every
+            // branch keeps a non-null condRef), dropping the abort. But that
+            // assert(false) is the ONLY thing rejecting a selector value that
+            // matches no branch: without it, an unmatched selector leaves every
+            // property at its old value — a spendable NO-OP state continuation
+            // instead of a failed script (a funds-safety bug). A real final else
+            // (`else { prop = ... }`) instead yields a catch-all branch with
+            // condRef == null. So the presence of a null-condRef terminal branch
+            // exactly distinguishes the two cases. Re-introduce the abort as
+            // assert(cond0 || cond1 || ... || cond_{N-1}) iff the last branch
+            // has a non-null condRef (no catch-all).
+            boolean hasCatchAllElse = branches.get(branches.size() - 1).condRef == null;
+            if (!hasCatchAllElse) {
+                String orRef = condRefs.get(0);
+                for (int i = 1; i < condRefs.size(); i++) {
+                    String orName = "t" + (nextIdx[0]++);
+                    result.add(new AnfBinding(orName,
+                        new BinOp("||", orRef, condRefs.get(i), null), null));
+                    orRef = orName;
+                }
+                result.add(new AnfBinding("t" + (nextIdx[0]++),
+                    new Assert(orRef), null));
+            }
+
             // Emit load_old, conditional if-expression, update_prop per branch.
             for (int i = 0; i < branches.size(); i++) {
                 UpdateBranch branch = branches.get(i);
