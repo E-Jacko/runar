@@ -347,8 +347,9 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
     // Rule 7: PUSH(0) + OP_SUB -> (removed)
     if (isPushInt(a, 0) and isOp(b, .op_sub)) return .{ null, null };
 
-    // Rule 8: OP_NOT + OP_NOT -> (removed)
-    if (isOp(a, .op_not) and isOp(b, .op_not)) return .{ null, null };
+    // Rule 8 moved to tryWindow3: `OP_NOT + OP_NOT -> (removed)` was an
+    // UNGUARDED 2-op rule and is unsound (C17). The 3-op form takes the
+    // PRODUCER of the negated value into the window.
 
     // Rule 9: OP_NEGATE + OP_NEGATE -> (removed)
     if (isOp(a, .op_negate) and isOp(b, .op_negate)) return .{ null, null };
@@ -410,9 +411,66 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
 
 const Replacement3 = [3]?Inst;
 
+/// Opcodes whose result is guaranteed to be a CANONICAL boolean — the minimal
+/// script-number encoding of 0 (the empty element) or 1 (`{0x01}`), and nothing
+/// else. This is the precondition for rule 8: `x OP_NOT OP_NOT` is boolean
+/// *normalisation*, not identity, so deleting the pair is only value-preserving
+/// when `x` is already canonical.
+///
+/// Every entry pushes `CScriptNum(0|1).getvch()` (or `vchFalse`/`vchTrue`) in
+/// the reference interpreter. Stack-shuffling ops (`OP_DUP`/`OP_PICK`/
+/// `OP_ROLL`/`OP_SWAP`/…) are deliberately absent: they forward a value whose
+/// provenance this local window cannot see.
+fn producesCanonicalBool(inst: Inst) bool {
+    return switch (inst) {
+        .op => |o| switch (o) {
+            .op_equal,
+            .op_numequal,
+            .op_numnotequal,
+            .op_lessthan,
+            .op_greaterthan,
+            .op_lessthanorequal,
+            .op_greaterthanorequal,
+            .op_booland,
+            .op_boolor,
+            .op_within,
+            .op_not,
+            .op_0notequal,
+            .op_checksig,
+            .op_checkmultisig,
+            => true,
+            else => false,
+        },
+        .push_bool => true,
+        .push_int => |v| v == 0 or v == 1,
+        else => false,
+    };
+}
+
 fn tryWindow3(w: *const [3]Inst) ?Replacement3 {
     // raw_bytes is a hard peephole barrier — never rewrite across it.
     if (isRawBytes(w[0]) or isRawBytes(w[1]) or isRawBytes(w[2])) return null;
+
+    // Rule 8: <canonical-bool producer> + OP_NOT + OP_NOT -> <producer>
+    //
+    // `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity: for any
+    // non-canonical operand (say 5) the pair yields 1, while deleting it leaves
+    // 5. Truthiness is preserved, the VALUE is not — and a downstream
+    // OP_EQUAL / OP_NUMEQUAL / state serialisation consumes the value, so the
+    // two programs disagree on accept/reject.
+    //
+    // The window therefore includes the PRODUCER of the value being negated and
+    // only fires when that producer provably yields a canonical 0/1 (C17). This
+    // matters because rule 23 (`PUSH(0) + OP_NUMEQUAL -> OP_NOT`) synthesises a
+    // fresh OP_NOT sitting on top of an ARBITRARY script number: for `x !== 0n`
+    // the lowerer emits `PUSH x; PUSH 0; OP_NUMEQUAL; OP_NOT`, which the old
+    // unguarded 2-op rule collapsed all the way down to `PUSH x`. With the
+    // guard the pair survives as `PUSH x; OP_NOT; OP_NOT` — still one byte
+    // shorter than the input, and value-exact.
+    if (producesCanonicalBool(w[0]) and isOp(w[1], .op_not) and isOp(w[2], .op_not)) {
+        return .{ w[0], null, null };
+    }
+
     const va = getPushIntValue(w[0]) orelse return null;
     const vb = getPushIntValue(w[1]) orelse return null;
 
@@ -570,13 +628,92 @@ test "rule 7: push 0 + sub eliminated" {
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
-// --- Rule 8: OP_NOT + OP_NOT -> removed ---
-test "rule 8: not + not eliminated" {
+// --- Rule 8: <canonical-bool producer> + OP_NOT + OP_NOT -> <producer> ---
+test "rule 8: not + not eliminated after canonical-bool producer" {
     const alloc = testing.allocator;
-    const input = [_]Inst{ .{ .op = .op_not }, .{ .op = .op_not } };
+    const producers = [_]Opcode{
+        .op_equal,      .op_numequal,          .op_numnotequal, .op_lessthan,
+        .op_greaterthan, .op_lessthanorequal,  .op_greaterthanorequal,
+        .op_booland,    .op_boolor,            .op_within,      .op_not,
+        .op_0notequal,  .op_checksig,          .op_checkmultisig,
+    };
+    for (producers) |p| {
+        const input = [_]Inst{ .{ .op = p }, .{ .op = .op_not }, .{ .op = .op_not } };
+        const result = try optimizeOps(alloc, &input);
+        defer alloc.free(result);
+        try expectOps(&.{.{ .op = p }}, result);
+    }
+
+    // Literal canonical booleans qualify too.
+    const literals = [_]Inst{
+        .{ .push_bool = true },
+        .{ .push_bool = false },
+        .{ .push_int = 0 },
+        .{ .push_int = 1 },
+    };
+    for (literals) |lit| {
+        const input = [_]Inst{ lit, .{ .op = .op_not }, .{ .op = .op_not } };
+        const result = try optimizeOps(alloc, &input);
+        defer alloc.free(result);
+        try expectOps(&.{lit}, result);
+    }
+}
+
+// --- Rule 8 guard (C17): the pair MUST survive without a canonical producer ---
+//
+// `OP_NOT OP_NOT` is boolean normalisation, not numeric identity. Deleting it
+// unguarded turned `x !== 0n` into `x` and rejected valid spends.
+test "rule 8 guard: not + not kept without a canonical-bool producer" {
+    const alloc = testing.allocator;
+
+    // Bare pair: the negated value arrives from outside the window.
+    {
+        const input = [_]Inst{ .{ .op = .op_not }, .{ .op = .op_not } };
+        const result = try optimizeOps(alloc, &input);
+        defer alloc.free(result);
+        try expectOps(&input, result);
+    }
+
+    // Non-canonical producers: an arbitrary script number and stack-shuffling
+    // / arithmetic / hashing ops whose provenance the window cannot see.
+    const bad = [_]Inst{
+        .{ .push_int = 5 },
+        .{ .push_int = -1 },
+        .{ .op = .op_dup },
+        .{ .op = .op_swap },
+        .{ .op = .op_add },
+        .{ .op = .op_sha256 },
+    };
+    for (bad) |producer| {
+        const input = [_]Inst{ producer, .{ .op = .op_not }, .{ .op = .op_not } };
+        const result = try optimizeOps(alloc, &input);
+        defer alloc.free(result);
+        try expectOps(&input, result);
+    }
+}
+
+// --- C17 end-to-end shape: `x !== 0n` must not collapse to `x` ---
+//
+// The lowerer emits `PUSH 0; OP_NUMEQUAL; OP_NOT` for `x !== 0n`. Rule 23
+// rewrites the first pair to OP_NOT, leaving `OP_NOT; OP_NOT` on top of the
+// witness value; the old unguarded rule 8 then deleted both.
+test "C17: x !== 0n keeps its OP_NOT pair" {
+    const alloc = testing.allocator;
+    const input = [_]Inst{
+        .{ .push_int = 0 },
+        .{ .op = .op_numequal },
+        .{ .op = .op_not },
+        .{ .push_bool = true },
+        .{ .op = .op_numequal },
+    };
     const result = try optimizeOps(alloc, &input);
     defer alloc.free(result);
-    try testing.expectEqual(@as(usize, 0), result.len);
+    try expectOps(&.{
+        .{ .op = .op_not },
+        .{ .op = .op_not },
+        .{ .push_bool = true },
+        .{ .op = .op_numequal },
+    }, result);
 }
 
 // --- Rule 9: OP_NEGATE + OP_NEGATE -> removed ---

@@ -121,21 +121,24 @@ export const PEEPHOLE_RULES: PeepholeRuleSpec[] = [
     stackInputs: 1,
     sweep: { kind: 'stack', inputs: 1, domain: 'num' },
   },
-  // OP_NOT, OP_NOT → []  (double logical negation)
+  // <canonical-bool producer>, OP_NOT, OP_NOT → <canonical-bool producer>
   //
-  // IMPORTANT: this is boolean-idempotence, NOT numeric identity. For a
-  // non-canonical operand (e.g. 5) `OP_NOT OP_NOT` normalises to 1 while the
-  // empty replacement leaves 5. The compiler only emits OP_NOT for `!` / `!==`
-  // whose operand is bool-typed, so the sweep exercises it over the boolean
-  // edge domain {0,1} — its actual precondition. See the exhaustive test's
-  // note and TS-GAP-008 report for the residual (narrow) risk if a
-  // non-canonical witness-supplied bool ever reaches this rule.
+  // `OP_NOT OP_NOT` is boolean-idempotence, NOT numeric identity: for a
+  // non-canonical operand (e.g. 5) the pair normalises to 1 while deleting it
+  // leaves 5. The matcher therefore takes the PRODUCER of the negated value
+  // into the window and only fires when that producer provably yields a
+  // canonical 0/1 (C17). `push0-numequal-to-not` below synthesises an OP_NOT
+  // sitting on an arbitrary script number, so an unguarded 2-op version of this
+  // rule deleted the whole of `x !== 0n`; with the guard the pair survives.
+  //
+  // The sweep now runs over the FULL numeric edge domain: OP_NUMEQUAL
+  // normalises its operands, so equivalence holds for every input.
   {
     name: 'not-not-elim',
-    pattern: [opc('OP_NOT'), opc('OP_NOT')],
-    replacement: [],
-    stackInputs: 1,
-    sweep: { kind: 'stack', inputs: 1, domain: 'bool' },
+    pattern: [opc('OP_NUMEQUAL'), opc('OP_NOT'), opc('OP_NOT')],
+    replacement: [opc('OP_NUMEQUAL')],
+    stackInputs: 2,
+    sweep: { kind: 'stack', inputs: 2, domain: 'num' },
   },
   // OP_NEGATE, OP_NEGATE → []  (numeric identity for all integers)
   {

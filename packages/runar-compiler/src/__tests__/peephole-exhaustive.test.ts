@@ -24,6 +24,7 @@ import { ScriptVM, bytesToHex } from 'runar-testing';
 import type { StackOp } from '../ir/index.js';
 import { emitMethod } from '../passes/06-emit.js';
 import { PEEPHOLE_RULES, type PeepholeRuleSpec } from '../optimizer/peephole-rules.js';
+import { optimizeStackIR } from '../optimizer/peephole.js';
 
 // ---------------------------------------------------------------------------
 // Edge domains
@@ -197,24 +198,39 @@ describe('peephole rules preserve stack effect (bounded-exhaustive, TS-GAP-008)'
 // Documented precondition: OP_NOT, OP_NOT elimination is boolean-idempotence.
 // ---------------------------------------------------------------------------
 
-describe('not-not-elim precondition (documents TS-GAP-008 residual)', () => {
+describe('not-not-elim precondition (C17 — the guard that closed TS-GAP-008)', () => {
   const notNot = PEEPHOLE_RULES.find((r) => r.name === 'not-not-elim') as PeepholeRuleSpec;
 
-  it('is a true identity over the boolean domain {0,1}', () => {
-    for (const x of EDGE_BOOL) {
-      assertEquivalent('not-not-elim', `x=${x}`, [SENTINEL, push(x)], notNot.pattern, notNot.replacement);
+  it('is a true identity over the full numeric domain — the producer normalises', () => {
+    // The rule window now includes the canonical-boolean PRODUCER, so it holds
+    // for every operand, not merely the {0,1} edge domain the old 2-op version
+    // needed as an unchecked precondition.
+    for (const a of EDGE_NUM) {
+      for (const b of EDGE_BOOL) {
+        assertEquivalent(
+          'not-not-elim',
+          `a=${a} b=${b}`,
+          [SENTINEL, push(a), push(b)],
+          notNot.pattern,
+          notNot.replacement,
+        );
+      }
     }
   });
 
-  it('is NOT a numeric identity — normalises a non-canonical bool (e.g. 5 → 1)', () => {
-    // Removing OP_NOT OP_NOT is only sound because the compiler emits it on
-    // bool-typed operands. On a non-canonical operand the two op-sequences
-    // diverge numerically; this asserts that divergence so the precondition
-    // is documented, not hidden.
-    const pattern = runEffect([SENTINEL, push(5n), ...notNot.pattern]);
-    const replacement = runEffect([SENTINEL, push(5n), ...notNot.replacement]);
-    expect(pattern.stack.at(-1)).toBe('01'); // NOT(NOT(5)) = 1
-    expect(replacement.stack.at(-1)).toBe('05'); // untouched 5
-    expect(effectsEqual(pattern, replacement)).toBe(false);
+  it('a BARE OP_NOT pair is NOT a numeric identity — which is why the rule carries its producer', () => {
+    // This is the divergence the guard exists to prevent: on a non-canonical
+    // operand `OP_NOT OP_NOT` normalises to 1 while deleting it leaves 5.
+    const bare = [opc('OP_NOT'), opc('OP_NOT')];
+    const kept = runEffect([SENTINEL, push(5n), ...bare]);
+    const deleted = runEffect([SENTINEL, push(5n)]);
+    expect(kept.stack.at(-1)).toBe('01'); // NOT(NOT(5)) = 1
+    expect(deleted.stack.at(-1)).toBe('05'); // untouched 5
+    expect(effectsEqual(kept, deleted)).toBe(false);
+  });
+
+  it('the optimizer therefore leaves a bare OP_NOT pair in place', () => {
+    const ops = [push(5n), opc('OP_NOT'), opc('OP_NOT')];
+    expect(runEffect(optimizeStackIR(ops))).toEqual(runEffect(ops));
   });
 });

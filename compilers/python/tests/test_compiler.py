@@ -284,12 +284,26 @@ class TestPeepholeOptimizer:
         assert result[0].code == "OP_EQUALVERIFY"
 
     def test_optimizer_double_not(self):
+        # C17: the pair is boolean normalisation, not numeric identity, so it
+        # only collapses when the value beneath is provably canonical (0/1).
+        ops = [
+            StackOp(op="opcode", code="OP_NUMEQUAL"),
+            StackOp(op="opcode", code="OP_NOT"),
+            StackOp(op="opcode", code="OP_NOT"),
+        ]
+        result = optimize_stack_ops(ops)
+        assert len(result) == 1
+        assert result[0].code == "OP_NUMEQUAL"
+
+    def test_optimizer_bare_double_not_survives(self):
+        # C17: no visible producer -- the operand could be any script number,
+        # so deleting the pair would change the VALUE left on the stack.
         ops = [
             StackOp(op="opcode", code="OP_NOT"),
             StackOp(op="opcode", code="OP_NOT"),
         ]
         result = optimize_stack_ops(ops)
-        assert len(result) == 0
+        assert len(result) == 2
 
     def test_optimizer_dup_drop(self):
         ops = [

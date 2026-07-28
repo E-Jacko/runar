@@ -192,9 +192,68 @@ fn is_raw_bytes(op: &StackOp) -> bool {
     matches!(op, StackOp::RawBytes { .. })
 }
 
+/// Opcodes whose result is guaranteed to be a CANONICAL boolean -- the minimal
+/// script-number encoding of 0 (the empty element) or 1 (`{0x01}`), and nothing
+/// else. This is the precondition for the `OP_NOT OP_NOT` elimination below:
+/// `x OP_NOT OP_NOT` is boolean *normalisation*, not identity, so deleting the
+/// pair is only value-preserving when `x` is already canonical.
+///
+/// Every entry pushes `CScriptNum(0|1).getvch()` (or `vchFalse`/`vchTrue`) in
+/// the reference interpreter. Stack-shuffling ops (`OP_DUP`/`OP_PICK`/
+/// `OP_ROLL`/`OP_SWAP`/...) are deliberately absent: they forward a value whose
+/// provenance this local window cannot see.
+const CANONICAL_BOOL_OPCODES: &[&str] = &[
+    "OP_EQUAL",
+    "OP_NUMEQUAL",
+    "OP_NUMNOTEQUAL",
+    "OP_LESSTHAN",
+    "OP_GREATERTHAN",
+    "OP_LESSTHANOREQUAL",
+    "OP_GREATERTHANOREQUAL",
+    "OP_BOOLAND",
+    "OP_BOOLOR",
+    "OP_WITHIN",
+    "OP_NOT",
+    "OP_0NOTEQUAL",
+    "OP_CHECKSIG",
+    "OP_CHECKMULTISIG",
+];
+
+/// True when `op` provably leaves a canonical boolean (0 or 1) on the stack.
+fn produces_canonical_bool(op: &StackOp) -> bool {
+    use num_traits::ToPrimitive;
+    match op {
+        StackOp::Opcode(code) => CANONICAL_BOOL_OPCODES.contains(&code.as_str()),
+        StackOp::Push(PushValue::Bool(_)) => true,
+        StackOp::Push(PushValue::Int(v)) => matches!(v.to_i128(), Some(0) | Some(1)),
+        _ => false,
+    }
+}
+
 fn match_window_3(a: &StackOp, b: &StackOp, c: &StackOp) -> Option<Vec<StackOp>> {
     if is_raw_bytes(a) || is_raw_bytes(b) || is_raw_bytes(c) {
         return None;
+    }
+
+    // <canonical-bool producer>, OP_NOT, OP_NOT → <canonical-bool producer>
+    //
+    // `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity: for any
+    // non-canonical operand (say 5) the pair yields 1, while deleting it leaves
+    // 5. Truthiness is preserved, the VALUE is not -- and a downstream
+    // `OP_EQUAL` / `OP_NUMEQUAL` / state serialisation consumes the value, so
+    // the two programs disagree on accept/reject.
+    //
+    // The window therefore includes the PRODUCER of the value being negated and
+    // only fires when that producer provably yields a canonical 0/1 (C17). This
+    // matters because the `PUSH 0; OP_NUMEQUAL → OP_NOT` rule in
+    // `match_window_2` synthesises a fresh `OP_NOT` sitting on top of an
+    // ARBITRARY script number: for `x !== 0n` the lowerer emits
+    // `PUSH x; PUSH 0; OP_NUMEQUAL; OP_NOT`, which the old unguarded 2-op rule
+    // collapsed all the way down to `PUSH x`. With the guard the pair survives
+    // as `PUSH x; OP_NOT; OP_NOT` -- still one byte shorter than the input, and
+    // value-exact.
+    if produces_canonical_bool(a) && is_opcode(b, "OP_NOT") && is_opcode(c, "OP_NOT") {
+        return Some(vec![a.clone()]);
     }
 
     // Constant folding: PUSH(a) PUSH(b) ADD → PUSH(a+b)
@@ -288,10 +347,9 @@ fn match_window_2(a: &StackOp, b: &StackOp) -> Option<Vec<StackOp>> {
         return Some(vec![]);
     }
 
-    // OP_NOT, OP_NOT -> remove both
-    if is_opcode(a, "OP_NOT") && is_opcode(b, "OP_NOT") {
-        return Some(vec![]);
-    }
+    // NOTE: `OP_NOT, OP_NOT -> []` used to live here as an unguarded 2-op rule.
+    // It is unsound (C17) and now lives in `match_window_3`, which takes the
+    // PRODUCER of the negated value into the window.
 
     // OP_NEGATE, OP_NEGATE -> remove both
     if is_opcode(a, "OP_NEGATE") && is_opcode(b, "OP_NEGATE") {
@@ -438,14 +496,111 @@ mod tests {
         assert!(result.is_empty(), "PUSH DROP should be eliminated, got {:?}", result);
     }
 
+    /// NEGATIVE case for the C17 guard: a genuinely canonical producer still
+    /// gets its `OP_NOT OP_NOT` pair removed, so the rule is not dead.
     #[test]
-    fn test_not_not_removed() {
-        let ops = vec![
+    fn test_not_not_removed_after_canonical_bool_producer() {
+        for producer in [
+            "OP_NUMEQUAL",
+            "OP_EQUAL",
+            "OP_LESSTHAN",
+            "OP_BOOLAND",
+            "OP_WITHIN",
+            "OP_NOT",
+            "OP_0NOTEQUAL",
+            "OP_CHECKSIG",
+        ] {
+            let ops = vec![
+                StackOp::Opcode(producer.to_string()),
+                StackOp::Opcode("OP_NOT".to_string()),
+                StackOp::Opcode("OP_NOT".to_string()),
+            ];
+            let result = optimize_stack_ops(&ops);
+            assert_eq!(result.len(), 1, "{producer} NOT NOT should collapse, got {result:?}");
+            assert!(matches!(&result[0], StackOp::Opcode(c) if c == producer));
+        }
+
+        // Literal canonical booleans qualify too.
+        for lit in [
+            StackOp::Push(PushValue::Bool(true)),
+            StackOp::Push(PushValue::Int(BigInt::from(0))),
+            StackOp::Push(PushValue::Int(BigInt::from(1))),
+        ] {
+            let ops = vec![
+                lit.clone(),
+                StackOp::Opcode("OP_NOT".to_string()),
+                StackOp::Opcode("OP_NOT".to_string()),
+            ];
+            let result = optimize_stack_ops(&ops);
+            assert_eq!(result.len(), 1, "{lit:?} NOT NOT should collapse, got {result:?}");
+        }
+    }
+
+    /// C17: `OP_NOT OP_NOT` is boolean normalisation, not numeric identity.
+    /// Without a provably-canonical producer in the window the pair MUST
+    /// survive, otherwise `x !== 0n` compiles to `x` and valid spends are
+    /// rejected.
+    #[test]
+    fn test_not_not_kept_without_canonical_producer() {
+        // Bare pair: the negated value came from outside the window.
+        let bare = vec![
             StackOp::Opcode("OP_NOT".to_string()),
             StackOp::Opcode("OP_NOT".to_string()),
         ];
+        assert_eq!(optimize_stack_ops(&bare).len(), 2, "bare NOT NOT must survive");
+
+        // Non-canonical producers: an arbitrary script number, a byte string,
+        // and stack-shuffling ops whose provenance the window cannot see.
+        for producer in [
+            StackOp::Push(PushValue::Int(BigInt::from(5))),
+            StackOp::Push(PushValue::Bytes(vec![0xde, 0xad])),
+            StackOp::Dup,
+            StackOp::Swap,
+            StackOp::Opcode("OP_ADD".to_string()),
+            StackOp::Opcode("OP_SHA256".to_string()),
+        ] {
+            let ops = vec![
+                producer.clone(),
+                StackOp::Opcode("OP_NOT".to_string()),
+                StackOp::Opcode("OP_NOT".to_string()),
+            ];
+            let result = optimize_stack_ops(&ops);
+            assert_eq!(
+                result.len(),
+                3,
+                "NOT NOT must survive after non-canonical producer {producer:?}, got {result:?}"
+            );
+        }
+    }
+
+    /// End-to-end shape of the C17 bug: `x !== 0n` lowers to
+    /// `PUSH 0; OP_NUMEQUAL; OP_NOT`. The `PUSH 0; OP_NUMEQUAL → OP_NOT` rule
+    /// fires first and yields `OP_NOT; OP_NOT` on top of the witness value; the
+    /// unguarded rule then deleted both, turning `x !== 0n` into `x`. The pair
+    /// must survive.
+    #[test]
+    fn test_ne_zero_does_not_collapse_to_operand() {
+        let ops = vec![
+            StackOp::Push(PushValue::Int(BigInt::from(0))),
+            StackOp::Opcode("OP_NUMEQUAL".to_string()),
+            StackOp::Opcode("OP_NOT".to_string()),
+            StackOp::Push(PushValue::Bool(true)),
+            StackOp::Opcode("OP_NUMEQUAL".to_string()),
+        ];
         let result = optimize_stack_ops(&ops);
-        assert!(result.is_empty(), "NOT NOT should be eliminated, got {:?}", result);
+        let codes: Vec<String> = result
+            .iter()
+            .map(|op| match op {
+                StackOp::Opcode(c) => c.clone(),
+                StackOp::Push(PushValue::Bool(b)) => format!("PUSH({b})"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["OP_NOT", "OP_NOT", "PUSH(true)", "OP_NUMEQUAL"],
+            "x !== 0n must keep its OP_NOT pair"
+        );
     }
 
     #[test]

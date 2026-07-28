@@ -116,7 +116,7 @@ module RunarCompiler
       if _is_push_bigint(a, 0) && _is_opcode(b, "OP_ADD") then return [] end
       if _is_push_bigint(a, 0) && _is_opcode(b, "OP_SUB") then return [] end
 
-      if _is_opcode(a, "OP_NOT") && _is_opcode(b, "OP_NOT") then return [] end
+      # OP_NOT + OP_NOT is NOT a 2-op rule -- see _match_window3 (C17).
       if _is_opcode(a, "OP_NEGATE") && _is_opcode(b, "OP_NEGATE") then return [] end
 
       if _is_opcode(a, "OP_EQUAL") && _is_opcode(b, "OP_VERIFY")
@@ -176,6 +176,26 @@ module RunarCompiler
 
     def self._match_window3(a, b, c)
       return nil if _raw_bytes?(a) || _raw_bytes?(b) || _raw_bytes?(c)
+
+      # <canonical-bool producer> + OP_NOT + OP_NOT -> <canonical-bool producer>
+      #
+      # C17: `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity. For
+      # any non-canonical operand (say 5) the pair yields 1, while deleting it
+      # leaves 5. Truthiness is preserved, the VALUE is not -- and a downstream
+      # OP_EQUAL / OP_NUMEQUAL / state serialisation consumes the value, so the
+      # two programs disagree on accept/reject.
+      #
+      # The window therefore includes the PRODUCER of the value being negated and
+      # only fires when that producer provably yields a canonical 0/1. This
+      # matters because the `push(0) + OP_NUMEQUAL -> OP_NOT` rule in
+      # _match_window2 manufactures a fresh OP_NOT sitting on an ARBITRARY script
+      # number: for `x !== 0n` the lowerer emits
+      # `push x; push 0; OP_NUMEQUAL; OP_NOT`, which an unguarded 2-op rule
+      # collapsed all the way down to `push x`. With the guard the pair survives
+      # as `push x; OP_NOT; OP_NOT` -- value-exact.
+      if _canonical_bool_producer?(a) && _is_opcode(b, "OP_NOT") && _is_opcode(c, "OP_NOT")
+        return [a]
+      end
 
       a_val = _push_bigint_value(a)
       b_val = _push_bigint_value(b)
@@ -243,5 +263,44 @@ module RunarCompiler
       op[:op] == "opcode" && op[:code] == code
     end
     private_class_method :_is_opcode
+
+    # Opcodes whose result is guaranteed to be a CANONICAL boolean -- the minimal
+    # script-number encoding of 0 (the empty element) or 1 (0x01), and nothing
+    # else. Every entry pushes CScriptNum(0|1).getvch() (or vchFalse/vchTrue) in
+    # the reference interpreter.
+    #
+    # Stack-shuffling ops (dup / pick / roll / swap / ...) are deliberately
+    # absent: they forward a value whose provenance this local window cannot see.
+    CANONICAL_BOOL_OPCODES = %w[
+      OP_EQUAL
+      OP_NUMEQUAL
+      OP_NUMNOTEQUAL
+      OP_LESSTHAN
+      OP_GREATERTHAN
+      OP_LESSTHANOREQUAL
+      OP_GREATERTHANOREQUAL
+      OP_BOOLAND
+      OP_BOOLOR
+      OP_WITHIN
+      OP_NOT
+      OP_0NOTEQUAL
+      OP_CHECKSIG
+      OP_CHECKMULTISIG
+    ].freeze
+
+    # True when op provably leaves a canonical boolean (0 or 1) on the stack.
+    def self._canonical_bool_producer?(op)
+      return CANONICAL_BOOL_OPCODES.include?(op[:code]) if op[:op] == "opcode"
+
+      if op[:op] == "push"
+        v = op[:value]
+        return false if v.nil?
+        return true if v[:kind] == "bool"
+        return v[:big_int] == 0 || v[:big_int] == 1 if v[:kind] == "bigint"
+      end
+
+      false
+    end
+    private_class_method :_canonical_bool_producer?
   end
 end

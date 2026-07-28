@@ -8,7 +8,12 @@ from TS/Go/Rust on contracts with position-dispatch patterns (nested
 All 6 Rúnar compilers must produce byte-identical Bitcoin Script for the
 same canonical TypeScript source. For the canonical TicTacToe contracts
 (both v1 hand-rolled and v2 FixedArray), the expected locking script size
-is **9476 bytes** (18952 hex chars). The count grew a further 27 bytes to 9476
+is **9494 bytes** (18988 hex chars). The count grew a further 18 bytes to 9494
+with the C17 fix (peephole ``not-not-elim`` guard): the rule was an unguarded
+2-op window that composed with ``PUSH 0; OP_NUMEQUAL -> OP_NOT`` to delete
+``x !== 0n`` outright, so TicTacToe's 9 × ``if (this.cN != 0n)`` comparisons
+each regain their ``OP_NOT OP_NOT`` pair (first divergence at byte offset 5996).
+Before that it was 9476: the count grew 27 bytes to 9476
 with the C20 fix (anf-lower ``liftBranchUpdateProps``): TicTacToe's position
 dispatch ends in ``assert(false)`` for out-of-range moves, and C20 re-emits that
 dropped abort as ``assert(cond0 || ... || cond8)`` per method — restoring the
@@ -37,7 +42,7 @@ TS_V1 = REPO_ROOT / "examples" / "ts" / "tic-tac-toe" / "TicTacToe.runar.ts"
 TS_V2 = REPO_ROOT / "examples" / "ts" / "tic-tac-toe" / "TicTacToe.v2.runar.ts"
 PY_DSL = REPO_ROOT / "examples" / "python" / "tic-tac-toe" / "TicTacToe.runar.py"
 
-EXPECTED_BYTES = 9476
+EXPECTED_BYTES = 9494
 
 
 def _byte_len(hex_str: str) -> int:
@@ -45,7 +50,7 @@ def _byte_len(hex_str: str) -> int:
 
 
 class TestTicTacToeCrossCompilerBytes:
-    def test_canonical_ts_v1_locks_to_9476_bytes(self):
+    def test_canonical_ts_v1_locks_to_9494_bytes(self):
         assert TS_V1.exists(), f"missing canonical source: {TS_V1}"
         artifact = must_compile_source(str(TS_V1))
         assert _byte_len(artifact.script) == EXPECTED_BYTES, (
@@ -53,7 +58,7 @@ class TestTicTacToeCrossCompilerBytes:
             f"to match the TS/Go/Rust reference; got {_byte_len(artifact.script)}."
         )
 
-    def test_canonical_ts_v2_locks_to_9476_bytes(self):
+    def test_canonical_ts_v2_locks_to_9494_bytes(self):
         assert TS_V2.exists(), f"missing canonical source: {TS_V2}"
         artifact = must_compile_source(str(TS_V2))
         assert _byte_len(artifact.script) == EXPECTED_BYTES, (
@@ -71,7 +76,7 @@ class TestTicTacToeCrossCompilerBytes:
             "Bitcoin Script."
         )
 
-    def test_python_dsl_source_locks_to_9476_bytes(self):
+    def test_python_dsl_source_locks_to_9494_bytes(self):
         # The Python DSL TicTacToe is a snake_case port of the TS source.
         # It was reported as 4684 bytes before the liftBranchUpdateProps
         # port, confirming the same bug affected Python-DSL parsing as well.

@@ -20,14 +20,18 @@ func TestTicTacToeV2_Compile(t *testing.T) {
 // FixedArray feature in the Go compiler. It compiles both the
 // hand-rolled v1 contract and the v2 FixedArray rewrite through the full
 // Go compiler pipeline and asserts that the resulting locking scripts
-// are byte-identical and have length 9476. (BUG-100: each of the three public
+// are byte-identical and have length 9494. (BUG-100: each of the three public
 // methods now carries the fixed on-chain OP_PUSH_TX preimage-binding blob, so
 // the script grew from the pre-fix 5087 bytes. #116: the numeric `!=` migration
 // to [OP_NUMEQUAL, OP_NOT] added one byte per numeric inequality, growing the
 // script from 9425 to 9449. Deep-review C20: makeMove's 9-way position dispatch
 // ends in assert(false); the anf-lower fix (liftBranchUpdateProps) re-emits that
 // dropped abort as assert(cond0 || ... || cond8), growing the script from 9449
-// to 9476 — verified byte-identical against the fixed TS reference.)
+// to 9476. Deep-review C17: `not-not-elim` was an unguarded 2-op rule that
+// composed with `PUSH 0; OP_NUMEQUAL -> OP_NOT` to delete `x !== 0n` outright;
+// the guarded 3-op rule lets the 9 × `if (this.cN != 0n)` comparisons regain
+// their OP_NOT OP_NOT pair, growing the script from 9476 to 9494 — verified
+// byte-identical against the fixed TS reference.)
 //
 // The v2 contract uses `Board [9]runar.Bigint`. The expand-fixed-arrays
 // pass runs between typecheck and ANF lowering, expanding the array
@@ -53,7 +57,7 @@ func TestTicTacToeV2_ByteIdenticalToV1(t *testing.T) {
 	v1Bytes := len(v1.Script) / 2
 	v2Bytes := len(v2.Script) / 2
 
-	const expectedBytes = 9476
+	const expectedBytes = 9494
 	if v1Bytes != expectedBytes {
 		t.Errorf("v1 script length = %d bytes, want %d", v1Bytes, expectedBytes)
 	}

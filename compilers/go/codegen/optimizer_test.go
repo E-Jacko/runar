@@ -132,17 +132,33 @@ func TestOptimizer_Push0Add_Removed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2-op window: OP_NOT OP_NOT -> removed (double negation)
+// 3-op window: <canonical-bool producer> OP_NOT OP_NOT -> producer
+//
+// C17: the pair is boolean normalisation, not numeric identity, so it is only
+// removable when the value beneath is provably canonical (0/1). A bare pair
+// with no visible producer must survive.
 // ---------------------------------------------------------------------------
 
 func TestOptimizer_DoubleNot_Removed(t *testing.T) {
+	ops := []StackOp{
+		opcodeOp("OP_NUMEQUAL"),
+		opcodeOp("OP_NOT"),
+		opcodeOp("OP_NOT"),
+	}
+	result := OptimizeStackOps(ops)
+	if len(result) != 1 || result[0].Code != "OP_NUMEQUAL" {
+		t.Errorf("OP_NUMEQUAL OP_NOT OP_NOT should reduce to OP_NUMEQUAL, got %d ops", len(result))
+	}
+}
+
+func TestOptimizer_DoubleNot_BarePair_Survives(t *testing.T) {
 	ops := []StackOp{
 		opcodeOp("OP_NOT"),
 		opcodeOp("OP_NOT"),
 	}
 	result := OptimizeStackOps(ops)
-	if len(result) != 0 {
-		t.Errorf("OP_NOT OP_NOT should be removed, got %d ops", len(result))
+	if len(result) != 2 {
+		t.Errorf("a bare OP_NOT OP_NOT pair must survive (operand provenance unknown), got %d ops", len(result))
 	}
 }
 

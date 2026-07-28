@@ -194,8 +194,7 @@ public final class Peephole {
         // PUSH 0, OP_SUB → identity
         if (isPushBigInt(a, 0) && isOpcode(b, "OP_SUB")) return List.of();
 
-        // OP_NOT, OP_NOT → remove both
-        if (isOpcode(a, "OP_NOT") && isOpcode(b, "OP_NOT")) return List.of();
+        // OP_NOT, OP_NOT is NOT a 2-op rule — see matchWindow3 (C17).
         // OP_NEGATE, OP_NEGATE → remove both
         if (isOpcode(a, "OP_NEGATE") && isOpcode(b, "OP_NEGATE")) return List.of();
 
@@ -240,6 +239,27 @@ public final class Peephole {
 
     static List<StackOp> matchWindow3(StackOp a, StackOp b, StackOp c) {
         if (isRawBytes(a) || isRawBytes(b) || isRawBytes(c)) return null;
+
+        // <canonical-bool producer>, OP_NOT, OP_NOT → <canonical-bool producer>
+        //
+        // C17: `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity.
+        // For any non-canonical operand (say 5) the pair yields 1, while
+        // deleting it leaves 5. Truthiness is preserved, the VALUE is not — and
+        // a downstream OP_EQUAL / OP_NUMEQUAL / state serialisation consumes the
+        // value, so the two programs disagree on accept/reject.
+        //
+        // The window therefore includes the PRODUCER of the value being negated
+        // and only fires when that producer provably yields a canonical 0/1.
+        // This matters because the `PUSH 0; OP_NUMEQUAL → OP_NOT` rule in
+        // matchWindow2 manufactures a fresh OP_NOT sitting on an ARBITRARY
+        // script number: for `x !== 0n` the lowerer emits
+        // `PUSH x; PUSH 0; OP_NUMEQUAL; OP_NOT`, which an unguarded 2-op rule
+        // collapsed all the way down to `PUSH x`. With the guard the pair
+        // survives as `PUSH x; OP_NOT; OP_NOT` — value-exact.
+        if (producesCanonicalBool(a) && isOpcode(b, "OP_NOT") && isOpcode(c, "OP_NOT")) {
+            return List.of(a);
+        }
+
         BigInteger av = pushBigInt(a);
         BigInteger bv = pushBigInt(b);
         if (av != null && bv != null) {
@@ -271,6 +291,45 @@ public final class Peephole {
 
     private static boolean isOpcode(StackOp op, String code) {
         return op instanceof OpcodeOp o && code.equals(o.code());
+    }
+
+    /**
+     * Opcodes whose result is guaranteed to be a CANONICAL boolean — the
+     * minimal script-number encoding of 0 (the empty element) or 1
+     * ({@code {0x01}}), and nothing else. Every entry pushes
+     * {@code CScriptNum(0|1).getvch()} (or {@code vchFalse}/{@code vchTrue}) in
+     * the reference interpreter.
+     *
+     * <p>Stack-shuffling ops (DUP / PICK / ROLL / SWAP / …) are deliberately
+     * absent: they forward a value whose provenance this local window cannot
+     * see.
+     */
+    private static final java.util.Set<String> CANONICAL_BOOL_OPCODES = java.util.Set.of(
+        "OP_EQUAL",
+        "OP_NUMEQUAL",
+        "OP_NUMNOTEQUAL",
+        "OP_LESSTHAN",
+        "OP_GREATERTHAN",
+        "OP_LESSTHANOREQUAL",
+        "OP_GREATERTHANOREQUAL",
+        "OP_BOOLAND",
+        "OP_BOOLOR",
+        "OP_WITHIN",
+        "OP_NOT",
+        "OP_0NOTEQUAL",
+        "OP_CHECKSIG",
+        "OP_CHECKMULTISIG");
+
+    /** True when {@code op} provably leaves a canonical boolean (0 or 1) on the stack. */
+    private static boolean producesCanonicalBool(StackOp op) {
+        if (op instanceof OpcodeOp o) return CANONICAL_BOOL_OPCODES.contains(o.code());
+        if (op instanceof PushOp p) {
+            if (p.value() instanceof runar.compiler.ir.stack.BoolPushValue) return true;
+            if (p.value() instanceof BigIntPushValue bi) {
+                return bi.value().equals(BigInteger.ZERO) || bi.value().equals(BigInteger.ONE);
+            }
+        }
+        return false;
     }
 
     private static boolean isPushBigInt(StackOp op, long n) {

@@ -162,16 +162,34 @@ fn test_double_over_becomes_2dup() {
 }
 
 // ---------------------------------------------------------------------------
-// 2-op window: NOT NOT -> removed
+// 3-op window: <canonical-bool producer> NOT NOT -> <canonical-bool producer>
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_double_not_removed() {
+    // C17: the pair is only removable when the value beneath it is provably a
+    // canonical 0/1, so the producer has to be inside the window.
+    let ops = vec![opcode("OP_NUMEQUAL"), opcode("OP_NOT"), opcode("OP_NOT")];
+    let result = optimize_stack_ops(&ops);
+    assert_eq!(
+        result.len(),
+        1,
+        "OP_NUMEQUAL OP_NOT OP_NOT should collapse to OP_NUMEQUAL, got {:?}",
+        result
+    );
+    assert!(matches!(&result[0], StackOp::Opcode(c) if c == "OP_NUMEQUAL"));
+}
+
+#[test]
+fn test_double_not_kept_without_canonical_producer() {
+    // C17 regression: a bare pair negates a value of unknown provenance.
+    // Deleting it turned `x !== 0n` into `x` and rejected valid spends.
     let ops = vec![opcode("OP_NOT"), opcode("OP_NOT")];
     let result = optimize_stack_ops(&ops);
-    assert!(
-        result.is_empty(),
-        "OP_NOT OP_NOT should be removed entirely, got {:?}",
+    assert_eq!(
+        result.len(),
+        2,
+        "bare OP_NOT OP_NOT must survive, got {:?}",
         result
     );
 }
@@ -858,16 +876,22 @@ fn test_else_branch_optimized() {
 
 #[test]
 fn test_both_branches_optimized() {
-    // if { DUP DROP } else { OP_NOT OP_NOT } -> if { } else { }
+    // if { DUP DROP } else { OP_EQUAL OP_NOT OP_NOT } -> if { } else { OP_EQUAL }
     let ops = vec![StackOp::If {
         then_ops: vec![StackOp::Dup, StackOp::Drop],
-        else_ops: vec![opcode("OP_NOT"), opcode("OP_NOT")],
+        else_ops: vec![opcode("OP_EQUAL"), opcode("OP_NOT"), opcode("OP_NOT")],
     }];
     let result = optimize_stack_ops(&ops);
     assert_eq!(result.len(), 1);
     if let StackOp::If { then_ops, else_ops } = &result[0] {
         assert!(then_ops.is_empty(), "DUP DROP in then should be eliminated, got {:?}", then_ops);
-        assert!(else_ops.is_empty(), "NOT NOT in else should be eliminated, got {:?}", else_ops);
+        assert_eq!(
+            else_ops.len(),
+            1,
+            "EQUAL NOT NOT in else should collapse to EQUAL, got {:?}",
+            else_ops
+        );
+        assert!(matches!(&else_ops[0], StackOp::Opcode(c) if c == "OP_EQUAL"));
     } else {
         panic!("expected If, got {:?}", result[0]);
     }
@@ -894,12 +918,13 @@ fn test_then_branch_with_constant_fold() {
 #[test]
 fn test_nested_if_complex() {
     // Outer sequence containing both an If and a trailing SWAP SWAP
-    // if { OP_EQUAL OP_VERIFY } else { OP_NOT OP_NOT }  followed by SWAP SWAP
-    // -> if { OP_EQUALVERIFY } else {} followed by nothing
+    // if { OP_EQUAL OP_VERIFY } else { OP_NUMEQUAL OP_NOT OP_NOT }  followed by
+    // SWAP SWAP
+    // -> if { OP_EQUALVERIFY } else { OP_NUMEQUAL } followed by nothing
     let ops = vec![
         StackOp::If {
             then_ops: vec![opcode("OP_EQUAL"), opcode("OP_VERIFY")],
-            else_ops: vec![opcode("OP_NOT"), opcode("OP_NOT")],
+            else_ops: vec![opcode("OP_NUMEQUAL"), opcode("OP_NOT"), opcode("OP_NOT")],
         },
         StackOp::Swap,
         StackOp::Swap,
@@ -914,7 +939,13 @@ fn test_nested_if_complex() {
             then_ops
         );
         assert!(matches!(&then_ops[0], StackOp::Opcode(c) if c == "OP_EQUALVERIFY"));
-        assert!(else_ops.is_empty(), "NOT NOT in else should be eliminated, got {:?}", else_ops);
+        assert_eq!(
+            else_ops.len(),
+            1,
+            "NUMEQUAL NOT NOT in else should collapse to NUMEQUAL, got {:?}",
+            else_ops
+        );
+        assert!(matches!(&else_ops[0], StackOp::Opcode(c) if c == "OP_NUMEQUAL"));
     } else {
         panic!("expected If, got {:?}", result[0]);
     }

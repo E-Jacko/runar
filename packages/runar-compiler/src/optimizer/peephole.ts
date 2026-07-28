@@ -34,6 +34,45 @@ function isPushOne(op: StackOp): boolean {
   return isPushBigInt(op, 1n);
 }
 
+/**
+ * Opcodes whose result is guaranteed to be a CANONICAL boolean — the minimal
+ * script-number encoding of 0 (the empty element) or 1 (`{0x01}`), and nothing
+ * else. This is the precondition for `not-not-elim`: `x OP_NOT OP_NOT` is
+ * boolean *normalisation*, not identity, so deleting the pair is only
+ * value-preserving when `x` is already canonical (see the rule below).
+ *
+ * Every entry pushes `CScriptNum(0|1).getvch()` (or `vchFalse`/`vchTrue`) in
+ * the reference interpreter. Stack-shuffling ops (`dup`/`pick`/`roll`/…) are
+ * deliberately absent: they forward a value whose provenance this local window
+ * cannot see.
+ */
+const CANONICAL_BOOL_OPCODES = new Set<string>([
+  'OP_EQUAL',
+  'OP_NUMEQUAL',
+  'OP_NUMNOTEQUAL',
+  'OP_LESSTHAN',
+  'OP_GREATERTHAN',
+  'OP_LESSTHANOREQUAL',
+  'OP_GREATERTHANOREQUAL',
+  'OP_BOOLAND',
+  'OP_BOOLOR',
+  'OP_WITHIN',
+  'OP_NOT',
+  'OP_0NOTEQUAL',
+  'OP_CHECKSIG',
+  'OP_CHECKMULTISIG',
+]);
+
+/** True when `op` provably leaves a canonical boolean (0 or 1) on the stack. */
+function producesCanonicalBool(op: StackOp): boolean {
+  if (isOpcode(op)) return CANONICAL_BOOL_OPCODES.has(op.code);
+  if (isPush(op)) {
+    if (typeof op.value === 'boolean') return true;
+    return typeof op.value === 'bigint' && (op.value === 0n || op.value === 1n);
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Peephole rules
 // ---------------------------------------------------------------------------
@@ -139,13 +178,33 @@ const rules: PeepholeRule[] = [
   },
 
   // -------------------------------------------------------------------------
-  // OP_NOT, OP_NOT → remove both (double negation)
+  // <canonical-bool producer>, OP_NOT, OP_NOT → <canonical-bool producer>
+  //
+  // `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity: for any
+  // non-canonical operand (say 5) the pair yields 1, while deleting it leaves
+  // 5. Truthiness is preserved, the VALUE is not — and a downstream `OP_EQUAL`
+  // / `OP_NUMEQUAL` / state serialisation consumes the value, so the two
+  // programs disagree on accept/reject.
+  //
+  // The window therefore includes the PRODUCER of the value being negated and
+  // only fires when that producer provably yields a canonical 0/1 (C17). This
+  // matters because `push0-numequal-to-not` below rewrites
+  // `PUSH 0; OP_NUMEQUAL` into a fresh `OP_NOT` that sits on top of an
+  // ARBITRARY script number: for `x !== 0n` the lowerer emits
+  // `PUSH x; PUSH 0; OP_NUMEQUAL; OP_NOT`, which an unguarded 2-op rule
+  // collapsed all the way down to `PUSH x`. With the guard the pair survives as
+  // `PUSH x; OP_NOT; OP_NOT` — still one byte shorter than the input, and
+  // value-exact.
   // -------------------------------------------------------------------------
   {
-    windowSize: 2,
+    windowSize: 3,
     match(ops) {
-      if (isOpcode(ops[0]!, 'OP_NOT') && isOpcode(ops[1]!, 'OP_NOT')) {
-        return [];
+      if (
+        producesCanonicalBool(ops[0]!) &&
+        isOpcode(ops[1]!, 'OP_NOT') &&
+        isOpcode(ops[2]!, 'OP_NOT')
+      ) {
+        return [ops[0]!];
       }
       return null;
     },

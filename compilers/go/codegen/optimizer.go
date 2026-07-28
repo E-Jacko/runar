@@ -136,10 +136,10 @@ func matchWindow2(a, b StackOp) ([]StackOp, bool) {
 		return nil, true
 	}
 
-	// OP_NOT, OP_NOT -> remove both (double negation)
-	if isOpcodeOp(a, "OP_NOT") && isOpcodeOp(b, "OP_NOT") {
-		return nil, true
-	}
+	// NOTE: `OP_NOT, OP_NOT` is NOT eliminated here — see the guarded 3-op
+	// rule in matchWindow3 (C17). The pair is boolean normalisation, not
+	// numeric identity, so it may only be dropped when the producer of the
+	// negated value provably leaves a canonical 0/1 behind.
 
 	// OP_NEGATE, OP_NEGATE -> remove both
 	if isOpcodeOp(a, "OP_NEGATE") && isOpcodeOp(b, "OP_NEGATE") {
@@ -238,9 +238,71 @@ func makePushBigInt(n *big.Int) StackOp {
 	}
 }
 
+// canonicalBoolOpcodes are the opcodes whose result is guaranteed to be a
+// CANONICAL boolean — the minimal script-number encoding of 0 (the empty
+// element) or 1 ({0x01}), and nothing else. Every entry pushes
+// CScriptNum(0|1).getvch() (or vchFalse/vchTrue) in the reference interpreter.
+//
+// Stack-shuffling ops (OP_DUP / OP_PICK / OP_ROLL / OP_SWAP / …) are
+// deliberately absent: they forward a value whose provenance this local window
+// cannot see.
+var canonicalBoolOpcodes = map[string]bool{
+	"OP_EQUAL":              true,
+	"OP_NUMEQUAL":           true,
+	"OP_NUMNOTEQUAL":        true,
+	"OP_LESSTHAN":           true,
+	"OP_GREATERTHAN":        true,
+	"OP_LESSTHANOREQUAL":    true,
+	"OP_GREATERTHANOREQUAL": true,
+	"OP_BOOLAND":            true,
+	"OP_BOOLOR":             true,
+	"OP_WITHIN":             true,
+	"OP_NOT":                true,
+	"OP_0NOTEQUAL":          true,
+	"OP_CHECKSIG":           true,
+	"OP_CHECKMULTISIG":      true,
+}
+
+// producesCanonicalBool reports whether op provably leaves a canonical boolean
+// (0 or 1) on the stack.
+func producesCanonicalBool(op StackOp) bool {
+	if op.Op == "opcode" {
+		return canonicalBoolOpcodes[op.Code]
+	}
+	if op.Op == "push" {
+		switch op.Value.Kind {
+		case "bool":
+			return true
+		case "bigint":
+			return isPushBigInt(op, 0) || isPushBigInt(op, 1)
+		}
+	}
+	return false
+}
+
 func matchWindow3(a, b, c StackOp) ([]StackOp, bool) {
 	if isRawBytes(a) || isRawBytes(b) || isRawBytes(c) {
 		return nil, false
+	}
+
+	// <canonical-bool producer>, OP_NOT, OP_NOT -> <canonical-bool producer>
+	//
+	// `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity: for any
+	// non-canonical operand (say 5) the pair yields 1, while deleting it leaves
+	// 5. Truthiness is preserved, the VALUE is not — and a downstream OP_EQUAL /
+	// OP_NUMEQUAL / state serialisation consumes the value, so the two programs
+	// disagree on accept/reject.
+	//
+	// The window therefore includes the PRODUCER of the value being negated and
+	// only fires when that producer provably yields a canonical 0/1 (C17). This
+	// matters because the `PUSH 0; OP_NUMEQUAL -> OP_NOT` rule in matchWindow2
+	// synthesises a fresh OP_NOT sitting on top of an ARBITRARY script number:
+	// for `x !== 0n` the lowerer emits `<x>; PUSH 0; OP_NUMEQUAL; OP_NOT`, which
+	// an unguarded 2-op rule collapsed all the way down to `<x>`. With the guard
+	// the pair survives as `<x>; OP_NOT; OP_NOT` — still one byte shorter than
+	// the input, and value-exact.
+	if producesCanonicalBool(a) && isOpcodeOp(b, "OP_NOT") && isOpcodeOp(c, "OP_NOT") {
+		return []StackOp{a}, true
 	}
 
 	aVal := pushBigIntValue(a)

@@ -875,6 +875,26 @@ describe('Optimizer: Peephole (Stack IR)', () => {
 
   describe('recursive if-block optimization', () => {
     it('optimizes ops inside if-then blocks', () => {
+      // OP_NUMEQUAL is a canonical-boolean producer, so the OP_NOT pair on top
+      // of it is genuine double negation and collapses (C17: the pair is only
+      // removable when the value beneath is provably 0/1).
+      const ops: StackOp[] = [
+        {
+          op: 'if',
+          then: [
+            { op: 'opcode', code: 'OP_NUMEQUAL' },
+            { op: 'opcode', code: 'OP_NOT' },
+            { op: 'opcode', code: 'OP_NOT' },
+          ],
+        },
+      ];
+      const result = optimizeStackIR(ops);
+      expect(result).toEqual([{ op: 'if', then: [{ op: 'opcode', code: 'OP_NUMEQUAL' }] }]);
+    });
+
+    it('leaves a bare OP_NOT pair at the head of a branch alone (C17)', () => {
+      // The negated value arrives from outside the branch, so the window
+      // cannot prove it is a canonical boolean — the pair must survive.
       const ops: StackOp[] = [
         {
           op: 'if',
@@ -884,8 +904,7 @@ describe('Optimizer: Peephole (Stack IR)', () => {
           ],
         },
       ];
-      const result = optimizeStackIR(ops);
-      expect(result).toEqual([{ op: 'if', then: [] }]);
+      expect(optimizeStackIR(ops)).toEqual(ops);
     });
 
     it('optimizes ops inside if-else blocks', () => {
@@ -932,7 +951,7 @@ describe('Optimizer: Peephole (Stack IR)', () => {
 
     it('optimizes both then-branch and else-branch independently', () => {
       // then-branch: SWAP SWAP → removed
-      // else-branch: OP_NOT OP_NOT → removed
+      // else-branch: OP_EQUAL OP_NOT OP_NOT → OP_EQUAL
       const ops: StackOp[] = [
         {
           op: 'if',
@@ -941,6 +960,7 @@ describe('Optimizer: Peephole (Stack IR)', () => {
             { op: 'swap' },
           ],
           else: [
+            { op: 'opcode', code: 'OP_EQUAL' },
             { op: 'opcode', code: 'OP_NOT' },
             { op: 'opcode', code: 'OP_NOT' },
           ],
@@ -951,7 +971,7 @@ describe('Optimizer: Peephole (Stack IR)', () => {
         {
           op: 'if',
           then: [],
-          else: [],
+          else: [{ op: 'opcode', code: 'OP_EQUAL' }],
         },
       ]);
     });

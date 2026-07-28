@@ -135,9 +135,10 @@ def _match_window2(a: StackOp, b: StackOp) -> Optional[list[StackOp]]:
     if _is_push_bigint(a, 0) and _is_opcode_op(b, "OP_SUB"):
         return []
 
-    # OP_NOT, OP_NOT -> remove both (double negation)
-    if _is_opcode_op(a, "OP_NOT") and _is_opcode_op(b, "OP_NOT"):
-        return []
+    # NOTE: ``OP_NOT, OP_NOT`` is NOT eliminated here -- see the guarded 3-op
+    # rule in ``_match_window3`` (C17).  The pair is boolean normalisation, not
+    # numeric identity, so it may only be dropped when the producer of the
+    # negated value provably leaves a canonical 0/1 behind.
 
     # OP_NEGATE, OP_NEGATE -> remove both
     if _is_opcode_op(a, "OP_NEGATE") and _is_opcode_op(b, "OP_NEGATE"):
@@ -212,10 +213,75 @@ def _match_window2(a: StackOp, b: StackOp) -> Optional[list[StackOp]]:
     return None
 
 
+# Opcodes whose result is guaranteed to be a CANONICAL boolean -- the minimal
+# script-number encoding of 0 (the empty element) or 1 (``{0x01}``), and nothing
+# else.  Every entry pushes ``CScriptNum(0|1).getvch()`` (or
+# ``vchFalse``/``vchTrue``) in the reference interpreter.
+#
+# Stack-shuffling ops (``OP_DUP`` / ``OP_PICK`` / ``OP_ROLL`` / ``OP_SWAP`` / ...)
+# are deliberately absent: they forward a value whose provenance this local
+# window cannot see.
+CANONICAL_BOOL_OPCODES = frozenset(
+    {
+        "OP_EQUAL",
+        "OP_NUMEQUAL",
+        "OP_NUMNOTEQUAL",
+        "OP_LESSTHAN",
+        "OP_GREATERTHAN",
+        "OP_LESSTHANOREQUAL",
+        "OP_GREATERTHANOREQUAL",
+        "OP_BOOLAND",
+        "OP_BOOLOR",
+        "OP_WITHIN",
+        "OP_NOT",
+        "OP_0NOTEQUAL",
+        "OP_CHECKSIG",
+        "OP_CHECKMULTISIG",
+    }
+)
+
+
+def _produces_canonical_bool(op: StackOp) -> bool:
+    """Return True when *op* provably leaves a canonical boolean (0 or 1)."""
+    if op.op == "opcode":
+        return op.code in CANONICAL_BOOL_OPCODES
+    if op.op == "push" and op.value is not None:
+        if op.value.kind == "bool":
+            return True
+        if op.value.kind == "bigint":
+            return op.value.big_int in (0, 1)
+    return False
+
+
 def _match_window3(a: StackOp, b: StackOp, c: StackOp) -> Optional[list[StackOp]]:
     """Try to match a window-3 peephole rule."""
     if _is_raw_bytes(a) or _is_raw_bytes(b) or _is_raw_bytes(c):
         return None
+
+    # <canonical-bool producer>, OP_NOT, OP_NOT -> <canonical-bool producer>
+    #
+    # ``OP_NOT OP_NOT`` is boolean NORMALISATION, not numeric identity: for any
+    # non-canonical operand (say 5) the pair yields 1, while deleting it leaves
+    # 5.  Truthiness is preserved, the VALUE is not -- and a downstream
+    # ``OP_EQUAL`` / ``OP_NUMEQUAL`` / state serialisation consumes the value,
+    # so the two programs disagree on accept/reject.
+    #
+    # The window therefore includes the PRODUCER of the value being negated and
+    # only fires when that producer provably yields a canonical 0/1 (C17).  This
+    # matters because the ``PUSH 0; OP_NUMEQUAL -> OP_NOT`` rule in
+    # ``_match_window2`` synthesises a fresh ``OP_NOT`` sitting on top of an
+    # ARBITRARY script number: for ``x !== 0n`` the lowerer emits
+    # ``<x>; PUSH 0; OP_NUMEQUAL; OP_NOT``, which an unguarded 2-op rule
+    # collapsed all the way down to ``<x>``.  With the guard the pair survives
+    # as ``<x>; OP_NOT; OP_NOT`` -- still one byte shorter than the input, and
+    # value-exact.
+    if (
+        _produces_canonical_bool(a)
+        and _is_opcode_op(b, "OP_NOT")
+        and _is_opcode_op(c, "OP_NOT")
+    ):
+        return [a]
+
     a_val = _push_bigint_value(a)
     b_val = _push_bigint_value(b)
     if a_val is not None and b_val is not None:

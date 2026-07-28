@@ -58,12 +58,26 @@ class TestWindow2Optimizations:
         assert result[0].code == "OP_2DUP"
 
     def test_double_not_removed(self):
+        # C17: <canonical-bool producer> OP_NOT OP_NOT -> producer. The pair is
+        # boolean normalisation, not numeric identity, so it is only removable
+        # when the value beneath is provably canonical (0/1).
+        ops = [
+            StackOp(op="opcode", code="OP_NUMEQUAL"),
+            StackOp(op="opcode", code="OP_NOT"),
+            StackOp(op="opcode", code="OP_NOT"),
+        ]
+        result = optimize_stack_ops(ops)
+        assert len(result) == 1
+        assert result[0].code == "OP_NUMEQUAL"
+
+    def test_bare_double_not_survives(self):
+        # C17: no producer in the window -- the operand could be anything.
         ops = [
             StackOp(op="opcode", code="OP_NOT"),
             StackOp(op="opcode", code="OP_NOT"),
         ]
         result = optimize_stack_ops(ops)
-        assert len(result) == 0
+        assert len(result) == 2
 
     def test_double_negate_removed(self):
         ops = [
@@ -440,6 +454,9 @@ class TestNestedIfOptimization:
         assert result[0].else_ops[0].code == "OP_CHECKSIGVERIFY"
 
     def test_both_branches_optimized(self):
+        # then-branch: DUP DROP -> removed
+        # else-branch: OP_EQUAL OP_NOT OP_NOT -> OP_EQUAL (C17: the pair only
+        # collapses on top of a canonical-bool producer)
         ops = [
             StackOp(
                 op="if",
@@ -448,6 +465,7 @@ class TestNestedIfOptimization:
                     StackOp(op="drop"),
                 ],
                 else_ops=[
+                    StackOp(op="opcode", code="OP_EQUAL"),
                     StackOp(op="opcode", code="OP_NOT"),
                     StackOp(op="opcode", code="OP_NOT"),
                 ],
@@ -456,7 +474,8 @@ class TestNestedIfOptimization:
         result = optimize_stack_ops(ops)
         assert len(result) == 1
         assert len(result[0].then) == 0
-        assert len(result[0].else_ops) == 0
+        assert len(result[0].else_ops) == 1
+        assert result[0].else_ops[0].code == "OP_EQUAL"
 
 
 # ---------------------------------------------------------------------------

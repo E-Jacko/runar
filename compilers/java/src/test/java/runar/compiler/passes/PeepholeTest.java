@@ -69,9 +69,17 @@ class PeepholeTest {
     }
 
     @Test
-    void doubleOpNotCancels() {
-        List<StackOp> r = Peephole.optimize(List.of(new OpcodeOp("OP_NOT"), new OpcodeOp("OP_NOT")));
-        assertEquals(0, r.size());
+    void doubleOpNotCancelsOnlyOverACanonicalBoolProducer() {
+        // C17: the pair is boolean NORMALISATION, so it may only be dropped when
+        // the producer of the negated value provably leaves a canonical 0/1.
+        List<StackOp> canonical = Peephole.optimize(
+            List.of(new OpcodeOp("OP_NUMEQUAL"), new OpcodeOp("OP_NOT"), new OpcodeOp("OP_NOT")));
+        assertEquals(1, canonical.size());
+        assertTrue(canonical.get(0) instanceof OpcodeOp o && "OP_NUMEQUAL".equals(o.code()));
+
+        List<StackOp> unknownProducer =
+            Peephole.optimize(List.of(new OpcodeOp("OP_NOT"), new OpcodeOp("OP_NOT")));
+        assertEquals(2, unknownProducer.size());
     }
 
     @Test

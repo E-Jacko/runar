@@ -17,6 +17,10 @@ class TestOptimizer < Minitest::Test
     { op: "push", value: { kind: "bigint", big_int: n } }
   end
 
+  def push_bool(val)
+    { op: "push", value: { kind: "bool", bool_val: val } }
+  end
+
   def opcode(code)
     { op: "opcode", code: code }
   end
@@ -94,13 +98,100 @@ class TestOptimizer < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
-  # 8. Double NOT eliminated
+  # 8. Double NOT eliminated ONLY over a provably canonical producer (C17)
+  #
+  # `OP_NOT OP_NOT` is boolean NORMALISATION, not numeric identity: for a
+  # non-canonical operand (say 5) the pair yields 1, while deleting it leaves 5.
+  # Truthiness is preserved, the VALUE is not -- and a downstream OP_EQUAL /
+  # OP_NUMEQUAL / state serialisation consumes the value, so the optimised and
+  # unoptimised programs disagree on accept/reject. The rule therefore matches a
+  # 3-op window that includes the PRODUCER of the negated value.
   # ---------------------------------------------------------------------------
 
-  def test_double_not_eliminated
+  def test_double_not_eliminated_over_canonical_bool_producer
+    ops = [opcode("OP_NUMEQUAL"), opcode("OP_NOT"), opcode("OP_NOT")]
+    result = optimize(ops)
+    assert_equal 1, result.length, "redundant normalisation of a canonical bool should go"
+    assert_equal "OP_NUMEQUAL", result[0][:code]
+  end
+
+  def test_double_not_eliminated_over_every_canonical_bool_producer
+    %w[
+      OP_EQUAL OP_NUMEQUAL OP_NUMNOTEQUAL OP_LESSTHAN OP_GREATERTHAN
+      OP_LESSTHANOREQUAL OP_GREATERTHANOREQUAL OP_BOOLAND OP_BOOLOR
+      OP_WITHIN OP_NOT OP_0NOTEQUAL OP_CHECKSIG OP_CHECKMULTISIG
+    ].each do |producer|
+      result = optimize([opcode(producer), opcode("OP_NOT"), opcode("OP_NOT")])
+      assert_equal 1, result.length, "#{producer} leaves a canonical bool"
+      assert_equal producer, result[0][:code]
+    end
+  end
+
+  def test_double_not_eliminated_over_canonical_literal_pushes
+    [push_bigint(0), push_bigint(1), push_bool(true), push_bool(false)].each do |producer|
+      result = optimize([producer, opcode("OP_NOT"), opcode("OP_NOT")])
+      assert_equal 1, result.length, "#{producer.inspect} is already canonical"
+      assert_equal "push", result[0][:op]
+    end
+  end
+
+  def test_double_not_kept_when_producer_is_not_provably_canonical
+    # A rolled value has provenance this local window cannot see.
+    ops = [{ op: "roll", depth: 3 }, opcode("OP_NOT"), opcode("OP_NOT")]
+    result = optimize(ops)
+    assert_equal 3, result.length, "double NOT over an arbitrary value must not be deleted"
+    assert_equal "OP_NOT", result[1][:code]
+    assert_equal "OP_NOT", result[2][:code]
+  end
+
+  def test_double_not_kept_with_no_visible_producer
     ops = [opcode("OP_NOT"), opcode("OP_NOT")]
     result = optimize(ops)
-    assert_empty result, "double NOT should be eliminated"
+    assert_equal 2, result.length, "a bare NOT pair has no provable producer"
+  end
+
+  def test_double_not_kept_over_non_canonical_literal_push
+    ops = [push_bigint(5), opcode("OP_NOT"), opcode("OP_NOT")]
+    result = optimize(ops)
+    assert_equal 3, result.length, "PUSH 5 OP_NOT OP_NOT yields 1, not 5"
+  end
+
+  # The exact composition that made this a bug: `push(0) + OP_NUMEQUAL -> OP_NOT`
+  # (rule 23 below) manufactures a fresh OP_NOT sitting on an ARBITRARY script
+  # number, which the old unguarded 2-op rule then ate together with the
+  # lowerer's own OP_NOT -- compiling `x !== 0n` down to plain `x`.
+  def test_push_zero_numequal_not_chain_keeps_both_nots
+    ops = [{ op: "roll", depth: 3 }, push_bigint(0), opcode("OP_NUMEQUAL"), opcode("OP_NOT")]
+    result = optimize(ops)
+    assert_equal 3, result.length, "expected roll + OP_NOT + OP_NOT, got #{result.inspect}"
+    assert_equal "roll", result[0][:op]
+    assert_equal "OP_NOT", result[1][:code]
+    assert_equal "OP_NOT", result[2][:code]
+  end
+
+  # End-to-end: the boolean is consumed by value (`=== true`), so the collapse
+  # changes accept/reject. Peephole OFF the script is
+  # `PUSH0 SWAP SWAP NUMEQUAL NOT PUSH1 SWAP SWAP NUMEQUAL`; the unguarded rule
+  # optimised that to `519c` (compare the witness against 1 instead of against
+  # "x is non-zero"), rejecting the valid spend x = 5.
+  def test_not_equals_zero_survives_the_peephole_end_to_end
+    require "runar_compiler/compiler"
+    require "tmpdir"
+
+    source = <<~TS
+      class C17Check extends SmartContract {
+        constructor() { super(); }
+        public check(x: bigint): void { assert((x !== 0n) === true); }
+      }
+    TS
+
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "C17Check.runar.ts")
+      File.write(path, source)
+      artifact = RunarCompiler.compile_from_source(path, disable_constant_folding: true)
+      assert_equal "9191519c", artifact.script,
+                   "peephole must keep the OP_NOT OP_NOT boolean normalisation (C17)"
+    end
   end
 
   # ---------------------------------------------------------------------------
