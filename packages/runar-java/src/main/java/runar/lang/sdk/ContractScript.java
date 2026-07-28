@@ -251,12 +251,22 @@ public final class ContractScript {
         if (opcode == 0x00) {                       // OP_0
             return isBool ? Boolean.FALSE : (isInt ? BigInteger.ZERO : "");
         }
+        // S1: OP_1..OP_16 / OP_1NEGATE carry no separate data bytes — the
+        // opcode itself IS the value. For int/bool slots that value is the
+        // script number; for a ByteString (or other byte-typed) slot it is the
+        // 1-byte payload the MINIMALDATA encoder short-circuited, so it must be
+        // reconstructed as hex rather than degraded to a number. OP_0 above
+        // still yields "" for byte types — OP_0 genuinely pushes [].
         if (opcode == 0x4f) {                       // OP_1NEGATE
-            return BigInteger.valueOf(-1);
+            if (isInt) return BigInteger.valueOf(-1);
+            if (isBool) return Boolean.TRUE;
+            return "81";
         }
         if (opcode >= 0x51 && opcode <= 0x60) {     // OP_1..OP_16
             int v = opcode - 0x50;
-            return isBool ? Boolean.TRUE : BigInteger.valueOf(v);
+            if (isBool) return Boolean.TRUE;
+            if (isInt) return BigInteger.valueOf(v);
+            return String.format("%02x", v);
         }
         String dataHex = ScriptUtils.decodePushData(deployed, offset).dataHex();
         if (isInt) return decodeScriptNumber(dataHex);

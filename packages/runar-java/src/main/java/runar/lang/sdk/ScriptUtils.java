@@ -17,10 +17,16 @@ public final class ScriptUtils {
      *
      * <p>Applies BSV consensus rule {@code SCRIPT_VERIFY_MINIMALDATA} for
      * single-byte pushes: a 1-byte payload whose value is in
-     * {@code {0x00, 0x01..0x10, 0x81}} MUST use the corresponding minimal
-     * opcode ({@code OP_0} / {@code OP_1..OP_16} / {@code OP_1NEGATE}) rather
-     * than the direct push {@code 01 NN}. Non-minimal direct pushes are
-     * relay-rejected as "Data push larger than necessary".
+     * {@code {0x01..0x10, 0x81}} MUST use the corresponding minimal opcode
+     * ({@code OP_1..OP_16} / {@code OP_1NEGATE}) rather than the direct push
+     * {@code 01 NN}. Non-minimal direct pushes are relay-rejected as
+     * "Data push larger than necessary".
+     *
+     * <p>NOTE: {@code 0x00} is deliberately NOT in that set. {@code OP_0}
+     * pushes the EMPTY byte array, not a 1-byte {@code 0x00} — so the minimal
+     * encoding of a 1-byte {@code 0x00} payload is the direct push
+     * {@code 01 00} (matching the compiler's {@code encodePushBytesHex} in
+     * push-encoding.ts), not {@code OP_0} (C9 / S1).
      */
     public static String encodePushData(String dataHex) {
         int dataLen = dataHex.length() / 2;
@@ -31,7 +37,6 @@ public final class ScriptUtils {
         // emit a relay-rejected non-minimal direct push.
         if (dataLen == 1) {
             int b = Integer.parseInt(dataHex, 16);
-            if (b == 0x00) return "00";                              // OP_0
             if (b >= 0x01 && b <= 0x10) return String.format("%02x", 0x50 + b); // OP_1..OP_16
             if (b == 0x81) return "4f";                              // OP_1NEGATE
         }
@@ -53,9 +58,26 @@ public final class ScriptUtils {
         return "4e" + String.format("%02x%02x%02x%02x", b0, b1, b2, b3) + dataHex;
     }
 
-    /** Decodes a push-data at {@code offset} in hex. Returns {@code [pushedHex, hexCharsConsumed]}. */
+    /**
+     * Decodes a push-data at {@code offset} in hex. Returns
+     * {@code [pushedHex, hexCharsConsumed]}.
+     *
+     * <p>Inverse of {@link #encodePushData}'s MINIMALDATA short-circuit:
+     * {@code OP_1..OP_16} (0x51..0x60) and {@code OP_1NEGATE} (0x4f) each push
+     * a single byte with no separate data bytes in the script — the opcode
+     * itself encodes the value (C9). {@code OP_0} (0x00) falls through to the
+     * {@code opcode <= 75} branch and correctly decodes as the empty byte
+     * array, since the encoder no longer emits {@code OP_0} for a 1-byte
+     * {@code 0x00} payload.
+     */
     public static DecodedPush decodePushData(String hex, int offset) {
         int opcode = Integer.parseInt(hex.substring(offset, offset + 2), 16);
+        if (opcode >= 0x51 && opcode <= 0x60) {  // OP_1..OP_16
+            return new DecodedPush(String.format("%02x", opcode - 0x50), 2);
+        }
+        if (opcode == 0x4f) {                    // OP_1NEGATE
+            return new DecodedPush("81", 2);
+        }
         if (opcode <= 75) {
             int dataLen = opcode * 2;
             return new DecodedPush(hex.substring(offset + 2, offset + 2 + dataLen), 2 + dataLen);

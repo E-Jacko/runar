@@ -19,10 +19,13 @@ class ScriptUtilsTest {
     }
 
     // MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
-    // {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+    // {0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+    // 0x00 is NOT in that set: OP_0 pushes the EMPTY byte array, so the
+    // minimal encoding of a 1-byte 0x00 is the direct push `01 00` —
+    // matching the compiler's encodePushBytesHex (C9 / S1).
     @Test
     void encodePushDataMinimalDataSingleByte() {
-        assertEquals("00", ScriptUtils.encodePushData("00")); // OP_0
+        assertEquals("0100", ScriptUtils.encodePushData("00")); // direct push, NOT OP_0
         assertEquals("55", ScriptUtils.encodePushData("05")); // OP_5
         assertEquals("4f", ScriptUtils.encodePushData("81")); // OP_1NEGATE
         for (int n = 1; n <= 16; n++) {

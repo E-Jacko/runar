@@ -469,6 +469,9 @@ public final class RunarContract {
                 resolved.set(i, "00".repeat(72));
             } else if ("PubKey".equals(type) && resolved.get(i) == null) {
                 resolved.set(i, ScriptUtils.bytesToHex(signer.pubKey()));
+            } else {
+                rejectUnresolvableNullArg(
+                    "RunarContract.call", userParams.get(i), i, resolved.get(i));
             }
         }
 
@@ -1204,7 +1207,7 @@ public final class RunarContract {
     int getCodeSepIndex(int methodIndex) {
         if (currentUtxo != null && currentUtxo.scriptHex() != null) {
             java.util.List<Integer> realOffsets =
-                findCodesepOffsets(currentUtxo.scriptHex());
+                findCodesepOffsets(codeScriptForCodesepScan());
             if (artifact.codeSeparatorIndices() != null
                 && methodIndex >= 0
                 && methodIndex < artifact.codeSeparatorIndices().size()
@@ -1225,6 +1228,30 @@ public final class RunarContract {
             return adjustCodeSepOffset(artifact.codeSeparatorIndex());
         }
         return -1;
+    }
+
+    /**
+     * The portion of the live locking script that {@link #getCodeSepIndex} is
+     * allowed to byte-walk: the CODE part only.
+     *
+     * <p>Everything after the state {@code OP_RETURN} separator is raw state
+     * data, not script — and several state field types are serialised with no
+     * push prefix at all ({@link StateSerializer}: {@code int}/{@code bigint}
+     * become 8 raw little-endian bytes, {@code PubKey}/{@code Sha256}/
+     * {@code Point} the raw value). Walking those bytes as opcodes decodes
+     * payload as script: a state byte equal to {@code 0xab} is recorded as a
+     * phantom {@code OP_CODESEPARATOR}, and a byte sequence that reads as
+     * {@code OP_PUSHDATA4} drives the cursor off the end of the script.
+     *
+     * <p>Mirrors the TS {@code _codeScript} (contract.ts {@code fromUtxo}) and
+     * Go {@code codeScript} (sdk_contract.go {@code FromUtxo}) bound, including
+     * the stateless carve-out: a contract with no state fields has no state
+     * region, so its whole script is code.
+     */
+    private String codeScriptForCodesepScan() {
+        String scriptHex = currentUtxo.scriptHex();
+        if (!artifact.isStateful()) return scriptHex;
+        return ContractScript.extractCodePart(scriptHex);
     }
 
     /**
@@ -1282,8 +1309,14 @@ public final class RunarContract {
                 int b1 = byteAt(scriptHex, off + 4);
                 int b2 = byteAt(scriptHex, off + 6);
                 int b3 = byteAt(scriptHex, off + 8);
-                int pushLen = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-                off += 10 + pushLen * 2;
+                // Widen to long: Java's int is signed, so b3 >= 0x80 makes the
+                // OR result negative and walks the cursor backwards, forever or
+                // past the start of the string (contract.ts uses `>>> 0` here).
+                long pushLen = ((long) (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))) & 0xffffffffL;
+                // A declared push length past the script end means a malformed
+                // script; stop scanning rather than skipping into nothing.
+                if (pushLen > (n - off - 10) / 2) break;
+                off += 10 + (int) (pushLen * 2);
             } else {
                 off += 2;
             }
@@ -1355,6 +1388,38 @@ public final class RunarContract {
      * witness param ({@code _prevOutScript_<i>} or {@code _serialisedOutputs}). */
     private static boolean isAutoInjectedWitnessParam(String paramName) {
         return paramName.startsWith("_prevOutScript_") || "_serialisedOutputs".equals(paramName);
+    }
+
+    /**
+     * Rejects a {@code null} call arg the SDK has no rule for resolving.
+     *
+     * <p>The Java tier auto-resolves exactly two slots: {@code Sig} (signed once
+     * the tx layout settles) and {@code PubKey} (taken from the signer). A
+     * {@code null} for a {@code ByteString} param is a caller mistake, and
+     * letting it through means {@link ContractScript#encodeConstructorArg}
+     * reaches its last resort — {@code encodePushData(String.valueOf(null))},
+     * i.e. the literal string {@code "02null"} spliced into the unlocking-script
+     * hex — or the call dies later with an opaque NullPointerException. Neither
+     * names the parameter the caller got wrong.
+     *
+     * <p>Auto-injected intent-witness params ({@code _prevOutScript_<i>},
+     * {@code _serialisedOutputs}) are exempt: their values come from
+     * {@link #setPrevOutScript} / {@link #setSerialisedOutputs}, not the args
+     * list, and {@link #buildIntentWitnessHex} already fails loudly when one is
+     * unset.
+     */
+    private static void rejectUnresolvableNullArg(
+        String where, RunarArtifact.ABIParam param, int index, Object value
+    ) {
+        if (value != null) return;
+        if (!"ByteString".equals(param.type())) return;
+        if (isAutoInjectedWitnessParam(param.name())) return;
+        throw new IllegalArgumentException(
+            where + ": null arg for " + param.type() + " param '" + param.name()
+                + "' (index " + index + "): null is only auto-resolved for Sig "
+                + "(auto-signed) and PubKey (taken from the signer). Pass an explicit "
+                + "value (hex string, or \"\" for an empty ByteString)"
+        );
     }
 
     private static boolean hasParam(RunarArtifact.ABIMethod m, String name) {
@@ -1452,6 +1517,8 @@ public final class RunarContract {
             if ("PubKey".equals(type) && resolved.get(i) == null && signer != null) {
                 resolved.set(i, ScriptUtils.bytesToHex(signer.pubKey()));
             }
+            rejectUnresolvableNullArg(
+                "RunarContract.prepareCall", m.params().get(i), i, resolved.get(i));
         }
 
         String unlockHex = buildUnlockingScript(m, resolved) + intentWitnessHex;
@@ -1590,6 +1657,8 @@ public final class RunarContract {
             if ("PubKey".equals(type) && resolved.get(i) == null && signer != null) {
                 resolved.set(i, ScriptUtils.bytesToHex(signer.pubKey()));
             }
+            rejectUnresolvableNullArg(
+                "RunarContract.prepareTerminalCall", m.params().get(i), i, resolved.get(i));
         }
 
         // Build the same tx layout as callTerminal: contract input +

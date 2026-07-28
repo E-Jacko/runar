@@ -326,7 +326,16 @@ public final class TransactionBuilder {
             selected.add(next);
             totalFunding += next.satoshis();
         }
-        if (change < 0) {
+        // Fail closed only when the inputs cannot cover the (non-change)
+        // contract + data outputs — the tx would spend more than it takes in
+        // and can never confirm (finding C3). Do NOT reject merely because
+        // change < 0: an exact-cover continuation (issue #116) keeps the full
+        // input value and adds no funding, so change == -fee (negative) even
+        // though the zero-fee tx is valid and the covenant accepts a no-change
+        // spend. Mirrors TS/Go/Rust/Python/Zig/Ruby
+        // (`totalInput < contractOutputSats`); the change output is still
+        // omitted below whenever change is not positive.
+        if (contractIn + totalFunding < contractOutSats + dataOutSats) {
             throw new IllegalStateException(
                 "TransactionBuilder.buildCallTransactionFull: insufficient funds: "
                     + "need fee " + fee + " + contract output " + contractOutSats
@@ -356,7 +365,10 @@ public final class TransactionBuilder {
         if (change > 0) {
             tx.addOutput(change, changeScript);
         }
-        return new CallTxResult(tx, change, selected);
+        // Report 0 (not the negative estimate) when no change output was
+        // emitted — TS/Go clamp the same way, and the reported amount is
+        // spliced into the unlocking script by RunarContract.call.
+        return new CallTxResult(tx, change > 0 ? change : 0, selected);
     }
 
     /**
@@ -429,7 +441,10 @@ public final class TransactionBuilder {
             selected.add(next);
             totalFunding += next.satoshis();
         }
-        if (change < 0) {
+        // Same fail-closed condition as buildCallTransactionFull (finding C3):
+        // reject only when the inputs cannot cover the non-change outputs, so
+        // an exact-cover / zero-fee continuation (issue #116) still builds.
+        if (contractIn + totalFunding < contractOutSats + dataOutSats) {
             throw new IllegalStateException(
                 "TransactionBuilder.buildCallTransactionFullOrdered: insufficient funds: "
                     + "need fee " + fee + " + contract outputs " + contractOutSats
@@ -455,7 +470,10 @@ public final class TransactionBuilder {
         if (change > 0) {
             tx.addOutput(change, changeScript);
         }
-        return new CallTxResult(tx, change, selected);
+        // Report 0 (not the negative estimate) when no change output was
+        // emitted — TS/Go clamp the same way, and the reported amount is
+        // spliced into the unlocking script by RunarContract.call.
+        return new CallTxResult(tx, change > 0 ? change : 0, selected);
     }
 
     /**
