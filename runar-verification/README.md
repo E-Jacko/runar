@@ -52,14 +52,54 @@ stateful change-output fixtures are byte-exact again and `state-covenant`'s
 stored constant was regenerated from the model's genuine output.
 
 Unlike the discovery-driven gates below, `pipelineGolden` carries a
-**hand-curated fixture inventory** (`expectedFixtureTotal := 49` as a
-lower bound, plus the `baselineMatches` / `cryptoAxiomPending` /
-`lowerDivergencePending` bucket lists in `tests/PipelineGolden.lean`).
-All 64 discovered fixtures are bucketed (39 baseline + 20 crypto-pending
-+ 5 lower-divergence); the gate byte-checks the 47 the Lean model
-reproduces exactly. The discovered counts in the status table (64/64)
-come from the dynamic `readDir` gates (`goldenLoad` / `roundtrip` /
-`pipelineConformance`), which auto-track the corpus.
+**hand-curated fixture inventory** (the `baselineMatches` /
+`cryptoAxiomPending` / `lowerDivergencePending` bucket lists in
+`tests/PipelineGolden.lean`). All 64 discovered fixtures are bucketed
+(39 baseline + 20 crypto-pending + 5 lower-divergence); the gate
+byte-checks the 47 the Lean model reproduces exactly. The discovered
+counts in the status table (64/64) come from the dynamic `readDir` gates
+(`goldenLoad` / `roundtrip` / `pipelineConformance`), which auto-track
+the corpus.
+
+**Finding #24 (2026-07-28)** removed the drift room in that inventory.
+`expectedFixtureTotal` (which had gone stale at `49` as a *lower bound*
+while 64 fixtures existed, so it could never fire) and
+`expectedByteExact` are now pinned by compile-time `example`s to
+`trackedFixtures.length` and to
+`baselineMatches.length + (cryptoAxiomPending.length -
+cryptoAnchorGaps.length)` respectively, and `main` enforces both with
+`=` against what the run actually observed — a count that disagrees with
+the buckets is a build error, and a count that disagrees with the run is
+a gate failure (in *either* direction; a fixture silently becoming
+byte-exact used to be a non-fatal NOTICE).
+
+The same finding gave the stored crypto byte anchors **provenance**.
+Every `cryptoAxiomPendingExpected` constant now carries an
+`AnchorProvenance` record (`cryptoAxiomPendingProvenance`) naming the
+Lean model it was established under, and each run digests the model on
+disk — `RunarVerification.lean`, every `RunarVerification/**/*.lean`, and
+`lean-toolchain`, with `tests/**` excluded — into the
+`MODEL FINGERPRINT:` line. A live anchor whose recorded fingerprint is
+not the fingerprint on disk FAILS the gate: it was derived under a
+different model, so byte-matching the golden no longer proves anything
+about the current pipeline. The two legitimate responses (re-derive via
+`RUNAR_VERIFICATION_REGEN=1`, which stamps origin `.regenLive`; or a
+reviewed re-attest that bumps `modelFingerprintAdopted` and stays
+`.inherited`) are documented in the file header.
+
+Of the 8 live anchors, **6 are `.regenLive`** — sharded live regens on
+2026-07-28 re-derived `babybear`, `babybear-ext4`, `merkle-proof`,
+`p256-primitives`, `p384-primitives` and `state-covenant` at the recorded
+fingerprint and each came back `[fresh]` in under a second (the header's
+"multi-hour regen" warning applies to the SLH-DSA / EC fixtures, not
+these). The remaining **2 stay `.inherited`**: live `compileHex` aborts
+with a Lean stack overflow (SIGABRT, exit 134) on `p256-wallet` and
+`p384-wallet`, so they cannot be re-derived at all today. Their
+constants still byte-match the golden and still count, but the
+`.inherited` tier is printed on every run rather than overclaiming them
+— and it flags a real hole in the anti-paste backstop, since an
+unsharded regen sweep dies on exactly those two fixtures. Fixing the
+overflow is separate work.
 
 `pipelineConformance` is the formal-evidence gate. It reports
 **0/63 VERIFIED-direct** and **63/63 VERIFIED-modulo-codegen-axioms**

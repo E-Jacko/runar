@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Mirror of the `runar-verification` CI job (Lean 4). Builds runar-verification/
-# and runs the goldenLoad / roundtrip / pipelineGolden gates against the 49
-# checked-in conformance fixtures.
+# and runs the goldenLoad / roundtrip / pipelineGolden gates against the
+# checked-in conformance fixtures. The exact count is not hardcoded here: it is
+# pinned inside the gate itself (`expectedFixtureTotal` in
+# runar-verification/tests/PipelineGolden.lean, compile-time-checked against
+# `trackedFixtures.length`), so it cannot drift out of sync with reality.
 #
 # Local devs without elan on PATH can set RUNAR_LEAN_STRICT=0 (default) to
 # print a notice and skip; set RUNAR_LEAN_STRICT=1 to mirror CI's hard-fail
