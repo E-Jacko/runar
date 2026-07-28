@@ -575,10 +575,7 @@ const NATIVE_COMPILERS: Record<Exclude<CompilerId, 'ts'>, NativeCompilerSpec> = 
   go: { id: 'go', find: findGoBinary, cwd: GO_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
   rust: { id: 'rust', find: findRustBinary, cwd: RUST_COMPILER_DIR, env: cargoAwareEnv, combined: true, timeoutMs: 30_000 },
   python: { id: 'python', find: () => findPythonCompiler(), cwd: PYTHON_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
-  // Zig stays on the two-spawn path: `compilers/zig/` is owned by a separate
-  // workstream, so no `--emit-ir-to` flag was added there. Flip `combined` to
-  // true once the Zig CLI grows the flag — nothing else here has to change.
-  zig: { id: 'zig', find: findZigBinary, cwd: ZIG_COMPILER_DIR, combined: false, timeoutMs: 30_000 },
+  zig: { id: 'zig', find: findZigBinary, cwd: ZIG_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
   ruby: { id: 'ruby', find: findRubyBinary, cwd: RUBY_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
   java: { id: 'java', find: findJavaBinary, cwd: JAVA_COMPILER_DIR, combined: true, timeoutMs: 30_000, tolerateHexFailure: true },
 };

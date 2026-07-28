@@ -28,6 +28,12 @@ const CompileOptions = struct {
     disable_constant_folding: bool = false,
     parse_only: bool = false,
     emit_source_map_path: ?[]const u8 = null,
+    /// `--emit-ir-to <path>`: write the SAME bytes `--emit-ir` would print to
+    /// this file and then CONTINUE compiling, so one process yields both the
+    /// ANF IR and the script hex. The conformance runner drives every tier with
+    /// `--source X --hex --emit-ir-to Y` to avoid a second parse+compile of the
+    /// same source (audit finding #17).
+    emit_ir_to_path: ?[]const u8 = null,
 };
 
 const ParseOptionsError = error{
@@ -68,6 +74,18 @@ fn parseCompileOptions(args: []const []const u8, allow_disable_constant_folding:
         }
         if (std.mem.startsWith(u8, arg, "--emit-source-map=")) {
             opts.emit_source_map_path = arg["--emit-source-map=".len..];
+            continue;
+        }
+        // --emit-ir-to <PATH> writes the canonical ANF IR JSON (byte-identical
+        // to what --emit-ir prints) to PATH, then continues compiling.
+        if (std.mem.eql(u8, arg, "--emit-ir-to")) {
+            if (i + 1 >= args.len) return error.MissingFlagValue;
+            i += 1;
+            opts.emit_ir_to_path = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--emit-ir-to=")) {
+            opts.emit_ir_to_path = arg["--emit-ir-to=".len..];
             continue;
         }
         return error.UnknownFlag;
@@ -435,6 +453,19 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
         const canonical = try json_parser.serializeCanonicalJSON(work_allocator, program);
         try writeStdout(io, canonical);
         return;
+    }
+
+    // --emit-ir-to <path>: write the SAME bytes --emit-ir would print, then
+    // fall through and keep compiling so one process can hand back both the
+    // ANF IR and the script hex (audit #17).
+    if (opts.emit_ir_to_path) |ir_path| {
+        const canonical = try json_parser.serializeCanonicalJSON(work_allocator, program);
+        var ir_file = try std.Io.Dir.cwd().createFile(io, ir_path, .{});
+        defer ir_file.close(io);
+        var ir_buf: [4096]u8 = undefined;
+        var ir_w = ir_file.writer(io, &ir_buf);
+        try ir_w.interface.writeAll(canonical);
+        try ir_w.interface.flush();
     }
 
     // Pass 5: Stack Lower
