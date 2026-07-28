@@ -259,10 +259,15 @@ pub fn encodeBigNum2Bin(allocator: std.mem.Allocator, decimal_str: []const u8, w
 /// data opcode.
 ///
 /// Applies BSV consensus rule SCRIPT_VERIFY_MINIMALDATA for single-byte
-/// pushes: a 1-byte payload whose value is in {0x00, 0x01..=0x10, 0x81}
-/// MUST use the corresponding minimal opcode (OP_0 / OP_1..OP_16 /
-/// OP_1NEGATE) rather than the direct push "01 NN". Non-minimal direct
-/// pushes are relay-rejected as "Data push larger than necessary".
+/// pushes: a 1-byte payload whose value is in {0x01..=0x10, 0x81} MUST use the
+/// corresponding minimal opcode (OP_1..OP_16 / OP_1NEGATE) rather than the
+/// direct push "01 NN". Non-minimal direct pushes are relay-rejected as
+/// "Data push larger than necessary".
+///
+/// NOTE: 0x00 is deliberately NOT in that set. OP_0 pushes the EMPTY byte
+/// array, not a 1-byte 0x00 — so the minimal encoding of a 1-byte 0x00 payload
+/// is the direct push "01 00" (matching the compiler's encodePushBytesHex in
+/// push-encoding.ts), not OP_0 (C9 / S1).
 pub fn encodePushData(allocator: std.mem.Allocator, data_hex: []const u8) ![]u8 {
     const data_len = data_hex.len / 2;
 
@@ -274,7 +279,6 @@ pub fn encodePushData(allocator: std.mem.Allocator, data_hex: []const u8) ![]u8 
     if (data_len == 1) {
         const maybe_byte: ?u8 = std.fmt.parseInt(u8, data_hex, 16) catch null;
         if (maybe_byte) |b| {
-            if (b == 0x00) return allocator.dupe(u8, "00"); // OP_0
             if (b >= 0x01 and b <= 0x10) {
                 var buf: [2]u8 = undefined;
                 _ = std.fmt.bufPrint(&buf, "{x:0>2}", .{@as(u8, @intCast(0x50 + @as(u16, b)))}) catch unreachable;
@@ -436,6 +440,20 @@ const PushDataResult = struct {
     bytes_consumed: usize,
 };
 
+/// Static hex for the single byte each of OP_1..OP_16 pushes. `PushDataResult.data`
+/// is a non-owned slice (normally borrowed from the input hex), and OP_N carries
+/// no data bytes in the script, so the value must come from a static table.
+const OP_N_BYTE_HEX = [16][]const u8{
+    "01", "02", "03", "04", "05", "06", "07", "08",
+    "09", "0a", "0b", "0c", "0d", "0e", "0f", "10",
+};
+
+/// Inverse of `encodePushData`'s MINIMALDATA short-circuit: OP_1..OP_16
+/// (0x51..0x60) and OP_1NEGATE (0x4f) each push a single byte with no separate
+/// data bytes in the script — the opcode itself encodes the value (C9). OP_0
+/// (0x00) falls through to the `opcode <= 75` branch and correctly decodes as
+/// the empty byte array (0-length push), since the encoder no longer emits
+/// OP_0 for a 1-byte 0x00 payload.
 pub fn decodePushData(hex: []const u8, offset: usize) PushDataResult {
     if (offset >= hex.len) {
         return .{ .data = "", .bytes_consumed = 0 };
@@ -443,7 +461,13 @@ pub fn decodePushData(hex: []const u8, offset: usize) PushDataResult {
 
     const opcode = hexByteAt(hex, offset) orelse return .{ .data = "", .bytes_consumed = 2 };
 
-    if (opcode <= 75) {
+    if (opcode >= 0x51 and opcode <= 0x60) {
+        // OP_1..OP_16 — the opcode IS the single-byte value.
+        return .{ .data = OP_N_BYTE_HEX[opcode - 0x51], .bytes_consumed = 2 };
+    } else if (opcode == 0x4f) {
+        // OP_1NEGATE
+        return .{ .data = "81", .bytes_consumed = 2 };
+    } else if (opcode <= 75) {
         const data_len = @as(usize, opcode) * 2;
         const start = offset + 2;
         if (start + data_len > hex.len) return .{ .data = "", .bytes_consumed = 2 };
@@ -711,13 +735,19 @@ test "encodePushData empty returns OP_0" {
 }
 
 // MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
-// {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+// {0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
 test "encodePushData MINIMALDATA single-byte opcodes" {
     const allocator = std.testing.allocator;
     {
+        // C9/S1: 0x00 is NOT a MINIMALDATA opcode case. OP_0 pushes the EMPTY
+        // byte array, not a 1-byte 0x00, so encoding a 1-byte 0x00 payload as
+        // OP_0 changes the value (and it did not round-trip). The compiler's
+        // canonical encoder encodePushBytesHex
+        // (packages/runar-compiler/src/passes/push-encoding.ts) emits "0100"
+        // for payload 00 and reserves "00"/OP_0 for a genuinely empty payload.
         const r = try encodePushData(allocator, "00");
         defer allocator.free(r);
-        try std.testing.expectEqualStrings("00", r); // OP_0
+        try std.testing.expectEqualStrings("0100", r); // direct push, NOT OP_0
     }
     {
         const r = try encodePushData(allocator, "05");

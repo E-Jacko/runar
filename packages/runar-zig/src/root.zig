@@ -244,9 +244,11 @@ test {
     _ = @import("sdk_gorillapool.zig");
     _ = @import("sdk_woc_provider.zig");
     _ = @import("sdk_script_utils.zig");
+    _ = @import("sdk_c9_s1_minimaldata_roundtrip_test.zig");
     _ = @import("sdk_anf_interpreter.zig");
     _ = @import("sdk_anf_interpreter_intent_test.zig");
     _ = @import("sdk_g1_raw_outputs_test.zig");
+    _ = @import("sdk_null_bytestring_arg_test.zig");
     _ = @import("sdk_satcounter_continuation_test.zig");
     _ = @import("sdk_envelope.zig");
     _ = @import("sdk_envelope_sign.zig");

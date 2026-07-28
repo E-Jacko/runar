@@ -12,6 +12,12 @@ const ordinals = @import("sdk_ordinals.zig");
 const errors_mod = @import("sdk_errors.zig");
 const script_utils = @import("sdk_script_utils.zig");
 
+/// The well-known ByteString parameter the SDK fills in with the transaction's
+/// concatenated outpoints (36 bytes per input) once the input list has
+/// converged. It is the ONLY ByteString slot for which the `.int = 0` call-arg
+/// sentinel is an auto-resolve request rather than a legitimate empty value.
+pub const AUTO_PREVOUTS_PARAM_NAME = "allPrevouts";
+
 // ---------------------------------------------------------------------------
 // Call-path funding fee-sizing helpers (findings C2 + C15)
 // ---------------------------------------------------------------------------
@@ -499,7 +505,7 @@ pub const RunarContract = struct {
             } else if ((std.mem.eql(u8, param_type, "ByteString") or
                 std.mem.eql(u8, param_type, "Ripemd160")) and
                 arg == .int and arg.int == 0 and
-                std.mem.eql(u8, param_name, "allPrevouts"))
+                std.mem.eql(u8, param_name, AUTO_PREVOUTS_PARAM_NAME))
             {
                 // Auto-resolve `allPrevouts`: placeholder of 36*(1+n_extra+1)
                 // zero bytes — sized for the primary contract input + every
@@ -888,8 +894,13 @@ pub const RunarContract = struct {
                     slice[j] = .{ .bytes = pk };
                 } else if ((std.mem.eql(u8, param_type, "ByteString") or
                     std.mem.eql(u8, param_type, "Ripemd160")) and
-                    arg == .int and arg.int == 0)
+                    arg == .int and arg.int == 0 and
+                    std.mem.eql(u8, user_params[j].name, AUTO_PREVOUTS_PARAM_NAME))
                 {
+                    // Same name gate as the primary resolution above: without it
+                    // a user's `.int = 0` for an ordinary ByteString param (a
+                    // legitimate empty bytestring) is replaced by the prevouts
+                    // blob, and the spend fails at script execution.
                     const placeholder_inputs: usize = 1 + n_extra_contract_inputs + 1;
                     const placeholder_hex_len: usize = 36 * 2 * placeholder_inputs;
                     const buf = try self.allocator.alloc(u8, placeholder_hex_len);
@@ -1445,7 +1456,16 @@ pub const RunarContract = struct {
                                     per_input_args[oi] = .{ .bytes = real_sig };
                                     continue;
                                 }
-                                if (std.mem.eql(u8, ptype, "ByteString") or std.mem.eql(u8, ptype, "Ripemd160")) {
+                                // Name-gated exactly like the primary resolution:
+                                // only the well-known `allPrevouts` slot is the
+                                // SDK's to fill. For any other ByteString param
+                                // `.int = 0` is the caller's own empty value, and
+                                // substituting prevouts here is what actually
+                                // reaches the chain (the placeholder pass above
+                                // is only used for fee sizing).
+                                if ((std.mem.eql(u8, ptype, "ByteString") or std.mem.eql(u8, ptype, "Ripemd160")) and
+                                    std.mem.eql(u8, user_params[oi].name, AUTO_PREVOUTS_PARAM_NAME))
+                                {
                                     const real_pv = try extractAllPrevoutsHex(self.allocator, signed_tx);
                                     per_input_args[oi].deinit(self.allocator);
                                     per_input_args[oi] = .{ .bytes = real_pv };

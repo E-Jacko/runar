@@ -104,7 +104,22 @@ fn interpretScriptElement(allocator: std.mem.Allocator, opcode: u8, data_hex: []
         return .{ .boolean = !std.mem.eql(u8, data_hex, "00") };
     }
 
-    // Default: bytes
+    // Default: bytes.
+    //
+    // S1: a ByteString (or other non-numeric) ctor arg whose 1-byte value was
+    // MINIMALDATA-encoded as OP_1..OP_16 / OP_1NEGATE carries no separate data
+    // bytes in the script — `readScriptElement` reports an empty `data_hex` for
+    // these opcodes (they aren't direct pushes or OP_PUSHDATA*). The opcode
+    // itself IS the value; reconstruct it instead of forwarding the (empty)
+    // data_hex. OP_0 correctly falls through to `data_hex` (the empty string),
+    // matching OP_0's true semantics (pushes [], not a 1-byte 0x00).
+    if (opcode >= 0x51 and opcode <= 0x60) {
+        var buf: [2]u8 = undefined;
+        _ = std.fmt.bufPrint(&buf, "{x:0>2}", .{opcode - 0x50}) catch unreachable;
+        return .{ .bytes = try allocator.dupe(u8, &buf) };
+    }
+    if (opcode == 0x4f) return .{ .bytes = try allocator.dupe(u8, "81") };
+
     return .{ .bytes = try allocator.dupe(u8, data_hex) };
 }
 
