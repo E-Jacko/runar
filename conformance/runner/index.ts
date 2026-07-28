@@ -19,7 +19,7 @@ import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { writeFileSync, readdirSync, existsSync } from 'fs';
 import { spawn } from 'child_process';
-import { runAllConformanceTests, runAllMultiFormatConformanceTests, runAllParserOnlyChecks, printParserCoverageReport, updateGoldenFiles, shutdownJavaDaemon } from './runner.js';
+import { runAllConformanceTests, runAllMultiFormatConformanceTests, runAllParserOnlyChecks, printParserCoverageReport, runAllIrParityChecks, printIrParityReport, updateGoldenFiles, shutdownJavaDaemon, getSpawnStats } from './runner.js';
 import {
   generateReport,
   formatReportAsJSON,
@@ -43,6 +43,8 @@ interface CLIOptions {
   multiFormat: boolean;
   /** When true, run the universal `--parse-only` matrix and exit. */
   parserOnly: boolean;
+  /** When true, run the IR -> hex cross-tier parity gate and exit. */
+  irParity: boolean;
   prebuild: boolean;
   help: boolean;
 }
@@ -54,6 +56,7 @@ function parseArgs(argv: string[]): CLIOptions {
     updateGolden: false,
     multiFormat: false,
     parserOnly: false,
+    irParity: false,
     // Pre-build is OFF by default to keep the runner safe to drop into CI
     // jobs that ship prebuilt binaries via actions/download-artifact. Local
     // dev loops should pass --prebuild (or set RUNAR_PREBUILD=1) to ensure
@@ -85,6 +88,9 @@ function parseArgs(argv: string[]): CLIOptions {
         break;
       case '--parser-only':
         opts.parserOnly = true;
+        break;
+      case '--ir-parity':
+        opts.irParity = true;
         break;
       case '--prebuild':
         opts.prebuild = true;
@@ -132,6 +138,15 @@ Options:
                         this mode (it scopes Stack-IR / hex parity, not the
                         frontend layer). Exits non-zero on any (compiler,
                         fixture, format) parser failure.
+  --ir-parity           Run the cross-tier IR -> hex parity gate: compile
+                        every fixture's checked-in expected-ir.json with all
+                        six non-TS compilers and require byte-identical hex,
+                        plus equality with expected-script.hex. Unlike
+                        --parser-only, the per-fixture \`compilers\` allowlist
+                        DOES scope this gate. Always fold-OFF (the goldens
+                        were stamped fold-OFF). This mode is the single
+                        source of truth for the rule that ci.yml used to
+                        re-implement inline in bash/jq.
   --prebuild            Pre-build all native compiler binaries (Go, Rust, Zig,
                         Java) before running the suite. Default: off (so CI
                         jobs that download prebuilt artifacts aren't slowed
@@ -142,6 +157,7 @@ Options:
 Environment:
   RUNAR_CONFORMANCE_CONCURRENCY  Cap on parallel test execution (default: cpus/4, capped at 8)
   RUNAR_JAVA_DAEMON=0            Disable the Java compile daemon (default: on)
+  RUNAR_CONFORMANCE_SPAWN_STATS=1  Print the child-process tally at the end of the run
   RUNAR_PREBUILD=1               Same as --prebuild
 
   --help, -h            Show this help message
@@ -161,6 +177,23 @@ Exit Code:
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/**
+ * Print the child-process tally when RUNAR_CONFORMANCE_SPAWN_STATS=1. Every
+ * compiler invocation goes through `runCmd`, so this is an exact count — the
+ * cheapest way to confirm the runner is still on the single-spawn
+ * (`--hex --emit-ir-to`) path rather than the `--emit-ir` + `--hex` double.
+ */
+function maybePrintSpawnStats(): void {
+  if (process.env.RUNAR_CONFORMANCE_SPAWN_STATS !== '1') return;
+  const stats = getSpawnStats();
+  console.log('');
+  console.log(`Compiler subprocess spawns: ${stats.total}`);
+  for (const [cmd, n] of Object.entries(stats.byCommand).sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${cmd.padEnd(24)} ${n}`);
+  }
+  console.log('');
+}
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
@@ -188,8 +221,35 @@ async function main(): Promise<void> {
     const elapsedMs = Date.now() - startedAt;
     console.log(`\nCompleted ${report.entries.length} (fixture × format) parse checks in ${(elapsedMs / 1000).toFixed(1)}s.`);
     printParserCoverageReport(report);
+    maybePrintSpawnStats();
     await shutdownJavaDaemon();
     if (!report.allOk) {
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Handle --ir-parity mode (cross-tier IR -> hex parity gate). Compiles
+  // every fixture's checked-in expected-ir.json with all six non-TS tiers
+  // and requires byte-identical hex + equality with expected-script.hex.
+  // The per-fixture `compilers` allowlist DOES scope this gate (it scopes
+  // Stack-IR / hex parity — which is exactly what this is). Always fold-OFF.
+  // See runner.ts for why this is the single source of truth.
+  if (opts.irParity) {
+    console.log(`Running cross-tier IR -> hex parity check from: ${opts.testsDir}`);
+    if (opts.filter) console.log(`Filter: ${opts.filter}`);
+    console.log('');
+    const startedAt = Date.now();
+    const report = await runAllIrParityChecks(opts.testsDir, { filter: opts.filter });
+    const elapsedMs = Date.now() - startedAt;
+    console.log(`\nCompleted ${report.results.length} fixture parity checks in ${(elapsedMs / 1000).toFixed(1)}s.`);
+    printIrParityReport(report);
+    maybePrintSpawnStats();
+    await shutdownJavaDaemon();
+    if (!report.allOk) {
+      for (const f of report.failures) {
+        console.error(`::error::conformance: ${f.fixture} — ${f.error.split('\n')[0]}`);
+      }
       process.exit(1);
     }
     return;
@@ -264,6 +324,8 @@ async function main(): Promise<void> {
       break;
     }
   }
+
+  maybePrintSpawnStats();
 
   // Tear down the Java daemon (if any). We do this before process.exit so
   // the JVM gets a clean shutdown rather than a SIGKILL on parent exit.

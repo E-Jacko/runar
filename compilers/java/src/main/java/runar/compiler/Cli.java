@@ -186,6 +186,15 @@ public final class Cli {
             return 0;
         }
 
+        // --emit-ir-to writes the SAME bytes --emit-ir prints to a file and
+        // then CONTINUES (like --emit-source-map above), so `--source X --hex
+        // --emit-ir-to Y` yields both artefacts from one process. The
+        // conformance runner uses this to halve its compiler spawns.
+        if (parsed.emitIrTo != null) {
+            int rc = writeIrTo(anf, parsed.emitIrTo);
+            if (rc != 0) return rc;
+        }
+
         if (parsed.hex) {
             return emitHex(anf);
         }
@@ -194,6 +203,24 @@ public final class Cli {
         // the other compilers' behaviour when --emit-ir is implied.
         out.println(Jcs.stringify(anf));
         return 0;
+    }
+
+    /**
+     * Write the canonical ANF JSON (identical to what {@code --emit-ir}
+     * prints) to {@code path}. The path's parent directory is created on
+     * demand. Returns 0 on success, non-zero on failure.
+     */
+    private int writeIrTo(AnfProgram anf, String path) {
+        try {
+            Path irPath = Path.of(path);
+            Path parent = irPath.getParent();
+            if (parent != null) Files.createDirectories(parent);
+            Files.writeString(irPath, Jcs.stringify(anf) + "\n");
+            return 0;
+        } catch (IOException e) {
+            err.println("runar-java: cannot write IR to " + path + ": " + e.getMessage());
+            return 74;
+        }
     }
 
     /**
@@ -347,6 +374,7 @@ public final class Cli {
         stream.println("  --source <path>              source file (.runar.{ts,sol,move,py,go,rs,zig,rb,java})");
         stream.println("  --ir <path>                  pre-generated ANF JSON");
         stream.println("  --emit-ir                    emit canonical ANF JSON on stdout");
+        stream.println("  --emit-ir-to <path>          write canonical ANF JSON to <path> and keep compiling");
         stream.println("  --hex                        emit Bitcoin Script hex on stdout");
         stream.println("  --disable-constant-folding   disable the constant-folding optimizer (required for conformance)");
         stream.println("  --emit-source-map <path>     write the artifact's sourceMap JSON to <path>");
@@ -603,6 +631,11 @@ public final class Cli {
         // GAP-002: when non-null, after compile finishes write the
         // sourceMap object ({"mappings":[...]}) to this path.
         String emitSourceMap;
+        // When non-null, write the canonical ANF JSON (the same bytes
+        // --emit-ir prints) to this path and CONTINUE, so a single process
+        // can hand back both the IR and the script hex. Used by the
+        // conformance runner's single-spawn mode.
+        String emitIrTo;
 
         static Args parse(String[] argv) {
             Args out = new Args();
@@ -613,10 +646,15 @@ public final class Cli {
                     out.emitSourceMap = arg.substring("--emit-source-map=".length());
                     continue;
                 }
+                if (arg.startsWith("--emit-ir-to=")) {
+                    out.emitIrTo = arg.substring("--emit-ir-to=".length());
+                    continue;
+                }
                 switch (arg) {
                     case "--source" -> out.source = requireValue(list, "--source");
                     case "--ir" -> out.ir = requireValue(list, "--ir");
                     case "--emit-ir" -> out.emitIr = true;
+                    case "--emit-ir-to" -> out.emitIrTo = requireValue(list, "--emit-ir-to");
                     case "--hex" -> out.hex = true;
                     case "--parse-only" -> out.parseOnly = true;
                     case "--disable-constant-folding" -> out.disableConstantFolding = true;

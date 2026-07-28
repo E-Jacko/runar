@@ -45,7 +45,39 @@ interface RunOptions {
   maxBuffer?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Subprocess accounting
+// ---------------------------------------------------------------------------
+//
+// Every compiler invocation goes through `runCmd`, so counting here gives an
+// exact process-spawn tally for a run. Used by
+// `runner/__tests__/single-spawn.test.ts` to keep the "one spawn per
+// (fixture, format, tier)" invariant from regressing back to the old
+// `--emit-ir` + `--hex` double-spawn.
+
+let spawnTotal = 0;
+const spawnByCommand = new Map<string, number>();
+
+export interface SpawnStats {
+  /** Total child processes spawned since the last `resetSpawnStats()`. */
+  total: number;
+  /** Per-command tally, keyed by the command's basename. */
+  byCommand: Record<string, number>;
+}
+
+export function getSpawnStats(): SpawnStats {
+  return { total: spawnTotal, byCommand: Object.fromEntries(spawnByCommand) };
+}
+
+export function resetSpawnStats(): void {
+  spawnTotal = 0;
+  spawnByCommand.clear();
+}
+
 function runCmd(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
+  spawnTotal++;
+  const key = basename(cmd);
+  spawnByCommand.set(key, (spawnByCommand.get(key) ?? 0) + 1);
   return new Promise((resolvePromise) => {
     const proc = spawn(cmd, args, {
       cwd: opts.cwd,
@@ -500,126 +532,195 @@ async function runTsCompiler(source: string, sourceFile: string): Promise<Compil
   }
 }
 
+// ---------------------------------------------------------------------------
+// Native (non-TS) compiler driver — ONE implementation for all six tiers
+// ---------------------------------------------------------------------------
+//
+// Go / Rust / Python / Zig / Ruby / Java previously each carried their own
+// copy of "write temp source, run `--emit-ir`, run `--hex`, canonicalize".
+// That was six places to keep in sync AND two process spawns per (fixture,
+// format, tier) — the dominant cost of the conformance job.
+//
+// Single-spawn mode: tiers whose CLI accepts `--emit-ir-to <path>` get
+// `--source X --hex --emit-ir-to Y` in ONE invocation; the IR lands in the
+// file (byte-identical to what `--emit-ir` prints — the CLIs share the
+// serializer) while the hex comes back on stdout. Tiers without the flag,
+// and tiers whose on-disk binary predates it, fall back to the historical
+// two-spawn path with no loss of coverage.
+
+interface NativeCompilerSpec {
+  id: Exclude<CompilerId, 'ts'>;
+  /** Locate the binary (or interpreter invocation phrase); null = unavailable. */
+  find: () => string | null;
+  /** Working directory for the child process. */
+  cwd: string;
+  /** Optional environment override (Rust needs ~/.cargo/bin on PATH). */
+  env?: () => NodeJS.ProcessEnv;
+  /**
+   * Whether this tier's CLI supports `--emit-ir-to <path>` (write the IR to a
+   * file, keep compiling). `false` pins the tier to the two-spawn path.
+   */
+  combined: boolean;
+  timeoutMs: number;
+  /**
+   * When true, a non-zero exit is tolerated AS LONG AS the IR was produced;
+   * scriptHex is then left empty. Preserves the Java one-shot path's historical
+   * leniency (`compareScript` still treats success-with-empty-hex as a
+   * mismatch, so nothing is silently swallowed).
+   */
+  tolerateHexFailure?: boolean;
+}
+
+const NATIVE_COMPILERS: Record<Exclude<CompilerId, 'ts'>, NativeCompilerSpec> = {
+  go: { id: 'go', find: findGoBinary, cwd: GO_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
+  rust: { id: 'rust', find: findRustBinary, cwd: RUST_COMPILER_DIR, env: cargoAwareEnv, combined: true, timeoutMs: 30_000 },
+  python: { id: 'python', find: () => findPythonCompiler(), cwd: PYTHON_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
+  // Zig stays on the two-spawn path: `compilers/zig/` is owned by a separate
+  // workstream, so no `--emit-ir-to` flag was added there. Flip `combined` to
+  // true once the Zig CLI grows the flag — nothing else here has to change.
+  zig: { id: 'zig', find: findZigBinary, cwd: ZIG_COMPILER_DIR, combined: false, timeoutMs: 30_000 },
+  ruby: { id: 'ruby', find: findRubyBinary, cwd: RUBY_COMPILER_DIR, combined: true, timeoutMs: 30_000 },
+  java: { id: 'java', find: findJavaBinary, cwd: JAVA_COMPILER_DIR, combined: true, timeoutMs: 30_000, tolerateHexFailure: true },
+};
+
 /**
- * Run the Go compiler on the given source. Returns undefined if the Go
- * compiler is not available.
+ * Stderr signatures every CLI framework we drive emits for an unrecognized
+ * flag (Go `flag`, clap, argparse, Ruby OptionParser, the Java hand-rolled
+ * parser). Used to distinguish "this binary predates --emit-ir-to" from a
+ * genuine compile failure.
  */
-async function runGoCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
-  const binary = findGoBinary();
+const UNKNOWN_FLAG_RE =
+  /flag provided but not defined|unexpected argument|unrecognized argument|invalid option|unknown flag|unknown option|no such option/i;
+
+/** Tiers whose on-disk binary turned out NOT to support `--emit-ir-to`. */
+const combinedModeUnsupported = new Set<CompilerId>();
+
+/**
+ * Compile `source` with a native tier and return both its ANF IR and its
+ * script hex. Returns undefined when the tier's binary is not on disk.
+ */
+async function runNativeCompiler(
+  spec: NativeCompilerSpec,
+  source: string,
+  sourceFile: string,
+): Promise<CompilerOutput | undefined> {
+  const binary = spec.find();
   if (!binary) return undefined;
-  const { cmd, args: bin_args } = splitCmd(binary);
+  const { cmd, args: binArgs } = splitCmd(binary);
+  const env = spec.env?.();
+  const runOpts: RunOptions = { timeoutMs: spec.timeoutMs, cwd: spec.cwd, env };
 
   const start = performance.now();
-  let tmpFile = '';
+  const tmpDir = join(__dirname, '..', '.tmp');
+  const stem = `${spec.id}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tmpFile = join(tmpDir, `${stem}-${basename(sourceFile)}`);
+  const irFile = join(tmpDir, `${stem}.ir.json`);
+
   try {
-    const tmpDir = join(__dirname, '..', '.tmp');
     if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `go-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`);
     writeFileSync(tmpFile, source, 'utf-8');
 
-    // Get IR output
-    const irRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--emit-ir', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: GO_COMPILER_DIR },
-    );
-    if (irRes.code !== 0) {
-      throw new Error(`go --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
-    }
-    const irOutput = irRes.stdout.trim();
+    let irOutput: string | null = null;
+    let scriptHexOutput = '';
 
-    // Get script hex output
-    const hexRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--hex', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: GO_COMPILER_DIR },
-    );
-    if (hexRes.code !== 0) {
-      throw new Error(`go --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
+    // --- single-spawn path -------------------------------------------------
+    if (spec.combined && !combinedModeUnsupported.has(spec.id)) {
+      const res = await runCmd(
+        cmd,
+        [...binArgs, '--source', tmpFile, '--hex', '--emit-ir-to', irFile, ...foldFlag()],
+        runOpts,
+      );
+      if (existsSync(irFile)) {
+        // The CLI writes the IR file BEFORE emitting hex, so an IR file plus a
+        // non-zero exit means the hex stage failed — a real compile error.
+        if (res.code === 0) {
+          irOutput = readFileSync(irFile, 'utf-8').trim();
+          scriptHexOutput = res.stdout.trim();
+        } else if (spec.tolerateHexFailure) {
+          irOutput = readFileSync(irFile, 'utf-8').trim();
+          scriptHexOutput = '';
+        } else {
+          throw new Error(
+            `${spec.id} --hex --emit-ir-to exit ${res.code}: ${res.stderr || res.stdout}`,
+          );
+        }
+      } else if (res.code !== 0 && UNKNOWN_FLAG_RE.test(res.stderr)) {
+        // Stale binary built before --emit-ir-to landed. Remember it and use
+        // the two-spawn path for the rest of this process.
+        combinedModeUnsupported.add(spec.id);
+      } else if (res.code === 0) {
+        // Flag silently ignored (should not happen) — degrade rather than
+        // report an empty IR as a parity mismatch.
+        combinedModeUnsupported.add(spec.id);
+      } else {
+        throw new Error(
+          `${spec.id} --hex --emit-ir-to exit ${res.code}: ${res.stderr || res.stdout}`,
+        );
+      }
     }
-    const scriptHexOutput = hexRes.stdout.trim();
 
-    const durationMs = performance.now() - start;
+    // --- two-spawn fallback ------------------------------------------------
+    if (irOutput === null) {
+      const irRes = await runCmd(
+        cmd,
+        [...binArgs, '--source', tmpFile, '--emit-ir', ...foldFlag()],
+        runOpts,
+      );
+      if (irRes.code !== 0) {
+        throw new Error(`${spec.id} --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
+      }
+      irOutput = irRes.stdout.trim();
+
+      const hexRes = await runCmd(
+        cmd,
+        [...binArgs, '--source', tmpFile, '--hex', ...foldFlag()],
+        runOpts,
+      );
+      if (hexRes.code === 0) {
+        scriptHexOutput = hexRes.stdout.trim();
+      } else if (spec.tolerateHexFailure) {
+        scriptHexOutput = '';
+      } else {
+        throw new Error(`${spec.id} --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
+      }
+    }
+
     return {
       irJson: canonicalizeJson(irOutput),
       scriptHex: scriptHexOutput,
       scriptAsm: '',
       success: true,
-      durationMs,
+      durationMs: performance.now() - start,
     };
   } catch (err) {
-    const durationMs = performance.now() - start;
     return {
       irJson: '',
       scriptHex: '',
       scriptAsm: '',
       success: false,
       error: err instanceof Error ? err.message : String(err),
-      durationMs,
+      durationMs: performance.now() - start,
     };
   } finally {
-    if (tmpFile) safeRm(tmpFile);
+    safeRm(tmpFile);
+    safeRm(irFile);
   }
+}
+
+/**
+ * Run the Go compiler on the given source. Returns undefined if the Go
+ * compiler is not available.
+ */
+function runGoCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
+  return runNativeCompiler(NATIVE_COMPILERS.go, source, sourceFile);
 }
 
 /**
  * Run the Rust compiler on the given source. Returns undefined if the Rust
  * compiler is not available.
  */
-async function runRustCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
-  const binary = findRustBinary();
-  if (!binary) return undefined;
-  const { cmd, args: bin_args } = splitCmd(binary);
-
-  const start = performance.now();
-  let tmpFile = '';
-  try {
-    const tmpDir = join(__dirname, '..', '.tmp');
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `rust-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`);
-    writeFileSync(tmpFile, source, 'utf-8');
-
-    const irRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--emit-ir', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: RUST_COMPILER_DIR, env: cargoAwareEnv() },
-    );
-    if (irRes.code !== 0) {
-      throw new Error(`rust --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
-    }
-    const irOutput = irRes.stdout.trim();
-
-    const hexRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--hex', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: RUST_COMPILER_DIR, env: cargoAwareEnv() },
-    );
-    if (hexRes.code !== 0) {
-      throw new Error(`rust --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
-    }
-    const scriptHexOutput = hexRes.stdout.trim();
-
-    const durationMs = performance.now() - start;
-    return {
-      irJson: canonicalizeJson(irOutput),
-      scriptHex: scriptHexOutput,
-      scriptAsm: '',
-      success: true,
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = performance.now() - start;
-    return {
-      irJson: '',
-      scriptHex: '',
-      scriptAsm: '',
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-      durationMs,
-    };
-  } finally {
-    if (tmpFile) safeRm(tmpFile);
-  }
+function runRustCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
+  return runNativeCompiler(NATIVE_COMPILERS.rust, source, sourceFile);
 }
 
 /**
@@ -644,60 +745,8 @@ function findPythonCompiler(): string | null {
  * Run the Python compiler on the given source. Returns undefined if the Python
  * compiler is not available.
  */
-async function runPythonCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
-  const binary = findPythonCompiler();
-  if (!binary) return undefined;
-  const { cmd, args: bin_args } = splitCmd(binary);
-
-  const start = performance.now();
-  let tmpFile = '';
-  try {
-    const tmpDir = join(__dirname, '..', '.tmp');
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `python-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`);
-    writeFileSync(tmpFile, source, 'utf-8');
-
-    const irRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--emit-ir', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: PYTHON_COMPILER_DIR },
-    );
-    if (irRes.code !== 0) {
-      throw new Error(`python --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
-    }
-    const irOutput = irRes.stdout.trim();
-
-    const hexRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--hex', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: PYTHON_COMPILER_DIR },
-    );
-    if (hexRes.code !== 0) {
-      throw new Error(`python --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
-    }
-    const scriptHexOutput = hexRes.stdout.trim();
-
-    const durationMs = performance.now() - start;
-    return {
-      irJson: canonicalizeJson(irOutput),
-      scriptHex: scriptHexOutput,
-      scriptAsm: '',
-      success: true,
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = performance.now() - start;
-    return {
-      irJson: '',
-      scriptHex: '',
-      scriptAsm: '',
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-      durationMs,
-    };
-  } finally {
-    if (tmpFile) safeRm(tmpFile);
-  }
+function runPythonCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
+  return runNativeCompiler(NATIVE_COMPILERS.python, source, sourceFile);
 }
 
 /**
@@ -731,60 +780,8 @@ export function findZigBinary(): string | null {
  * Run the Zig compiler on the given source. Returns undefined if the Zig
  * compiler is not available.
  */
-async function runZigCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
-  const binary = findZigBinary();
-  if (!binary) return undefined;
-  const { cmd, args: bin_args } = splitCmd(binary);
-
-  const start = performance.now();
-  let tmpFile = '';
-  try {
-    const tmpDir = join(__dirname, '..', '.tmp');
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `zig-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`);
-    writeFileSync(tmpFile, source, 'utf-8');
-
-    const irRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--emit-ir', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: ZIG_COMPILER_DIR },
-    );
-    if (irRes.code !== 0) {
-      throw new Error(`zig --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
-    }
-    const irOutput = irRes.stdout.trim();
-
-    const hexRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--hex', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: ZIG_COMPILER_DIR },
-    );
-    if (hexRes.code !== 0) {
-      throw new Error(`zig --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
-    }
-    const scriptHexOutput = hexRes.stdout.trim();
-
-    const durationMs = performance.now() - start;
-    return {
-      irJson: canonicalizeJson(irOutput),
-      scriptHex: scriptHexOutput,
-      scriptAsm: '',
-      success: true,
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = performance.now() - start;
-    return {
-      irJson: '',
-      scriptHex: '',
-      scriptAsm: '',
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-      durationMs,
-    };
-  } finally {
-    if (tmpFile) safeRm(tmpFile);
-  }
+function runZigCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
+  return runNativeCompiler(NATIVE_COMPILERS.zig, source, sourceFile);
 }
 
 /**
@@ -805,60 +802,8 @@ export function findRubyBinary(): string | null {
  * Run the Ruby compiler on the given source. Returns undefined if the Ruby
  * compiler is not available.
  */
-async function runRubyCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
-  const binary = findRubyBinary();
-  if (!binary) return undefined;
-  const { cmd, args: bin_args } = splitCmd(binary);
-
-  const start = performance.now();
-  let tmpFile = '';
-  try {
-    const tmpDir = join(__dirname, '..', '.tmp');
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `ruby-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`);
-    writeFileSync(tmpFile, source, 'utf-8');
-
-    const irRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--emit-ir', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: RUBY_COMPILER_DIR },
-    );
-    if (irRes.code !== 0) {
-      throw new Error(`ruby --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
-    }
-    const irOutput = irRes.stdout.trim();
-
-    const hexRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--hex', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: RUBY_COMPILER_DIR },
-    );
-    if (hexRes.code !== 0) {
-      throw new Error(`ruby --hex exit ${hexRes.code}: ${hexRes.stderr || hexRes.stdout}`);
-    }
-    const scriptHexOutput = hexRes.stdout.trim();
-
-    const durationMs = performance.now() - start;
-    return {
-      irJson: canonicalizeJson(irOutput),
-      scriptHex: scriptHexOutput,
-      scriptAsm: '',
-      success: true,
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = performance.now() - start;
-    return {
-      irJson: '',
-      scriptHex: '',
-      scriptAsm: '',
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-      durationMs,
-    };
-  } finally {
-    if (tmpFile) safeRm(tmpFile);
-  }
+function runRubyCompiler(source: string, sourceFile: string): Promise<CompilerOutput | undefined> {
+  return runNativeCompiler(NATIVE_COMPILERS.ruby, source, sourceFile);
 }
 
 /**
@@ -1013,58 +958,9 @@ async function runJavaCompiler(source: string, sourceFile: string): Promise<Comp
     }
   }
 
-  // One-shot mode (original behaviour, for `RUNAR_JAVA_DAEMON=0`).
-  const binary = findJavaBinary();
-  if (!binary) return undefined;
-  const { cmd, args: bin_args } = splitCmd(binary);
-  let tmpFile = '';
-  try {
-    const tmpDir = join(__dirname, '..', '.tmp');
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `java-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`);
-    writeFileSync(tmpFile, source, 'utf-8');
-
-    const irRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--emit-ir', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: JAVA_COMPILER_DIR },
-    );
-    if (irRes.code !== 0) {
-      throw new Error(`java --emit-ir exit ${irRes.code}: ${irRes.stderr || irRes.stdout}`);
-    }
-    const irOutput = irRes.stdout.trim();
-
-    let scriptHex = '';
-    const hexRes = await runCmd(
-      cmd,
-      [...bin_args, '--source', tmpFile, '--hex', ...foldFlag()],
-      { timeoutMs: 30_000, cwd: JAVA_COMPILER_DIR },
-    );
-    if (hexRes.code === 0) {
-      scriptHex = hexRes.stdout.trim();
-    }
-
-    const durationMs = performance.now() - start;
-    return {
-      irJson: canonicalizeJson(irOutput),
-      scriptHex,
-      scriptAsm: '',
-      success: true,
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = performance.now() - start;
-    return {
-      irJson: '',
-      scriptHex: '',
-      scriptAsm: '',
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-      durationMs,
-    };
-  } finally {
-    if (tmpFile) safeRm(tmpFile);
-  }
+  // One-shot mode (original behaviour, for `RUNAR_JAVA_DAEMON=0`). Uses the
+  // shared native driver, which prefers the single-spawn `--emit-ir-to` form.
+  return runNativeCompiler(NATIVE_COMPILERS.java, source, sourceFile);
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,6 +1411,252 @@ export function printParserCoverageReport(report: ParserCoverageReport): void {
       console.log(`    ${s.fixture}: ${oneLineError}`);
     }
   }
+  console.log('');
+}
+
+// ---------------------------------------------------------------------------
+// IR -> hex cross-tier parity (the `--ir-parity` mode)
+// ---------------------------------------------------------------------------
+//
+// THIS FILE IS THE SINGLE SOURCE OF TRUTH for "do all tiers agree
+// byte-for-byte". The rule used to be written three times — here, inline in
+// `.github/workflows/ci.yml`, and in
+// `runar-verification/scripts/cross-compiler-diff.sh` — each with its own
+// allowlist handling, so a fix to one silently left the others wrong. The
+// ci.yml copy has been deleted; that workflow step now shells out to
+// `runner/index.ts --ir-parity`. (The runar-verification script remains a
+// separate implementation: it is the Tier-6.1 verification gate and also
+// drives the Lean reference tier, which this runner does not know about. If
+// you change parity or allowlist semantics here, mirror it there.)
+//
+// Semantics, preserved exactly from the ci.yml loop this replaces:
+//   * Input is the checked-in `expected-ir.json`, NOT source — this gates
+//     each tier's `--ir` loader + Stack-IR/emit path, complementing the
+//     source-driven multi-format mode.
+//   * Only the six NON-TS tiers participate. TS is covered by the
+//     multi-format runner (which compiles from source).
+//   * The per-fixture `compilers` allowlist in source.json SCOPES this gate
+//     (unlike `--parser-only`, where it is intentionally ignored). A fixture
+//     whose allowlist has no overlap with the six tiers is skipped.
+//   * Always fold-OFF: the goldens were stamped fold-OFF, so this mode pins
+//     `--disable-constant-folding` regardless of
+//     RUNAR_DISABLE_CONSTANT_FOLDING. Fold-ON parity is the multi-format
+//     runner's job.
+//   * Reference tier is Go when active, else the first active tier. Every
+//     other active tier must match it, and the reference must match
+//     `expected-script.hex` when that golden exists.
+
+/** The tiers driven by `--ir-parity`, in the ci.yml loop's original order. */
+const IR_PARITY_COMPILERS: readonly Exclude<CompilerId, 'ts'>[] = [
+  'go', 'rust', 'zig', 'ruby', 'python', 'java',
+] as const;
+
+export interface IrParityFixtureResult {
+  fixture: string;
+  status: 'ok' | 'skipped' | 'failed';
+  /** Tiers actually driven for this fixture (allowlist ∩ available). */
+  activeCompilers: CompilerId[];
+  /** Tiers excluded by the fixture's `compilers` allowlist. */
+  allowlistExcluded: CompilerId[];
+  /** Tiers skipped because their binary is not on disk (local dev only). */
+  unavailable: CompilerId[];
+  reference?: CompilerId;
+  hexByCompiler: Record<string, string>;
+  skipReason?: string;
+  errors: string[];
+}
+
+export interface IrParityReport {
+  results: IrParityFixtureResult[];
+  allOk: boolean;
+  /** Flattened failures for easy printing. */
+  failures: Array<{ fixture: string; error: string }>;
+}
+
+/**
+ * Compile a fixture's `expected-ir.json` to hex with one native tier.
+ * Returns null when the tier's binary is not on disk.
+ */
+async function runIrToHex(
+  id: Exclude<CompilerId, 'ts'>,
+  irPath: string,
+): Promise<{ code: number; hex: string; stderr: string } | null> {
+  const spec = NATIVE_COMPILERS[id];
+  const binary = spec.find();
+  if (!binary) return null;
+  const { cmd, args: binArgs } = splitCmd(binary);
+  // Zig's IR consumer is a positional subcommand (`compile-ir <file>`) and
+  // takes no fold flag — matching the ci.yml loop this replaces.
+  const args = id === 'zig'
+    ? [...binArgs, 'compile-ir', irPath, '--hex']
+    : [...binArgs, '--ir', irPath, '--hex', '--disable-constant-folding'];
+  const res = await runCmd(cmd, args, {
+    timeoutMs: spec.timeoutMs,
+    cwd: spec.cwd,
+    env: spec.env?.(),
+  });
+  // Zig interleaves allocator diagnostics with its output; keep only the
+  // first line, exactly as the ci.yml loop's `head -1` did.
+  const raw = id === 'zig' ? (res.stdout.split('\n')[0] ?? '') : res.stdout;
+  return { code: res.code, hex: raw.replace(/\s/g, '').toLowerCase(), stderr: res.stderr };
+}
+
+/**
+ * Cross-tier IR -> hex parity over every fixture that ships an
+ * `expected-ir.json`. See the block comment above for the exact semantics.
+ */
+export async function runAllIrParityChecks(
+  testsDir: string,
+  options?: { filter?: string },
+): Promise<IrParityReport> {
+  // CI safety net: a missing binary must not silently shrink the tier set.
+  assertAllCompilersAvailableInCi();
+
+  const entries = readdirSync(testsDir, { withFileTypes: true });
+  let testDirs = entries
+    .filter((e) => e.isDirectory())
+    .map((e) => join(testsDir, e.name))
+    .sort();
+  if (options?.filter) {
+    const filterLower = options.filter.toLowerCase();
+    testDirs = testDirs.filter((d) => basename(d).toLowerCase().includes(filterLower));
+  }
+  testDirs = testDirs.filter((d) => existsSync(join(d, 'expected-ir.json')));
+
+  const limit = makeLimiter(defaultConcurrency());
+  const results = await Promise.all(testDirs.map((testDir) => limit(async (): Promise<IrParityFixtureResult> => {
+    const fixture = basename(testDir);
+    const irPath = join(testDir, 'expected-ir.json');
+    const allowlist = readFixtureCompilerAllowlist(testDir);
+
+    const inScope = IR_PARITY_COMPILERS.filter((c) => !allowlist || allowlist.has(c));
+    const allowlistExcluded = IR_PARITY_COMPILERS.filter((c) => allowlist !== null && !allowlist.has(c));
+
+    if (inScope.length === 0) {
+      // Allowlist had no overlap with the six non-TS tiers (e.g. a ts-only
+      // fixture). Covered by the TS-side multi-format runner.
+      return {
+        fixture,
+        status: 'skipped',
+        activeCompilers: [],
+        allowlistExcluded,
+        unavailable: [],
+        hexByCompiler: {},
+        skipReason: 'no non-TS compilers in allowlist',
+        errors: [],
+      };
+    }
+
+    const errors: string[] = [];
+    const hexByCompiler: Record<string, string> = {};
+    const unavailable: CompilerId[] = [];
+    const active: CompilerId[] = [];
+
+    const runs = await Promise.all(inScope.map(async (id) => ({ id, res: await runIrToHex(id, irPath) })));
+    for (const { id, res } of runs) {
+      if (res === null) {
+        unavailable.push(id);
+        continue;
+      }
+      active.push(id);
+      if (res.code !== 0) {
+        errors.push(`${id}: non-zero exit ${res.code}: ${(res.stderr || '').split('\n').slice(0, 5).join(' | ')}`);
+        continue;
+      }
+      if (res.hex === '') {
+        errors.push(`${id}: empty hex output`);
+        continue;
+      }
+      hexByCompiler[id] = res.hex;
+    }
+
+    if (errors.length > 0) {
+      return { fixture, status: 'failed', activeCompilers: active, allowlistExcluded, unavailable, hexByCompiler, errors };
+    }
+
+    if (active.length === 0) {
+      return {
+        fixture,
+        status: 'skipped',
+        activeCompilers: [],
+        allowlistExcluded,
+        unavailable,
+        hexByCompiler,
+        skipReason: 'no compiler binaries available locally',
+        errors: [],
+      };
+    }
+
+    // Reference tier: Go when in scope, else the first active tier.
+    const reference = (active.includes('go') ? 'go' : active[0]!) as CompilerId;
+    const refHex = hexByCompiler[reference]!;
+
+    for (const id of active) {
+      if (id === reference) continue;
+      if (hexByCompiler[id] !== refHex) {
+        errors.push(
+          `${reference} hex differs from ${id} hex\n` +
+          `    ${reference}: ${refHex}\n` +
+          `    ${id}: ${hexByCompiler[id]}`,
+        );
+      }
+    }
+
+    // Golden comparison against expected-script.hex (fold-OFF stamped).
+    const goldenPath = join(testDir, 'expected-script.hex');
+    if (existsSync(goldenPath)) {
+      const expected = readFileSync(goldenPath, 'utf-8').replace(/\s/g, '').toLowerCase();
+      if (expected !== '' && refHex !== expected) {
+        errors.push(
+          `${reference} output does not match golden file\n` +
+          `    ${reference}: ${refHex}\n` +
+          `    expected:  ${expected}`,
+        );
+      }
+    }
+
+    return {
+      fixture,
+      status: errors.length === 0 ? 'ok' : 'failed',
+      activeCompilers: active,
+      allowlistExcluded,
+      unavailable,
+      reference,
+      hexByCompiler,
+      errors,
+    };
+  })));
+
+  const failures = results.flatMap((r) => r.errors.map((error) => ({ fixture: r.fixture, error })));
+  return { results, allOk: failures.length === 0, failures };
+}
+
+/** Pretty-print an IR -> hex parity report to stdout. */
+export function printIrParityReport(report: IrParityReport): void {
+  console.log('');
+  console.log('Cross-tier IR -> hex parity (expected-ir.json compiled by every non-TS tier):');
+  console.log('');
+  for (const r of report.results) {
+    if (r.status === 'skipped') {
+      console.log(`  === ${r.fixture} === SKIP (${r.skipReason})`);
+      continue;
+    }
+    const activeCsv = r.activeCompilers.join(',');
+    if (r.status === 'ok') {
+      const refHex = r.reference ? r.hexByCompiler[r.reference] ?? '' : '';
+      console.log(`  === ${r.fixture} === active=[${activeCsv}] OK (${refHex.length} hex chars, ref=${r.reference})`);
+    } else {
+      console.log(`  === ${r.fixture} === active=[${activeCsv}] FAIL`);
+      for (const e of r.errors) {
+        console.log(`    ${e}`);
+      }
+    }
+  }
+  console.log('');
+  const ok = report.results.filter((r) => r.status === 'ok').length;
+  const skipped = report.results.filter((r) => r.status === 'skipped').length;
+  const failed = report.results.filter((r) => r.status === 'failed').length;
+  console.log(`  ${ok} ok, ${failed} failed, ${skipped} skipped (${report.results.length} fixtures with expected-ir.json)`);
   console.log('');
 }
 

@@ -98,6 +98,13 @@ module RunarCompiler
           options[:emit_ir] = true
         end
 
+        opts.on(
+          "--emit-ir-to PATH",
+          "Write the ANF IR JSON (same bytes as --emit-ir) to PATH and keep compiling (requires --source)"
+        ) do |path|
+          options[:emit_ir_to] = path
+        end
+
         opts.on("--parse-only", "Stop after parse + validate; print 'parser ok' on success (requires --source)") do
           options[:parse_only] = true
         end
@@ -169,6 +176,31 @@ module RunarCompiler
         ir_json = JSON.pretty_generate(_anf_to_camel_dict(program))
         puts ir_json
         return
+      end
+
+      # Handle --emit-ir-to: write the SAME bytes --emit-ir would print to a
+      # file, then fall through to the normal compile below. The conformance
+      # runner uses this to collect IR + hex from a single spawn.
+      if options[:emit_ir_to]
+        unless options[:source]
+          $stderr.puts "--emit-ir-to requires --source"
+          exit 1
+        end
+
+        begin
+          program = RunarCompiler.compile_source_to_ir(
+            options[:source],
+            disable_constant_folding: disable_cf
+          )
+        rescue RunarCompiler::CompilationError => e
+          $stderr.puts "Compilation error: #{e.message}"
+          exit 1
+        end
+
+        require "fileutils"
+        ir_dir = File.dirname(options[:emit_ir_to])
+        FileUtils.mkdir_p(ir_dir) unless ir_dir.empty?
+        File.write(options[:emit_ir_to], JSON.pretty_generate(_anf_to_camel_dict(program)) + "\n")
       end
 
       begin

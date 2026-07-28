@@ -120,6 +120,20 @@ Run locally:
 cd conformance && npx tsx runner/index.ts --parser-only
 ```
 
+#### Cross-tier IR → hex parity (`--ir-parity`) — the single source of truth
+
+The runner's `--ir-parity` mode (CI step "Run IR -> hex cross-tier parity") compiles every fixture's checked-in `expected-ir.json` with all six **non-TS** tiers and requires byte-identical script hex plus equality with `expected-script.hex`. It gates each tier's `--ir` loader + Stack-IR + emit path, complementing the source-driven `--multi-format` mode (which is where the TypeScript tier is covered).
+
+Unlike `--parser-only`, this gate **is** scoped by the per-fixture `compilers` allowlist — hex parity is exactly what the allowlist governs. A fixture whose allowlist has no overlap with the six non-TS tiers is skipped. The mode always runs fold-OFF (`--disable-constant-folding`), regardless of `RUNAR_DISABLE_CONSTANT_FOLDING`, because the goldens were stamped fold-OFF; fold-ON parity is `--multi-format`'s job.
+
+This replaces ~180 lines of inline bash/jq that `.github/workflows/ci.yml` used to carry, which held its **own** copy of the allowlist rule and could drift from the runner's. The workflow step is now a thin caller. `runar-verification/scripts/cross-compiler-diff.sh` remains a separate implementation — it is the Tier-6.1 verification gate and additionally drives the Lean reference tier, which this runner does not know about. **If you change parity or allowlist semantics, change `runner/runner.ts` first and mirror it there.**
+
+Run locally:
+
+```bash
+cd conformance && npx tsx runner/index.ts --ir-parity
+```
+
 #### Audited allowlists
 
 The complete set of fixtures with a `compilers` allowlist is enumerated and pinned by `runner/__tests__/allowlist-audit.test.ts`. That test fails if a new allowlist appears (or an existing one drifts) without being approved here, so the set cannot silently expand. Adding a new allowlisted fixture requires **both**:

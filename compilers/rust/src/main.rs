@@ -63,6 +63,13 @@ struct Args {
     #[arg(long)]
     emit_ir: bool,
 
+    /// Write the ANF IR JSON (same bytes as --emit-ir) to this path and
+    /// CONTINUE compiling, so one process can hand back both the IR and the
+    /// script hex. Requires --source. Used by the conformance runner's
+    /// single-spawn mode (`--source X --hex --emit-ir-to Y`).
+    #[arg(long)]
+    emit_ir_to: Option<PathBuf>,
+
     /// Stop after parse + validate; print "parser ok" and exit 0 on success
     /// (requires --source). Used by the conformance runner's --parser-only
     /// universal-frontend coverage check.
@@ -115,6 +122,7 @@ fn main() {
         eprintln!("  --hex            Output only script hex");
         eprintln!("  --asm            Output only script ASM");
         eprintln!("  --emit-ir        Output only ANF IR JSON (requires --source)");
+        eprintln!("  --emit-ir-to <p> Write ANF IR JSON to <p> and keep compiling (requires --source)");
         process::exit(1);
     }
 
@@ -171,6 +179,42 @@ fn main() {
                 }
                 return;
             }
+            Err(e) => {
+                eprintln!("Compilation error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    // Handle --emit-ir-to: write the SAME bytes --emit-ir would print to a
+    // file, then fall through to the normal compile below. The conformance
+    // runner uses this to collect IR + hex from a single spawn.
+    if let Some(ref ir_path) = args.emit_ir_to {
+        let source_path = match &args.source {
+            Some(p) => p,
+            None => {
+                eprintln!("--emit-ir-to requires --source");
+                process::exit(1);
+            }
+        };
+        match runar_compiler_rust::compile_source_to_ir_with_options(source_path, &opts) {
+            Ok(program) => match serde_json::to_string_pretty(&program) {
+                Ok(json) => {
+                    if let Some(parent) = ir_path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                    }
+                    if let Err(e) = std::fs::write(ir_path, format!("{}\n", json)) {
+                        eprintln!("Error writing IR: {}", e);
+                        process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("JSON serialization error: {}", e);
+                    process::exit(1);
+                }
+            },
             Err(e) => {
                 eprintln!("Compilation error: {}", e);
                 process::exit(1);

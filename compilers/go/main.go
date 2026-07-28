@@ -94,6 +94,7 @@ func main() {
 	hexOnly := flag.Bool("hex", false, "output only the script hex (no artifact JSON)")
 	asmOnly := flag.Bool("asm", false, "output only the script ASM (no artifact JSON)")
 	emitIR := flag.Bool("emit-ir", false, "output only the ANF IR JSON (requires --source)")
+	emitIRTo := flag.String("emit-ir-to", "", "write the ANF IR JSON (same bytes as --emit-ir) to this path and CONTINUE compiling (requires --source)")
 	parseOnly := flag.Bool("parse-only", false, "stop after parse + validate; exits 0 with 'parser ok' marker (requires --source)")
 	disableConstFold := flag.Bool("disable-constant-folding", false, "disable ANF constant folding pass")
 	emitSourceMap := flag.String("emit-source-map", "", "after a successful compile, write artifact.sourceMap JSON to this path")
@@ -107,7 +108,7 @@ func main() {
 	}
 
 	if *irFile == "" && *sourceFile == "" {
-		fmt.Fprintln(os.Stderr, "Usage: runar-compiler-go [--ir <path> | --source <path>] [--output <path>] [--hex] [--asm] [--emit-ir]")
+		fmt.Fprintln(os.Stderr, "Usage: runar-compiler-go [--ir <path> | --source <path>] [--output <path>] [--hex] [--asm] [--emit-ir] [--emit-ir-to <path>]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Phase 1: Compile from ANF IR JSON to Bitcoin Script (--ir).")
 		fmt.Fprintln(os.Stderr, "Phase 2: Compile from .runar.ts source to Bitcoin Script (--source).")
@@ -146,32 +147,34 @@ func main() {
 			fmt.Fprintln(os.Stderr, "--emit-ir requires --source")
 			os.Exit(1)
 		}
-		program, err := compiler.CompileSourceToIR(*sourceFile, opts)
+		irJSON, err := sourceToIRJSON(*sourceFile, opts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Compilation error: %v\n", err)
-			os.Exit(1)
-		}
-		// Serialize to generic map and ensure "if" values always have an
-		// "else" field (even if empty) to match TS compiler IR format.
-		// Go's omitempty drops empty slices, but TS always emits else: [].
-		fullJSON, err := json.Marshal(program)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "JSON error: %v\n", err)
-			os.Exit(1)
-		}
-		var raw map[string]interface{}
-		if err := json.Unmarshal(fullJSON, &raw); err != nil {
-			fmt.Fprintf(os.Stderr, "JSON error: %v\n", err)
-			os.Exit(1)
-		}
-		ensureIRFields(raw)
-		irJSON, err := json.MarshalIndent(raw, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "JSON error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 		fmt.Println(string(irJSON))
 		return
+	}
+
+	// Handle --emit-ir-to: write the SAME bytes --emit-ir would print to a
+	// file, then CONTINUE into the normal compile so one process can hand
+	// back both the ANF IR and the script hex. The conformance runner uses
+	// `--source X --hex --emit-ir-to Y` to collect both artifacts from a
+	// single spawn instead of one `--emit-ir` run plus one `--hex` run.
+	if *emitIRTo != "" {
+		if *sourceFile == "" {
+			fmt.Fprintln(os.Stderr, "--emit-ir-to requires --source")
+			os.Exit(1)
+		}
+		irJSON, err := sourceToIRJSON(*sourceFile, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*emitIRTo, append(irJSON, '\n'), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing IR: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	var artifact *compiler.Artifact
@@ -306,6 +309,35 @@ func runGroth16WA() error {
 		fmt.Fprintf(os.Stderr, "  vk sha256: %s\n", artifact.Groth16WA.VKDigest)
 	}
 	return nil
+}
+
+// sourceToIRJSON runs passes 1-4 on a source file and renders the ANF IR as
+// the canonical indented JSON that `--emit-ir` prints. Shared by `--emit-ir`
+// (stdout) and `--emit-ir-to` (file) so the two modes are byte-identical by
+// construction — the conformance runner compares one against the other's
+// goldens.
+func sourceToIRJSON(sourcePath string, opts compiler.CompileOptions) ([]byte, error) {
+	program, err := compiler.CompileSourceToIR(sourcePath, opts)
+	if err != nil {
+		return nil, fmt.Errorf("Compilation error: %v", err)
+	}
+	// Serialize to generic map and ensure "if" values always have an
+	// "else" field (even if empty) to match TS compiler IR format.
+	// Go's omitempty drops empty slices, but TS always emits else: [].
+	fullJSON, err := json.Marshal(program)
+	if err != nil {
+		return nil, fmt.Errorf("JSON error: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(fullJSON, &raw); err != nil {
+		return nil, fmt.Errorf("JSON error: %v", err)
+	}
+	ensureIRFields(raw)
+	irJSON, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("JSON error: %v", err)
+	}
+	return irJSON, nil
 }
 
 // ensureIRFields walks a generic JSON map and patches up fields that Go's

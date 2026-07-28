@@ -91,6 +91,16 @@ def main() -> None:
         help="Output only the ANF IR JSON (requires --source)",
     )
     parser.add_argument(
+        "--emit-ir-to",
+        dest="emit_ir_to",
+        metavar="PATH",
+        help=(
+            "Write the ANF IR JSON (same bytes as --emit-ir) to PATH and CONTINUE "
+            "compiling, so one process can hand back both the IR and the script hex "
+            "(requires --source). Used by the conformance runner's single-spawn mode."
+        ),
+    )
+    parser.add_argument(
         "--parse-only",
         dest="parse_only",
         action="store_true",
@@ -185,6 +195,27 @@ def main() -> None:
         ir_json = json.dumps(_anf_to_camel_dict(program), indent=2, default=str)
         print(ir_json)
         return
+
+    # Handle --emit-ir-to: write the SAME bytes --emit-ir would print to a
+    # file, then fall through to the normal compile below. The conformance
+    # runner uses this to collect IR + hex from a single spawn.
+    if args.emit_ir_to:
+        if not args.source:
+            print("--emit-ir-to requires --source", file=sys.stderr)
+            sys.exit(1)
+        try:
+            program = compile_source_to_ir(
+                args.source,
+                disable_constant_folding=args.disable_constant_folding,
+            )
+        except CompilationError as e:
+            print(f"Compilation error: {e}", file=sys.stderr)
+            sys.exit(1)
+        ir_json = json.dumps(_anf_to_camel_dict(program), indent=2, default=str)
+        os.makedirs(os.path.dirname(os.path.abspath(args.emit_ir_to)) or ".", exist_ok=True)
+        with open(args.emit_ir_to, "w") as f:
+            f.write(ir_json)
+            f.write("\n")
 
     try:
         if args.source:
