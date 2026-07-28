@@ -91,8 +91,9 @@ interface FuzzerCLIOptions {
    * Issue #124 — TRI-MODAL source-vs-script execution oracle in fast-check
    * PROPERTY mode. Generates stateless contracts with loops + byte-ops +
    * post-loop param reads, and runs every spend through the ANF interpreter,
-   * the hand-rolled ScriptVM, AND the upstream @bsv/sdk Spend engine, asserting
-   * all three agree. Unlike `--execute` (bi-modal, `fc.sample`, no shrinking),
+   * ScriptVM (the @bsv/sdk Spend engine stepped opcode by opcode), AND a strict
+   * full-consensus Spend.validate(), asserting all three agree. Unlike
+   * `--execute` (bi-modal, `fc.sample`, no shrinking),
    * a divergence is SHRUNK to a minimal (contract, inputs) repro. `--num` =
    * property runs; `--seed` reproduces the run.
    */
@@ -267,9 +268,10 @@ Options:
                          PROPERTY mode. Generates stateless contracts with loops
                          (non-zero start + countdown), substr/cat/len byte-ops
                          over ByteString params, and post-loop param reads, then
-                         runs every spend through the ANF interpreter, the
-                         hand-rolled ScriptVM, AND the upstream @bsv/sdk Spend
-                         engine, asserting all three agree. Unlike --execute
+                         runs every spend through the ANF interpreter, ScriptVM
+                         (the @bsv/sdk Spend engine stepped opcode by opcode),
+                         AND a strict full-consensus Spend.validate(),
+                         asserting all three agree. Unlike --execute
                          (bi-modal, fc.sample, no shrinking), a divergence is
                          SHRUNK to a minimal (contract, inputs) repro. --num =
                          property runs (~200 for the PR gate); --seed reproduces.

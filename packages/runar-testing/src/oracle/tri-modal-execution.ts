@@ -2,24 +2,26 @@
  * Tri-modal source-vs-script differential-execution oracle (issue #124).
  *
  * Extends the bi-modal {@link runDifferentialExecution} (ANF `RunarInterpreter`
- * vs. the repo's hand-rolled `ScriptVM`) with a THIRD, fully independent
- * execution engine: the upstream `@bsv/sdk` `Spend` interpreter. The three
- * engines have three separate provenances:
+ * vs. `ScriptVM`) with a strict, full-consensus `Spend.validate()` leg:
  *
  *   1. interpreter — the ANF `RunarInterpreter` (source semantics, our code).
- *   2. ScriptVM   — the repo's hand-rolled Bitcoin Script VM (our code).
- *   3. Spend      — the upstream `@bsv/sdk` production Script interpreter
- *                   (third-party code, the same engine that validates real
- *                   BSV transactions).
+ *   2. ScriptVM   — the upstream `@bsv/sdk` `Spend` engine driven opcode by
+ *                   opcode, with `success` = "no evaluation error and a truthy
+ *                   top of stack" and the consensus wrappers switched off (see
+ *                   `vm/script-vm.ts`).
+ *   3. Spend      — the SAME upstream engine via `Spend.validate()`, which adds
+ *                   the consensus **clean-stack** rule (exactly one truthy item
+ *                   must remain), the **push-only unlocking** rule, and
+ *                   **minimal-push** encoding.
  *
- * Because engines (1) and (2) are both maintained in this repo, a shared-design
- * mistake could be mirrored in both and slip past the bi-modal oracle. Engine
- * (3) is written by a different team against the consensus rules, so a
- * disagreement between it and the other two is a strong signal of a real
- * miscompile. `Spend` additionally enforces the consensus **clean-stack** rule
- * (exactly one truthy item must remain) and the **push-only unlocking** rule,
- * which the hand-rolled ScriptVM does not — so it catches a strictly larger
- * class of script-shape bugs.
+ * NOTE ON INDEPENDENCE: legs (2) and (3) are now the same third-party engine,
+ * so they are no longer independent implementations — that changed when
+ * `ScriptVM` stopped being a hand-rolled interpreter and became a wrapper around
+ * `Spend`. What leg (3) still adds over leg (2) is the consensus script-SHAPE
+ * rules, so a (2) accept / (3) reject disagreement means the compiled script
+ * evaluates fine but is not a valid spend on the network. Genuine engine
+ * independence lives in leg (1), the ANF interpreter — a separate
+ * implementation of the SOURCE semantics.
  *
  * Scope matches the bi-modal oracle: STATELESS, non-crypto contracts (no
  * `checkSig`, no sighash, no state continuation). For those, `Spend` never needs

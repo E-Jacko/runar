@@ -1,61 +1,61 @@
 {
   "mappings": [
     {
-      "opcodeIndex": 32,
+      "opcodeIndex": 38,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 40,
       "column": 8
     },
     {
-      "opcodeIndex": 33,
+      "opcodeIndex": 39,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 40,
       "column": 8
     },
     {
-      "opcodeIndex": 34,
+      "opcodeIndex": 40,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 40,
       "column": 8
     },
     {
-      "opcodeIndex": 164,
+      "opcodeIndex": 188,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 48,
       "column": 8
     },
     {
-      "opcodeIndex": 165,
+      "opcodeIndex": 189,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 48,
       "column": 8
     },
     {
-      "opcodeIndex": 166,
+      "opcodeIndex": 190,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 48,
       "column": 8
     },
     {
-      "opcodeIndex": 167,
+      "opcodeIndex": 191,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 48,
       "column": 8
     },
     {
-      "opcodeIndex": 168,
+      "opcodeIndex": 192,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 49,
       "column": 8
     },
     {
-      "opcodeIndex": 169,
+      "opcodeIndex": 193,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 49,
       "column": 8
     },
     {
-      "opcodeIndex": 170,
+      "opcodeIndex": 194,
       "sourceFile": "examples/python/stateful-counter/Counter.runar.py",
       "line": 49,
       "column": 8

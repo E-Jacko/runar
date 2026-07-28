@@ -1,52 +1,52 @@
 {
   "mappings": [
     {
-      "opcodeIndex": 32,
+      "opcodeIndex": 38,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 36,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 34,
+      "opcodeIndex": 40,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 36,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 164,
+      "opcodeIndex": 188,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 42,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 165,
+      "opcodeIndex": 189,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 42,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 166,
+      "opcodeIndex": 190,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 42,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 167,
+      "opcodeIndex": 191,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 42,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 168,
+      "opcodeIndex": 192,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 43,
-      "column": 2
+      "column": 1
     },
     {
-      "opcodeIndex": 170,
+      "opcodeIndex": 194,
       "sourceFile": "examples/go/stateful-counter/Counter.runar.go",
       "line": 43,
-      "column": 2
+      "column": 1
     }
   ]
 }

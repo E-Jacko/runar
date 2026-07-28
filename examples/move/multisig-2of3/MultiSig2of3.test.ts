@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TestContract } from 'runar-testing';
 import { compile } from 'runar-compiler';
-import { ScriptVM } from 'runar-testing';
+import { ScriptVM, runStatelessSigned, testKey } from 'runar-testing';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(__dirname, 'MultiSig2of3.runar.move'), 'utf8');
@@ -56,29 +56,34 @@ describe('MultiSig2of3 (Move)', () => {
   it('rejects all-empty signatures', () => {
     const locking = buildLockingScript([PK1, PK2, PK3]);
     const unlocking = encodePush('') + encodePush('');
-    const vm = new ScriptVM({ checkSigCallback: (sig) => sig.length > 0 });
+    const vm = new ScriptVM();
     expect(vm.execute(hexToBytes(unlocking), hexToBytes(locking)).success).toBe(false);
   });
 
   it('rejects sigs in wrong order', () => {
     const locking = buildLockingScript([PK1, PK2, PK3]);
     const unlocking = encodePush(SIG2) + encodePush(SIG1);
-    const cb = (sig: Uint8Array, pk: Uint8Array) => {
-      const sh = Array.from(sig, x => x.toString(16).padStart(2, '0')).join('');
-      const ph = Array.from(pk, x => x.toString(16).padStart(2, '0')).join('');
-      return (sh === SIG1 && ph === PK1) || (sh === SIG2 && ph === PK2);
-    };
-    expect(new ScriptVM({ checkSigCallback: cb }).execute(hexToBytes(unlocking), hexToBytes(locking)).success).toBe(false);
+    expect(new ScriptVM().execute(hexToBytes(unlocking), hexToBytes(locking)).success).toBe(false);
   });
 
-  it('accepts a valid 2-of-3 unlock', () => {
-    const locking = buildLockingScript([PK1, PK2, PK3]);
-    const unlocking = encodePush(SIG1) + encodePush(SIG2);
-    const cb = (sig: Uint8Array, pk: Uint8Array) => {
-      const sh = Array.from(sig, x => x.toString(16).padStart(2, '0')).join('');
-      const ph = Array.from(pk, x => x.toString(16).padStart(2, '0')).join('');
-      return (sh === SIG1 && ph === PK1) || (sh === SIG2 && ph === PK2);
-    };
-    expect(new ScriptVM({ checkSigCallback: cb }).execute(hexToBytes(unlocking), hexToBytes(locking)).success).toBe(true);
+  it('accepts a valid 2-of-3 unlock (REAL secp256k1 signatures)', () => {
+    // ScriptVM wraps @bsv/sdk's `Spend`, so OP_CHECKMULTISIG is real ECDSA and
+    // no mock can make a placeholder signature pass. `runStatelessSigned`
+    // compiles with real pubkeys baked in, builds the real BIP-143 sighash and
+    // produces real DER signatures. `checkInterpreter: false` — the ANF
+    // interpreter does not model checkMultiSig.
+    const res = runStatelessSigned({
+      source,
+      fileName: 'MultiSig2of3.runar.move',
+      method: 'unlock',
+      args: [{ signWith: 'alice' }, { signWith: 'bob' }],
+      constructorArgs: {
+        pk1: testKey('alice').pubKey,
+        pk2: testKey('bob').pubKey,
+        pk3: testKey('charlie').pubKey,
+      },
+      checkInterpreter: false,
+    });
+    expect(res.vmAccepted).toBe(true);
   });
 });

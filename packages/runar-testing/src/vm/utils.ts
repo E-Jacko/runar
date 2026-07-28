@@ -79,10 +79,12 @@ export function decodeScriptNumber(bytes: Uint8Array): bigint {
 // the operands' minimal script-number encoding, not on their numeric value
 // (spec/opcodes.md). AND/OR/XOR require equal-length operands and fail
 // otherwise; shifts treat the byte array as a big-endian bit string and
-// preserve its length. These helpers reproduce EXACTLY what ScriptVM's opcode
-// handlers do, so the interpreter (which models values as bigint) agrees with
-// the deployed script byte-for-byte. A differential fuzz test pins the two
-// together. Callers convert bigint -> minimal bytes -> byte op -> bigint.
+// preserve its length. These helpers reproduce EXACTLY what the on-chain
+// opcodes do (as implemented by @bsv/sdk's `Spend`, which `ScriptVM` wraps), so
+// the interpreter (which models values as bigint) agrees with the deployed
+// script byte-for-byte. A differential fuzz test pins the two together
+// (`__tests__/script-number-bitwise.test.ts`, which fuzzes these helpers
+// against ScriptVM). Callers convert bigint -> minimal bytes -> byte op -> bigint.
 
 // The *Bytes helpers below operate on RAW stack bytes (the exact byte array a
 // value would occupy on the deployed script's stack), NOT on a value's minimal

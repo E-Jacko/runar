@@ -16,8 +16,12 @@
  *      - `mappings` is sorted ascending by `opcodeIndex`.
  *      - No duplicate `opcodeIndex` values.
  *      - Each entry has `line >= 0` and `column >= 0` (the JSON schema
- *        allows column 0 but requires line >= 1; pre-existing Java
- *        parser defaults make line 0 acceptable as a structural floor).
+ *        allows column 0 but requires line >= 1; the floor stays at 0
+ *        because a tier may emit line=0/column=0 for a SYNTHESIZED node
+ *        with no source position. Nodes that come from source are
+ *        position-tracked in every tier — see `independent-oracle.ts`,
+ *        which anchors each mapping against the real file. Columns are
+ *        0-based; lines are 1-based.).
  *      - `opcodeIndex` values are in `[0, opcodeCount)`.
  *      - `sourceFile` is a non-empty string.
  *

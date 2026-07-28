@@ -69,13 +69,24 @@ pub const EmitContext = struct {
     }
 
     /// Record a source mapping for the current opcode if a source location is pending.
+    ///
+    /// Column convention: `types.SourceLocation.column` carries the parser's
+    /// 1-BASED tokenizer column (parse_zig.zig's Tokenizer starts each line at
+    /// col=1) because that is what `file:line:col` diagnostics want. The
+    /// source-map schema, however, is **1-based line / 0-based column** — the
+    /// same convention the TypeScript reference tier emits (see
+    /// docs/compiler-architecture.md and
+    /// conformance/source-map/independent-oracle.ts, which indexes
+    /// `lineText[column]` directly). Convert here, at the single point where
+    /// SourceMapping entries are created, so diagnostics keep their 1-based
+    /// columns. Saturating so a synthesized location with column 0 stays 0.
     fn recordSourceMapping(self: *EmitContext) !void {
         if (self.pending_source_loc) |loc| {
             try self.source_map.append(self.allocator, .{
                 .opcode_index = self.opcode_index,
                 .source_file = loc.file,
                 .line = loc.line,
-                .column = loc.column,
+                .column = if (loc.column > 0) loc.column - 1 else 0,
             });
             self.pending_source_loc = null;
         }

@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compile } from '../index.js';
 // @ts-expect-error vitest resolves this via alias
-import { ScriptVM } from 'runar-testing';
+import { ScriptVM, runStatelessSigned, testKey } from 'runar-testing';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -17,11 +17,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // (or no) signatures because nSigs was read off as 0 from a stray empty-bytes
 // slot. See _review/BUG-003-finding.md (sibling worktree) for the original
 // trace.
+//
+// The accept/reject cases used to be driven by a mocked `checkSigCallback` on
+// the hand-rolled ScriptVM. That VM is now a wrapper around the upstream
+// @bsv/sdk `Spend` engine, which performs REAL secp256k1 verification, so:
+//   - the STRUCTURAL assertions still step the script through ScriptVM;
+//   - the ACCEPT cases go through `runStatelessSigned`, which builds real DER
+//     signatures over the real BIP-143 sighash;
+//   - the REJECT cases stay on ScriptVM — malformed/garbage signatures are now
+//     rejected by real crypto instead of by a mock that could be told to lie.
 // ---------------------------------------------------------------------------
 
-/** 33-byte compressed pubkey placeholders (constructor args). Real curve
- *  points are not required because we drive OP_CHECKMULTISIG via a
- *  controlled checkSigCallback. */
+/** 33-byte compressed pubkey placeholders (constructor args) for the
+ *  STRUCTURAL / reject cases, where no valid signature exists anyway. */
 const PK1 = new Uint8Array(33); PK1[0] = 0x02; PK1.fill(0xaa, 1);
 const PK2 = new Uint8Array(33); PK2[0] = 0x02; PK2.fill(0xbb, 1);
 const PK3 = new Uint8Array(33); PK3[0] = 0x02; PK3.fill(0xcc, 1);
@@ -83,8 +91,8 @@ function buildUnlockingScript(sigs: Uint8Array[]): string {
 
 /** Step the script through ScriptVM, return the stack snapshots at every
  *  step keyed by the executed opcode name. */
-function stepAll(unlocking: string, locking: string, cb?: (sig: Uint8Array, pk: Uint8Array) => boolean) {
-  const vm = new ScriptVM({ checkSigCallback: cb });
+function stepAll(unlocking: string, locking: string) {
+  const vm = new ScriptVM();
   vm.loadHex(unlocking, locking);
   const steps: { opcode: string; mainStack: Uint8Array[] }[] = [];
   while (true) {
@@ -109,7 +117,7 @@ describe('BUG-009: checkMultiSig stack layout', () => {
   it('places the right items at the right depths when stepped through ScriptVM', () => {
     const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
     const unlocking = buildUnlockingScript([SIG1, SIG2]);
-    const steps = stepAll(unlocking, locking, () => true);
+    const steps = stepAll(unlocking, locking);
 
     // Find the OP_CHECKMULTISIG step and look at the stack JUST BEFORE it.
     const cmsIdx = steps.findIndex(s => s.opcode === 'OP_CHECKMULTISIG');
@@ -129,88 +137,84 @@ describe('BUG-009: checkMultiSig stack layout', () => {
     expect(bytesToHex(top8[7]!)).toBe('03'); // OP_3
   });
 
-  it('REJECTS all-false signature verification (always-false callback)', () => {
+  it('REJECTS DER-shaped but invalid signatures (real ECDSA, no mock)', () => {
     const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
     const unlocking = buildUnlockingScript([SIG1, SIG2]);
-    const vm = new ScriptVM({ checkSigCallback: () => false });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
+    const r = new ScriptVM().execute(hexToBytes(unlocking), hexToBytes(locking));
     expect(r.success).toBe(false);
   });
 
   it('REJECTS all-empty signatures', () => {
     const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
     const unlocking = encodePush(new Uint8Array(0)) + encodePush(new Uint8Array(0));
-    // Even with an always-true callback, an empty-sig would still be checked
-    // against a real pubkey by the callback. Here we use a strict callback
-    // that returns false for empty sigs (mimicking real ECDSA).
-    const vm = new ScriptVM({
-      checkSigCallback: (sig: Uint8Array) => sig.length > 0,
-    });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
+    const r = new ScriptVM().execute(hexToBytes(unlocking), hexToBytes(locking));
     expect(r.success).toBe(false);
   });
 
   it('REJECTS a single signature pushed twice (below threshold via dup)', () => {
-    // Push only one distinct sig but provide two stack items. With a callback
-    // that only validates (sig1->pk1, sig2->pk2, sig2->pk3) — i.e. only the
-    // ordered pairing succeeds — a dup'd sig1 cannot satisfy both slots.
     const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
     const unlocking = buildUnlockingScript([SIG1, SIG1]);
-    const callback = (sig: Uint8Array, pk: Uint8Array) =>
-      (bytesToHex(sig) === bytesToHex(SIG1) && bytesToHex(pk) === bytesToHex(PK1)) ||
-      (bytesToHex(sig) === bytesToHex(SIG2) && (bytesToHex(pk) === bytesToHex(PK2) || bytesToHex(pk) === bytesToHex(PK3))) ||
-      (bytesToHex(sig) === bytesToHex(SIG3) && bytesToHex(pk) === bytesToHex(PK3));
-    const vm = new ScriptVM({ checkSigCallback: callback });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
+    const r = new ScriptVM().execute(hexToBytes(unlocking), hexToBytes(locking));
     expect(r.success).toBe(false);
   });
 
-  it('REJECTS sigs supplied in wrong order (sig2 before sig1)', () => {
-    // OP_CHECKMULTISIG requires sigs to match pubkeys in the SAME relative
-    // order as their corresponding pubkeys appear in the committed array.
-    // Supplying [sig2, sig1] (i.e. sig2 was meant for pk2, sig1 for pk1, but
-    // pushed in reverse) will fail because the verify loop pops sigs top-down
-    // and walks pubkeys forward.
+  it('REJECTS an unrelated third signature (SIG3 was never a committed key)', () => {
     const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
-    const unlocking = buildUnlockingScript([SIG2, SIG1]); // wrong order
-    const callback = (sig: Uint8Array, pk: Uint8Array) =>
-      (bytesToHex(sig) === bytesToHex(SIG1) && bytesToHex(pk) === bytesToHex(PK1)) ||
-      (bytesToHex(sig) === bytesToHex(SIG2) && bytesToHex(pk) === bytesToHex(PK2));
-    const vm = new ScriptVM({ checkSigCallback: callback });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
+    const unlocking = buildUnlockingScript([SIG3, SIG2]);
+    const r = new ScriptVM().execute(hexToBytes(unlocking), hexToBytes(locking));
     expect(r.success).toBe(false);
   });
 
-  it('ACCEPTS a valid 2-of-3 unlock (sig1->pk1, sig2->pk2)', () => {
-    const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
-    const unlocking = buildUnlockingScript([SIG1, SIG2]);
-    const callback = (sig: Uint8Array, pk: Uint8Array) =>
-      (bytesToHex(sig) === bytesToHex(SIG1) && bytesToHex(pk) === bytesToHex(PK1)) ||
-      (bytesToHex(sig) === bytesToHex(SIG2) && bytesToHex(pk) === bytesToHex(PK2));
-    const vm = new ScriptVM({ checkSigCallback: callback });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
-    expect(r.success).toBe(true);
+  // ---------------------------------------------------------------------------
+  // Real-crypto accept/reject. `runStatelessSigned` compiles the contract with
+  // the given pubkeys baked in, builds the real BIP-143 sighash, produces real
+  // DER signatures from the named test keys, and validates on @bsv/sdk `Spend`.
+  // `checkInterpreter: false` — the ANF interpreter does not model checkMultiSig.
+  // ---------------------------------------------------------------------------
+
+  const MULTISIG_SOURCE = readFileSync(
+    join(__dirname, '../../../../examples/ts/multisig-2of3/MultiSig2of3.runar.ts'),
+    'utf8',
+  );
+
+  function runRealMultiSig(
+    keyNames: [string, string, string],
+    signers: [string, string],
+  ): boolean {
+    const res = runStatelessSigned({
+      source: MULTISIG_SOURCE,
+      fileName: 'MultiSig2of3.runar.ts',
+      method: 'unlock',
+      args: [{ signWith: signers[0] }, { signWith: signers[1] }],
+      constructorArgs: {
+        pk1: testKey(keyNames[0]).pubKey,
+        pk2: testKey(keyNames[1]).pubKey,
+        pk3: testKey(keyNames[2]).pubKey,
+      },
+      checkInterpreter: false,
+    });
+    return res.vmAccepted;
+  }
+
+  it('ACCEPTS a real 2-of-3 unlock (sig1->pk1, sig2->pk2)', () => {
+    expect(runRealMultiSig(['alice', 'bob', 'charlie'], ['alice', 'bob'])).toBe(true);
   });
 
-  it('ACCEPTS a valid 2-of-3 unlock (sig1->pk1, sig2->pk3)', () => {
-    const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
-    const unlocking = buildUnlockingScript([SIG1, SIG2]);
-    const callback = (sig: Uint8Array, pk: Uint8Array) =>
-      (bytesToHex(sig) === bytesToHex(SIG1) && bytesToHex(pk) === bytesToHex(PK1)) ||
-      (bytesToHex(sig) === bytesToHex(SIG2) && bytesToHex(pk) === bytesToHex(PK3));
-    const vm = new ScriptVM({ checkSigCallback: callback });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
-    expect(r.success).toBe(true);
+  it('ACCEPTS a real 2-of-3 unlock (sig1->pk1, sig2->pk3)', () => {
+    expect(runRealMultiSig(['alice', 'bob', 'charlie'], ['alice', 'charlie'])).toBe(true);
   });
 
-  it('ACCEPTS a valid 2-of-3 unlock (sig1->pk2, sig2->pk3)', () => {
-    const locking = buildMultiSigLockingScript([PK1, PK2, PK3]);
-    const unlocking = buildUnlockingScript([SIG1, SIG2]);
-    const callback = (sig: Uint8Array, pk: Uint8Array) =>
-      (bytesToHex(sig) === bytesToHex(SIG1) && bytesToHex(pk) === bytesToHex(PK2)) ||
-      (bytesToHex(sig) === bytesToHex(SIG2) && bytesToHex(pk) === bytesToHex(PK3));
-    const vm = new ScriptVM({ checkSigCallback: callback });
-    const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
-    expect(r.success).toBe(true);
+  it('ACCEPTS a real 2-of-3 unlock (sig1->pk2, sig2->pk3)', () => {
+    expect(runRealMultiSig(['alice', 'bob', 'charlie'], ['bob', 'charlie'])).toBe(true);
+  });
+
+  it('REJECTS real sigs supplied out of committed-key order (pk2 then pk1)', () => {
+    // OP_CHECKMULTISIG walks the key array forward, so signatures must appear
+    // in the same relative order as their committed pubkeys.
+    expect(runRealMultiSig(['alice', 'bob', 'charlie'], ['bob', 'alice'])).toBe(false);
+  });
+
+  it('REJECTS a real signature from a key that is not committed', () => {
+    expect(runRealMultiSig(['alice', 'bob', 'charlie'], ['alice', 'dave'])).toBe(false);
   });
 });

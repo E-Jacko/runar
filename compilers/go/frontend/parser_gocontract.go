@@ -63,6 +63,28 @@ func (p *goContractParser) addError(msg string) {
 	p.errors = append(p.errors, Diagnostic{Message: msg, Severity: SeverityError})
 }
 
+// locAt converts a go/token position into a Rúnar SourceLocation.
+//
+// Rúnar source maps use 1-based line / 0-based column (the convention the
+// TypeScript reference tier emits, and the one this tier's own .runar.{ts,
+// sol,move,py} frontends already produce). go/token reports 1-based
+// columns, so the column is rebased here — at the single boundary where
+// go/token positions enter the AST. Converting here rather than in
+// codegen/emit.go is deliberate: emit.go is shared by every frontend, and
+// the already-0-based ones would be corrupted by a blanket adjustment.
+//
+// An invalid position (token.NoPos) yields Line 0 / Column 0; the clamp
+// keeps such an "unknown" location at 0 instead of producing -1.
+//
+// Diagnostic messages intentionally keep the raw 1-based pos.Column.
+func (p *goContractParser) locAt(pos token.Position) SourceLocation {
+	col := pos.Column - 1
+	if col < 0 {
+		col = 0
+	}
+	return SourceLocation{File: p.fileName, Line: pos.Line, Column: col}
+}
+
 func (p *goContractParser) extractContract() *ContractNode {
 	var contractName string
 	var parentClass string
@@ -135,14 +157,10 @@ func (p *goContractParser) extractContract() *ContractNode {
 
 					pos := p.fset.Position(field.Pos())
 					properties = append(properties, PropertyNode{
-						Name:     propName,
-						Type:     propType,
-						Readonly: readonly,
-						SourceLocation: SourceLocation{
-							File:   p.fileName,
-							Line:   pos.Line,
-							Column: pos.Column,
-						},
+						Name:           propName,
+						Type:           propType,
+						Readonly:       readonly,
+						SourceLocation: p.locAt(pos),
 					})
 				}
 			}
@@ -192,15 +210,11 @@ func (p *goContractParser) extractContract() *ContractNode {
 
 		pos := p.fset.Position(funcDecl.Pos())
 		methods = append(methods, MethodNode{
-			Name:       methodName,
-			Params:     params,
-			Body:       body,
-			Visibility: visibility,
-			SourceLocation: SourceLocation{
-				File:   p.fileName,
-				Line:   pos.Line,
-				Column: pos.Column,
-			},
+			Name:           methodName,
+			Params:         params,
+			Body:           body,
+			Visibility:     visibility,
+			SourceLocation: p.locAt(pos),
 		})
 	}
 
@@ -230,15 +244,11 @@ func (p *goContractParser) extractContract() *ContractNode {
 
 		pos := p.fset.Position(funcDecl.Pos())
 		methods = append(methods, MethodNode{
-			Name:       methodName,
-			Params:     params,
-			Body:       body,
-			Visibility: "private",
-			SourceLocation: SourceLocation{
-				File:   p.fileName,
-				Line:   pos.Line,
-				Column: pos.Column,
-			},
+			Name:           methodName,
+			Params:         params,
+			Body:           body,
+			Visibility:     "private",
+			SourceLocation: p.locAt(pos),
 		})
 	}
 
@@ -289,7 +299,7 @@ func (p *goContractParser) extractContract() *ContractNode {
 			Callee: Identifier{Name: "super"},
 			Args:   superArgs,
 		},
-		SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 1},
+		SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 0},
 	}
 
 	// Property assignments
@@ -299,7 +309,7 @@ func (p *goContractParser) extractContract() *ContractNode {
 		constructorBody = append(constructorBody, AssignmentStmt{
 			Target:         PropertyAccessExpr{Property: prop.Name},
 			Value:          Identifier{Name: prop.Name},
-			SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 1},
+			SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 0},
 		})
 	}
 
@@ -312,7 +322,7 @@ func (p *goContractParser) extractContract() *ContractNode {
 			Params:         constructorParams,
 			Body:           constructorBody,
 			Visibility:     "public",
-			SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 1},
+			SourceLocation: SourceLocation{File: p.fileName, Line: 1, Column: 0},
 		},
 		Methods:    methods,
 		SourceFile: p.fileName,
@@ -409,7 +419,7 @@ func (p *goContractParser) extractStatements(block *ast.BlockStmt) []Statement {
 
 func (p *goContractParser) convertStatement(stmt ast.Stmt) Statement {
 	pos := p.fset.Position(stmt.Pos())
-	loc := SourceLocation{File: p.fileName, Line: pos.Line, Column: pos.Column}
+	loc := p.locAt(pos)
 
 	switch s := stmt.(type) {
 	case *ast.ExprStmt:

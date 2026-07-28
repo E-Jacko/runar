@@ -158,7 +158,11 @@ func javaTokenize(source string) []javaToken {
 	var tokens []javaToken
 	pos := 0
 	line := 1
-	col := 1
+	// 0-based column, matching this tier's other format parsers
+	// (parser_sol/python/move/gocontract) and the source-map convention
+	// (1-based line, 0-based column). These tokenizers were 1-based, which
+	// made source maps for this format anchor one char past every token.
+	col := 0
 
 	for pos < len(chars) {
 		ch := chars[pos]
@@ -167,7 +171,7 @@ func javaTokenize(source string) []javaToken {
 		// Whitespace
 		if ch == '\n' {
 			line++
-			col = 1
+			col = 0
 			pos++
 			continue
 		}
@@ -192,7 +196,7 @@ func javaTokenize(source string) []javaToken {
 			for pos+1 < len(chars) {
 				if chars[pos] == '\n' {
 					line++
-					col = 1
+					col = 0
 					pos++
 				} else if chars[pos] == '*' && chars[pos+1] == '/' {
 					pos += 2

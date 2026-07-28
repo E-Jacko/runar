@@ -6,14 +6,19 @@
  *
  * Post-Genesis BSV semantics: during execution OP_CODESEPARATOR marks the
  * position after itself as the scriptCode start for subsequent signature
- * ops. With the mockable checkSigCallback this means: don't throw, track
- * the offset, keep executing.
+ * ops. The VM now wraps the upstream @bsv/sdk `Spend` engine, so the trimmed
+ * scriptCode is exercised by REAL secp256k1 verification, not a mock: the
+ * signature below is only valid if the sighash was computed over the
+ * post-separator subscript.
  */
 
 import { describe, it, expect } from 'vitest';
 import { compile } from 'runar-compiler';
+import { PrivateKey, Script, TransactionSignature, Hash } from '@bsv/sdk';
 import { ScriptVM } from '../vm/index.js';
 import { Opcode } from '../vm/opcodes.js';
+import { TEST_KEYS } from '../test-keys.js';
+import { hexToBytes } from '../vm/utils.js';
 
 describe('ScriptVM OP_CODESEPARATOR', () => {
   it('executes a script containing 0xab instead of throwing', () => {
@@ -51,14 +56,47 @@ describe('ScriptVM OP_CODESEPARATOR', () => {
     expect(vm.lastCodeSeparator).toBe(-1);
   });
 
-  it('works before a mocked OP_CHECKSIG (stateful scriptCode shape)', () => {
-    // <sig> <pubkey> pushed by unlocking; locking: 0xab OP_CHECKSIG
+  it('trims the scriptCode for a REAL OP_CHECKSIG (stateful scriptCode shape)', () => {
+    // Locking: 0xab OP_CHECKSIG. The separator is chunk 0, so the scriptCode
+    // the engine signs over is chunks[1..] = [OP_CHECKSIG] alone.
+    const locking = new Uint8Array([Opcode.OP_CODESEPARATOR, Opcode.OP_CHECKSIG]);
+    const key = TEST_KEYS[0]!;
+    const scope = TransactionSignature.SIGHASH_ALL | TransactionSignature.SIGHASH_FORKID;
+    const preimage = TransactionSignature.formatBytes({
+      sourceTXID: '00'.repeat(32),
+      sourceOutputIndex: 0,
+      sourceSatoshis: 100000,
+      transactionVersion: 1,
+      otherInputs: [],
+      outputs: [],
+      inputIndex: 0,
+      subscript: Script.fromHex('ac'), // post-separator subscript
+      inputSequence: 0xffffffff,
+      lockTime: 0,
+      scope,
+    });
+    const digest = Hash.sha256(Array.from(preimage));
+    const raw = PrivateKey.fromHex(key.privKey).sign(digest);
+    const sig = new TransactionSignature(raw.r, raw.s, scope).toChecksigFormat();
+    const pubkey = hexToBytes(key.pubKey);
+
+    const unlocking = new Uint8Array([sig.length, ...sig, pubkey.length, ...pubkey]);
+    const vm = new ScriptVM();
+    const result = vm.execute(unlocking, locking);
+    expect(result.error).toBeUndefined();
+    expect(result.success).toBe(true);
+  });
+
+  it('REJECTS a garbage signature — checksig is real, not a fail-open mock', () => {
+    // The pre-wrapper VM defaulted `checkSigCallback` to `() => true`, so this
+    // exact script "succeeded" with 0xaa as the signature and 0xbb as the
+    // pubkey. The upstream engine rejects it.
     const vm = new ScriptVM();
     const unlocking = new Uint8Array([0x01, 0xaa, 0x01, 0xbb]); // push 0xaa, push 0xbb
     const locking = new Uint8Array([Opcode.OP_CODESEPARATOR, Opcode.OP_CHECKSIG]);
     const result = vm.execute(unlocking, locking);
-    expect(result.error).toBeUndefined();
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
   });
 
   it('step mode steps over OP_CODESEPARATOR without error', () => {

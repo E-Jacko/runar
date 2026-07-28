@@ -13,6 +13,7 @@ import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.ForLoopTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.IfTree;
+import com.sun.source.tree.LineMap;
 import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
@@ -110,16 +111,27 @@ public final class JavaParser {
 
     /** Parse Java source into a Rúnar contract AST. */
     public static ContractNode parse(String source, String filename) {
-        CompilationUnitTree cu = parseToTree(source, filename);
-        ClassTree classTree = firstTopLevelClass(cu, filename);
-        return convertClass(classTree, filename, cu);
+        Unit unit = parseToTree(source, filename);
+        ClassTree classTree = firstTopLevelClass(unit.cu(), filename);
+        return convertClass(classTree, filename, unit);
     }
 
     // ---------------------------------------------------------------
     // javac frontend invocation
     // ---------------------------------------------------------------
 
-    private static CompilationUnitTree parseToTree(String source, String filename) {
+    /**
+     * A parsed compilation unit paired with the {@link SourcePositions}
+     * helper bound to the {@link JavacTask} that produced it. Both halves
+     * are needed to resolve a {@link Tree} to a (line, column) pair:
+     * {@code positions} maps a tree to a character offset, and the unit's
+     * {@link LineMap} maps that offset to line/column. The task is local
+     * to {@link #parseToTree}, so the pair is threaded through the
+     * converters instead of the bare {@code CompilationUnitTree}.
+     */
+    private record Unit(CompilationUnitTree cu, SourcePositions positions) {}
+
+    private static Unit parseToTree(String source, String filename) {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
             throw new ParseException("no system Java compiler available — is this a JRE without tools.jar?");
@@ -159,7 +171,7 @@ public final class JavaParser {
         if (!iter.hasNext()) {
             throw new ParseException("no compilation unit parsed from " + filename);
         }
-        return iter.next();
+        return new Unit(iter.next(), Trees.instance(task).getSourcePositions());
     }
 
     private static String stripRunarInfix(String filename) {
@@ -181,7 +193,7 @@ public final class JavaParser {
     // Class conversion
     // ---------------------------------------------------------------
 
-    private static ContractNode convertClass(ClassTree cls, String filename, CompilationUnitTree cu) {
+    private static ContractNode convertClass(ClassTree cls, String filename, Unit cu) {
         ParentClass parentClass = determineParentClass(cls, filename);
 
         List<PropertyNode> properties = new ArrayList<>();
@@ -243,7 +255,7 @@ public final class JavaParser {
     // Field / property conversion
     // ---------------------------------------------------------------
 
-    private static PropertyNode convertField(VariableTree v, String filename, CompilationUnitTree cu) {
+    private static PropertyNode convertField(VariableTree v, String filename, Unit cu) {
         boolean readonly = hasAnnotation(v.getModifiers(), "Readonly");
         TypeNode type = convertType(v.getType(), filename);
         Expression init = v.getInitializer() != null ? convertExpression(v.getInitializer(), filename, cu) : null;
@@ -261,7 +273,7 @@ public final class JavaParser {
     // Method conversion
     // ---------------------------------------------------------------
 
-    private static MethodNode convertMethod(MethodTree m, String filename, CompilationUnitTree cu, String className) {
+    private static MethodNode convertMethod(MethodTree m, String filename, Unit cu, String className) {
         boolean isConstructor = m.getName().contentEquals("<init>") || m.getName().contentEquals(className);
 
         Visibility vis;
@@ -382,7 +394,7 @@ public final class JavaParser {
     // Statement conversion
     // ---------------------------------------------------------------
 
-    private static List<Statement> convertStatements(List<? extends StatementTree> stmts, String filename, CompilationUnitTree cu) {
+    private static List<Statement> convertStatements(List<? extends StatementTree> stmts, String filename, Unit cu) {
         List<Statement> out = new ArrayList<>(stmts.size());
         for (StatementTree s : stmts) {
             out.add(convertStatement(s, filename, cu));
@@ -390,7 +402,7 @@ public final class JavaParser {
         return out;
     }
 
-    private static Statement convertStatement(StatementTree s, String filename, CompilationUnitTree cu) {
+    private static Statement convertStatement(StatementTree s, String filename, Unit cu) {
         SourceLocation loc = locationOf(s, cu, filename);
         if (s instanceof VariableTree v) {
             TypeNode type = convertType(v.getType(), filename);
@@ -443,7 +455,7 @@ public final class JavaParser {
         throw new ParseException("unsupported statement kind " + s.getKind() + " in " + filename);
     }
 
-    private static List<Statement> flattenBlock(StatementTree s, String filename, CompilationUnitTree cu) {
+    private static List<Statement> flattenBlock(StatementTree s, String filename, Unit cu) {
         if (s instanceof BlockTree bt) {
             return convertStatements(bt.getStatements(), filename, cu);
         }
@@ -454,7 +466,7 @@ public final class JavaParser {
     // Expression conversion
     // ---------------------------------------------------------------
 
-    private static Expression convertExpression(ExpressionTree e, String filename, CompilationUnitTree cu) {
+    private static Expression convertExpression(ExpressionTree e, String filename, Unit cu) {
         if (e instanceof ParenthesizedTree pt) {
             return convertExpression(pt.getExpression(), filename, cu);
         }
@@ -635,7 +647,7 @@ public final class JavaParser {
         throw new ParseException("unsupported literal type " + value.getClass().getSimpleName() + " in " + filename);
     }
 
-    private static Expression convertCall(MethodInvocationTree mi, String filename, CompilationUnitTree cu) {
+    private static Expression convertCall(MethodInvocationTree mi, String filename, Unit cu) {
         ExpressionTree callee = mi.getMethodSelect();
         // Recognise xxx.fromHex("deadbeef") → ByteStringLiteral.
         if (callee instanceof MemberSelectTree ms
@@ -795,7 +807,7 @@ public final class JavaParser {
     private static Optional<Expression> tryLowerBigintMethod(
         MethodInvocationTree mi,
         String filename,
-        CompilationUnitTree cu
+        Unit cu
     ) {
         ExpressionTree callee = mi.getMethodSelect();
         if (!(callee instanceof MemberSelectTree ms)) return Optional.empty();
@@ -864,7 +876,7 @@ public final class JavaParser {
         Map.entry("shiftRight", Expression.BinaryOp.SHR)
     );
 
-    private static List<Expression> convertArgs(MethodInvocationTree mi, String filename, CompilationUnitTree cu) {
+    private static List<Expression> convertArgs(MethodInvocationTree mi, String filename, Unit cu) {
         List<Expression> args = new ArrayList<>(mi.getArguments().size());
         for (ExpressionTree arg : mi.getArguments()) {
             args.add(convertExpression(arg, filename, cu));
@@ -896,7 +908,7 @@ public final class JavaParser {
         };
     }
 
-    private static Expression convertUnary(UnaryTree ut, String filename, CompilationUnitTree cu) {
+    private static Expression convertUnary(UnaryTree ut, String filename, Unit cu) {
         Expression operand = convertExpression(ut.getExpression(), filename, cu);
         return switch (ut.getKind()) {
             case LOGICAL_COMPLEMENT -> new UnaryExpr(Expression.UnaryOp.NOT, operand);
@@ -932,14 +944,35 @@ public final class JavaParser {
         return t.toString();
     }
 
-    private static SourceLocation locationOf(Tree t, CompilationUnitTree cu, String filename) {
-        // Trees has a SourcePositions helper, but it needs a Trees
-        // instance bound to the JavacTask. We don't have one at this
-        // point — the parser returns only the tree. Source locations at
-        // this pass are approximate (line 0, column 0); the AST loses
-        // precision here. A future pass can re-attach locations by
-        // tracking line breaks in the source string.
-        return new SourceLocation(filename, 0, 0);
+    /**
+     * Resolve a javac {@link Tree} to a Rúnar {@link SourceLocation}.
+     *
+     * <p>Rúnar's cross-tier source-map convention is <strong>1-based line,
+     * 0-based column</strong>, where the column is a raw character index
+     * into the line's text (see {@code conformance/source-map/README.md}
+     * and {@code independent-oracle.ts}, which resolves a mapping by
+     * indexing {@code lineText[column]}).
+     *
+     * <p>The column is therefore derived as {@code start - lineStart} rather
+     * than from {@link LineMap#getColumnNumber}: the latter expands a tab to
+     * the next 8-column stop, which would report column 16 for a two-tab
+     * indent whose token actually sits at character index 2.
+     *
+     * <p>Positions javac cannot resolve ({@link Diagnostic#NOPOS}, e.g.
+     * synthesised trees) stay at the degenerate {@code 0/0} — the source-anchor
+     * oracle treats {@code line == 0} as "untracked" rather than as a wrong
+     * position, so a genuine unknown must not be reported as line 1.
+     */
+    private static SourceLocation locationOf(Tree t, Unit cu, String filename) {
+        if (t == null || cu == null) return new SourceLocation(filename, 0, 0);
+        long start = cu.positions().getStartPosition(cu.cu(), t);
+        if (start == Diagnostic.NOPOS || start < 0) return new SourceLocation(filename, 0, 0);
+        LineMap lineMap = cu.cu().getLineMap();
+        if (lineMap == null) return new SourceLocation(filename, 0, 0);
+        long line = lineMap.getLineNumber(start);
+        if (line < 1) return new SourceLocation(filename, 0, 0);
+        long lineStart = lineMap.getStartPosition(line);
+        return new SourceLocation(filename, (int) line, (int) Math.max(0, start - lineStart));
     }
 
     // ---------------------------------------------------------------

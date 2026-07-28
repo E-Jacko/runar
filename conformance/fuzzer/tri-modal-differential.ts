@@ -3,16 +3,17 @@
  * PROPERTY-mode harness.
  *
  * The `--execute` harness (`execute-differential.ts`) is bi-modal (ANF
- * interpreter vs. the hand-rolled ScriptVM) and drives a `fc.sample` corpus
- * (no shrinking). This harness upgrades both axes:
+ * interpreter vs. `ScriptVM`) and drives a `fc.sample` corpus (no shrinking).
+ * This harness upgrades both axes:
  *
- *   - Tri-modal: every generated spend runs through THREE independent engines —
- *     the ANF `RunarInterpreter`, the repo's hand-rolled `ScriptVM`, and the
- *     upstream `@bsv/sdk` `Spend` interpreter (the same engine that validates
- *     real BSV transactions, which additionally enforces the consensus
- *     clean-stack + push-only + minimal-push rules the hand-rolled VM does not).
- *     A disagreement between the third-party engine and the two in-repo engines
- *     is a strong signal of a real, shared-design miscompile.
+ *   - Tri-modal: every generated spend runs through the ANF `RunarInterpreter`
+ *     (source semantics — the one genuinely independent implementation),
+ *     `ScriptVM` (the upstream `@bsv/sdk` `Spend` engine stepped opcode by
+ *     opcode, consensus wrappers off), and a strict `Spend.validate()` that
+ *     additionally enforces the consensus clean-stack + push-only +
+ *     minimal-push rules. An interpreter-vs-engine disagreement is a strong
+ *     signal of a real, shared-design miscompile; a ScriptVM-vs-validate
+ *     disagreement means the script evaluates but is not a valid spend.
  *
  *   - PROPERTY mode: it drives `arbExecCase` through `fc.check` so that ANY
  *     divergence is SHRUNK to a minimal (contract, inputs) counterexample —

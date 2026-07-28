@@ -372,4 +372,74 @@ class JavaParserTest {
         assertEquals("other", ((Identifier) equalsCmp.left()).name());
         assertEquals("a", ((PropertyAccessExpr) equalsCmp.right()).property());
     }
+
+    @Test
+    void tracksRealStatementSourceLocations() {
+        // Source locations use the cross-tier convention: 1-based line,
+        // 0-based column, pointing at the first character of the token
+        // that starts the statement. They feed the artifact's sourceMap
+        // (see Emit.SourceMapping) and must land on a real token start.
+        //
+        // P2PKH_SOURCE line/column layout (text block, common indent stripped):
+        //   13: class P2PKH extends SmartContract {
+        //   17:         super(pubKeyHash);
+        //   18:         this.pubKeyHash = pubKeyHash;
+        //   22:     void unlock(Sig sig, PubKey pubKey) {
+        //   23:         assertThat(hash160(pubKey).equals(pubKeyHash));
+        //   24:         assertThat(checkSig(sig, pubKey));
+        ContractNode c = JavaParser.parse(P2PKH_SOURCE, "P2PKH.runar.java");
+
+        var unlock = c.methods().stream().filter(m -> m.name().equals("unlock")).findFirst().orElseThrow();
+        // The `@Public` annotation starts the method declaration.
+        assertEquals(21, unlock.sourceLocation().line());
+        assertEquals(4, unlock.sourceLocation().column());
+        assertEquals("P2PKH.runar.java", unlock.sourceLocation().file());
+
+        var first = unlock.body().get(0).sourceLocation();
+        assertEquals(23, first.line());
+        assertEquals(8, first.column());
+
+        var second = unlock.body().get(1).sourceLocation();
+        assertEquals(24, second.line());
+        assertEquals(8, second.column());
+
+        // Every tracked position must index a real, non-whitespace token
+        // start in the source (the independent source-anchor oracle in
+        // conformance/source-map/independent-oracle.ts applies the same rule).
+        String[] lines = P2PKH_SOURCE.split("\n", -1);
+        for (var loc : new runar.compiler.ir.ast.SourceLocation[] { first, second }) {
+            String text = lines[loc.line() - 1];
+            assertTrue(loc.column() < text.length(), "column past end of line " + loc.line());
+            assertEquals('a', text.charAt(loc.column()), "expected `assertThat` token start");
+        }
+
+        var ctor = c.constructor();
+        assertEquals(17, ctor.body().get(0).sourceLocation().line());
+        assertEquals(8, ctor.body().get(0).sourceLocation().column());
+        assertEquals(18, ctor.body().get(1).sourceLocation().line());
+        assertEquals(8, ctor.body().get(1).sourceLocation().column());
+    }
+
+    @Test
+    void columnIsARawCharacterIndexNotATabExpandedColumn() {
+        // javac's LineMap.getColumnNumber expands a tab to the next 8-column
+        // stop, so a two-tab indent reports column 17. Consumers of the
+        // source map (conformance/source-map/independent-oracle.ts, editors
+        // resolving a mapping back to source) index the line text by raw
+        // character offset, where the same token sits at column 2. The
+        // column must therefore be the raw offset from the line start.
+        String src = "class C extends SmartContract {\n"
+            + "\t@Readonly Addr a;\n"
+            + "\tC(Addr a) { super(a); this.a = a; }\n"
+            + "\t@Public\n"
+            + "\tvoid check(Addr other) {\n"
+            + "\t\tassertThat(other.equals(this.a));\n"
+            + "\t}\n"
+            + "}\n";
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var loc = c.methods().get(0).body().get(0).sourceLocation();
+        assertEquals(6, loc.line());
+        assertEquals(2, loc.column());
+        assertEquals('a', src.split("\n", -1)[loc.line() - 1].charAt(loc.column()));
+    }
 }

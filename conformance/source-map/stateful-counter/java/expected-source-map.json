@@ -1,14 +1,14 @@
 {
   "mappings": [
-    {"opcodeIndex": 32, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 33, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 34, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 164, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 165, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 166, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 167, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 168, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 169, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
-    {"opcodeIndex": 170, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0}
+    {"opcodeIndex": 38, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 42, "column": 8},
+    {"opcodeIndex": 39, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 42, "column": 8},
+    {"opcodeIndex": 40, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 42, "column": 8},
+    {"opcodeIndex": 188, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 51, "column": 8},
+    {"opcodeIndex": 189, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 51, "column": 8},
+    {"opcodeIndex": 190, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 51, "column": 8},
+    {"opcodeIndex": 191, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 51, "column": 8},
+    {"opcodeIndex": 192, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 52, "column": 8},
+    {"opcodeIndex": 193, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 52, "column": 8},
+    {"opcodeIndex": 194, "sourceFile": "examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 52, "column": 8}
   ]
 }

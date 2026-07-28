@@ -1,0 +1,86 @@
+{
+  "fixture": "cross-covenant",
+  "_doc": [
+    "Plain-oracle witness for CrossCovenantRef (hash256 preimage + substr/bin2num).",
+    "",
+    "This fixture needs NO signature and NO transaction context: the contract",
+    "hashes a caller-supplied byte string and compares it against a constructor-",
+    "baked hash256, then substrs a field out of it. So the differential oracle",
+    "(ANF interpreter vs the @bsv/sdk-backed ScriptVM, fold-ON bytes) can execute",
+    "it directly — which is why the previous `crypto-exempt.json` entry, whose own",
+    "reason admitted 'it likely COULD be witnessed ... but nobody has written that",
+    "spec yet', has been dropped in favour of this file.",
+    "",
+    "Witness construction (all values below are derived, not arbitrary):",
+    "  referencedOutput = e803000000000000  (8-byte LE amount = 1000 sats)",
+    "                   + 22                (varint script length = 34)",
+    "                   + 6a20              (OP_RETURN, PUSH 32)",
+    "                   + 11 * 32           (the 32-byte state root)",
+    "  sourceScriptHash = hash256(referencedOutput)",
+    "                   = b62b8750350efa7d279d2de817ee4a09aa2aabcf6bb3a64b5ad6a53d68c84e4e",
+    "  stateRoot lives at byte offset 11, so substr(output, 11, 32) == 11*32.",
+    "  bin2num(substr(output, 0, 8)) == 1000 (the LE amount field).",
+    "",
+    "Both rejecting shapes are covered per method: a tampered preimage (fails the",
+    "hash256 equality) and a correct preimage with a wrong extracted value (passes",
+    "the hash check, fails the field assert) — so the hash guard and the extract",
+    "guard are each independently proven to be load-bearing."
+  ],
+  "constructorArgs": {
+    "sourceScriptHash": "0xb62b8750350efa7d279d2de817ee4a09aa2aabcf6bb3a64b5ad6a53d68c84e4e"
+  },
+  "spends": [
+    {
+      "method": "verifyAndExtract",
+      "args": [
+        "0xe803000000000000226a201111111111111111111111111111111111111111111111111111111111111111",
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "11n"
+      ],
+      "expect": "accept",
+      "note": "Authentic referenced output; state root at offset 11 matches."
+    },
+    {
+      "method": "verifyAndExtract",
+      "args": [
+        "0x1703000000000000226a201111111111111111111111111111111111111111111111111111111111111111",
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "11n"
+      ],
+      "expect": "reject",
+      "note": "First byte of the output flipped (e8 -> 17): hash256 != sourceScriptHash, so the authenticity guard must abort before any extraction."
+    },
+    {
+      "method": "verifyAndExtract",
+      "args": [
+        "0xe803000000000000226a201111111111111111111111111111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222222222222222222222222222",
+        "11n"
+      ],
+      "expect": "reject",
+      "note": "Authentic output (hash guard passes) but the caller claims a state root of 22*32; the substr equality must abort. Proves the extract assert is load-bearing independently of the hash assert."
+    },
+    {
+      "method": "verifyAndExtractNumeric",
+      "args": [
+        "0xe803000000000000226a201111111111111111111111111111111111111111111111111111111111111111",
+        "1000n",
+        "0n",
+        "8n"
+      ],
+      "expect": "accept",
+      "note": "bin2num of the 8-byte LE amount field == 1000."
+    },
+    {
+      "method": "verifyAndExtractNumeric",
+      "args": [
+        "0xe803000000000000226a201111111111111111111111111111111111111111111111111111111111111111",
+        "1001n",
+        "0n",
+        "8n"
+      ],
+      "expect": "reject",
+      "note": "Authentic output, but the claimed numeric value is off by one; the bin2num equality must abort."
+    }
+  ]
+}

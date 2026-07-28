@@ -2,9 +2,13 @@
  * Real-crypto execution oracle (post-mortem remediation #1).
  *
  * The plain differential-execution oracle (`differential-execution.ts`) runs
- * the compiled bytes on the in-process `ScriptVM`, whose `checkSigCallback`
- * defaults to MOCK crypto (`() => true`) and which has NO transaction context,
- * so it cannot verify a real signature or a real BIP-143 sighash preimage.
+ * the compiled bytes on the in-process `ScriptVM` against a SYNTHETIC, fixed
+ * transaction context (null outpoint, no outputs), so while its OP_CHECKSIG is
+ * real (it is `@bsv/sdk`'s `Spend`), no witness it is handed carries a signature
+ * over a real spending transaction, and it cannot exercise a state-continuation
+ * preimage at all. (Historically it was worse: `ScriptVM` was a hand-rolled
+ * interpreter whose `checkSigCallback` defaulted to `() => true`, i.e. every
+ * signature check passed unconditionally.)
  * Every fixture needing a signature or a tx-context preimage was therefore
  * routed OUT into `crypto-exempt.json` / `harness-inapplicable.json` and got
  * NO real execution — the exact blind spot behind BUG-100 / #99 / #100 / #44

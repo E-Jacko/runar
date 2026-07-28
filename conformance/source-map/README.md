@@ -66,10 +66,17 @@ committed golden:
 4. No duplicate `opcodeIndex` values.
 5. Each entry has `opcodeIndex >= 0`, `line >= 0`, `column >= 0`, and
    a non-empty `sourceFile`. (The JSON schema demands `line >= 1` and
-   `column >= 0`; the Java tier's parser still defaults to `line=0`
-   on the surface forms it doesn't track, so the structural check
-   relaxes to `>= 0`. A future Java parser improvement should bump this
-   back to `>= 1` here and across the schema.)
+   `column >= 0`. The check stays relaxed to `line >= 0` because a tier
+   may legitimately emit `line=0, column=0` for a *synthesized* node that
+   has no position in any source file; every tier now tracks real
+   positions for nodes that do come from source.)
+
+**Column convention: 1-based line, 0-based column.** The TypeScript tier is
+the reference (e.g. `P2PKH.runar.ts` line 43 column 4 = the `a` of `assert`,
+where `'    assert(...)'[4] === 'a'`), and `independent-oracle.ts` indexes
+`lineText[column]` directly. Tiers whose parsers/tokenizers carry 1-based
+columns for diagnostics (`file:line:column`) convert at the source-map
+emission point only, so diagnostics keep their conventional 1-based columns.
 6. `opcodeIndex` values lie in `[0, opcodeCount)`.
 
 ## Independent source-anchor oracle (audit finding #22)
@@ -112,14 +119,22 @@ weaker property still has real teeth: run against the current committed
 goldens, it independently found genuine, pre-existing bugs across four of
 the seven tiers (details in `conformance/source-map/anchor-known-issues.json`):
 
-- **Go, Rust, Ruby** — the tracked column is consistently one character
-  past the true token start (e.g. `assert(` mapped at the `s`, not the `a`)
-  on effectively every tracked mapping in every fixture.
-- **Zig** — most mappings anchor cleanly to a token (often the enclosing
-  method's parameter-list start), but a subset split a token mid-word.
-- **Java** — every mapping across every fixture carries `line=0, column=0`;
-  none of the Java tier's source locations are actually tracked yet,
-  despite passing every structural invariant.
+- **Go, Rust, Ruby, Zig** — the tracked column was consistently one
+  character past the true token start (e.g. `assert(` mapped at the `s`,
+  not the `a`), because these tiers emitted their parsers' 1-based
+  diagnostic columns into a 0-based source-map field. **FIXED** — each now
+  converts at its source-map emission point only.
+- **Java** — every mapping carried `line=0, column=0`: `JavaParser`'s
+  `locationOf()` was a stub returning zeros because `parseToTree` discarded
+  the `JavacTask` before `Trees.getSourcePositions()` could be taken. The
+  rest of the pipeline (AST → ANF → StackLower → Emit) already threaded
+  positions correctly. **FIXED** — positions are now resolved, with the
+  column taken as a raw character offset (`start - lineMap.getStartPosition`)
+  rather than `LineMap.getColumnNumber`, which expands tabs to 8-column
+  stops and would mis-anchor every tab-indented contract.
+
+All of the above are fixed: `anchor-known-issues.json` is now empty, so
+every (fixture, tier) pair is unconditionally enforced.
 
 None of this is visible from byte-identity or `checkStructural` alone —
 both were green before this oracle existed. Fixing those generators is out

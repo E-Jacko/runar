@@ -181,7 +181,11 @@ func (p *rbParser) tokenize(source string) []rbToken {
 
 		for pos < len(line) {
 			ch := line[pos]
-			col := pos + 1
+			// 0-based column, matching this tier's other format parsers
+			// (parser_sol/python/move/gocontract) and the source-map convention
+			// (1-based line, 0-based column). These tokenizers were 1-based, which
+			// made source maps for this format anchor one char past every token.
+			col := pos
 
 			// Whitespace within line
 			if ch == ' ' || ch == '\t' {

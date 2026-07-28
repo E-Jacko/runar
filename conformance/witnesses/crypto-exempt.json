@@ -35,15 +35,6 @@
       }
     },
     {
-      "fixture": "cross-covenant",
-      "reason": "hash256 preimage verification — hash-preimage witness, not a checkSig. NOTE: hash256 is a base builtin (no dedicated codegen module; see packages/runar-compiler/src/passes/04-anf-lower.ts), unlike the special-cased sha256Compress/sha256Finalize family, so this exemption's justification is weaker than the others in this file — it likely COULD be witnessed by the plain oracle (pick any bytes, compute hash256 locally, no real signature needed) but nobody has written that spec yet.",
-      "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "hash256",
-        "note": "byte-golden only (expected-script.hex); no dedicated per-family codegen module exists for hash256 since it is a base builtin, not a special-cased primitive like sha256Compress/Finalize."
-      }
-    },
-    {
       "fixture": "ec-demo",
       "reason": "secp256k1 EC primitives — EC point witness",
       "coveredBy": { "kind": "codegen-golden", "family": "ec" }

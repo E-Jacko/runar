@@ -8,7 +8,7 @@
  * rather than a 1-byte data push. This is the CONSENSUS minimal-push encoding:
  * the upstream `@bsv/sdk` `Spend` interpreter rejects a non-minimally-encoded
  * push (`SCRIPT_VERIFY_MINIMALDATA`), so the tri-modal oracle (issue #124)
- * requires it. The hand-rolled `ScriptVM` and the ANF interpreter accept either
+ * requires it. `ScriptVM` (relaxed mode) and the ANF interpreter accept either
  * form and treat them identically, so this is a semantics-preserving change.
  */
 import { encodeScriptNumber } from '../vm/index.js';

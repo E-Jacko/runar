@@ -162,7 +162,7 @@ export const PEEPHOLE_RULES: PeepholeRuleSpec[] = [
     sweep: {
       kind: 'skip',
       reason:
-        'OP_CHECKSIG needs sig+pubkey+tx-sighash context; ScriptVM uses a mock always-true checksig, so accept/reject cannot be exercised over a numeric edge domain. The X;VERIFY≡XVERIFY fusion is covered by the go-sdk real-crypto script_execution_test.go path.',
+        'OP_CHECKSIG needs a real sig+pubkey over the spending tx sighash, which the numeric edge domain cannot produce, so accept/reject cannot be exercised here. The X;VERIFY≡XVERIFY fusion is covered by the real-crypto paths (go-sdk script_execution_test.go, and the TS checkmultisig/real-crypto oracles on @bsv/sdk Spend).',
     },
   },
   // OP_NUMEQUAL, OP_VERIFY → OP_NUMEQUALVERIFY

@@ -1,64 +1,64 @@
 {
   "mappings": [
     {
-      "opcodeIndex": 32,
+      "opcodeIndex": 38,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 13,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 33,
+      "opcodeIndex": 39,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 13,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 34,
+      "opcodeIndex": 40,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 13,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 164,
+      "opcodeIndex": 188,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 165,
+      "opcodeIndex": 189,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 166,
+      "opcodeIndex": 190,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 167,
+      "opcodeIndex": 191,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 168,
+      "opcodeIndex": 192,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 19,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 169,
+      "opcodeIndex": 193,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 19,
-      "column": 5
+      "column": 4
     },
     {
-      "opcodeIndex": 170,
+      "opcodeIndex": 194,
       "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 19,
-      "column": 5
+      "column": 4
     }
   ]
 }

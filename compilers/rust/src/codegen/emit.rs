@@ -130,13 +130,24 @@ impl EmitContext {
     }
 
     /// Record a source mapping if a pending source location is set.
+    ///
+    /// The frontend tracks columns 1-based (that's what compiler diagnostics
+    /// print, e.g. `file:line:column`), but the emitted source map uses the
+    /// cross-tier convention of **1-based line, 0-based column** — the same
+    /// one the TypeScript reference tier emits and that
+    /// `conformance/source-map/independent-oracle.ts` verifies by indexing
+    /// `lineText[column]`. Convert here, at the source-map emission point, so
+    /// diagnostics keep their conventional 1-based columns.
+    ///
+    /// `saturating_sub` both clamps at 0 (never underflows a `usize`) and
+    /// leaves an untracked `line == 0 && column == 0` location as 0/0.
     fn record_source_mapping(&mut self) {
         if let Some(ref loc) = self.pending_source_loc {
             self.source_map.push(SourceMapping {
                 opcode_index: self.opcode_index,
                 source_file: loc.file.clone(),
                 line: loc.line,
-                column: loc.column,
+                column: loc.column.saturating_sub(1),
             });
         }
     }

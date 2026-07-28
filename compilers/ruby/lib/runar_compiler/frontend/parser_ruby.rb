@@ -347,7 +347,13 @@ module RunarCompiler
 
         while pos < line.length
           ch = line[pos]
-          col = pos + 1 # 1-based column
+          # 0-based column, matching this tier's eight other format parsers
+          # (parser_ts/go/sol/move/python/rust/zig/java all start each line at
+          # col 0) and the source-map convention (1-based line, 0-based column
+          # — see conformance/source-map/README.md). This parser was the lone
+          # 1-based outlier, which made .runar.rb source maps anchor one
+          # character past every token start.
+          col = pos
 
           # Whitespace within a line
           if ch == " " || ch == "\t"

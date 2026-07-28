@@ -7,8 +7,9 @@ import { runTriModalExecution } from '../oracle/index.js';
  * Property-mode smoke test for the tri-modal execution-oracle generator
  * (issue #124). Every generated case must:
  *   (a) compile (a compile throw fails the property), and
- *   (b) produce ACCEPT/REJECT agreement across the interpreter, the hand-rolled
- *       ScriptVM, and the upstream @bsv/sdk Spend engine.
+ *   (b) produce ACCEPT/REJECT agreement across the ANF interpreter, `ScriptVM`
+ *       (the @bsv/sdk Spend engine stepped opcode by opcode), and a strict
+ *       full-consensus `Spend.validate()`.
  * fast-check shrinks any counterexample to a minimal (contract, inputs) repro.
  */
 describe('arbExecCase — tri-modal agreement (loops + byte-ops + post-loop reads)', () => {

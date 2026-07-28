@@ -4,49 +4,49 @@
       "opcodeIndex": 5,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 41,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 6,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 41,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 8,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 42,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 9,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 42,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 13,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 48,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 14,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 48,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 16,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 49,
-      "column": 2
+      "column": 1
     },
     {
       "opcodeIndex": 17,
       "sourceFile": "examples/go/escrow/Escrow.runar.go",
       "line": 49,
-      "column": 2
+      "column": 1
     }
   ]
 }

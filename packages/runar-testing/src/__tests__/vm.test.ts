@@ -139,7 +139,8 @@ describe('ScriptVM: OP_VERIFY', () => {
     const vm = new ScriptVM();
     const result = vm.executeHex('0069');
     expect(result.success).toBe(false);
-    expect(result.error).toBe('OP_VERIFY failed');
+    // Wording comes from the upstream @bsv/sdk engine, not from this repo.
+    expect(result.error).toContain('OP_VERIFY');
   });
 });
 
@@ -281,6 +282,69 @@ describe('ScriptVM: executeScript vs executeHex', () => {
     const locking = hexToBytes('5187'); // OP_1 OP_EQUAL
     const result = vm.execute(unlocking, locking);
     expect(result.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Behaviours the previous hand-rolled VM got wrong. Pinned so a regression is
+// caught rather than silently re-introduced.
+// ---------------------------------------------------------------------------
+
+describe('ScriptVM: post-Genesis BSV behaviours', () => {
+  it('OP_RETURN terminates the script instead of failing it', () => {
+    // Legacy VM: threw "OP_RETURN encountered", i.e. reported FAILURE for every
+    // script that reached an OP_RETURN — including the `codePart OP_RETURN
+    // <state>` shape of a deployed stateful contract.
+    const result = new ScriptVM().executeHex('516a'); // OP_1 OP_RETURN
+    expect(result.error).toBeUndefined();
+    expect(result.success).toBe(true);
+  });
+
+  it('OP_RETURN still fails when the stack top is falsy', () => {
+    expect(new ScriptVM().executeHex('006a').success).toBe(false);
+  });
+
+  it('accepts the BSV NOP range above OP_CHECKMULTISIGVERIFY', () => {
+    // Legacy VM's opcode table stopped at 0xaf, so 0xb0..0xfc were all
+    // "Unknown or disabled opcode" — it rejected valid BSV scripts.
+    expect(new ScriptVM().executeHex('51b0ba').success).toBe(true); // OP_1 OP_NOP1 OP_NOP11
+  });
+
+  it('executes BSV string opcodes (OP_SPLIT peer OP_LEFT, 0xb4)', () => {
+    // push 'aabbcc', OP_2, OP_LEFT -> 'aabb'
+    const r = new ScriptVM().executeHex('03aabbcc52b4');
+    expect(r.success).toBe(true);
+    expect(bytesToHex(r.stack[0]!)).toBe('aabb');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// flags.strictEncoding — turns the upstream engine's consensus encoding rules
+// back on. Without a test the option would be indistinguishable from a no-op.
+// ---------------------------------------------------------------------------
+
+describe('ScriptVM: flags.strictEncoding', () => {
+  // 0x01 0x01 is a 1-byte data push of 0x01; the minimal encoding is OP_1 (0x51).
+  const NON_MINIMAL_PUSH_OF_1 = '0101';
+
+  it('relaxed (default) accepts a non-minimally-encoded push', () => {
+    const result = new ScriptVM().executeHex(NON_MINIMAL_PUSH_OF_1);
+    expect(result.success).toBe(true);
+    expect(bytesToHex(result.stack[0]!)).toBe('01');
+  });
+
+  it('strictEncoding rejects a non-minimally-encoded push', () => {
+    const vm = new ScriptVM({ flags: { strictEncoding: true } });
+    const result = vm.executeHex(NON_MINIMAL_PUSH_OF_1);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('minimally-encoded');
+  });
+
+  it('strictEncoding rejects a non-minimally-encoded script number operand', () => {
+    // push 0x0100 (non-minimal 1) then OP_1 OP_ADD
+    const vm = new ScriptVM({ flags: { strictEncoding: true } });
+    const result = vm.executeHex('02010051' + '93');
+    expect(result.success).toBe(false);
   });
 });
 

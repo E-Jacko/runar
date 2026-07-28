@@ -4,31 +4,31 @@
       "opcodeIndex": 0,
       "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
-      "column": 9
+      "column": 8
     },
     {
       "opcodeIndex": 1,
       "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
-      "column": 9
+      "column": 8
     },
     {
       "opcodeIndex": 2,
       "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
-      "column": 9
+      "column": 8
     },
     {
       "opcodeIndex": 3,
       "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
-      "column": 9
+      "column": 8
     },
     {
       "opcodeIndex": 4,
       "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 42,
-      "column": 9
+      "column": 8
     }
   ]
 }
