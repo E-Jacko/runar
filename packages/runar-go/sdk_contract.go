@@ -36,6 +36,33 @@ func IsEmptySig(value interface{}) bool {
 	return ok
 }
 
+// AutoPrevoutsParamName is the well-known ByteString parameter the SDK fills in
+// with the transaction's concatenated outpoints (36 bytes per input) once the
+// input list has converged. It is the ONLY ByteString slot for which a nil call
+// arg is a request rather than a mistake.
+const AutoPrevoutsParamName = "allPrevouts"
+
+// isAutoPrevoutsParam reports whether a nil arg for param is the SDK's
+// auto-compute sentinel. Mirrors the Zig SDK's name gate (sdk_contract.zig):
+// nil for any other ByteString param is a caller error, not a stub request.
+func isAutoPrevoutsParam(param ABIParam) bool {
+	return param.Name == AutoPrevoutsParamName
+}
+
+// errNilNonSigArg reports a nil call arg supplied for a parameter that has no
+// auto-resolution rule. Silently substituting the allPrevouts stub here builds
+// a transaction that broadcasts and then fails at script execution with an
+// opaque error; failing at build time names the offending parameter instead.
+func errNilNonSigArg(where string, param ABIParam, index int) error {
+	return fmt.Errorf(
+		"%s: nil arg for %s param %q (index %d): nil is only auto-resolved for "+
+			"Sig (auto-signed), PubKey (taken from the signer), SigHashPreimage, "+
+			"and the %q outpoint slot. Pass an explicit value (hex string, or \"\" "+
+			"for an empty ByteString)",
+		where, param.Type, param.Name, index, AutoPrevoutsParamName,
+	)
+}
+
 // ---------------------------------------------------------------------------
 // RunarContract — main contract runtime wrapper
 // ---------------------------------------------------------------------------
@@ -599,6 +626,9 @@ func (c *RunarContract) PrepareCall(
 			resolvedArgs[i] = strings.Repeat("00", 181)
 		}
 		if param.Type == "ByteString" && args[i] == nil {
+			if !isAutoPrevoutsParam(param) {
+				return nil, errNilNonSigArg("RunarContract.PrepareCall", param, i)
+			}
 			prevoutsIndices = append(prevoutsIndices, i)
 			nExtra := 0
 			if options != nil {
@@ -866,6 +896,9 @@ func (c *RunarContract) PrepareCall(
 					resolved[j] = strings.Repeat("00", 181)
 				}
 				if param.Type == "ByteString" && resolved[j] == nil {
+					if !isAutoPrevoutsParam(param) {
+						return nil, errNilNonSigArg("RunarContract.PrepareCall (extra input "+strconv.Itoa(i)+")", param, j)
+					}
 					nExtra := len(options.AdditionalContractInputs)
 					estimatedInputs := 1 + nExtra + 1
 					resolved[j] = strings.Repeat("00", 36*estimatedInputs)
@@ -1272,15 +1305,9 @@ func (c *RunarContract) PrepareCall(
 		signedTx = InsertUnlockingScript(signedTx, 0, realUnlockingScript)
 	}
 
-	// Compute sighash from preimage
-	sighash := ""
-	if finalPreimage != "" {
-		preimageBytes, decErr := hex.DecodeString(finalPreimage)
-		if decErr == nil {
-			h := sha256.Sum256(preimageBytes)
-			sighash = hex.EncodeToString(h[:])
-		}
-	}
+	// Compute sighash from preimage (C19: the true BIP-143 digest external
+	// signers must sign — hash256(preimage), NOT sha256(preimage)).
+	sighash := computeBip143Sighash(finalPreimage)
 
 	return &PreparedCall{
 		Sighash:              sighash,
@@ -2253,15 +2280,9 @@ func (c *RunarContract) prepareCallTerminal(
 		termTx = InsertUnlockingScript(termTx, inputIdx, unlockScript)
 	}
 
-	// Compute sighash from preimage
-	sighash := ""
-	if finalPreimage != "" {
-		preimageBytes, decErr := hex.DecodeString(finalPreimage)
-		if decErr == nil {
-			h := sha256.Sum256(preimageBytes)
-			sighash = hex.EncodeToString(h[:])
-		}
-	}
+	// Compute sighash from preimage (C19: the true BIP-143 digest external
+	// signers must sign — hash256(preimage), NOT sha256(preimage)).
+	sighash := computeBip143Sighash(finalPreimage)
 
 	return &PreparedCall{
 		Sighash:              sighash,
@@ -2339,6 +2360,33 @@ func readVarintBytes(data []byte, offset int) (uint64, int) {
 
 // Argument encoding
 // ---------------------------------------------------------------------------
+
+// computeBip143Sighash returns the BIP-143 sighash digest — hash256(preimage),
+// i.e. sha256(sha256(preimage)) — that is ACTUALLY ECDSA-signed by OP_CHECKSIG
+// on-chain. Returns "" for an empty or non-hex preimage.
+//
+// Deep-review finding C19: PreparedCall.Sighash previously stored only
+// sha256(preimage) (a SINGLE hash). The default Call() path never reads that
+// field — it re-derives the digest through LocalSigner.Sign, which calls
+// go-sdk's CalcInputSignatureHash (Sha256d) — so the bug stayed invisible
+// there. But the documented multi-signer path hands PreparedCall.Sighash to an
+// EXTERNAL signer (a BRC-100-style `signHash(digest)` wallet) that ECDSA-signs
+// those 32 bytes DIRECTLY with no further hashing. Handed the single-hashed
+// value, such a signer signs the wrong message and the node's real OP_CHECKSIG
+// rejects the spend. Mirrors computeBip143Sighash in
+// packages/runar-sdk/src/contract.ts.
+func computeBip143Sighash(preimageHex string) string {
+	if preimageHex == "" {
+		return ""
+	}
+	preimageBytes, err := hex.DecodeString(preimageHex)
+	if err != nil {
+		return ""
+	}
+	first := sha256.Sum256(preimageBytes)
+	second := sha256.Sum256(first[:])
+	return hex.EncodeToString(second[:])
+}
 
 // encodeArg encodes an argument value as a Bitcoin Script push data element.
 func encodeArg(value interface{}) string {

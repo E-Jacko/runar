@@ -262,7 +262,7 @@ txid, _, err := contract.FinalizeCall(prepared, map[int]string{
 Important details:
 
 - `PrepareCall` already signs the **funding** P2PKH inputs and the **additional contract inputs** (when present) using the provided signer. Only the primary contract input's `Sig` parameters are left as 72-byte placeholders — those are the slots in `prepared.SigIndices`.
-- `Sighash` is the SHA-256 of the BIP-143 preimage; `Preimage` is the full preimage. External signers usually sign `Sighash` directly.
+- `Sighash` is `hash256(preimage)` — `sha256(sha256(preimage))`, the BIP-143 digest `OP_CHECKSIG` verifies against; `Preimage` is the full preimage. External signers ECDSA-sign `Sighash` **directly**, with no further hashing.
 - `OpPushTxSig` is the OP_PUSH_TX DER signature over the same preimage, signed with the well-known `k=1` private key. The SDK computes this for stateful contracts; it is exposed on `PreparedCall` for inspection.
 - `FinalizeCall` re-injects the real signatures, broadcasts, and returns the same `(txid, *TransactionData, error)` tuple as `Call`.
 

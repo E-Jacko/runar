@@ -167,7 +167,7 @@ type OutputSpec struct {
 // are consumed by FinalizeCall().
 type PreparedCall struct {
 	// Public: callers use these to coordinate external signing
-	Sighash     string `json:"sighash"`     // 64-char hex — BIP-143 hash external signers sign
+	Sighash     string `json:"sighash"`     // 64-char hex — hash256(preimage), the BIP-143 digest external signers ECDSA-sign directly
 	Preimage    string `json:"preimage"`    // hex — full BIP-143 preimage
 	OpPushTxSig string `json:"opPushTxSig"` // hex — OP_PUSH_TX DER sig (empty if not needed)
 	TxHex       string `json:"txHex"`       // hex — built TX (for backward compat / JSON serialization)

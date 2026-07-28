@@ -2876,15 +2876,20 @@ func TestPushData_76Bytes_UsesPUSHDATA1(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
-// {0x00, 0x01..0x10, 0x81} must use the minimal opcode (OP_0 / OP_1..OP_16 /
-// OP_1NEGATE), not a direct push "01 NN". Byte-identical with the other SDKs.
+// {0x01..0x10, 0x81} must use the minimal opcode (OP_1..OP_16 / OP_1NEGATE),
+// not a direct push "01 NN". Byte-identical with the other SDKs.
+//
+// 0x00 is deliberately EXCLUDED (C9 / S1): OP_0 pushes the EMPTY byte array,
+// not a 1-byte 0x00, so the minimal encoding of a 1-byte 0x00 payload is the
+// direct push "0100" — exactly what the compiler's `encodePushBytesHex`
+// (packages/runar-compiler/src/passes/push-encoding.ts) emits.
 // ---------------------------------------------------------------------------
 
 func TestPushData_MinimalData_SingleByte(t *testing.T) {
 	cases := map[string]string{
-		"00": "00", // OP_0
-		"05": "55", // OP_5
-		"81": "4f", // OP_1NEGATE
+		"00": "0100", // direct push, NOT OP_0 -- OP_0 pushes [], not [0x00]
+		"05": "55",   // OP_5
+		"81": "4f",   // OP_1NEGATE
 	}
 	for input, want := range cases {
 		if got := EncodePushData(input); got != want {
