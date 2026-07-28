@@ -1,7 +1,8 @@
 /**
  * Ledger honesty gate (audit findings #P0-1, #11, #14, #24).
  *
- * `crypto-exempt.json` and `harness-inapplicable.json` used to carry only a
+ * `coverage-ledger.json` (formerly split across `crypto-exempt.json` and
+ * `harness-inapplicable.json`) used to carry only a
  * free-text `reason` string. Membership in the list was treated as "covered"
  * by `completeness.test.ts` with NO verification that the claimed coverage
  * (e.g. "Covered by the Go tx-context path") is actually true. Several
@@ -72,10 +73,25 @@ interface LedgerEntry {
   [key: string]: unknown;
 }
 
-function loadLedger(file: string, listKey: string): LedgerEntry[] {
-  const doc = JSON.parse(readFileSync(join(__dirname, file), 'utf-8'));
-  return doc[listKey] as LedgerEntry[];
+const LEDGER_FILE = 'coverage-ledger.json';
+
+function loadLedger(): LedgerEntry[] {
+  const doc = JSON.parse(readFileSync(join(__dirname, LEDGER_FILE), 'utf-8'));
+  return doc.entries as LedgerEntry[];
 }
+
+/**
+ * Closed `cause` vocabulary — the discriminator that survived the merge of the
+ * old `crypto-exempt.json` (all its entries became `crypto-witness-infeasible`)
+ * and `harness-inapplicable.json` (which already carried the other three).
+ * Enforced so a typo cannot invent a new, unreviewed exemption axis.
+ */
+const CAUSES = new Set([
+  'crypto-witness-infeasible',
+  'stateful-harness-gap',
+  'go-only',
+  'interpreter-unsupported',
+]);
 
 // Per-family dedicated codegen module — only families that genuinely have one
 // are listed; a "codegen-golden" entry for a family NOT in this map is still
@@ -212,16 +228,33 @@ function verifyClaim(entry: LedgerEntry): string | null {
 }
 
 describe('ledger honesty — coveredBy claims must be literally true', () => {
-  it('every crypto-exempt.json entry\'s coveredBy claim is verifiably true', () => {
-    const entries = loadLedger('crypto-exempt.json', 'exempt');
+  it("every coverage-ledger.json entry's coveredBy claim is verifiably true", () => {
+    const entries = loadLedger();
     const failures = entries.map(verifyClaim).filter((f): f is string => f !== null);
     expect(failures, `false coverage claims:\n${failures.join('\n')}`).toEqual([]);
   });
 
-  it('every harness-inapplicable.json entry\'s coveredBy claim is verifiably true', () => {
-    const entries = loadLedger('harness-inapplicable.json', 'inapplicable');
-    const failures = entries.map(verifyClaim).filter((f): f is string => f !== null);
-    expect(failures, `false coverage claims:\n${failures.join('\n')}`).toEqual([]);
+  it('every coverage-ledger.json entry has a known cause, a reason, and a unique fixture', () => {
+    const entries = loadLedger();
+    const failures: string[] = [];
+    const seen = new Set<string>();
+    for (const e of entries) {
+      if (typeof e.fixture !== 'string' || e.fixture.length === 0) {
+        failures.push(`entry with missing/empty "fixture": ${JSON.stringify(e)}`);
+        continue;
+      }
+      if (seen.has(e.fixture)) failures.push(`${e.fixture}: duplicate ledger entry`);
+      seen.add(e.fixture);
+      if (typeof e.cause !== 'string' || !CAUSES.has(e.cause)) {
+        failures.push(
+          `${e.fixture}: unknown cause ${JSON.stringify(e.cause)} — must be one of ${[...CAUSES].join(', ')}`,
+        );
+      }
+      if (typeof e.reason !== 'string' || e.reason.trim().length === 0) {
+        failures.push(`${e.fixture}: missing/empty "reason"`);
+      }
+    }
+    expect(failures, `malformed ledger entries:\n${failures.join('\n')}`).toEqual([]);
   });
 });
 
@@ -257,7 +290,7 @@ function checkAcceptReject(dir: string, files: string[]): string[] {
   return failures;
 }
 
-const NON_SPEC_JSON = new Set(['crypto-exempt.json', 'harness-inapplicable.json']);
+const NON_SPEC_JSON = new Set([LEDGER_FILE]);
 
 describe('ledger honesty — every spend spec has >=1 accept and >=1 reject, or an explicit opt-out', () => {
   it('witnesses/*.json (mock-crypto differential oracle specs)', () => {

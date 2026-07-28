@@ -10,7 +10,8 @@
  * interpreter whose `checkSigCallback` defaulted to `() => true`, i.e. every
  * signature check passed unconditionally.)
  * Every fixture needing a signature or a tx-context preimage was therefore
- * routed OUT into `crypto-exempt.json` / `harness-inapplicable.json` and got
+ * routed OUT into the coverage ledger (`conformance/witnesses/coverage-ledger.json`,
+ * formerly split across `crypto-exempt.json` / `harness-inapplicable.json`) and got
  * NO real execution — the exact blind spot behind BUG-100 / #99 / #100 / #44
  * ("compiled to wrong bytes, all seven tiers agreed, nobody executed it with
  * real crypto").

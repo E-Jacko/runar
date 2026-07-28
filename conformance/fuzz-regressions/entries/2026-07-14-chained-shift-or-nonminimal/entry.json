@@ -1,0 +1,22 @@
+{
+  "id": "2026-07-14-chained-shift-or-nonminimal",
+  "title": "chained `(x << 8) | 5` succeeds on-chain (equal 1-byte operands) but the interpreter aborted — the ACCEPT direction of the same bug",
+  "discovered": "2026-07-14",
+  "oracle": "execute",
+  "sourceFile": "contract.runar.ts",
+  "fileName": "ChainedShiftOr.runar.ts",
+  "method": "testChainedOr",
+  "constructorArgs": {},
+  "args": ["2n"],
+  "expect": {
+    "interpreterAccepted": true,
+    "vmAccepted": true
+  },
+  "requiredOpcodes": ["OP_LSHIFT", "OP_OR"],
+  "provenance": {
+    "fixedBy": ["694c891b"],
+    "issue": "PR #141 (fix/shift-bitwise-semantics)",
+    "note": "Reconstructed from the per-tier chained tests commit 694c891b added, which pin `(2<<8)|5 === 5`. Kept as a separate entry from the OP_AND case because it is the OPPOSITE verdict direction: a one-sided 'fix' that only makes the interpreter abort more eagerly would pass the OP_AND entry and fail this one."
+  },
+  "rationale": "`2 << 8` leaves a 1-byte non-minimal [0x00] (OP_LSHIFT preserves length) and the literal 5 is the 1-byte [0x05]; the lengths MATCH so OP_OR succeeds and yields [0x05] = 5, making the spend valid. The buggy interpreters re-minimised `2 << 8` to numeric 0 -> EMPTY array, then hit a length mismatch against [0x05] and rejected a spend the deployed script accepts. Both engines must now accept."
+}

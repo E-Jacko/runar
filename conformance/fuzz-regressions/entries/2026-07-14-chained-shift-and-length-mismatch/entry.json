@@ -1,0 +1,22 @@
+{
+  "id": "2026-07-14-chained-shift-and-length-mismatch",
+  "title": "FUNDS LOSS — chained `(x << 8) & 0` aborts on-chain (OP_AND length mismatch) but the interpreter reported the spend VALID",
+  "discovered": "2026-07-14",
+  "oracle": "execute",
+  "sourceFile": "contract.runar.ts",
+  "fileName": "ChainedShiftAnd.runar.ts",
+  "method": "testChainedAnd",
+  "constructorArgs": {},
+  "args": ["1n"],
+  "expect": {
+    "interpreterAccepted": false,
+    "vmAccepted": false
+  },
+  "requiredOpcodes": ["OP_LSHIFT", "OP_AND"],
+  "provenance": {
+    "fixedBy": ["694c891b"],
+    "issue": "PR #141 (fix/shift-bitwise-semantics)",
+    "note": "Reconstructed from the funds-loss divergence documented verbatim in commit 694c891b: '((1<<8)&0)===0 returned 0 (TestContract reported the spend VALID) while the deployed OP_AND aborts on a length mismatch, leaving the UTXO un-spendable.' This is the highest-severity entry in the corpus: the failure mode is an un-spendable UTXO, not a wrong number."
+  },
+  "rationale": "OP_LSHIFT preserves byte length, so `1 << 8` leaves a 1-byte NON-MINIMAL [0x00] on the stack, while the literal 0 is the EMPTY byte array. OP_AND requires equal-length operands, so the deployed script aborts and the spend is impossible. The buggy interpreters re-minimised each intermediate to a bare integer, so `1 << 8` became numeric 0 -> empty array, `& 0` succeeded, `=== 0` was true, and TestContract reported ACCEPT — a developer deploying against that verdict would have locked the funds forever. Both engines must now REJECT, with the interpreter raising the same length-mismatch abort the opcode does. Pinning reject/reject (rather than only `agrees`) is what makes this entry fail if the interpreter drifts back to accepting."
+}

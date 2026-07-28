@@ -1,0 +1,401 @@
+{
+  "_doc": [
+    "SINGLE coverage ledger for conformance fixtures that the plain differential",
+    "oracle (packages/runar-testing/src/oracle/differential-execution.ts) does NOT",
+    "execute. It answers one question per fixture: why is this fixture not covered",
+    "by the plain oracle, and what covers it INSTEAD?",
+    "",
+    "Consolidated from the two files this replaces — `crypto-exempt.json` (array",
+    "key `exempt`) and `harness-inapplicable.json` (array key `inapplicable`) —",
+    "which were the same mechanism read by the same tests, differing only in that",
+    "the second carried a `cause` discriminator. Every entry now carries that",
+    "discriminator, so the two axes are still distinguishable without two files.",
+    "",
+    "Schema — one object per fixture under `entries`:",
+    "  fixture   — directory name under conformance/tests/ (must exist; typos are",
+    "              caught by completeness.test.ts, duplicates by",
+    "              coverage-claims.test.ts)",
+    "  cause     — WHY the plain oracle cannot run it (vocabulary below; enforced",
+    "              by coverage-claims.test.ts)",
+    "  reason    — free-text, FOR HUMANS ONLY. Never machine-checked and never",
+    "              treated as evidence. Several of these strings record a real bug",
+    "              and its fix; do not paraphrase them away.",
+    "  coveredBy — the MACHINE-CHECKED claim of what actually covers the fixture.",
+    "              coverage-claims.test.ts proves each claim by grepping the",
+    "              artifact it names.",
+    "",
+    "`cause` vocabulary (the closed set enforced in coverage-claims.test.ts):",
+    "  crypto-witness-infeasible — the spend needs a REAL cryptographic witness",
+    "      (ECDSA/Schnorr checkSig, secp256k1 / NIST-P EC, SHA-256 / BLAKE3 /",
+    "      Merkle hash-preimage, Rabin, or a post-quantum SLH-DSA / WOTS+",
+    "      signature) that the in-process oracle cannot synthesise from bare args.",
+    "      These are the entries formerly in `crypto-exempt.json`. Post-mortem",
+    "      remediation #1 gave the oracle REAL secp256k1: every stateless/stateful",
+    "      ECDSA-checkSig / checkMultiSig fixture that could be given a real",
+    "      signature was MOVED to conformance/witnesses/real-crypto/ (executed for",
+    "      real on @bsv/sdk Spend) and removed from the ledger. What remains under",
+    "      this cause is genuinely out of reach for the current TS real-crypto",
+    "      harness. NOTE: this cause also records PROVENANCE — it marks every entry",
+    "      that came from `crypto-exempt.json`, so the pre-merge partition stays",
+    "      recoverable. A few of them (all-readonly-cleanstack, covenant-vault) are",
+    "      really stateful-harness gaps, and merkle-proof / state-covenant are",
+    "      really go-only, as their own `reason` and `coveredBy` say; they were",
+    "      filed in the crypto ledger historically and were NOT reclassified during",
+    "      the merge. Reclassify deliberately, not as a side effect.",
+    "  stateful-harness-gap — non-crypto: the SDK deploy->call->Spend continuation",
+    "      path cannot reconstruct the exact tx shape a StatefulSmartContract",
+    "      method demands. Remediation #1 added that real path (runar-testing",
+    "      runStatefulSpend) and MOVED every stateful fixture whose continuation",
+    "      could be driven and re-validated on @bsv/sdk Spend with a real",
+    "      checkPreimage binding out of the ledger; what remains still cannot be",
+    "      composed by it.",
+    "  go-only — a compilers:[\"go\"] proof-system fixture: no TypeScript Stack-IR",
+    "      codegen exists, so compile() cannot emit deployed bytes for the TS-based",
+    "      harness to run.",
+    "  interpreter-unsupported — the ANF interpreter (source-semantics engine) does",
+    "      not model the intrinsic the fixture uses, so the differential /",
+    "      real-crypto oracles cannot execute it at all.",
+    "",
+    "CONTRACTS THIS FILE IS HELD TO (both enforced in code, not just documented):",
+    "  1. Membership in this ledger is NOT itself coverage. The machine-checked",
+    "     truth of an entry's claim lives in `coveredBy`, verified by",
+    "     coverage-claims.test.ts against the artifact it names — the fix for a",
+    "     past bug where entries claimed a script_execution_test.go execution path",
+    "     that did not reference the fixture at all.",
+    "  2. `coveredBy.kind === \"UNCOVERED\"` is an HONEST HOLE, NOT COVERAGE.",
+    "     completeness.test.ts deliberately does not count such an entry as",
+    "     covered, so the top-level completeness gate fails on it BY DESIGN and the",
+    "     hole cannot hide behind list membership (audit findings #P0-1, #11, #14,",
+    "     #24). UNCOVERED additionally requires a non-empty `issue` field.",
+    "",
+    "The `coveredBy.kind` vocabulary is documented in conformance/witnesses/README.md",
+    "and enforced in conformance/witnesses/coverage-claims.test.ts. Other ledgers in",
+    "the repo (golden-provenance-allowlist.json, fold-on-allowlist.json,",
+    "sdk-output/coverage-allowlist.json, source-map/anchor-known-issues.json) are",
+    "DIFFERENT axes and deliberately stay separate — see the README section",
+    "\"Why the other ledgers stay separate\"."
+  ],
+  "entries": [
+    {
+      "fixture": "add-raw-output",
+      "cause": "stateful-harness-gap",
+      "reason": "sendToScript(): a TWO-output method — addRawOutput(1000, scriptBytes) plus the addOutput(0, count) state continuation. The SDK deploy->call->Spend path (real-crypto/ style) funds a single continuation output; it does not fund/emit the separate 1000-sat raw output, so a real Spend rejects (checkPreimage output binding fails). RESOLVED (audit P0 follow-up): the SDK deploy->call path still can't compose this, but conformance/script_execution_test.go now hand-builds the exact 3-output tx (raw output, state continuation, change) via executeScriptWithTx and gets a genuine tx-context accept/reject differential against the compiled Bitcoin Script bytes — TestRawOutput_ScriptExecution_Accept (raw output present) and TestRawOutput_ScriptExecution_Reject_RawOutputAbsent (raw output omitted from the real tx while the unlocking script still claims it) — superseding the ANF-interpreter-only anf-cross-tier-parity coverage below as the primary claim.",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "add-raw-output"
+      }
+    },
+    {
+      "fixture": "all-readonly-cleanstack",
+      "cause": "crypto-witness-infeasible",
+      "reason": "zero-mutable-field StatefulSmartContract (issue #44): RunarContract.prepareCall derives isStateful from stateFields.length>0, which is false here, so it exposes the auto-injected SigHashPreimage as a REQUIRED user arg and the standard call([null]) continuation path does not apply — the tx-context preimage cannot be supplied via the SDK call() harness. FOLLOW-UP: drive it via a hand-built preimage in the TS harness.",
+      "coveredBy": {
+        "kind": "integration",
+        "path": "integration/rust/tests/all_readonly_cleanstack.rs",
+        "note": "real deploy + terminal claim() spend on a live regtest node (accept-only; gated behind `cargo test --features regtest`); proves the parentClass sighash-trim fix, not a full accept/reject differential."
+      }
+    },
+    {
+      "fixture": "asm-raw-script",
+      "cause": "interpreter-unsupported",
+      "reason": "UnsafeSmartContract asm({body:'51'}) raw-script intrinsic is not implemented by the ANF interpreter (source-semantics engine reports 'Unknown function: asm'), so the differential / real-crypto oracles cannot execute it. Instead the compiled OP_1 is executed directly on the go-sdk Bitcoin Script engine (anyone-can-spend, empty unlocking → clean TRUE); deliberately no reject case, since universal acceptance is the contract's semantics.",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "asm-raw-script"
+      }
+    },
+    {
+      "fixture": "babybear",
+      "cause": "go-only",
+      "reason": "BabyBear field proof-system primitive is Go-only (compilers:[go]); no TypeScript Stack-IR codegen, compile() cannot emit deployed bytes",
+      "coveredBy": {
+        "kind": "go-only-nocodegen"
+      }
+    },
+    {
+      "fixture": "babybear-ext4",
+      "cause": "go-only",
+      "reason": "BabyBear quartic-extension proof-system primitive is Go-only (compilers:[go]); no TypeScript codegen",
+      "coveredBy": {
+        "kind": "go-only-nocodegen"
+      }
+    },
+    {
+      "fixture": "blake3",
+      "cause": "crypto-witness-infeasible",
+      "reason": "BLAKE3 hash-preimage (blake3Compress/blake3Hash) — not a secp256k1 signature",
+      "coveredBy": {
+        "kind": "go-family-exec",
+        "family": "blake3",
+        "marker": "TestBlake3Compress_",
+        "note": "script_execution_test.go also has func TestBlake3Hash_* real-execution tests; both run inline blake3Compress/blake3Hash contracts through the real Go BSV SDK Spend, not the literal 'blake3' fixture file."
+      }
+    },
+    {
+      "fixture": "branched-readonly-len",
+      "cause": "stateful-harness-gap",
+      "reason": "spend(): branched mutation of count + a fixed-width ByteString state field re-encodes state via OP_NUM2BIN. Driven through the SDK call() path the recomputed continuation width does not match (OP_NUM2BIN 'size not large enough') — the harness cannot reconstruct the exact branched serialisation. FOLLOW-UP: port the Go witness construction.",
+      "coveredBy": {
+        "kind": "interpreter-witness-exec",
+        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
+        "note": "both branches (then/else of the len(scratch)-driven conditional) executed via the ANF interpreter with realistic args; TS tier only, not a full Bitcoin Script byte execution, and this particular fixture's spec is accept-only by design (both arms succeed — the branching logic itself is what's under test, not a checkSig/checkPreimage guard)."
+      }
+    },
+    {
+      "fixture": "convergence-proof",
+      "cause": "crypto-witness-infeasible",
+      "reason": "secp256k1 EC ops (ecAdd/ecMulGen/ecNegate) — EC point witness, not a checkSig",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "ec"
+      }
+    },
+    {
+      "fixture": "covenant-vault",
+      "cause": "crypto-witness-infeasible",
+      "reason": "stateless SmartContract mixing checkSig + checkPreimage + extractOutputHash — needs a hand-built SigHashPreimage arg bound to a specific expected output; the stateless single-input signed harness cannot synthesise it. FOLLOW-UP candidate for the TS real-crypto harness.",
+      "coveredBy": {
+        "kind": "integration",
+        "path": "integration/go/covenant_vault_test.go",
+        "note": "real deploy + spend on a live regtest node: TestCovenantVault_ValidSpend (accept) and TestCovenantVault_WrongOutput_Rejected (reject) — both against examples/ts/covenant-vault/CovenantVault.runar.ts, the exact .runar.ts source this fixture resolves to."
+      }
+    },
+    {
+      "fixture": "ec-demo",
+      "cause": "crypto-witness-infeasible",
+      "reason": "secp256k1 EC primitives — EC point witness",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "ec"
+      }
+    },
+    {
+      "fixture": "ec-primitives",
+      "cause": "crypto-witness-infeasible",
+      "reason": "secp256k1 EC primitives — EC point witness",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "ec-primitives",
+        "note": "compileRúnar(\"ec-primitives\", ...) is executed by ~16 TestECPrimitives_* functions in script_execution_test.go, including _Fail variants (reject)."
+      }
+    },
+    {
+      "fixture": "ec-unit",
+      "cause": "crypto-witness-infeasible",
+      "reason": "secp256k1 EC primitives — EC point witness",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "ec"
+      }
+    },
+    {
+      "fixture": "intent-output-p2pkh",
+      "cause": "stateful-harness-gap",
+      "reason": "payBond() is a TERMINAL StatefulSmartContract method that asserts output 0 is a bond P2PKH via requireOutputP2PKH(0, ...) with no state mutation, so there is no state continuation and output 0 is free. The SDK deploy->call->Spend path does not compose an external bond output, so there is no go-script-exec accept/reject differential; covered instead by the ANF interpreter (1 accept + 2 reject: correct witness, wrong PKH bytes, wrong hashOutputs) across all 7 tiers. NOTE: the earlier variant that mixed requireOutputP2PKH(0) with a state mutation (the implicit single-output continuation ALSO claiming output 0, making it permanently unspendable) is now a COMPILE-TIME ERROR — see the guard in packages/runar-compiler/src/passes/03-typecheck.ts and TestIntentOutputP2PKH_GuardRejectsMutatingVariant in conformance/script_execution_test.go.",
+      "coveredBy": {
+        "kind": "interpreter-witness-exec",
+        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
+        "note": "1 accept + 2 reject (wrong PKH bytes, wrong hashOutputs) executed via the ANF interpreter with witness-injected serialised outputs (TestContract.setSerialisedOutputs / setMockPreimageBytes), mirrored per-tier in the runar-{go,rs,py,zig,rb,java} intent interpreter tests. Not a full Bitcoin Script byte execution."
+      }
+    },
+    {
+      "fixture": "intent-prev-output-script",
+      "cause": "stateful-harness-gap",
+      "reason": "bind(): extractPrevOutputScript(0, expectedHash) asserts hash256(witness) === expectedHash, a constructor-baked readonly field — the witness-bridge pattern documented in docs/cross-covenant-pattern.md (it does NOT itself introspect input 0's real prevout script; only the current input's own BIP-143 preimage fields are available to Bitcoin Script). RESOLVED (audit P0 follow-up): the earlier 'circular' framing assumed input 0 must be the contract's own (self-referential, hence impossible) UTXO; conformance/script_execution_test.go instead builds a real TWO-input transaction where input 0 carries an independent companion prevout (whose real locking script is the witness) and input 1 carries the contract's own UTXO being spent — TestIntentPrevOutputScript_ScriptExecution_Accept (witness bytes hash to expectedHash, genuinely equal to input 0's real prevout script) and TestIntentPrevOutputScript_ScriptExecution_Reject_WrongWitness (tampered witness bytes) — a real tx-context accept/reject differential against the compiled Bitcoin Script bytes.",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "intent-prev-output-script"
+      }
+    },
+    {
+      "fixture": "merkle-proof",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SHA-256 Merkle root verification (Go-only proof-system primitive, compilers:[go]) — no TS codegen",
+      "coveredBy": {
+        "kind": "go-only-nocodegen"
+      }
+    },
+    {
+      "fixture": "oracle-price",
+      "cause": "crypto-witness-infeasible",
+      "reason": "Rabin signature (verifyRabinSig) + ECDSA checkSig — Rabin witness is not secp256k1; real signatures required",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "rabin"
+      }
+    },
+    {
+      "fixture": "p256-primitives",
+      "cause": "crypto-witness-infeasible",
+      "reason": "NIST P-256 EC primitives — non-secp256k1 EC witness",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "p256"
+      }
+    },
+    {
+      "fixture": "p256-wallet",
+      "cause": "crypto-witness-infeasible",
+      "reason": "NIST P-256 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "p256"
+      }
+    },
+    {
+      "fixture": "p384-primitives",
+      "cause": "crypto-witness-infeasible",
+      "reason": "NIST P-384 EC primitives — non-secp256k1 EC witness",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "p384"
+      }
+    },
+    {
+      "fixture": "p384-wallet",
+      "cause": "crypto-witness-infeasible",
+      "reason": "NIST P-384 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "p384"
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA-SHA2-128s verification — huge PQ witness",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa",
+        "note": "compileRúnar(\"post-quantum-slhdsa\", ...) is executed by TestSLHDSA_ScriptExecution (accept) and _TamperedSig / _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-128f",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA-SHA2-128f verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-128f",
+        "note": "compileRúnar(\"post-quantum-slhdsa-128f\", ...) is executed by TestSLHDSA128f_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-192f",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA-SHA2-192f verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-192f",
+        "note": "compileRúnar(\"post-quantum-slhdsa-192f\", ...) is executed by TestSLHDSA192f_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-192s",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA-SHA2-192s verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order + emitSLHFors 3-byte FORS window for a=14) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-192s",
+        "note": "compileRúnar(\"post-quantum-slhdsa-192s\", ...) is executed by TestSLHDSA192s_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-256f",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA-SHA2-256f verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-256f",
+        "note": "compileRúnar(\"post-quantum-slhdsa-256f\", ...) is executed by TestSLHDSA256f_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-256s",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA-SHA2-256s verification — huge PQ witness. UPGRADED from byte-golden-only: conformance/script_execution_test.go now compiles and EXECUTES this exact fixture with a real, independently cross-checked-valid signature (packages/runar-go's native impl, byte-identical to the TS reference impl) on the go-sdk interpreter, and the compiled script ACCEPTS it (and REJECTS a tampered / wrong-message signature). The pre-existing SLH-DSA codegen miscompile that made it reject a genuinely valid signature (emitSLHHmsg multi-block CAT order + emitSLHFors 3-byte FORS window for a=14) is now FIXED byte-identically across all 7 tiers (audit #2).",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa-256s",
+        "note": "compileRúnar(\"post-quantum-slhdsa-256s\", ...) is executed by TestSLHDSA256s_ScriptExecution (accept, real valid signature) + _TamperedSig + _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-wallet",
+      "cause": "crypto-witness-infeasible",
+      "reason": "WOTS+ verification + ECDSA checkSig — WOTS+ one-time witness; real signatures required",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "wots"
+      }
+    },
+    {
+      "fixture": "post-quantum-wots",
+      "cause": "crypto-witness-infeasible",
+      "reason": "WOTS+ one-time signature verification — WOTS+ witness",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-wots",
+        "note": "compileRúnar(\"post-quantum-wots\", ...) is executed by TestWOTS_ScriptExecution (accept) and _TamperedSig / _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "schnorr-zkp",
+      "cause": "crypto-witness-infeasible",
+      "reason": "secp256k1 EC + hash256 Schnorr proof — EC/hash witness, not an ECDSA checkSig",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "ec"
+      }
+    },
+    {
+      "fixture": "sha256-compress",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SHA-256 compression preimage (sha256Compress) — hash-preimage witness",
+      "coveredBy": {
+        "kind": "go-family-exec",
+        "family": "sha256",
+        "marker": "TestSha256Compress_",
+        "note": "script_execution_test.go runs an inline sha256Compress contract (not the literal 'sha256-compress' fixture file) through the real Go BSV SDK Spend, including a rejects-wrong-hash case."
+      }
+    },
+    {
+      "fixture": "sha256-finalize",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SHA-256 finalize preimage (sha256Finalize) — hash-preimage witness",
+      "coveredBy": {
+        "kind": "go-family-exec",
+        "family": "sha256",
+        "marker": "TestSha256Finalize_",
+        "note": "script_execution_test.go runs an inline sha256Finalize contract (not the literal 'sha256-finalize' fixture file) through the real Go BSV SDK Spend, including a rejects-wrong-hash case."
+      }
+    },
+    {
+      "fixture": "sphincs-wallet",
+      "cause": "crypto-witness-infeasible",
+      "reason": "SLH-DSA (SPHINCS+) verification + ECDSA checkSig — huge PQ witness; real signatures required",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "slh-dsa"
+      }
+    },
+    {
+      "fixture": "state-covenant",
+      "cause": "crypto-witness-infeasible",
+      "reason": "hash256 + SHA-256 Merkle covenant (Go-only, compilers:[go]) + stateful preimage — no TS codegen",
+      "coveredBy": {
+        "kind": "go-only-nocodegen"
+      }
+    },
+    {
+      "fixture": "stateful-wots-gate",
+      "cause": "crypto-witness-infeasible",
+      "reason": "WOTS+ verification gate + checkPreimage — WOTS+ one-time witness + tx context. UPGRADED from byte-golden-only: script_execution_test.go now compiles and EXECUTES this exact fixture with a real tx-context spend (stateful preimage check + state continuation composed with a real WOTS+ signature in one script) on the go-sdk Spend engine.",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "stateful-wots-gate",
+        "note": "compileRúnar(\"stateful-wots-gate\", ...) is executed by TestStatefulWOTSGate_ScriptExecution (accept, real tx-context spend via executeScriptWithTx) and TestStatefulWOTSGate_ScriptExecution_TamperedSig (reject) in script_execution_test.go."
+      }
+    }
+  ]
+}

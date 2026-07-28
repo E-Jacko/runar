@@ -7,8 +7,9 @@
  * stateful contracts, a real state-continuation preimage synthesised by the
  * deploy→call SDK path. This closes the blind spot behind BUG-100 / #99 / #100
  * / #44: fixtures needing a signature or a tx-context preimage used to be
- * routed out to `crypto-exempt.json` / `harness-inapplicable.json` and got NO
- * real execution — all seven tiers agreed on bytes nobody ever ran.
+ * routed out to the coverage ledger (`coverage-ledger.json`, formerly split
+ * across `crypto-exempt.json` / `harness-inapplicable.json`) and got NO real
+ * execution — all seven tiers agreed on bytes nobody ever ran.
  *
  * Two spec kinds:
  *   - `stateless-signed` — a stateless SmartContract; `$sig` args are filled

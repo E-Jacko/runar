@@ -27,6 +27,9 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Matches ci.yml — pins turbo's filesystem cache to the path the restore step
+  # below reads (also turbo 2.x's default).
+  TURBO_CACHE_DIR: .turbo/cache
 
 jobs:
   cross-compiler-bytewise:
@@ -83,6 +86,19 @@ jobs:
             cross-compiler-bytewise-${{ runner.os }}-
 
       # ----- build all 7 compilers (parser + emit-hex via --source/--hex) -----
+      # Read-only restore of the turbo build-output cache written by ci.yml's
+      # ts-compiler job (GitHub caches are shared across workflows in the same
+      # branch scope). See that job's writer step for the staleness argument:
+      # turbo re-hashes every package's inputs and only replays an entry whose
+      # hash matches exactly, so `pnpm run build` below still rebuilds anything
+      # that changed.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       # tsx + the conformance/ runner deps power the TS compiler invocation

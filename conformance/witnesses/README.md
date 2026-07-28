@@ -44,7 +44,7 @@ The plain differential oracle runs on the in-process `ScriptVM`, whose
 `checkSigCallback` defaults to MOCK crypto (`() => true`) and which has NO tx
 context — so it can neither verify a real signature nor a real BIP-143 sighash
 preimage. Every fixture needing a signature or a tx-context preimage was
-therefore routed OUT into `crypto-exempt.json` / `harness-inapplicable.json`
+therefore routed OUT into the coverage ledger (`coverage-ledger.json`)
 and got **no real execution** — the exact blind spot behind BUG-100 / #99 /
 #100 / #44 (all seven tiers agreed on bytes nobody ever ran with real crypto).
 
@@ -82,26 +82,41 @@ hex for byte payloads, `true`/`false`, and `null` for an SDK-auto-signed Sig.
 explicit `addOutput(<sats>, …)`; `lockTime` threads `nLockTime` for
 `extractLocktime` / `currentBlockHeight` introspection.
 
-## Exemptions — every fixture is witnessed, executed, OR exempt
+## Exemptions — every fixture is witnessed, executed, OR in the coverage ledger
 
 `completeness.test.ts` fails CI if any `conformance/tests/<fixture>` is neither
-witnessed here, executed in `real-crypto/`, nor listed in one of the two
-exemption files with a `coveredBy` claim that is NOT `"UNCOVERED"` (and fails if
-a `real-crypto/` fixture is ALSO still listed as exempt — a stale over-claim
+witnessed here, executed in `real-crypto/`, nor listed in **`coverage-ledger.json`**
+with a `coveredBy` claim that is NOT `"UNCOVERED"` (and fails if
+a `real-crypto/` fixture is ALSO still listed in the ledger — a stale over-claim
 guard).
 
-- **`crypto-exempt.json`** — fixtures whose spend needs a REAL cryptographic
+`coverage-ledger.json` is the SINGLE ledger of fixtures the plain differential
+oracle does not execute. (It replaces the former `crypto-exempt.json` +
+`harness-inapplicable.json` pair, which were the same mechanism read by the same
+tests and differed only in that the second carried a `cause` discriminator.)
+Each entry is `{fixture, cause, reason, coveredBy}`; the `cause` field is a
+closed vocabulary, enforced by `coverage-claims.test.ts`:
+
+- **`crypto-witness-infeasible`** — the spend needs a REAL cryptographic
   witness (ECDSA/Schnorr checkSig, secp256k1 / NIST-P EC, SHA-256 / BLAKE3 /
   RIPEMD / Merkle hash-preimage, Rabin, or a post-quantum SLH-DSA / WOTS+
   signature) that the in-process oracle cannot synthesise from plain args.
-- **`harness-inapplicable.json`** — non-crypto fixtures the oracle cannot
-  execute for a structural reason: (1) **stateful-harness-gap** — the SDK
-  `call()` continuation path cannot reconstruct the exact tx shape a
-  `StatefulSmartContract` method demands; (2) **go-only** — `compilers:[go]`
-  fixtures have no TypeScript codegen; (3) **interpreter-unsupported** — the
-  ANF interpreter does not model the raw-script (`asm`) intrinsic.
+  This cause also records PROVENANCE: it marks exactly the entries that used to
+  live in `crypto-exempt.json`, so the pre-merge partition stays recoverable.
+  A handful of them (`all-readonly-cleanstack`, `covenant-vault`,
+  `merkle-proof`, `state-covenant`) were historically filed there but read as
+  `stateful-harness-gap` / `go-only`; the merge did NOT silently reclassify
+  them. Reclassify deliberately, not as a side effect of another change.
+- **`stateful-harness-gap`** — non-crypto: the SDK `call()` continuation path
+  cannot reconstruct the exact tx shape a `StatefulSmartContract` method
+  demands.
+- **`go-only`** — `compilers:[go]` fixtures have no TypeScript codegen, so
+  `compile()` cannot emit deployed bytes for the TS-based harness to run.
+- **`interpreter-unsupported`** — the ANF interpreter does not model the
+  intrinsic the fixture uses (today: the raw-script `asm` intrinsic).
 
-Each entry's free-text `reason`/`cause` is for humans only. The MACHINE-CHECKED
+Each entry's free-text `reason` is for humans only, and `cause` says only WHY
+the plain oracle is out of the picture — neither is evidence. The MACHINE-CHECKED
 truth of "what actually covers this fixture" lives in a structured `coveredBy`
 field, verified by `coverage-claims.test.ts` — list membership alone is never
 treated as coverage (this is the fix for a past bug where several entries
@@ -147,6 +162,31 @@ without that file actually referencing the fixture). `coveredBy.kind` is one of:
   `issue` field describing the follow-up. `completeness.test.ts` does NOT
   count an `"UNCOVERED"` fixture as covered — the top-level completeness gate
   fails on it BY DESIGN, so a real coverage hole cannot hide behind list
-  membership. As of this writing `asm-raw-script` is the one fixture in this
-  state (the ANF interpreter explicitly rejects the `asm` intrinsic, so it
-  cannot even enter the cross-tier interpreter parity suite below).
+  membership. No entry currently carries this kind (`asm-raw-script`, the last
+  one that did, is now executed by `script_execution_test.go`); the kind stays
+  supported so a future hole can be recorded honestly instead of dressed up.
+
+## Why the other ledgers stay separate
+
+`coverage-ledger.json` merged the only two files that were the same mechanism.
+The repo has several other allowlist/ledger files. They look similar and are
+NOT fragmentation — each answers a different question, has a different
+lifecycle, and is enforced by a different gate. Do not fold them in:
+
+- **`conformance/golden-provenance-allowlist.json`** — "was this changed golden
+  file's new content reviewed?" Entries are sha256 content-pins plus a reviewer
+  sign-off, and they go STALE the moment the golden legitimately changes. The
+  coverage ledger pins no bytes and is expected to outlive individual goldens.
+- **`conformance/fold-on-allowlist.json`** — the constant-folding parity axis:
+  "this fixture's 7 tiers are allowed to disagree with fold ON." Nothing to do
+  with whether an execution engine runs the fixture. Currently empty, and the
+  right state for it is empty.
+- **`conformance/sdk-output/coverage-allowlist.json`** — a different suite
+  entirely (the 7-SDK deployed-locking-script comparison), prose-mapped rather
+  than `coveredBy`-structured.
+- **`conformance/source-map/anchor-known-issues.json`** — per-`(fixture, tier)`
+  source-map anchor signatures. It is EMPTY and must stay empty; merging it
+  into a populated file would hide that property.
+- **`conformance/script-size-baseline.json`**, **`conformance/mutation/baseline.json`**
+  — measurements, not exemptions. They record what IS, and a diff against them
+  is the signal; they never assert that something is covered.

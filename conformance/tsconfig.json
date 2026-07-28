@@ -15,6 +15,7 @@
   "include": [
     "runner/**/*.ts",
     "fuzzer/**/*.ts",
+    "fuzz-regressions/*.ts",
     "tests/**/*.runar.ts"
   ]
 }

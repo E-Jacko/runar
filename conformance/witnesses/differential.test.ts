@@ -38,7 +38,7 @@ function decodeCtor(v: unknown): bigint | boolean | string {
   throw new Error(`unencodable constructor arg: ${JSON.stringify(v)}`);
 }
 
-const NON_SPEC_JSON = new Set(['crypto-exempt.json', 'harness-inapplicable.json']);
+const NON_SPEC_JSON = new Set(['coverage-ledger.json']);
 const specFiles = readdirSync(__dirname).filter(
   (f) => f.endsWith('.json') && !NON_SPEC_JSON.has(f),
 );

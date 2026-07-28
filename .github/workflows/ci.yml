@@ -14,6 +14,11 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Pin turbo's filesystem cache to the path the `Cache turbo build outputs`
+  # steps below persist. This is also turbo 2.x's default, so the pin only
+  # protects against a future default change silently turning the cache steps
+  # into no-ops.
+  TURBO_CACHE_DIR: .turbo/cache
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -264,6 +269,45 @@ jobs:
         run: cd compilers/zig && zig build -Doptimize=ReleaseSafe
       - name: Build Java compiler jar (for cross-compiler tests)
         run: cd compilers/java && gradle jar --no-daemon
+      # ---- turbo build-output cache (shared by every job that runs
+      #      `pnpm run build`) -------------------------------------------------
+      # Seven jobs in this workflow (plus four in fuzzer-nightly.yml and one in
+      # cross-compiler-bytewise.yml) rebuild the same TypeScript packages from
+      # scratch. turbo already content-hashes each package's inputs and stores
+      # its `dist/**` outputs under .turbo/cache, so persisting that directory
+      # lets the other jobs replay the outputs instead of re-running tsc.
+      #
+      # STALENESS SAFETY: the key below decides only WHICH cache directory is
+      # downloaded, never which outputs are reused. turbo re-computes a content
+      # hash per package (package files + its dependencies' hashes + lockfile-
+      # derived external deps + task definition) on every run and only replays
+      # an entry whose hash matches exactly; anything else is rebuilt. A stale
+      # `dist/` therefore cannot be served even from a coarse restore-keys hit.
+      # The one input turbo does NOT hash is the repo-root build config
+      # (tsconfig.base.json, which every package extends, plus turbo.json /
+      # pnpm-workspace.yaml / package.json / the lockfile), so that config's
+      # hash is baked into BOTH the key and the restore-keys prefix: changing
+      # any of them can only miss into a cold cache, never fall back to an entry
+      # produced under the old config.
+      #
+      # This job is the single writer — it gates the other TypeScript jobs
+      # (conformance, decompiler-roundtrip, sdk-conformance, script-execution,
+      # integration all `needs:` it) and it builds the whole workspace, so its
+      # cache is complete. Every other job restores read-only, which avoids
+      # N concurrent jobs racing to reserve the same cache key.
+      - name: Cache turbo build outputs (writer)
+        uses: actions/cache@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
+      - name: Prune turbo cache entries not touched in 14 days
+        # The restored directory keeps one tarball per distinct task hash
+        # forever, so drop the entries no recent build has replayed before this
+        # job re-saves it. Bounds cache size; never affects correctness (a
+        # pruned entry is simply rebuilt).
+        run: find .turbo/cache -type f -mtime +14 -delete 2>/dev/null || true
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - run: pnpm run test
@@ -273,6 +317,19 @@ jobs:
         # the BSV Spend interpreter — a correctness oracle for the fold pass beyond
         # cross-tier byte agreement (catches an all-7-tier-shared fold bug).
         run: npx vitest run packages/runar-testing/src/__tests__/fold-equivalence.test.ts
+      - name: Fuzzer regression corpus replay
+        # Replays every checked-in minimised fuzzer reproducer under
+        # conformance/fuzz-regressions/entries/ through the same source-vs-script
+        # differential oracle the `--execute` fuzzer uses. The nightly fuzzer only
+        # keeps a finding for `retention-days: 30` as a CI artifact, so without
+        # this gate a fixed bug stops being covered and has to be rediscovered by
+        # chance. Deterministic (no seed, no network) and sub-second for the whole
+        # corpus, so it runs on every PR rather than nightly.
+        # See conformance/fuzz-regressions/README.md.
+        run: |
+          cd conformance
+          npm ci
+          npx tsx fuzz-regressions/replay.ts
       - name: Example tests (TS + Sol + Move)
         run: npx vitest run examples/ts/ examples/sol/ examples/move/
       - run: pnpm run typecheck
@@ -766,6 +823,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Read-only restore of the turbo build-output cache written by the
+      # ts-compiler job (this job `needs:` it, so the same-commit entry exists).
+      # See that job's writer step for the staleness argument. `pnpm run build`
+      # below still runs and rebuilds anything whose turbo hash does not match.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       # conformance/ is not a pnpm workspace member (uses npm + package-lock.json
@@ -817,8 +885,8 @@ jobs:
         # require they agree on accept/reject. This catches a bug all seven
         # compilers share (byte-identical but wrong). completeness.test.ts in
         # the same directory (completeness.test.ts) fails CI if any fixture is
-        # neither witnessed nor listed in crypto-exempt.json /
-        # harness-inapplicable.json.
+        # neither witnessed nor listed in the coverage ledger
+        # (conformance/witnesses/coverage-ledger.json).
         run: cd conformance && npx vitest run witnesses/
 
   conformance-anf-parity:
@@ -866,6 +934,17 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
+      # Read-only restore of the turbo build-output cache (see the ts-compiler
+      # job's writer step for the staleness argument). This job runs in parallel
+      # with ts-compiler, so it restores the newest prior entry via restore-keys
+      # and `pnpm run build` rebuilds only the packages that actually changed.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - name: Build Rust ANF driver
@@ -1033,6 +1112,16 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      # Read-only restore of the turbo build-output cache written by the
+      # ts-compiler job (this job `needs:` it). See that job's writer step for
+      # the staleness argument.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - name: Decompiler typecheck
@@ -1098,6 +1187,16 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
+      # Read-only restore of the turbo build-output cache written by the
+      # ts-compiler job (this job `needs:` it). See that job's writer step for
+      # the staleness argument.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - name: Build Rust SDK tool
@@ -1131,6 +1230,16 @@ jobs:
           go-version: '1.26'
       # The suite's compileRúnar helper imports packages/runar-compiler/dist,
       # so the TS workspace must be built first.
+      # Read-only restore of the turbo build-output cache written by the
+      # ts-compiler job (this job `needs:` it). See that job's writer step for
+      # the staleness argument.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - name: Run script-execution oracle
@@ -1201,6 +1310,16 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
+      # Read-only restore of the turbo build-output cache written by the
+      # ts-compiler job (this job `needs:` it). See that job's writer step for
+      # the staleness argument.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       # Java integration's ContractCompiler spawns `node --import tsx`; tsx

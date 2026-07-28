@@ -59,6 +59,9 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Matches ci.yml — pins turbo's filesystem cache to the path the restore steps
+  # below read (also turbo 2.x's default).
+  TURBO_CACHE_DIR: .turbo/cache
 
 jobs:
   fuzz:
@@ -101,6 +104,17 @@ jobs:
 
       # ----- TypeScript workspace install + build (so the fuzzer can
       # ----- in-process `import` the runar-compiler / runar-ir-schema)
+      # Read-only restore of the turbo build-output cache written by ci.yml's
+      # ts-compiler job (caches are shared across workflows in the same branch
+      # scope). turbo re-hashes each package's inputs and only replays a
+      # matching entry, so `pnpm run build` still rebuilds whatever changed.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       # conformance/ is not a pnpm workspace member; install its own deps.
@@ -437,6 +451,16 @@ jobs:
 
       # ----- TS workspace install + build (the canonical fuzzer in-process
       # ----- imports the TS reference `canonicalJsonStringify`). -----
+      # Read-only restore of the turbo build-output cache written by ci.yml's
+      # ts-compiler job (see the `fuzz` job above / ci.yml for the staleness
+      # argument).
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - run: cd conformance && npm ci
@@ -556,6 +580,16 @@ jobs:
 
       # The driver imports runar-compiler / runar-testing in-process, so the TS
       # workspace must be installed + built; conformance is not a pnpm member.
+      # Read-only restore of the turbo build-output cache written by ci.yml's
+      # ts-compiler job (see the `fuzz` job above / ci.yml for the staleness
+      # argument).
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - run: cd conformance && npm ci
@@ -612,6 +646,16 @@ jobs:
       # The gates import runar-compiler / runar-testing in-process via the src
       # alias; the workspace must be installed + built, and conformance needs
       # its own tsx (it is not a pnpm member).
+      # Read-only restore of the turbo build-output cache written by ci.yml's
+      # ts-compiler job (see the `fuzz` job above / ci.yml for the staleness
+      # argument).
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - run: cd conformance && npm ci

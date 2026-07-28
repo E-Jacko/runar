@@ -1,0 +1,23 @@
+{
+  "id": "2026-07-12-shift-truncation",
+  "title": "`<<` is OP_LSHIFT over script-number BYTES (length-preserving), not a native bigint shift",
+  "discovered": "2026-07-12",
+  "oracle": "execute",
+  "sourceFile": "contract.runar.ts",
+  "fileName": "ShiftTruncation.runar.ts",
+  "method": "testShift",
+  "constructorArgs": {},
+  "args": ["255n"],
+  "expect": {
+    "interpreterAccepted": true,
+    "vmAccepted": true
+  },
+  "requiredOpcodes": ["OP_LSHIFT"],
+  "provenance": {
+    "finding": "fuzz-findings-execute/2026-07-12T08-02-20-043Z-ShiftTruncation-testShift",
+    "fixedBy": ["61796893", "88bb6903"],
+    "issue": "PR #141 (fix/shift-bitwise-semantics); audit #10",
+    "note": "The original findings directory was only ever a CI artifact (retention-days: 30) and had already expired, so the reproducer was reconstructed from the divergence documented verbatim in commit 61796893: '255<<1 is 254 on-chain not 510'. The reconstruction was re-run against the current oracle and confirmed to compile to OP_LSHIFT and to reach accept/accept."
+  },
+  "rationale": "255 encodes as the 2-byte script number [0xff, 0x00]; OP_LSHIFT shifts the byte array left one bit and PRESERVES its length, giving [0xfe, 0x00] = 254. Native bigint semantics give 510. Before the fix the ANF interpreter (and the constant folder) used native bigint, so it rejected a spend the deployed script accepts. Both engines must now accept. The contract asserts the identity twice — once on literal operands (which also pins that the constant folder refuses to fold `<<`, since a native-bigint fold would bake `510 === 254` into the script and flip the VM to reject) and once on a witness operand (which pins the runtime OP_LSHIFT path regardless of folding)."
+}

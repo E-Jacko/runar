@@ -43,6 +43,7 @@ import {
 } from './canonical-json-differential.js';
 import { runExecuteDifferential } from './execute-differential.js';
 import { runTriModalDifferential } from './tri-modal-differential.js';
+import { runReplayAndReport } from '../fuzz-regressions/replay.js';
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -98,6 +99,18 @@ interface FuzzerCLIOptions {
    * property runs; `--seed` reproduces the run.
    */
   triModal: boolean;
+  /**
+   * Regression-replay mode. Instead of generating anything, replay every
+   * checked-in reproducer under `conformance/fuzz-regressions/entries/` through
+   * the same differential oracle `--execute` uses. Deterministic and fast, so
+   * unlike every other mode here this one runs on EVERY CI run — it is what
+   * keeps a divergence the fuzzer already found from having to be rediscovered
+   * by chance once its 30-day findings artifact expires.
+   * See `conformance/fuzz-regressions/README.md`.
+   */
+  replay: boolean;
+  /** Replay mode only. Substring filter over entry ids. */
+  replayFilter?: string;
   /** Execution-oracle input vectors per (contract, method). Default 6. */
   inputs?: number;
   /** Wall-clock budget in ms (anf / execute modes). */
@@ -132,6 +145,7 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
     canonical: false,
     execute: false,
     triModal: false,
+    replay: false,
     foldOn: false,
   };
 
@@ -190,6 +204,12 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
         break;
       case '--tri-modal':
         opts.triModal = true;
+        break;
+      case '--replay':
+        opts.replay = true;
+        break;
+      case '--replay-filter':
+        opts.replayFilter = argv[++i];
         break;
       case '--inputs':
         opts.inputs = parseInt(argv[++i] ?? '6', 10);
@@ -275,6 +295,18 @@ Options:
                          (bi-modal, fc.sample, no shrinking), a divergence is
                          SHRUNK to a minimal (contract, inputs) repro. --num =
                          property runs (~200 for the PR gate); --seed reproduces.
+  --replay               Regression replay. Generates NOTHING — replays every
+                         checked-in minimised reproducer under
+                         conformance/fuzz-regressions/entries/ through the same
+                         differential oracle --execute uses, and fails with the
+                         entry name on any divergence. Deterministic and fast
+                         (no seed, no network), so unlike every other mode here
+                         it runs on EVERY CI run: it is what stops a divergence
+                         the fuzzer already found from having to be rediscovered
+                         by chance once its 30-day findings artifact expires.
+                         See conformance/fuzz-regressions/README.md.
+  --replay-filter <s>    Replay mode only. Only replay entries whose id contains
+                         the substring <s>.
   --inputs <n>           Execute mode only. Input vectors per (contract, method)
                          (default 6).
   --time-budget-ms <n>   ANF / execute modes. Early-stop once wall-clock exceeded.
@@ -316,6 +348,22 @@ async function main(): Promise<void> {
   if (opts.help) {
     printHelp();
     process.exit(0);
+  }
+
+  // Replay generates nothing, so it short-circuits before the generator banner
+  // and before any seed/compiler setup. See conformance/fuzz-regressions/.
+  if (opts.replay) {
+    const report = runReplayAndReport({ filter: opts.replayFilter, verbose: opts.verbose });
+    if (opts.output) {
+      writeOutput(opts.output, {
+        timestamp: new Date().toISOString(),
+        generator: 'replay',
+        ...report,
+      });
+      console.log(`\nResults written to: ${opts.output}`);
+    }
+    if (report.failed > 0) process.exit(1);
+    return;
   }
 
   console.log('Rúnar Differential Fuzzer');

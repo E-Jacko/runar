@@ -1,0 +1,22 @@
+{
+  "id": "2026-07-12-invert-byte-semantics",
+  "title": "`~` is OP_INVERT over script-number BYTES, not numeric two's-complement",
+  "discovered": "2026-07-12",
+  "oracle": "execute",
+  "sourceFile": "contract.runar.ts",
+  "fileName": "InvertBytes.runar.ts",
+  "method": "testInvert",
+  "constructorArgs": {},
+  "args": ["5n"],
+  "expect": {
+    "interpreterAccepted": true,
+    "vmAccepted": true
+  },
+  "requiredOpcodes": ["OP_INVERT"],
+  "provenance": {
+    "fixedBy": ["61796893", "88bb6903"],
+    "issue": "PR #141 (fix/shift-bitwise-semantics); audit #10",
+    "note": "Reconstructed from the divergence documented verbatim in commit 61796893: '~5 is -122 not -6'. Same root cause and same fix as 2026-07-12-shift-truncation, but a different opcode, so it needs its own entry."
+  },
+  "rationale": "5 encodes as the 1-byte script number [0x05]; OP_INVERT flips every bit to [0xfa], which decodes as little-endian sign-magnitude to -122. Native bigint `~5` is -6. Before the fix the ANF interpreter used `~n === -(n + 1)` and rejected a spend the deployed script accepts. Both engines must now accept. Asserted on both a literal operand (guards the constant folder) and a witness operand (guards the runtime opcode)."
+}
