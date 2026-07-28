@@ -33,10 +33,15 @@ module Runar
       #   - otherwise    — OP_PUSHDATA4 (0x4e) + 4-byte LE length
       #
       # Applies BSV consensus rule SCRIPT_VERIFY_MINIMALDATA for single-byte
-      # pushes: a 1-byte payload whose value is in {0x00, 0x01..0x10, 0x81}
-      # MUST use the corresponding minimal opcode (OP_0 / OP_1..OP_16 /
-      # OP_1NEGATE) rather than the direct push "01 NN". Non-minimal direct
-      # pushes are relay-rejected as "Data push larger than necessary".
+      # pushes: a 1-byte payload whose value is in {0x01..0x10, 0x81} MUST use
+      # the corresponding minimal opcode (OP_1..OP_16 / OP_1NEGATE) rather than
+      # the direct push "01 NN". Non-minimal direct pushes are relay-rejected as
+      # "Data push larger than necessary".
+      #
+      # NOTE: 0x00 is deliberately NOT in that set. OP_0 pushes the EMPTY byte
+      # array, not a 1-byte 0x00 — so the minimal encoding of a 1-byte 0x00
+      # payload is the direct push "01 00" (matching the compiler's
+      # encodePushBytesHex in push-encoding.ts), not OP_0 (C9 / S1).
       #
       # @param data_hex [String] hex-encoded bytes to push
       # @return [String] hex-encoded push instruction + data
@@ -50,7 +55,6 @@ module Runar
         # emit a relay-rejected non-minimal direct push.
         if data_len == 1
           byte = data_hex.to_i(16)
-          return '00' if byte.zero?                                # OP_0
           return format('%02x', 0x50 + byte) if byte.between?(1, 16) # OP_1..OP_16
           return '4f' if byte == 0x81                              # OP_1NEGATE
         end
@@ -395,6 +399,13 @@ module Runar
 
       # Decode a push-data item from hex_str at the given offset.
       #
+      # Inverse of encode_push_data's MINIMALDATA short-circuit: OP_1..OP_16
+      # (0x51..0x60) and OP_1NEGATE (0x4f) each push a single byte with no
+      # separate data bytes in the script — the opcode itself encodes the value
+      # (C9). OP_0 (0x00) falls through to the +opcode <= 75+ branch below and
+      # correctly decodes as the empty byte array (0-length push), since the
+      # encoder no longer emits OP_0 for a 1-byte 0x00 payload.
+      #
       # @param hex_str [String]
       # @param offset  [Integer]
       # @return [Array(String, Integer)] [data_hex, hex_chars_consumed]
@@ -403,7 +414,13 @@ module Runar
 
         opcode = hex_str[offset, 2].to_i(16)
 
-        if opcode <= 75
+        if opcode >= 0x51 && opcode <= 0x60
+          # OP_1..OP_16
+          [format('%02x', opcode - 0x50), 2]
+        elsif opcode == 0x4F
+          # OP_1NEGATE
+          ['81', 2]
+        elsif opcode <= 75
           data_len = opcode * 2
           [hex_str[offset + 2, data_len] || '', 2 + data_len]
         elsif opcode == 0x4C

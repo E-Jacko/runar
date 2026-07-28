@@ -51,10 +51,16 @@ RSpec.describe 'Runar::SDK::State' do
     end
 
     # MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
-    # {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+    # {0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
     context 'MINIMALDATA single-byte pushes' do
-      it 'encodes 0x00 as OP_0 (00)' do
-        expect(mod.encode_push_data('00')).to eq('00')
+      # C9/S1: 0x00 is NOT a MINIMALDATA opcode case. OP_0 pushes the EMPTY
+      # byte array, not a 1-byte 0x00, so encoding a 1-byte 0x00 payload as
+      # OP_0 changes the value (and it did not round-trip). The compiler's
+      # canonical encoder encodePushBytesHex
+      # (packages/runar-compiler/src/passes/push-encoding.ts) emits "0100" for
+      # payload 00 and reserves "00"/OP_0 for a genuinely empty payload.
+      it 'encodes 0x00 as a direct push (0100), not OP_0' do
+        expect(mod.encode_push_data('00')).to eq('0100')
       end
 
       it 'encodes 0x05 as OP_5 (55)' do

@@ -1309,6 +1309,8 @@ module Runar
             end
           when 'ByteString'
             if args[i].nil?
+              raise nil_non_sig_arg_error(param, i) unless auto_prevouts_param?(param)
+
               prevouts_indices << i
               # 36 bytes per input (txid 32 + vout 4) as placeholder
               resolved_args[i] = '00' * (36 * estimated_inputs)
@@ -1319,6 +1321,33 @@ module Runar
         [resolved_args, sig_indices, preimage_index, prevouts_indices]
       end
       # rubocop:enable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/MethodLength
+
+      # The well-known ByteString parameter the SDK fills in with the
+      # transaction's concatenated outpoints (36 bytes per input) once the input
+      # list has converged. It is the ONLY ByteString slot for which a nil call
+      # arg is a request rather than a mistake.
+      AUTO_PREVOUTS_PARAM_NAME = 'allPrevouts'
+
+      # Is a nil arg for +param+ the SDK's auto-compute sentinel? Mirrors the Zig
+      # SDK's name gate (sdk_contract.zig): nil for any other ByteString param is
+      # a caller error, not a stub request.
+      def auto_prevouts_param?(param)
+        param.name == AUTO_PREVOUTS_PARAM_NAME
+      end
+
+      # Build-time error for a nil arg with no auto-resolution rule. Silently
+      # substituting the allPrevouts stub here produces a transaction that
+      # broadcasts and then fails at script execution with an opaque error;
+      # failing at build time names the offending parameter instead.
+      def nil_non_sig_arg_error(param, index)
+        ArgumentError.new(
+          "RunarContract#prepare_call: nil arg for #{param.type} param " \
+          "'#{param.name}' (index #{index}): nil is only auto-resolved for Sig " \
+          '(auto-signed), PubKey (taken from the signer), SigHashPreimage, and ' \
+          "the '#{AUTO_PREVOUTS_PARAM_NAME}' outpoint slot. Pass an explicit " \
+          "value (hex string, or '' for an empty ByteString)"
+        )
+      end
 
       def compute_change_pkh(signer, is_stateful, method_needs_change)
         return '' unless is_stateful && method_needs_change
