@@ -104,12 +104,20 @@ describe('Auction', () => {
     const { signer, pubKeyHex } = await createFundedWallet(provider);
 
     // Auctioneer is the funded signer so null Sig auto-computes correctly.
-    // deadline=0 so extractLocktime(txPreimage) >= deadline passes with nLocktime=0
+    // G5: a REAL non-zero block-height deadline paired with a matching
+    // CallOptions.locktime, mirroring integration/rust/tests/auction.rs. The old
+    // deadline=0 + nLockTime=0 combination made
+    // `extractLocktime(txPreimage) >= deadline` vacuously true, so a regression
+    // in the SDK's locktime threading (or in extractLocktime codegen) would not
+    // have been caught here. nLockTime=1 is safely in the past, so the tx is
+    // immediately mineable — but if the SDK stopped writing the locktime into
+    // the preimage, the preimage would carry 0 and `0 >= 1` would fail the spend.
+    const DEADLINE = 1n;
     const contract = new RunarContract(artifact, [
       pubKeyHex,
       initialBidder.pubKeyHex,
       1000n,
-      0n,
+      DEADLINE,
     ]);
 
     await contract.deploy(provider, signer, {});
@@ -117,7 +125,7 @@ describe('Auction', () => {
     // null Sig is auto-computed from the signer (who is the auctioneer)
     // close() does not continue state, so no newState needed
     const { txid: callTxid } = await contract.call(
-      'close', [null], provider, signer,
+      'close', [null], provider, signer, { locktime: Number(DEADLINE) },
     );
     expect(callTxid).toBeTruthy();
     expect(callTxid.length).toBe(64);
@@ -135,16 +143,18 @@ describe('Auction', () => {
       auctioneerPubKey,
       initialBidder.pubKeyHex,
       1000n,
-      0n, // deadline=0 so extractLocktime passes
+      1n, // non-zero block-height deadline (see the close test above)
     ]);
 
     await contract.deploy(provider, auctioneerSigner, {});
 
-    // Call close with walletB — checkSig will fail on-chain
+    // Call close with walletB — checkSig will fail on-chain. locktime is set so
+    // the ONLY reason for rejection is the wrong signer, not an unsatisfied
+    // deadline.
     const { signer: wrongSigner } = await createFundedWallet(provider);
 
     await expect(
-      contract.call('close', [null], provider, wrongSigner),
+      contract.call('close', [null], provider, wrongSigner, { locktime: 1 }),
     ).rejects.toThrow();
   });
 });

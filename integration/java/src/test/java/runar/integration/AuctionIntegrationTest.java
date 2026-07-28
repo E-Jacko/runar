@@ -10,6 +10,7 @@ import runar.integration.helpers.ContractCompiler;
 import runar.integration.helpers.IntegrationBase;
 import runar.integration.helpers.IntegrationWallet;
 import runar.integration.helpers.RpcProvider;
+import runar.lang.sdk.CallOptions;
 import runar.lang.sdk.RunarArtifact;
 import runar.lang.sdk.RunarContract;
 
@@ -56,24 +57,33 @@ class AuctionIntegrationTest extends IntegrationBase {
     }
 
     @Test
-    @DisplayName("close: auctioneer signs, deadline=0 → spend accepted")
+    @DisplayName("close: auctioneer signs, non-zero deadline + matching nLockTime → spend accepted")
     void closeSucceeds() {
         RunarArtifact a = ContractCompiler.compileRelative(SOURCE);
         RpcProvider provider = new RpcProvider(rpc);
         IntegrationWallet auctioneer = IntegrationWallet.createFunded(rpc, 1.0);
         IntegrationWallet bidder = IntegrationWallet.create();
 
-        // deadline=0 makes extractLocktime(preimage) >= deadline always pass.
+        // G5: a REAL non-zero block-height deadline paired with a matching
+        // CallOptions.locktime, mirroring integration/rust/tests/auction.rs. The
+        // old deadline=0 + nLockTime=0 combination made
+        // extractLocktime(preimage) >= deadline vacuously true, so a regression
+        // in the SDK's locktime threading (or in extractLocktime codegen) would
+        // not have been caught. nLockTime=1 is safely in the past so the tx is
+        // immediately mineable — but if the SDK stopped writing the locktime
+        // into the preimage, the preimage would carry 0 and 0 >= 1 would fail.
+        final int deadline = 1;
         RunarContract contract = new RunarContract(a, List.of(
             auctioneer.pubKeyHex(), bidder.pubKeyHex(),
-            BigInteger.valueOf(100), BigInteger.ZERO
+            BigInteger.valueOf(100), BigInteger.valueOf(deadline)
         ));
         contract.deploy(provider, auctioneer.signer(), 5_000L);
 
         java.util.ArrayList<Object> args = new java.util.ArrayList<>();
         args.add(null); // sig auto-computed
-        RunarContract.CallOutcome call = contract.call(
-            "close", args, null, provider, auctioneer.signer()
+        RunarContract.CallOutcome call = contract.callWithOptions(
+            "close", args, new CallOptions(null, null, null, deadline),
+            provider, auctioneer.signer()
         );
         assertNotNull(call.txid());
     }
@@ -87,16 +97,22 @@ class AuctionIntegrationTest extends IntegrationBase {
         IntegrationWallet attacker = IntegrationWallet.createFunded(rpc, 1.0);
         IntegrationWallet bidder = IntegrationWallet.create();
 
+        // Non-zero block-height deadline (see closeSucceeds). locktime is set so
+        // the ONLY reason for rejection is the wrong signer, not an unsatisfied
+        // deadline.
         RunarContract contract = new RunarContract(a, List.of(
             auctioneer.pubKeyHex(), bidder.pubKeyHex(),
-            BigInteger.valueOf(100), BigInteger.ZERO
+            BigInteger.valueOf(100), BigInteger.ONE
         ));
         contract.deploy(provider, auctioneer.signer(), 5_000L);
 
         java.util.ArrayList<Object> args = new java.util.ArrayList<>();
         args.add(null);
         assertThrows(RuntimeException.class, () ->
-            contract.call("close", args, null, provider, attacker.signer())
+            contract.callWithOptions(
+                "close", args, new CallOptions(null, null, null, 1),
+                provider, attacker.signer()
+            )
         );
     }
 

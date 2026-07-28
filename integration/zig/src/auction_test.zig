@@ -151,6 +151,63 @@ test "Auction_ABI_Methods" {
     try std.testing.expect(public_count >= 2);
 }
 
+test "Auction_Close" {
+    const allocator = std.testing.allocator;
+
+    helpers.requireNodeAvailable(allocator);
+
+    var artifact = try compile.compileContract(allocator, "examples/zig/auction/Auction.runar.zig");
+    defer artifact.deinit();
+
+    var auctioneer = try helpers.newWallet(allocator);
+    defer auctioneer.deinit();
+    var bidder = try helpers.newWallet(allocator);
+    defer bidder.deinit();
+
+    const auctioneer_pk = try auctioneer.pubKeyHex(allocator);
+    defer allocator.free(auctioneer_pk);
+    const bidder_pk = try bidder.pubKeyHex(allocator);
+    defer allocator.free(bidder_pk);
+
+    // G5: this tier previously had NO successful-close test at all, so a
+    // locktime regression could not be caught here even in principle. A REAL
+    // non-zero block-height deadline paired with a matching CallOptions.locktime
+    // (mirroring integration/rust/tests/auction.rs) makes
+    // `extractLocktime(txPreimage) >= deadline` a live assertion: nLockTime=1 is
+    // safely in the past so the tx is immediately mineable, but if the SDK
+    // stopped writing the locktime into the preimage the preimage would carry 0
+    // and `0 >= 1` would fail the spend.
+    var contract = try runar.RunarContract.init(allocator, &artifact, &[_]runar.StateValue{
+        .{ .bytes = auctioneer_pk },
+        .{ .bytes = bidder_pk },
+        .{ .int = 100 },
+        .{ .int = 1 },
+    });
+    defer contract.deinit();
+
+    const fund_auctioneer = try helpers.fundWallet(allocator, &auctioneer, 1.0);
+    defer allocator.free(fund_auctioneer);
+
+    var rpc_provider = helpers.RPCProvider.init(allocator);
+    var auctioneer_signer = try auctioneer.localSigner();
+
+    const deploy_txid = try contract.deploy(rpc_provider.provider(), auctioneer_signer.signer(), .{ .satoshis = 5000 });
+    defer allocator.free(deploy_txid);
+
+    // close: sig auto-signed by the auctioneer (the connected signer)
+    const call_txid = try contract.call(
+        "close",
+        &[_]runar.StateValue{
+            .{ .int = 0 }, // sig: auto-sign
+        },
+        rpc_provider.provider(),
+        auctioneer_signer.signer(),
+        .{ .locktime = 1 },
+    );
+    defer allocator.free(call_txid);
+    try std.testing.expectEqual(@as(usize, 64), call_txid.len);
+}
+
 test "Auction_WrongSignerRejected" {
     const allocator = std.testing.allocator;
 
@@ -172,12 +229,17 @@ test "Auction_WrongSignerRejected" {
     const bidder_pk = try bidder.pubKeyHex(allocator);
     defer allocator.free(bidder_pk);
 
-    // deadline=0 so extractLocktime(txPreimage) >= deadline passes
+    // G5: a REAL non-zero block-height deadline paired with a matching
+    // CallOptions.locktime, mirroring integration/rust/tests/auction.rs. The old
+    // deadline=0 + nLockTime=0 combination made
+    // `extractLocktime(txPreimage) >= deadline` vacuously true, so the deadline
+    // could never be the reason a spend failed. nLockTime=1 is safely in the
+    // past, so here the ONLY reason for rejection is the wrong signer.
     var contract = try runar.RunarContract.init(allocator, &artifact, &[_]runar.StateValue{
         .{ .bytes = auctioneer_pk },
         .{ .bytes = bidder_pk },
         .{ .int = 100 },
-        .{ .int = 0 },
+        .{ .int = 1 },
     });
     defer contract.deinit();
 
@@ -197,7 +259,8 @@ test "Auction_WrongSignerRejected" {
 
     var wrong_local_signer = try wrong_signer.localSigner();
 
-    // Attempt to close with wrong signer -- should be rejected
+    // Attempt to close with wrong signer -- should be rejected. locktime=1
+    // satisfies the non-zero deadline, so the signature is the only failure.
     const result = contract.call(
         "close",
         &[_]runar.StateValue{
@@ -205,7 +268,7 @@ test "Auction_WrongSignerRejected" {
         },
         rpc_provider.provider(),
         wrong_local_signer.signer(),
-        null,
+        .{ .locktime = 1 },
     );
 
     if (result) |call_txid| {

@@ -16,7 +16,7 @@ import pytest
 from conftest import (
     compile_contract, create_provider, create_funded_wallet, create_wallet,
 )
-from runar.sdk import RunarContract, DeployOptions
+from runar.sdk import RunarContract, DeployOptions, CallOptions
 
 
 class TestAuction:
@@ -94,12 +94,21 @@ class TestAuction:
         auctioneer_wallet = create_funded_wallet(provider)
         bidder = create_wallet()
 
-        # deadline=0 so extractLocktime(txPreimage) >= deadline passes with nLocktime=0
+        # G5: a REAL non-zero block-height deadline paired with a matching
+        # CallOptions.locktime, mirroring integration/rust/tests/auction.rs. The
+        # old deadline=0 + nLockTime=0 combination made
+        # `extractLocktime(txPreimage) >= deadline` vacuously true, so a
+        # regression in the SDK's locktime threading (or in extractLocktime
+        # codegen) would not have been caught. nLockTime=1 is safely in the past
+        # so the tx is immediately mineable — but if the SDK stopped writing the
+        # locktime into the preimage, the preimage would carry 0 and `0 >= 1`
+        # would fail the spend.
+        deadline = 1
         contract = RunarContract(artifact, [
             auctioneer_wallet["pubKeyHex"],
             bidder["pubKeyHex"],
             100,
-            0,
+            deadline,
         ])
 
         contract.deploy(provider, auctioneer_wallet["signer"], DeployOptions(satoshis=5000))
@@ -107,6 +116,7 @@ class TestAuction:
         # close: sig=None (auto-computed from signer who is the auctioneer)
         call_txid, _ = contract.call(
             "close", [None], provider, auctioneer_wallet["signer"],
+            CallOptions(locktime=deadline),
         )
         assert call_txid
         assert len(call_txid) == 64
@@ -124,12 +134,15 @@ class TestAuction:
             auctioneer_wallet["pubKeyHex"],
             bidder["pubKeyHex"],
             100,
-            0,
+            1,  # non-zero block-height deadline (see test_close_auction)
         ])
 
         contract.deploy(provider, auctioneer_wallet["signer"], DeployOptions(satoshis=5000))
 
+        # locktime is set so the ONLY reason for rejection is the wrong signer,
+        # not an unsatisfied deadline.
         with pytest.raises(Exception):
             contract.call(
                 "close", [None], provider, wrong_wallet["signer"],
+                CallOptions(locktime=1),
             )
