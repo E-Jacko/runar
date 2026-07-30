@@ -715,6 +715,18 @@ public final class RunarContract {
             ? fullScriptHex.substring((codeSepIdx + 1) * 2)
             : fullScriptHex;
 
+        // The BIP-143 preimage placeholder MUST be the length the real preimage
+        // will be, because both layout passes below fix the change output — and
+        // therefore the fee — from the size of the unlock they are handed, and
+        // the real preimage is spliced in afterwards with no further layout. A
+        // fixed 181-byte stand-in encodes a 24-byte scriptCode; a real contract's
+        // scriptCode is its own (post-OP_CODESEPARATOR) locking script, so the
+        // tx broadcast was hundreds of bytes larger than the one the fee was
+        // computed for and under-paid the miner. The length is fully determined
+        // by the scriptCode — every other BIP-143 field is fixed-width — so
+        // sizing it here makes the layout byte-exact.
+        String preimagePlaceholder = "00".repeat(bip143PreimageLen(sighashSubscript));
+
         // First pass: build a placeholder unlock so we can size the tx,
         // estimate the fee, lay out outputs, and compute the change
         // amount that will be embedded in the real unlock.
@@ -722,7 +734,7 @@ public final class RunarContract {
             m, methodName, resolved, /*opPushTxSigHex*/ "00".repeat(72),
             methodNeedsChange ? changePkhHex : null,
             /*changeAmount*/ 0L, methodNeedsNewAmount, newSats,
-            /*preimageHex*/ "00".repeat(181),
+            /*preimageHex*/ preimagePlaceholder,
             intentWitnessHex
         );
 
@@ -750,7 +762,7 @@ public final class RunarContract {
             m, methodName, resolved, /*opPushTxSigHex*/ "00".repeat(72),
             methodNeedsChange ? changePkhHex : null,
             changeAmount, methodNeedsNewAmount, newSats,
-            /*preimageHex*/ "00".repeat(181),
+            /*preimageHex*/ preimagePlaceholder,
             intentWitnessHex
         );
         TransactionBuilder.CallTxResult secondPass = orderedContractOutputs != null
@@ -1174,6 +1186,30 @@ public final class RunarContract {
             if (m.isPublic()) n++;
         }
         return n;
+    }
+
+    /**
+     * Byte length of the BIP-143 preimage for a given scriptCode. Every field
+     * other than the scriptCode is fixed-width:
+     *
+     * <pre>
+     *   4 nVersion + 32 hashPrevouts + 32 hashSequence + 36 outpoint
+     * + varint(scriptCodeLen) + scriptCodeLen
+     * + 8 amount + 4 nSequence + 32 hashOutputs + 4 nLocktime + 4 sighashType
+     * </pre>
+     *
+     * so the total is exactly {@code 156 + varint + scriptCodeLen}. Used to size
+     * the preimage stand-in in the call-layout passes; a stand-in of the wrong
+     * length silently mis-sizes the fee (see the comment at its use site).
+     *
+     * @param scriptCodeHex the sighash subscript, hex-encoded
+     */
+    static int bip143PreimageLen(String scriptCodeHex) {
+        int scriptCodeLen = scriptCodeHex.length() / 2;
+        int varintLen = scriptCodeLen < 0xfd ? 1
+            : scriptCodeLen <= 0xffff ? 3
+            : scriptCodeLen <= 0xffffffffL ? 5 : 9;
+        return 156 + varintLen + scriptCodeLen;
     }
 
     private int findPublicMethodIndex(String methodName) {
