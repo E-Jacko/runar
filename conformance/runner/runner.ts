@@ -1844,7 +1844,83 @@ function sortKeys(value: unknown): unknown {
 // ---------------------------------------------------------------------------
 
 /**
- * Compare IR output across all available compilers. Returns true if every
+ * Slot order of the `outputs` array both parity call sites build. Kept next to
+ * the comparison functions so a diagnostic can name the tier that diverged
+ * instead of reporting an anonymous "IR mismatch between compilers".
+ */
+const PARITY_TIER_ORDER = ['ts', 'go', 'rust', 'python', 'zig', 'ruby', 'java'] as const;
+
+/**
+ * Result of a cross-tier parity comparison. `detail`, when present, names the
+ * divergent tier(s) and where they diverge — a bare boolean forces the operator
+ * to re-run the suite per tier by hand to learn anything actionable.
+ */
+export interface ParityComparison {
+  ok: boolean;
+  detail?: string;
+}
+
+function tierName(index: number): string {
+  return PARITY_TIER_ORDER[index] ?? `slot${index}`;
+}
+
+/** Group slot indices by the value they produced, largest group first. */
+function groupByValue(
+  entries: { tier: string; value: string }[],
+): { value: string; tiers: string[] }[] {
+  const groups = new Map<string, string[]>();
+  for (const { tier, value } of entries) {
+    const bucket = groups.get(value);
+    if (bucket) bucket.push(tier);
+    else groups.set(value, [tier]);
+  }
+  return [...groups.entries()]
+    .map(([value, tiers]) => ({ value, tiers }))
+    .sort((a, b) => b.tiers.length - a.tiers.length);
+}
+
+/** Index of the first differing character, or -1 when one string prefixes the other. */
+function firstDiffIndex(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i;
+  return -1;
+}
+
+/**
+ * Build a human-readable divergence report: which tiers formed which group, and
+ * the position at which the minority groups first depart from the majority.
+ */
+function describeDivergence(
+  groups: { value: string; tiers: string[] }[],
+  unit: 'char' | 'byte',
+): string {
+  const [majority, ...rest] = groups;
+  if (!majority) return 'no output to compare';
+
+  const parts = rest.map((g) => {
+    const at = firstDiffIndex(majority.value, g.value);
+    let where: string;
+    if (at === -1) {
+      const scale = unit === 'byte' ? 2 : 1;
+      where = `identical up to length; ${unit === 'byte' ? 'byte length' : 'length'} ` +
+        `${Math.floor(g.value.length / scale)} vs ${Math.floor(majority.value.length / scale)}`;
+    } else if (unit === 'byte') {
+      where = `first differs at byte ${Math.floor(at / 2)} ` +
+        `(${g.value.slice(at - (at % 2), at - (at % 2) + 2)} vs ` +
+        `${majority.value.slice(at - (at % 2), at - (at % 2) + 2)})`;
+    } else {
+      where = `first differs at offset ${at} ` +
+        `(${JSON.stringify(g.value.slice(at, at + 24))} vs ` +
+        `${JSON.stringify(majority.value.slice(at, at + 24))})`;
+    }
+    return `[${g.tiers.join(', ')}] ${where}`;
+  });
+
+  return `majority [${majority.tiers.join(', ')}] vs ${parts.join('; ')}`;
+}
+
+/**
+ * Compare IR output across all available compilers. `ok` is true when every
  * pair of successful compilers produced the same canonical IR JSON.
  *
  * When the caller restricted the compiler set (e.g. via the per-fixture
@@ -1852,60 +1928,88 @@ function sortKeys(value: unknown): unknown {
  * pass `expectedCount` so a single successful compiler is treated as a
  * trivial match rather than a "cannot cross-validate" failure.
  */
-function compareIR(
+export function compareIR(
   outputs: (CompilerOutput | undefined)[],
   expectedCount?: number,
-): boolean {
+): ParityComparison {
   // A tier reporting success but emitting EMPTY IR is a defect, not an absent
   // tier (absent tiers return `undefined`). Never silently drop it — otherwise
   // an emit regression degrades to <N-tier parity while still reporting green.
-  if (outputs.some((o) => o !== undefined && o.success && o.irJson === '')) {
-    console.warn('  WARNING: a compiler reported success but produced empty IR — treating as mismatch');
-    return false;
+  const empty = outputs
+    .map((o, i) => ({ o, i }))
+    .filter(({ o }) => o !== undefined && o.success && o.irJson === '')
+    .map(({ i }) => tierName(i));
+  if (empty.length > 0) {
+    return {
+      ok: false,
+      detail: `reported success but produced empty IR: [${empty.join(', ')}]`,
+    };
   }
 
-  const successfulIRs = outputs
-    .filter((o): o is CompilerOutput => o !== undefined && o.success && o.irJson !== '')
-    .map((o) => o.irJson);
+  const present = outputs
+    .map((o, i) => ({ o, tier: tierName(i) }))
+    .filter((e): e is { o: CompilerOutput; tier: string } =>
+      e.o !== undefined && e.o.success && e.o.irJson !== '')
+    .map(({ o, tier }) => ({ tier, value: o.irJson }));
 
-  if (successfulIRs.length < 2) {
-    if (successfulIRs.length === 0) return true; // No compilers produced IR — not a mismatch
-    if (expectedCount === 1) return true; // Single-compiler fixture: trivial match
-    console.warn(`  WARNING: only ${successfulIRs.length} compiler(s) produced IR — cannot cross-validate`);
-    return false;
+  if (present.length < 2) {
+    if (present.length === 0) return { ok: true }; // No compilers produced IR — not a mismatch
+    if (expectedCount === 1) return { ok: true }; // Single-compiler fixture: trivial match
+    return {
+      ok: false,
+      detail: `only 1 of ${expectedCount ?? PARITY_TIER_ORDER.length} expected tier(s) produced IR ` +
+        `— cannot cross-validate (present: [${present[0]!.tier}])`,
+    };
   }
-  return successfulIRs.every((ir) => ir === successfulIRs[0]);
+
+  const groups = groupByValue(present);
+  if (groups.length === 1) return { ok: true };
+  return { ok: false, detail: describeDivergence(groups, 'char') };
 }
 
 /**
  * Compare compiled Bitcoin Script hex across all available compilers.
- * Returns true if every pair of successful compilers produced the same hex.
+ * `ok` is true when every pair of successful compilers produced the same hex.
  *
  * See `compareIR` for `expectedCount` semantics.
  */
-function compareScript(
+export function compareScript(
   outputs: (CompilerOutput | undefined)[],
   expectedCount?: number,
-): boolean {
+): ParityComparison {
   // A tier reporting success but emitting EMPTY hex is a defect, not an absent
   // tier (absent tiers return `undefined`). Never silently drop it — otherwise
   // an emit regression degrades to <N-tier parity while still reporting green.
-  if (outputs.some((o) => o !== undefined && o.success && o.scriptHex.replace(/\s/g, '') === '')) {
-    console.warn('  WARNING: a compiler reported success but produced empty hex — treating as mismatch');
-    return false;
+  const empty = outputs
+    .map((o, i) => ({ o, i }))
+    .filter(({ o }) => o !== undefined && o.success && o.scriptHex.replace(/\s/g, '') === '')
+    .map(({ i }) => tierName(i));
+  if (empty.length > 0) {
+    return {
+      ok: false,
+      detail: `reported success but produced empty hex: [${empty.join(', ')}]`,
+    };
   }
 
-  const successfulHexes = outputs
-    .filter((o): o is CompilerOutput => o !== undefined && o.success && o.scriptHex !== '')
-    .map((o) => o.scriptHex.toLowerCase().replace(/\s/g, ''));
+  const present = outputs
+    .map((o, i) => ({ o, tier: tierName(i) }))
+    .filter((e): e is { o: CompilerOutput; tier: string } =>
+      e.o !== undefined && e.o.success && e.o.scriptHex !== '')
+    .map(({ o, tier }) => ({ tier, value: o.scriptHex.toLowerCase().replace(/\s/g, '') }));
 
-  if (successfulHexes.length < 2) {
-    if (successfulHexes.length === 0) return true; // No compilers produced hex — not a mismatch
-    if (expectedCount === 1) return true; // Single-compiler fixture: trivial match
-    console.warn(`  WARNING: only ${successfulHexes.length} compiler(s) produced hex — cannot cross-validate`);
-    return false;
+  if (present.length < 2) {
+    if (present.length === 0) return { ok: true }; // No compilers produced hex — not a mismatch
+    if (expectedCount === 1) return { ok: true }; // Single-compiler fixture: trivial match
+    return {
+      ok: false,
+      detail: `only 1 of ${expectedCount ?? PARITY_TIER_ORDER.length} expected tier(s) produced hex ` +
+        `— cannot cross-validate (present: [${present[0]!.tier}])`,
+    };
   }
-  return successfulHexes.every((hex) => hex === successfulHexes[0]);
+
+  const groups = groupByValue(present);
+  if (groups.length === 1) return { ok: true };
+  return { ok: false, detail: describeDivergence(groups, 'byte') };
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,8 +2191,8 @@ export async function runConformanceTest(testDir: string): Promise<ConformanceRe
     [tsIncluded ? tsResult : undefined, goResult, rustResult, pythonResult, zigResult, rubyResult, javaResult],
     expectedCompilerCount,
   );
-  if (!irMatch) {
-    errors.push('IR mismatch between compilers');
+  if (!irMatch.ok) {
+    errors.push(`IR mismatch between compilers: ${irMatch.detail ?? 'no detail'}`);
   }
 
   // Cross-compiler script comparison
@@ -2096,8 +2200,8 @@ export async function runConformanceTest(testDir: string): Promise<ConformanceRe
     [tsIncluded ? tsResult : undefined, goResult, rustResult, pythonResult, zigResult, rubyResult, javaResult],
     expectedCompilerCount,
   );
-  if (!scriptMatch) {
-    errors.push('Script hex mismatch between compilers');
+  if (!scriptMatch.ok) {
+    errors.push(`Script hex mismatch between compilers: ${scriptMatch.detail ?? 'no detail'}`);
   }
 
   // Golden file comparisons. Skipped under fold-on (RUNAR_DISABLE_CONSTANT_FOLDING=0)
@@ -2190,8 +2294,8 @@ export async function runConformanceTest(testDir: string): Promise<ConformanceRe
     zigCompiler: zigResult,
     rubyCompiler: rubyResult,
     javaCompiler: javaResult,
-    irMatch,
-    scriptMatch,
+    irMatch: irMatch.ok,
+    scriptMatch: scriptMatch.ok,
     errors,
   };
 }
@@ -2525,8 +2629,8 @@ export async function runConformanceTestForFormat(
     ],
     supportedCompilers.length,
   );
-  if (!irMatch) {
-    errors.push(`IR mismatch between compilers for ${format.ext}`);
+  if (!irMatch.ok) {
+    errors.push(`IR mismatch between compilers for ${format.ext}: ${irMatch.detail ?? 'no detail'}`);
   }
 
   const scriptMatch = compareScript(
@@ -2541,8 +2645,8 @@ export async function runConformanceTestForFormat(
     ],
     supportedCompilers.length,
   );
-  if (!scriptMatch) {
-    errors.push(`Script hex mismatch between compilers for ${format.ext}`);
+  if (!scriptMatch.ok) {
+    errors.push(`Script hex mismatch between compilers for ${format.ext}: ${scriptMatch.detail ?? 'no detail'}`);
   }
 
   // Golden file comparison (use any successful compiler output). Skipped
@@ -2600,8 +2704,8 @@ export async function runConformanceTestForFormat(
     zigCompiler: zigResult,
     rubyCompiler: rubyResult,
     javaCompiler: javaResult,
-    irMatch,
-    scriptMatch,
+    irMatch: irMatch.ok,
+    scriptMatch: scriptMatch.ok,
     errors,
   };
 }
