@@ -456,7 +456,18 @@ async function runTsCompiler(source: string, sourceFile: string): Promise<Compil
   try {
     const tmpDir = join(__dirname, '..', '.tmp');
     if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    tmpFile = join(tmpDir, `${basename(sourceFile)}`);
+    // Unique per invocation. The runner compiles fixtures CONCURRENTLY, and this
+    // path was the only one in the file keyed on the bare basename — every other
+    // temp path (the native driver, and all nine parse-only drivers) already
+    // carries a `pid-timestamp-random` stem. Two concurrent compiles that resolve
+    // to the same basename therefore raced on one file: whichever wrote last won,
+    // and the other tier compiled the wrong source, surfacing as a spurious
+    // "IR mismatch between compilers". Observed intermittently on add-raw-output /
+    // add-data-output — a flaky gate is a gate that can be re-run until green.
+    tmpFile = join(
+      tmpDir,
+      `ts-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}-${basename(sourceFile)}`,
+    );
     writeFileSync(tmpFile, source, 'utf-8');
 
     artifactDir = join(tmpDir, `artifacts-ts-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
