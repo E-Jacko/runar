@@ -276,8 +276,34 @@ public final class TransactionBuilder {
         long feeRate,
         int locktime
     ) {
+        return buildCallTransactionFull(
+            currentUtxo, unlockingScriptHex, newLockingScriptHex, newSatoshis,
+            dataOutputs, additionalUtxos, changeAddress, feeRate, locktime, null
+        );
+    }
+
+    /**
+     * Multi-contract-input overload: spends {@code currentUtxo} plus every
+     * entry of {@code extraContractInputs}, which are placed at input indices
+     * {@code 1..N} ahead of the P2PKH funding inputs. Their satoshis count as
+     * input value and their serialized bytes count toward the fee, so a merge
+     * neither under-funds nor over-selects.
+     */
+    public static CallTxResult buildCallTransactionFull(
+        UTXO currentUtxo,
+        String unlockingScriptHex,
+        String newLockingScriptHex,
+        long newSatoshis,
+        List<DataOutput> dataOutputs,
+        List<UTXO> additionalUtxos,
+        String changeAddress,
+        long feeRate,
+        int locktime,
+        List<ContractInput> extraContractInputs
+    ) {
         long rate = feeRate > 0 ? feeRate : FeeEstimator.DEFAULT_FEE_RATE;
         if (dataOutputs == null) dataOutputs = List.of();
+        if (extraContractInputs == null) extraContractInputs = List.of();
 
         // Greedy largest-first selection of P2PKH funding UTXOs to cover
         // the fee. Stateful contracts forward all contract sats to the
@@ -285,7 +311,11 @@ public final class TransactionBuilder {
         List<UTXO> sortedFunding = new ArrayList<>(additionalUtxos);
         sortedFunding.sort((a, b) -> Long.compare(b.satoshis(), a.satoshis()));
 
+        // Every contract input contributes value, not just the primary one —
+        // that is what lets a merge fund its own continuation without extra
+        // P2PKH funding.
         long contractIn = currentUtxo.satoshis();
+        for (ContractInput ci : extraContractInputs) contractIn += ci.utxo().satoshis();
         long contractOutSats = newLockingScriptHex == null
             ? 0
             : (newSatoshis > 0 ? newSatoshis : currentUtxo.satoshis());
@@ -314,10 +344,11 @@ public final class TransactionBuilder {
         long change;
         // Iterate: add UTXOs until inputs cover the contract output +
         // estimated fee with positive change.
+        int extraInputBytes = extraContractInputBytes(extraContractInputs);
         int i = 0;
         while (true) {
             fee = FeeEstimator.estimateCallFee(
-                contractInputScriptLen, 0, selected.size(),
+                contractInputScriptLen, extraInputBytes, selected.size(),
                 contractOutputLens, /*withChange*/ true, rate
             );
             change = contractIn + totalFunding - contractOutSats - dataOutSats - fee;
@@ -349,6 +380,12 @@ public final class TransactionBuilder {
         // for contracts asserting extractLocktime(preimage) >= deadline.
         tx.locktime = locktime;
         tx.addInput(currentUtxo.txid(), currentUtxo.outputIndex(), unlockingScriptHex);
+        // Extra contract inputs occupy indices 1..N, ahead of every funding
+        // input, so the covenant's allPrevouts ordering is stable.
+        for (ContractInput ci : extraContractInputs) {
+            tx.addInput(ci.utxo().txid(), ci.utxo().outputIndex(),
+                ci.unlockingScriptHex() == null ? "" : ci.unlockingScriptHex());
+        }
         for (UTXO f : selected) {
             tx.addInput(f.txid(), f.outputIndex(), "");
         }
@@ -401,14 +438,35 @@ public final class TransactionBuilder {
         long feeRate,
         int locktime
     ) {
+        return buildCallTransactionFullOrdered(
+            currentUtxo, unlockingScriptHex, contractOutputs, dataOutputs,
+            additionalUtxos, changeAddress, feeRate, locktime, null
+        );
+    }
+
+    /** Multi-contract-input variant of the ordered builder (see the
+     *  {@link #buildCallTransactionFull} overload for the semantics). */
+    public static CallTxResult buildCallTransactionFullOrdered(
+        UTXO currentUtxo,
+        String unlockingScriptHex,
+        List<ContractOutput> contractOutputs,
+        List<DataOutput> dataOutputs,
+        List<UTXO> additionalUtxos,
+        String changeAddress,
+        long feeRate,
+        int locktime,
+        List<ContractInput> extraContractInputs
+    ) {
         long rate = feeRate > 0 ? feeRate : FeeEstimator.DEFAULT_FEE_RATE;
         if (dataOutputs == null) dataOutputs = List.of();
         if (contractOutputs == null) contractOutputs = List.of();
+        if (extraContractInputs == null) extraContractInputs = List.of();
 
         List<UTXO> sortedFunding = new ArrayList<>(additionalUtxos);
         sortedFunding.sort((a, b) -> Long.compare(b.satoshis(), a.satoshis()));
 
         long contractIn = currentUtxo.satoshis();
+        for (ContractInput ci : extraContractInputs) contractIn += ci.utxo().satoshis();
         long contractOutSats = 0;
         for (ContractOutput c : contractOutputs) contractOutSats += c.satoshis();
         long dataOutSats = 0;
@@ -429,10 +487,11 @@ public final class TransactionBuilder {
         long totalFunding = 0;
         long fee;
         long change;
+        int extraInputBytes = extraContractInputBytes(extraContractInputs);
         int i = 0;
         while (true) {
             fee = FeeEstimator.estimateCallFee(
-                contractInputScriptLen, 0, selected.size(),
+                contractInputScriptLen, extraInputBytes, selected.size(),
                 contractOutputLens, /*withChange*/ true, rate
             );
             change = contractIn + totalFunding - contractOutSats - dataOutSats - fee;
@@ -456,6 +515,12 @@ public final class TransactionBuilder {
         RawTx tx = new RawTx();
         tx.locktime = locktime;
         tx.addInput(currentUtxo.txid(), currentUtxo.outputIndex(), unlockingScriptHex);
+        // Extra contract inputs occupy indices 1..N, ahead of every funding
+        // input, so the covenant's allPrevouts ordering is stable.
+        for (ContractInput ci : extraContractInputs) {
+            tx.addInput(ci.utxo().txid(), ci.utxo().outputIndex(),
+                ci.unlockingScriptHex() == null ? "" : ci.unlockingScriptHex());
+        }
         for (UTXO f : selected) {
             tx.addInput(f.txid(), f.outputIndex(), "");
         }
@@ -492,6 +557,34 @@ public final class TransactionBuilder {
      * source order by {@link #buildCallTransactionFullOrdered}.
      */
     public record ContractOutput(long satoshis, String scriptHex) {}
+
+    /**
+     * An extra contract UTXO spent alongside the primary one, with the
+     * unlocking script that spends it. Placed at input index {@code 1..N},
+     * ahead of every P2PKH funding input, so the covenant's
+     * {@code allPrevouts} ordering is stable and predictable.
+     *
+     * <p>Its satoshis count toward the transaction's input value, so a merge
+     * funds its own continuation.
+     */
+    public record ContractInput(UTXO utxo, String unlockingScriptHex) {}
+
+    /**
+     * Total serialized size, in bytes, of a set of extra contract inputs:
+     * {@code 32 (outpoint txid) + 4 (vout) + varint(scriptLen) + scriptLen
+     * + 4 (sequence)} each. Feeds
+     * {@link FeeEstimator#estimateCallFee}'s {@code extraContractInputsScriptLen}
+     * slot, which expects an already-summed total.
+     */
+    static int extraContractInputBytes(List<ContractInput> extras) {
+        if (extras == null) return 0;
+        int total = 0;
+        for (ContractInput ci : extras) {
+            int scriptLen = ci.unlockingScriptHex() == null ? 0 : ci.unlockingScriptHex().length() / 2;
+            total += 32 + 4 + FeeEstimator.varIntByteSize(scriptLen) + scriptLen + 4;
+        }
+        return total;
+    }
 
     /**
      * Result of {@link #buildCallTransactionFull}. {@link #tx()} is

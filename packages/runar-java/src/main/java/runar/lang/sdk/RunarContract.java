@@ -469,6 +469,16 @@ public final class RunarContract {
                 resolved.set(i, "00".repeat(72));
             } else if ("PubKey".equals(type) && resolved.get(i) == null) {
                 resolved.set(i, ScriptUtils.bytesToHex(signer.pubKey()));
+            } else if (isAutoPrevoutsParam(userParams.get(i), resolved.get(i))) {
+                // `allPrevouts` is the documented auto-compute slot: the covenant
+                // hashes every input's outpoint, so its value only exists once the
+                // tx layout is known. Stand in with the right LENGTH (36 bytes per
+                // input) so the fee is sized correctly, then fill it in for real
+                // after layout. Gate on the parameter NAME, not just the type —
+                // finding G6: a type-blind stub silently spliced outpoint bytes
+                // into an ordinary null ByteString param.
+                int estimatedInputs = 1 + extraContractInputCount(options) + 1;
+                resolved.set(i, "00".repeat(36 * estimatedInputs));
             } else {
                 rejectUnresolvableNullArg(
                     "RunarContract.call", userParams.get(i), i, resolved.get(i));
@@ -491,6 +501,22 @@ public final class RunarContract {
         // outputs, no continuation, no automatic change. Bypasses both
         // legacy paths and routes to the dedicated terminal builder.
         // ------------------------------------------------------------
+        // Only the OP_PUSH_TX path below can bind an extra contract input to its
+        // own preimage. The terminal and legacy-stateless builders lay out a
+        // single contract input, so accepting the option there would silently
+        // drop the extra UTXOs — the tx would spend less than the caller asked
+        // and the merge would look like it succeeded. Fail loudly instead.
+        if (extraContractInputCount(options) > 0 && (terminalOutputs != null || !needsOpPushTx)) {
+            throw new IllegalArgumentException(
+                "RunarContract.call(" + methodName + "): additionalContractInputs is only "
+                    + "supported on the OP_PUSH_TX call path. "
+                    + (terminalOutputs != null
+                        ? "Terminal calls spend the contract into a caller-supplied output set "
+                          + "and take a single contract input."
+                        : "This method has no txPreimage parameter, so each extra input has no "
+                          + "covenant to bind it."));
+        }
+
         if (terminalOutputs != null) {
             int terminalLocktime = (options != null && options.locktime != null)
                 ? options.locktime : 0;
@@ -727,6 +753,66 @@ public final class RunarContract {
         // sizing it here makes the layout byte-exact.
         String preimagePlaceholder = "00".repeat(bip143PreimageLen(sighashSubscript));
 
+        // Extra contract inputs (merge / swap / any multi-input covenant).
+        // Each carries its OWN args, its own auto-signed Sig slots and its own
+        // BIP-143 preimage bound to its own outpoint; only the SDK-side layout
+        // is shared. Empty in the single-input case, where everything below is
+        // a no-op and the built tx is byte-for-byte unchanged.
+        List<UTXO> extraContractUtxos = options == null || options.additionalContractInputs == null
+            ? List.of() : options.additionalContractInputs;
+        List<List<Object>> perInputArgs = options == null ? null : options.additionalContractInputArgs;
+        if (perInputArgs != null && perInputArgs.size() > extraContractUtxos.size()) {
+            throw new IllegalArgumentException(
+                "RunarContract.call(" + methodName + "): additionalContractInputArgs has "
+                    + perInputArgs.size() + " entr" + (perInputArgs.size() == 1 ? "y" : "ies")
+                    + " but additionalContractInputs has " + extraContractUtxos.size()
+                    + ". Each arg list overrides the args for the input at the same index; "
+                    + "extra lists would be silently dropped.");
+        }
+
+        // Per-input resolved args and the Sig slots to sign for each.
+        List<List<Object>> extraResolved = new ArrayList<>();
+        List<List<Integer>> extraSigIndices = new ArrayList<>();
+        List<RunarArtifact.ABIParam> userParamsForExtra = userParams(m, isStateful);
+        for (int i = 0; i < extraContractUtxos.size(); i++) {
+            List<Object> baseArgs = (perInputArgs != null && i < perInputArgs.size()
+                && perInputArgs.get(i) != null)
+                ? perInputArgs.get(i)
+                : userArgsOf(resolved, userParamsForExtra.size());
+            if (baseArgs.size() != userParamsForExtra.size()) {
+                throw new IllegalArgumentException(
+                    "RunarContract.call(" + methodName + "): additionalContractInputArgs[" + i
+                        + "] has " + baseArgs.size() + " args, method expects "
+                        + userParamsForExtra.size());
+            }
+            List<Object> r = new ArrayList<>(baseArgs);
+            List<Integer> sigs = new ArrayList<>();
+            for (int j = 0; j < userParamsForExtra.size(); j++) {
+                RunarArtifact.ABIParam p = userParamsForExtra.get(j);
+                if ("Sig".equals(p.type()) && r.get(j) == null) {
+                    sigs.add(j);
+                    r.set(j, "00".repeat(72));
+                } else if ("PubKey".equals(p.type()) && r.get(j) == null) {
+                    r.set(j, ScriptUtils.bytesToHex(signer.pubKey()));
+                } else if (isAutoPrevoutsParam(p, r.get(j))) {
+                    r.set(j, "00".repeat(36 * (1 + extraContractUtxos.size() + 1)));
+                } else {
+                    rejectUnresolvableNullArg(
+                        "RunarContract.call(additionalContractInputArgs[" + i + "])", p, j, r.get(j));
+                }
+            }
+            extraResolved.add(r);
+            extraSigIndices.add(sigs);
+        }
+
+        // Sighash subscript for each extra input, from ITS OWN locking script.
+        List<String> extraSubscripts = new ArrayList<>();
+        for (UTXO u : extraContractUtxos) {
+            extraSubscripts.add(codeSepIdx >= 0
+                ? u.scriptHex().substring((codeSepIdx + 1) * 2)
+                : u.scriptHex());
+        }
+
         // First pass: build a placeholder unlock so we can size the tx,
         // estimate the fee, lay out outputs, and compute the change
         // amount that will be embedded in the real unlock.
@@ -738,6 +824,20 @@ public final class RunarContract {
             intentWitnessHex
         );
 
+        // Correctly-sized placeholder unlocks for the extra inputs, so the fee
+        // covers their bytes too.
+        List<TransactionBuilder.ContractInput> extraInputs = new ArrayList<>();
+        for (int i = 0; i < extraContractUtxos.size(); i++) {
+            extraInputs.add(new TransactionBuilder.ContractInput(
+                extraContractUtxos.get(i),
+                buildPushTxUnlock(
+                    m, methodName, extraResolved.get(i), "00".repeat(72),
+                    methodNeedsChange ? changePkhHex : null,
+                    0L, methodNeedsNewAmount, newSats,
+                    "00".repeat(bip143PreimageLen(extraSubscripts.get(i))),
+                    intentWitnessHex)));
+        }
+
         // Thread CallOptions.locktime so contracts asserting
         // extractLocktime(preimage) can succeed. 0 → legacy. The rebuild path
         // below must honor the same value or its preimage would mismatch the
@@ -745,11 +845,11 @@ public final class RunarContract {
         TransactionBuilder.CallTxResult firstPass = orderedContractOutputs != null
             ? TransactionBuilder.buildCallTransactionFullOrdered(
                 currentUtxo, placeholderUnlock, orderedContractOutputs,
-                dataOutputs, additional, funderAddress, feeRate, locktime
+                dataOutputs, additional, funderAddress, feeRate, locktime, extraInputs
             )
             : TransactionBuilder.buildCallTransactionFull(
                 currentUtxo, placeholderUnlock, newLockingScript, newSats,
-                dataOutputs, additional, funderAddress, feeRate, locktime
+                dataOutputs, additional, funderAddress, feeRate, locktime, extraInputs
             );
         long changeAmount = firstPass.changeAmount();
 
@@ -768,11 +868,11 @@ public final class RunarContract {
         TransactionBuilder.CallTxResult secondPass = orderedContractOutputs != null
             ? TransactionBuilder.buildCallTransactionFullOrdered(
                 currentUtxo, secondPassUnlock, orderedContractOutputs,
-                dataOutputs, additional, funderAddress, feeRate, locktime
+                dataOutputs, additional, funderAddress, feeRate, locktime, extraInputs
             )
             : TransactionBuilder.buildCallTransactionFull(
                 currentUtxo, secondPassUnlock, newLockingScript, newSats,
-                dataOutputs, additional, funderAddress, feeRate, locktime
+                dataOutputs, additional, funderAddress, feeRate, locktime, extraInputs
             );
         long finalChangeAmount = secondPass.changeAmount();
         RawTx tx = secondPass.tx();
@@ -811,6 +911,22 @@ public final class RunarContract {
         // method's declared @sighash mode (default 0x41 = ALL|FORKID). The mode
         // drives both which BIP-143 fields are zeroed and the appended flag byte.
         int methodSigHash = m.sigHashType() != null ? m.sigHashType() : OpPushTx.SIGHASH_ALL_FORKID;
+
+        // The input set is now final, so the auto-computed `allPrevouts` value
+        // exists. Fill it in every arg list — the primary input's and each
+        // extra input's — BEFORE any preimage or signature is derived, since
+        // they all commit to these bytes. Same length as the stand-in whenever
+        // the funding estimate held; when it did not, the layout below still
+        // reflects the real bytes because the unlocks are rebuilt from here.
+        List<Integer> prevoutsIdx = prevoutsIndices(userParamsForExtra);
+        if (!prevoutsIdx.isEmpty()) {
+            String prevouts = allPrevoutsHex(tx);
+            for (int idx : prevoutsIdx) {
+                resolved.set(idx, prevouts);
+                for (List<Object> r : extraResolved) r.set(idx, prevouts);
+            }
+        }
+
         byte[] preimage = OpPushTx.preimage(
             tx, 0, ScriptUtils.hexToBytes(sighashSubscript),
             currentUtxo.satoshis(), methodSigHash
@@ -843,12 +959,44 @@ public final class RunarContract {
         );
         tx.setUnlockingScript(0, finalUnlock);
 
-        // Sign each P2PKH funding input (input index >= 1). Signed by
+        // Each extra contract input gets its own unlock: its own BIP-143
+        // preimage (bound to ITS outpoint via inputIndex and to its own
+        // scriptCode), its own OP_PUSH_TX signature, and its own Sig args
+        // signed against its own sighash. Sharing input 0's unlock would make
+        // every covenant after the first verify the wrong outpoint.
+        for (int i = 0; i < extraContractUtxos.size(); i++) {
+            int inputIdx = 1 + i;
+            UTXO u = extraContractUtxos.get(i);
+            String subscript = extraSubscripts.get(i);
+            byte[] extraPreimage = OpPushTx.preimage(
+                tx, inputIdx, ScriptUtils.hexToBytes(subscript), u.satoshis(), methodSigHash);
+            byte[] extraPushTxSig = OpPushTx.computePushTxSig(
+                tx, inputIdx, subscript, u.satoshis(), methodSigHash);
+            List<Object> r = extraResolved.get(i);
+            List<Integer> sigs = extraSigIndices.get(i);
+            if (!sigs.isEmpty()) {
+                byte[] extraSighash = tx.sighashBIP143(
+                    inputIdx, subscript, u.satoshis(), methodSigHash);
+                for (int idx : sigs) {
+                    byte[] der = signer.sign(extraSighash, null);
+                    r.set(idx, ScriptUtils.bytesToHex(der)
+                        + String.format("%02x", methodSigHash & 0xff));
+                }
+            }
+            tx.setUnlockingScript(inputIdx, buildPushTxUnlock(
+                m, methodName, r, ScriptUtils.bytesToHex(extraPushTxSig),
+                methodNeedsChange ? changePkhHex : null,
+                finalChangeAmount, methodNeedsNewAmount, newSats,
+                ScriptUtils.bytesToHex(extraPreimage),
+                intentWitnessHex));
+        }
+
+        // Sign each P2PKH funding input (after the contract inputs). Signed by
         // fundingSigner (issue #134); the method's own Sig args stay with the
         // connected signer. Only the coin-selected funding inputs are on the tx
         // (issue #133), so iterate those.
         for (int i = 0; i < usedFunding.size(); i++) {
-            int inputIdx = 1 + i;
+            int inputIdx = 1 + extraContractUtxos.size() + i;
             UTXO u = usedFunding.get(i);
             byte[] fundSighash = tx.sighashBIP143(
                 inputIdx, u.scriptHex(), u.satoshis(), RawTx.SIGHASH_ALL_FORKID
@@ -1424,6 +1572,63 @@ public final class RunarContract {
      * witness param ({@code _prevOutScript_<i>} or {@code _serialisedOutputs}). */
     private static boolean isAutoInjectedWitnessParam(String paramName) {
         return paramName.startsWith("_prevOutScript_") || "_serialisedOutputs".equals(paramName);
+    }
+
+    /**
+     * The one {@code ByteString} parameter name the SDK auto-computes: the
+     * concatenated outpoints of every input, which a multi-input covenant
+     * hashes to bind the input set. Matches Go's {@code isAutoPrevoutsParam}
+     * and the TS {@code AUTO_PREVOUTS_PARAM_NAME} convention.
+     */
+    static final String AUTO_PREVOUTS_PARAM_NAME = "allPrevouts";
+
+    private static boolean isAutoPrevoutsParam(RunarArtifact.ABIParam param, Object value) {
+        return value == null
+            && "ByteString".equals(param.type())
+            && AUTO_PREVOUTS_PARAM_NAME.equals(param.name());
+    }
+
+    /**
+     * The first {@code n} entries of an already-resolved arg list — the user
+     * params, before the compiler-injected {@code _changePKH} /
+     * {@code _changeAmount} / {@code _newAmount} / {@code txPreimage} slots the
+     * unlock builder appends itself. An extra contract input with no explicit
+     * override reuses these.
+     */
+    private static List<Object> userArgsOf(List<Object> resolved, int n) {
+        return new ArrayList<>(resolved.subList(0, Math.min(n, resolved.size())));
+    }
+
+    private static int extraContractInputCount(CallOptions options) {
+        return options == null || options.additionalContractInputs == null
+            ? 0 : options.additionalContractInputs.size();
+    }
+
+    /** Indices (into the user-arg list) of every auto-computed prevouts slot. */
+    private static List<Integer> prevoutsIndices(List<RunarArtifact.ABIParam> userParams) {
+        List<Integer> idx = new ArrayList<>();
+        for (int i = 0; i < userParams.size(); i++) {
+            if (AUTO_PREVOUTS_PARAM_NAME.equals(userParams.get(i).name())
+                && "ByteString".equals(userParams.get(i).type())) {
+                idx.add(i);
+            }
+        }
+        return idx;
+    }
+
+    /**
+     * Concatenated outpoints of every input, in input order:
+     * {@code txid (little-endian) || vout (LE32)} per input. This is the
+     * preimage of BIP-143's {@code hashPrevouts}, which is exactly what a
+     * multi-input covenant re-hashes to prove it saw the whole input set.
+     */
+    private static String allPrevoutsHex(RawTx tx) {
+        StringBuilder sb = new StringBuilder();
+        for (RawTx.Input in : tx.inputs) {
+            sb.append(ScriptUtils.reverseHex(in.prevTxid));
+            sb.append(ScriptUtils.toLittleEndian32(in.prevVout));
+        }
+        return sb.toString();
     }
 
     /**

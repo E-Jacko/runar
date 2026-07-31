@@ -96,6 +96,39 @@ public final class CallOptions {
      */
     public final UTXO feeUtxo;
 
+    /**
+     * Extra contract UTXOs to spend alongside {@code currentUtxo} in the same
+     * transaction — the merge / swap / any multi-input covenant pattern. Each
+     * one becomes an input at index {@code 1..N} (ahead of every P2PKH funding
+     * input) and gets its OWN unlocking script: the same method, but with its
+     * own BIP-143 preimage bound to its own outpoint, its own OP_PUSH_TX
+     * signature, and its own auto-signed {@code Sig} args.
+     *
+     * <p>Their satoshis count as transaction input value, so a merge does not
+     * need extra funding to cover the continuation. {@code null} → single
+     * contract input (unchanged behaviour).
+     *
+     * <p>Parity: TypeScript / Go / Rust / Python / Zig / Ruby
+     * {@code additionalContractInputs}.
+     */
+    public final List<UTXO> additionalContractInputs;
+
+    /**
+     * Per-input argument overrides for {@link #additionalContractInputs}.
+     * {@code additionalContractInputArgs.get(i)} replaces the call args for
+     * {@code additionalContractInputs.get(i)}; {@code null} (or a shorter list)
+     * means that input reuses the primary call's args.
+     *
+     * <p>A merge needs this: each input's covenant sees a different
+     * counterparty balance, so input 0 passes {@code otherBalance = 600} while
+     * input 1 passes {@code otherBalance = 400}. {@code Sig} slots stay
+     * {@code null} and are auto-signed per input.
+     *
+     * <p>Supplying MORE arg lists than there are additional inputs is a caller
+     * mistake and throws, rather than silently dropping the extras.
+     */
+    public final List<List<Object>> additionalContractInputArgs;
+
     public CallOptions(
         Map<String, Object> newState,
         List<TerminalOutput> terminalOutputs,
@@ -113,7 +146,7 @@ public final class CallOptions {
         this(newState, terminalOutputs, fundingUtxos, locktime, null, null, null, null);
     }
 
-    /** Canonical all-fields constructor. */
+    /** Pre-merge-support all-fields constructor; kept for source compatibility. */
     public CallOptions(
         Map<String, Object> newState,
         List<TerminalOutput> terminalOutputs,
@@ -124,6 +157,23 @@ public final class CallOptions {
         Signer fundingSigner,
         UTXO feeUtxo
     ) {
+        this(newState, terminalOutputs, fundingUtxos, locktime, sequence,
+            maxFundingInputs, fundingSigner, feeUtxo, null, null);
+    }
+
+    /** Canonical all-fields constructor. */
+    public CallOptions(
+        Map<String, Object> newState,
+        List<TerminalOutput> terminalOutputs,
+        List<UTXO> fundingUtxos,
+        Integer locktime,
+        Integer sequence,
+        Integer maxFundingInputs,
+        Signer fundingSigner,
+        UTXO feeUtxo,
+        List<UTXO> additionalContractInputs,
+        List<List<Object>> additionalContractInputArgs
+    ) {
         this.newState = newState;
         this.terminalOutputs = terminalOutputs;
         this.fundingUtxos = fundingUtxos;
@@ -132,6 +182,8 @@ public final class CallOptions {
         this.maxFundingInputs = maxFundingInputs;
         this.fundingSigner = fundingSigner;
         this.feeUtxo = feeUtxo;
+        this.additionalContractInputs = additionalContractInputs;
+        this.additionalContractInputArgs = additionalContractInputArgs;
     }
 
     /** Convenience factory for the common terminal-call case. */
@@ -146,31 +198,50 @@ public final class CallOptions {
     /** Copy with {@link #locktime} set (issue #131 companion). */
     public CallOptions withLocktime(Integer locktime) {
         return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
-            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
     }
 
     /** Copy with {@link #sequence} set (issue #131). */
     public CallOptions withSequence(Integer sequence) {
         return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
-            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
     }
 
     /** Copy with {@link #maxFundingInputs} set (issue #133). */
     public CallOptions withMaxFundingInputs(Integer maxFundingInputs) {
         return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
-            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
     }
 
     /** Copy with {@link #fundingSigner} set (issue #134). */
     public CallOptions withFundingSigner(Signer fundingSigner) {
         return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
-            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
     }
 
     /** Copy with {@link #feeUtxo} set (issue #118). */
     public CallOptions withFeeUtxo(UTXO feeUtxo) {
         return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
-            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
+    }
+
+    /** Copy with {@link #additionalContractInputs} set (merge / multi-input calls). */
+    public CallOptions withAdditionalContractInputs(List<UTXO> additionalContractInputs) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
+    }
+
+    /** Copy with {@link #additionalContractInputArgs} set (merge / multi-input calls). */
+    public CallOptions withAdditionalContractInputArgs(List<List<Object>> additionalContractInputArgs) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo,
+            additionalContractInputs, additionalContractInputArgs);
     }
 
     /**

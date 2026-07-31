@@ -1,0 +1,5100 @@
+{
+  "version": "runar-v1.0.0-rc.1",
+  "compilerVersion": "1.0.0-rc.1",
+  "contractName": "FungibleToken",
+  "parentClass": "StatefulSmartContract",
+  "abi": {
+    "constructor": {
+      "params": [
+        {
+          "name": "owner",
+          "type": "PubKey"
+        },
+        {
+          "name": "balance",
+          "type": "bigint"
+        },
+        {
+          "name": "mergeBalance",
+          "type": "bigint"
+        },
+        {
+          "name": "tokenId",
+          "type": "ByteString"
+        }
+      ]
+    },
+    "methods": [
+      {
+        "name": "transfer",
+        "params": [
+          {
+            "name": "sig",
+            "type": "Sig"
+          },
+          {
+            "name": "to",
+            "type": "PubKey"
+          },
+          {
+            "name": "amount",
+            "type": "bigint"
+          },
+          {
+            "name": "outputSatoshis",
+            "type": "bigint"
+          },
+          {
+            "name": "_changePKH",
+            "type": "Ripemd160"
+          },
+          {
+            "name": "_changeAmount",
+            "type": "bigint"
+          },
+          {
+            "name": "txPreimage",
+            "type": "SigHashPreimage"
+          }
+        ],
+        "isPublic": true,
+        "usesCodePart": true
+      },
+      {
+        "name": "send",
+        "params": [
+          {
+            "name": "sig",
+            "type": "Sig"
+          },
+          {
+            "name": "to",
+            "type": "PubKey"
+          },
+          {
+            "name": "outputSatoshis",
+            "type": "bigint"
+          },
+          {
+            "name": "_changePKH",
+            "type": "Ripemd160"
+          },
+          {
+            "name": "_changeAmount",
+            "type": "bigint"
+          },
+          {
+            "name": "txPreimage",
+            "type": "SigHashPreimage"
+          }
+        ],
+        "isPublic": true,
+        "usesCodePart": true
+      },
+      {
+        "name": "merge",
+        "params": [
+          {
+            "name": "sig",
+            "type": "Sig"
+          },
+          {
+            "name": "otherBalance",
+            "type": "bigint"
+          },
+          {
+            "name": "allPrevouts",
+            "type": "ByteString"
+          },
+          {
+            "name": "outputSatoshis",
+            "type": "bigint"
+          },
+          {
+            "name": "_changePKH",
+            "type": "Ripemd160"
+          },
+          {
+            "name": "_changeAmount",
+            "type": "bigint"
+          },
+          {
+            "name": "txPreimage",
+            "type": "SigHashPreimage"
+          }
+        ],
+        "isPublic": true,
+        "usesCodePart": true
+      }
+    ]
+  },
+  "script": "76009c637576ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820131947f7701217f587f7c817c81597a5379ad567951a2696e93587900a069587978a16957795a7a5a79005d79016a7e537a7e7b58807e7c58807e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c58807c7e597952799f63587a55795a7a547a7c94005b79016a7e537a7e7b58807e7c58807e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c58807c7e67005a7a75597a757b7568577a577a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687b7b7e7c7eaa547a820128947f7701207f7587777777776776519c637576ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820131947f7701217f587f7c817c81587a5379ad567951a269567a577a5379537993005a79016a7e537a7e7b58807e7c58807e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c58807c7e567a567a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687eaa547a820128947f7701207f75877777777767529d76ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820131947f7701217f587f7c817c81597a5379ad567951a269587900a2695779aa5479547f7701207f7588537901447f7701247f75587a0001247b7b7f777c7f7553795379937b7b8763577a5479597a5a79016a7e7b7e537a58807e7c58807e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c58807c7e67577a5479597a5a79016a7e7b7e7c58807e7b58807e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c58807c7e68567a567a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687eaa547a820128947f7701207f7587777777776868",
+  "asm": "OP_DUP OP_0 OP_NUMEQUAL OP_IF OP_DROP OP_DUP OP_CODESEPARATOR <raw 760 bytes> OP_VERIFY OP_DUP OP_SIZE OP_4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM <41> OP_NUMEQUALVERIFY OP_DUP <68> OP_SPLIT OP_NIP OP_SIZE <2c> OP_SUB OP_SPLIT OP_DROP OP_SIZE OP_8 OP_SUB OP_SPLIT OP_DROP OP_SIZE <31> OP_SUB OP_SPLIT OP_NIP <21> OP_SPLIT OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM OP_9 OP_ROLL OP_3 OP_PICK OP_CHECKSIGVERIFY OP_6 OP_PICK OP_1 OP_GREATERTHANOREQUAL OP_VERIFY OP_2DUP OP_ADD OP_8 OP_PICK OP_0 OP_GREATERTHAN OP_VERIFY OP_8 OP_PICK OP_OVER OP_LESSTHANOREQUAL OP_VERIFY OP_7 OP_PICK OP_10 OP_ROLL OP_10 OP_PICK OP_0 OP_13 OP_PICK <6a> OP_CAT OP_3 OP_ROLL OP_CAT OP_ROT OP_8 OP_NUM2BIN OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_CAT OP_SIZE OP_DUP <fd00> OP_LESSTHAN OP_IF OP_2 OP_NUM2BIN OP_1 OP_SPLIT OP_DROP OP_ELSE OP_DUP <000001> OP_LESSTHAN OP_IF OP_3 OP_NUM2BIN OP_2 OP_SPLIT OP_DROP <fd> OP_SWAP OP_CAT OP_ELSE OP_DUP <0000000001> OP_LESSTHAN OP_IF OP_5 OP_NUM2BIN OP_4 OP_SPLIT OP_DROP <fe> OP_SWAP OP_CAT OP_ELSE OP_9 OP_NUM2BIN OP_8 OP_SPLIT OP_DROP <ff> OP_SWAP OP_CAT OP_ENDIF OP_ENDIF OP_ENDIF OP_SWAP OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_9 OP_PICK OP_2 OP_PICK OP_LESSTHAN OP_IF OP_8 OP_ROLL OP_5 OP_PICK OP_10 OP_ROLL OP_4 OP_ROLL OP_SWAP OP_SUB OP_0 OP_11 OP_PICK <6a> OP_CAT OP_3 OP_ROLL OP_CAT OP_ROT OP_8 OP_NUM2BIN OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_CAT OP_SIZE OP_DUP <fd00> OP_LESSTHAN OP_IF OP_2 OP_NUM2BIN OP_1 OP_SPLIT OP_DROP OP_ELSE OP_DUP <000001> OP_LESSTHAN OP_IF OP_3 OP_NUM2BIN OP_2 OP_SPLIT OP_DROP <fd> OP_SWAP OP_CAT OP_ELSE OP_DUP <0000000001> OP_LESSTHAN OP_IF OP_5 OP_NUM2BIN OP_4 OP_SPLIT OP_DROP <fe> OP_SWAP OP_CAT OP_ELSE OP_9 OP_NUM2BIN OP_8 OP_SPLIT OP_DROP <ff> OP_SWAP OP_CAT OP_ENDIF OP_ENDIF OP_ENDIF OP_SWAP OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_ELSE OP_0 OP_10 OP_ROLL OP_DROP OP_9 OP_ROLL OP_DROP OP_ROT OP_DROP OP_ENDIF OP_7 OP_ROLL OP_7 OP_ROLL OP_0 OP_OVER OP_SWAP OP_NUMEQUAL OP_NOT OP_IF <1976a914> OP_ROT OP_CAT <88ac> OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_ELSE OP_0 OP_ROT OP_DROP OP_NIP OP_ENDIF OP_ROT OP_ROT OP_CAT OP_SWAP OP_CAT OP_HASH256 OP_4 OP_ROLL OP_SIZE <28> OP_SUB OP_SPLIT OP_NIP <20> OP_SPLIT OP_DROP OP_EQUAL OP_NIP OP_NIP OP_NIP OP_NIP OP_ELSE OP_DUP OP_1 OP_NUMEQUAL OP_IF OP_DROP OP_DUP OP_CODESEPARATOR <raw 760 bytes> OP_VERIFY OP_DUP OP_SIZE OP_4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM <41> OP_NUMEQUALVERIFY OP_DUP <68> OP_SPLIT OP_NIP OP_SIZE <2c> OP_SUB OP_SPLIT OP_DROP OP_SIZE OP_8 OP_SUB OP_SPLIT OP_DROP OP_SIZE <31> OP_SUB OP_SPLIT OP_NIP <21> OP_SPLIT OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM OP_8 OP_ROLL OP_3 OP_PICK OP_CHECKSIGVERIFY OP_6 OP_PICK OP_1 OP_GREATERTHANOREQUAL OP_VERIFY OP_6 OP_ROLL OP_7 OP_ROLL OP_3 OP_PICK OP_3 OP_PICK OP_ADD OP_0 OP_10 OP_PICK <6a> OP_CAT OP_3 OP_ROLL OP_CAT OP_ROT OP_8 OP_NUM2BIN OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_CAT OP_SIZE OP_DUP <fd00> OP_LESSTHAN OP_IF OP_2 OP_NUM2BIN OP_1 OP_SPLIT OP_DROP OP_ELSE OP_DUP <000001> OP_LESSTHAN OP_IF OP_3 OP_NUM2BIN OP_2 OP_SPLIT OP_DROP <fd> OP_SWAP OP_CAT OP_ELSE OP_DUP <0000000001> OP_LESSTHAN OP_IF OP_5 OP_NUM2BIN OP_4 OP_SPLIT OP_DROP <fe> OP_SWAP OP_CAT OP_ELSE OP_9 OP_NUM2BIN OP_8 OP_SPLIT OP_DROP <ff> OP_SWAP OP_CAT OP_ENDIF OP_ENDIF OP_ENDIF OP_SWAP OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_6 OP_ROLL OP_6 OP_ROLL OP_0 OP_OVER OP_SWAP OP_NUMEQUAL OP_NOT OP_IF <1976a914> OP_ROT OP_CAT <88ac> OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_ELSE OP_0 OP_ROT OP_DROP OP_NIP OP_ENDIF OP_CAT OP_HASH256 OP_4 OP_ROLL OP_SIZE <28> OP_SUB OP_SPLIT OP_NIP <20> OP_SPLIT OP_DROP OP_EQUAL OP_NIP OP_NIP OP_NIP OP_NIP OP_ELSE OP_2 OP_NUMEQUALVERIFY OP_DUP OP_CODESEPARATOR <raw 760 bytes> OP_VERIFY OP_DUP OP_SIZE OP_4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM <41> OP_NUMEQUALVERIFY OP_DUP <68> OP_SPLIT OP_NIP OP_SIZE <2c> OP_SUB OP_SPLIT OP_DROP OP_SIZE OP_8 OP_SUB OP_SPLIT OP_DROP OP_SIZE <31> OP_SUB OP_SPLIT OP_NIP <21> OP_SPLIT OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM OP_9 OP_ROLL OP_3 OP_PICK OP_CHECKSIGVERIFY OP_6 OP_PICK OP_1 OP_GREATERTHANOREQUAL OP_VERIFY OP_8 OP_PICK OP_0 OP_GREATERTHANOREQUAL OP_VERIFY OP_7 OP_PICK OP_HASH256 OP_4 OP_PICK OP_4 OP_SPLIT OP_NIP <20> OP_SPLIT OP_DROP OP_EQUALVERIFY OP_3 OP_PICK <44> OP_SPLIT OP_NIP <24> OP_SPLIT OP_DROP OP_8 OP_ROLL OP_0 <24> OP_ROT OP_ROT OP_SPLIT OP_NIP OP_SWAP OP_SPLIT OP_DROP OP_3 OP_PICK OP_3 OP_PICK OP_ADD OP_ROT OP_ROT OP_EQUAL OP_IF OP_7 OP_ROLL OP_4 OP_PICK OP_9 OP_ROLL OP_10 OP_PICK <6a> OP_CAT OP_ROT OP_CAT OP_3 OP_ROLL OP_8 OP_NUM2BIN OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_CAT OP_SIZE OP_DUP <fd00> OP_LESSTHAN OP_IF OP_2 OP_NUM2BIN OP_1 OP_SPLIT OP_DROP OP_ELSE OP_DUP <000001> OP_LESSTHAN OP_IF OP_3 OP_NUM2BIN OP_2 OP_SPLIT OP_DROP <fd> OP_SWAP OP_CAT OP_ELSE OP_DUP <0000000001> OP_LESSTHAN OP_IF OP_5 OP_NUM2BIN OP_4 OP_SPLIT OP_DROP <fe> OP_SWAP OP_CAT OP_ELSE OP_9 OP_NUM2BIN OP_8 OP_SPLIT OP_DROP <ff> OP_SWAP OP_CAT OP_ENDIF OP_ENDIF OP_ENDIF OP_SWAP OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_ELSE OP_7 OP_ROLL OP_4 OP_PICK OP_9 OP_ROLL OP_10 OP_PICK <6a> OP_CAT OP_ROT OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_CAT OP_ROT OP_8 OP_NUM2BIN OP_CAT OP_SIZE OP_DUP <fd00> OP_LESSTHAN OP_IF OP_2 OP_NUM2BIN OP_1 OP_SPLIT OP_DROP OP_ELSE OP_DUP <000001> OP_LESSTHAN OP_IF OP_3 OP_NUM2BIN OP_2 OP_SPLIT OP_DROP <fd> OP_SWAP OP_CAT OP_ELSE OP_DUP <0000000001> OP_LESSTHAN OP_IF OP_5 OP_NUM2BIN OP_4 OP_SPLIT OP_DROP <fe> OP_SWAP OP_CAT OP_ELSE OP_9 OP_NUM2BIN OP_8 OP_SPLIT OP_DROP <ff> OP_SWAP OP_CAT OP_ENDIF OP_ENDIF OP_ENDIF OP_SWAP OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_ENDIF OP_6 OP_ROLL OP_6 OP_ROLL OP_0 OP_OVER OP_SWAP OP_NUMEQUAL OP_NOT OP_IF <1976a914> OP_ROT OP_CAT <88ac> OP_CAT OP_SWAP OP_8 OP_NUM2BIN OP_SWAP OP_CAT OP_ELSE OP_0 OP_ROT OP_DROP OP_NIP OP_ENDIF OP_CAT OP_HASH256 OP_4 OP_ROLL OP_SIZE <28> OP_SUB OP_SPLIT OP_NIP <20> OP_SPLIT OP_DROP OP_EQUAL OP_NIP OP_NIP OP_NIP OP_NIP OP_ENDIF OP_ENDIF",
+  "buildTimestamp": "2026-07-31T23:06:31.562Z",
+  "sourceMap": {
+    "mappings": [
+      {
+        "opcodeIndex": 45,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 60,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 46,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 60,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 47,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 60,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 48,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 60,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 50,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 61,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 51,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 61,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 52,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 61,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 53,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 61,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 54,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 61,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 56,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 62,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 57,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 63,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 58,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 63,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 59,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 63,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 60,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 63,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 61,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 63,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 62,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 64,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 63,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 64,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 64,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 64,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 65,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 64,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 66,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 64,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 67,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 68,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 69,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 70,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 71,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 72,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 73,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 74,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 75,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 76,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 77,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 78,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 79,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 80,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 81,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 82,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 83,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 84,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 85,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 86,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 87,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 88,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 89,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 90,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 91,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 92,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 93,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 94,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 95,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 96,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 97,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 98,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 99,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 100,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 101,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 102,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 103,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 104,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 105,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 106,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 107,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 108,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 109,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 110,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 111,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 112,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 113,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 114,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 115,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 116,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 117,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 118,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 119,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 120,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 121,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 122,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 123,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 124,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 125,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 126,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 127,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 128,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 129,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 130,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 131,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 132,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 133,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 134,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 135,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 136,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 137,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 138,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 139,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 140,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 141,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 142,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 143,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 66,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 144,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 67,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 145,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 67,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 146,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 67,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 147,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 67,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 148,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 67,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 150,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 151,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 152,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 153,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 154,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 155,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 156,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 157,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 158,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 159,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 160,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 161,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 162,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 163,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 164,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 165,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 166,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 167,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 168,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 169,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 170,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 171,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 172,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 173,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 174,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 175,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 176,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 177,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 178,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 179,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 180,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 181,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 182,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 183,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 184,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 185,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 186,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 187,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 188,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 189,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 190,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 191,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 192,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 193,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 194,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 195,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 196,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 197,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 198,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 199,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 200,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 201,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 202,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 203,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 204,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 205,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 206,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 207,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 208,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 209,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 210,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 211,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 212,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 213,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 214,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 215,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 216,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 217,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 218,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 219,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 220,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 221,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 222,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 223,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 224,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 225,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 226,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 227,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 228,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 229,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 230,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 68,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 335,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 76,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 336,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 76,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 337,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 76,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 338,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 76,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 340,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 77,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 341,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 77,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 342,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 77,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 343,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 77,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 344,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 77,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 345,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 346,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 347,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 348,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 349,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 350,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 351,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 352,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 353,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 354,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 355,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 356,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 357,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 358,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 359,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 360,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 361,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 362,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 363,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 364,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 365,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 366,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 367,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 368,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 369,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 370,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 371,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 372,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 373,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 374,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 375,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 376,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 377,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 378,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 379,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 380,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 381,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 382,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 383,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 384,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 385,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 386,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 387,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 388,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 389,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 390,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 391,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 392,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 393,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 394,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 395,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 396,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 397,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 398,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 399,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 400,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 401,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 402,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 403,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 404,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 405,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 406,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 407,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 408,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 409,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 410,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 411,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 412,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 413,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 414,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 415,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 416,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 417,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 418,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 419,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 420,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 421,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 422,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 423,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 424,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 79,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 511,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 115,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 512,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 115,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 513,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 115,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 514,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 115,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 516,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 116,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 517,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 116,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 518,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 116,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 519,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 116,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 520,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 116,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 521,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 117,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 522,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 117,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 523,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 117,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 524,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 117,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 525,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 117,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 526,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 527,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 528,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 529,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 530,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 531,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 532,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 533,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 534,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 535,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 536,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 120,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 538,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 539,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 540,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 541,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 542,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 543,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 544,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 545,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 123,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 546,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 547,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 548,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 549,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 550,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 551,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 552,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 553,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 554,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 555,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 556,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 124,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 557,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 125,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 558,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 125,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 559,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 125,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 560,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 125,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 561,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 125,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 562,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 127,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 563,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 127,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 564,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 127,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 566,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 567,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 568,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 569,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 570,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 571,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 572,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 573,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 574,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 575,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 576,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 577,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 578,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 579,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 580,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 581,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 582,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 583,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 584,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 585,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 586,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 587,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 588,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 589,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 590,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 591,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 592,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 593,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 594,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 595,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 596,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 597,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 598,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 599,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 600,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 601,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 602,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 603,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 604,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 605,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 606,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 607,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 608,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 609,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 610,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 611,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 612,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 613,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 614,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 615,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 616,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 617,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 618,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 619,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 620,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 621,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 622,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 623,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 624,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 625,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 626,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 627,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 628,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 629,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 630,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 631,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 632,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 633,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 634,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 635,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 636,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 637,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 638,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 639,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 640,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 641,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 129,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 643,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 644,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 645,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 646,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 647,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 648,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 649,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 650,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 651,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 652,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 653,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 654,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 655,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 656,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 657,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 658,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 659,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 660,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 661,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 662,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 663,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 664,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 665,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 666,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 667,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 668,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 669,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 670,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 671,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 672,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 673,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 674,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 675,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 676,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 677,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 678,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 679,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 680,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 681,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 682,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 683,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 684,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 685,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 686,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 687,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 688,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 689,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 690,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 691,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 692,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 693,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 694,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 695,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 696,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 697,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 698,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 699,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 700,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 701,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 702,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 703,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 704,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 705,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 706,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 707,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 708,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 709,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 710,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 711,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 712,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 713,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 714,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 715,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 716,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      },
+      {
+        "opcodeIndex": 717,
+        "sourceFile": "FungibleTokenExample.runar.ts",
+        "line": 132,
+        "column": 6
+      }
+    ]
+  },
+  "stateFields": [
+    {
+      "name": "owner",
+      "type": "PubKey",
+      "index": 0,
+      "encoding": "raw",
+      "byteLength": 33,
+      "byteOffset": 0,
+      "tailOffset": -49
+    },
+    {
+      "name": "balance",
+      "type": "bigint",
+      "index": 1,
+      "encoding": "num2bin-le8",
+      "byteLength": 8,
+      "byteOffset": 33,
+      "tailOffset": -16
+    },
+    {
+      "name": "mergeBalance",
+      "type": "bigint",
+      "index": 2,
+      "encoding": "num2bin-le8",
+      "byteLength": 8,
+      "byteOffset": 41,
+      "tailOffset": -8
+    }
+  ],
+  "anf": {
+    "contractName": "FungibleToken",
+    "properties": [
+      {
+        "name": "owner",
+        "type": "PubKey",
+        "readonly": false
+      },
+      {
+        "name": "balance",
+        "type": "bigint",
+        "readonly": false
+      },
+      {
+        "name": "mergeBalance",
+        "type": "bigint",
+        "readonly": false
+      },
+      {
+        "name": "tokenId",
+        "type": "ByteString",
+        "readonly": true
+      }
+    ],
+    "methods": [
+      {
+        "name": "constructor",
+        "params": [
+          {
+            "name": "owner",
+            "type": "PubKey"
+          },
+          {
+            "name": "balance",
+            "type": "bigint"
+          },
+          {
+            "name": "mergeBalance",
+            "type": "bigint"
+          },
+          {
+            "name": "tokenId",
+            "type": "ByteString"
+          }
+        ],
+        "body": [
+          {
+            "name": "t0",
+            "value": {
+              "kind": "load_prop",
+              "name": "owner"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 48,
+              "column": 4
+            }
+          },
+          {
+            "name": "t1",
+            "value": {
+              "kind": "load_prop",
+              "name": "balance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 48,
+              "column": 4
+            }
+          },
+          {
+            "name": "t2",
+            "value": {
+              "kind": "load_prop",
+              "name": "mergeBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 48,
+              "column": 4
+            }
+          },
+          {
+            "name": "t3",
+            "value": {
+              "kind": "load_prop",
+              "name": "tokenId"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 48,
+              "column": 4
+            }
+          },
+          {
+            "name": "t4",
+            "value": {
+              "kind": "call",
+              "func": "super",
+              "args": [
+                "t0",
+                "t1",
+                "t2",
+                "t3"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 48,
+              "column": 4
+            }
+          },
+          {
+            "name": "t5",
+            "value": {
+              "kind": "load_prop",
+              "name": "owner"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 49,
+              "column": 4
+            }
+          },
+          {
+            "name": "t6",
+            "value": {
+              "kind": "update_prop",
+              "name": "owner",
+              "value": "t5"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 49,
+              "column": 4
+            }
+          },
+          {
+            "name": "t7",
+            "value": {
+              "kind": "load_prop",
+              "name": "balance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 50,
+              "column": 4
+            }
+          },
+          {
+            "name": "t8",
+            "value": {
+              "kind": "update_prop",
+              "name": "balance",
+              "value": "t7"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 50,
+              "column": 4
+            }
+          },
+          {
+            "name": "t9",
+            "value": {
+              "kind": "load_prop",
+              "name": "mergeBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 51,
+              "column": 4
+            }
+          },
+          {
+            "name": "t10",
+            "value": {
+              "kind": "update_prop",
+              "name": "mergeBalance",
+              "value": "t9"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 51,
+              "column": 4
+            }
+          },
+          {
+            "name": "t11",
+            "value": {
+              "kind": "load_prop",
+              "name": "tokenId"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 52,
+              "column": 4
+            }
+          },
+          {
+            "name": "t12",
+            "value": {
+              "kind": "update_prop",
+              "name": "tokenId",
+              "value": "t11"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 52,
+              "column": 4
+            }
+          }
+        ],
+        "isPublic": false
+      },
+      {
+        "name": "transfer",
+        "params": [
+          {
+            "name": "sig",
+            "type": "Sig"
+          },
+          {
+            "name": "to",
+            "type": "PubKey"
+          },
+          {
+            "name": "amount",
+            "type": "bigint"
+          },
+          {
+            "name": "outputSatoshis",
+            "type": "bigint"
+          },
+          {
+            "name": "_changePKH",
+            "type": "Ripemd160"
+          },
+          {
+            "name": "_changeAmount",
+            "type": "bigint"
+          },
+          {
+            "name": "txPreimage",
+            "type": "SigHashPreimage"
+          }
+        ],
+        "body": [
+          {
+            "name": "t0",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t1",
+            "value": {
+              "kind": "check_preimage",
+              "preimage": "t0"
+            }
+          },
+          {
+            "name": "t2",
+            "value": {
+              "kind": "assert",
+              "value": "t1"
+            }
+          },
+          {
+            "name": "t3",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t4",
+            "value": {
+              "kind": "call",
+              "func": "extractSigHashType",
+              "args": [
+                "t3"
+              ]
+            }
+          },
+          {
+            "name": "t5",
+            "value": {
+              "kind": "load_const",
+              "value": "65"
+            }
+          },
+          {
+            "name": "t6",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t4",
+              "right": "t5"
+            }
+          },
+          {
+            "name": "t7",
+            "value": {
+              "kind": "assert",
+              "value": "t6"
+            }
+          },
+          {
+            "name": "t8",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t9",
+            "value": {
+              "kind": "deserialize_state",
+              "preimage": "t8"
+            }
+          },
+          {
+            "name": "t10",
+            "value": {
+              "kind": "load_param",
+              "name": "sig"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 60,
+              "column": 4
+            }
+          },
+          {
+            "name": "t11",
+            "value": {
+              "kind": "load_prop",
+              "name": "owner"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 60,
+              "column": 4
+            }
+          },
+          {
+            "name": "t12",
+            "value": {
+              "kind": "call",
+              "func": "checkSig",
+              "args": [
+                "t10",
+                "t11"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 60,
+              "column": 4
+            }
+          },
+          {
+            "name": "t13",
+            "value": {
+              "kind": "assert",
+              "value": "t12"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 60,
+              "column": 4
+            }
+          },
+          {
+            "name": "t14",
+            "value": {
+              "kind": "load_param",
+              "name": "outputSatoshis"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 61,
+              "column": 4
+            }
+          },
+          {
+            "name": "t15",
+            "value": {
+              "kind": "load_const",
+              "value": "1"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 61,
+              "column": 4
+            }
+          },
+          {
+            "name": "t16",
+            "value": {
+              "kind": "bin_op",
+              "op": ">=",
+              "left": "t14",
+              "right": "t15"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 61,
+              "column": 4
+            }
+          },
+          {
+            "name": "t17",
+            "value": {
+              "kind": "assert",
+              "value": "t16"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 61,
+              "column": 4
+            }
+          },
+          {
+            "name": "t18",
+            "value": {
+              "kind": "load_prop",
+              "name": "balance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 62,
+              "column": 4
+            }
+          },
+          {
+            "name": "t19",
+            "value": {
+              "kind": "load_prop",
+              "name": "mergeBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 62,
+              "column": 4
+            }
+          },
+          {
+            "name": "t20",
+            "value": {
+              "kind": "bin_op",
+              "op": "+",
+              "left": "t18",
+              "right": "t19"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 62,
+              "column": 4
+            }
+          },
+          {
+            "name": "totalBalance",
+            "value": {
+              "kind": "load_const",
+              "value": "@ref:t20"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 62,
+              "column": 4
+            }
+          },
+          {
+            "name": "t21",
+            "value": {
+              "kind": "load_param",
+              "name": "amount"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 63,
+              "column": 4
+            }
+          },
+          {
+            "name": "t22",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 63,
+              "column": 4
+            }
+          },
+          {
+            "name": "t23",
+            "value": {
+              "kind": "bin_op",
+              "op": ">",
+              "left": "t21",
+              "right": "t22"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 63,
+              "column": 4
+            }
+          },
+          {
+            "name": "t24",
+            "value": {
+              "kind": "assert",
+              "value": "t23"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 63,
+              "column": 4
+            }
+          },
+          {
+            "name": "t25",
+            "value": {
+              "kind": "load_param",
+              "name": "amount"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 64,
+              "column": 4
+            }
+          },
+          {
+            "name": "t26",
+            "value": {
+              "kind": "bin_op",
+              "op": "<=",
+              "left": "t25",
+              "right": "totalBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 64,
+              "column": 4
+            }
+          },
+          {
+            "name": "t27",
+            "value": {
+              "kind": "assert",
+              "value": "t26"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 64,
+              "column": 4
+            }
+          },
+          {
+            "name": "t28",
+            "value": {
+              "kind": "load_param",
+              "name": "outputSatoshis"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 66,
+              "column": 4
+            }
+          },
+          {
+            "name": "t29",
+            "value": {
+              "kind": "load_param",
+              "name": "to"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 66,
+              "column": 4
+            }
+          },
+          {
+            "name": "t30",
+            "value": {
+              "kind": "load_param",
+              "name": "amount"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 66,
+              "column": 4
+            }
+          },
+          {
+            "name": "t31",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 66,
+              "column": 4
+            }
+          },
+          {
+            "name": "t32",
+            "value": {
+              "kind": "add_output",
+              "satoshis": "t28",
+              "stateValues": [
+                "t29",
+                "t30",
+                "t31"
+              ],
+              "preimage": ""
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 66,
+              "column": 4
+            }
+          },
+          {
+            "name": "t33",
+            "value": {
+              "kind": "load_param",
+              "name": "amount"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 67,
+              "column": 4
+            }
+          },
+          {
+            "name": "t34",
+            "value": {
+              "kind": "bin_op",
+              "op": "<",
+              "left": "t33",
+              "right": "totalBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 67,
+              "column": 4
+            }
+          },
+          {
+            "name": "t41",
+            "value": {
+              "kind": "if",
+              "cond": "t34",
+              "then": [
+                {
+                  "name": "t35",
+                  "value": {
+                    "kind": "load_param",
+                    "name": "outputSatoshis"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 68,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t36",
+                  "value": {
+                    "kind": "load_prop",
+                    "name": "owner"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 68,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t37",
+                  "value": {
+                    "kind": "load_param",
+                    "name": "amount"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 68,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t38",
+                  "value": {
+                    "kind": "bin_op",
+                    "op": "-",
+                    "left": "totalBalance",
+                    "right": "t37"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 68,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t39",
+                  "value": {
+                    "kind": "load_const",
+                    "value": "0"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 68,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t40",
+                  "value": {
+                    "kind": "add_output",
+                    "satoshis": "t35",
+                    "stateValues": [
+                      "t36",
+                      "t38",
+                      "t39"
+                    ],
+                    "preimage": ""
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 68,
+                    "column": 6
+                  }
+                }
+              ],
+              "else": [
+                {
+                  "name": "t41",
+                  "value": {
+                    "kind": "load_const",
+                    "value": ""
+                  }
+                }
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 67,
+              "column": 4
+            }
+          },
+          {
+            "name": "t42",
+            "value": {
+              "kind": "load_param",
+              "name": "_changePKH"
+            }
+          },
+          {
+            "name": "t43",
+            "value": {
+              "kind": "load_param",
+              "name": "_changeAmount"
+            }
+          },
+          {
+            "name": "t44",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            }
+          },
+          {
+            "name": "t45",
+            "value": {
+              "kind": "bin_op",
+              "op": "!==",
+              "left": "t43",
+              "right": "t44"
+            }
+          },
+          {
+            "name": "t48",
+            "value": {
+              "kind": "if",
+              "cond": "t45",
+              "then": [
+                {
+                  "name": "t46",
+                  "value": {
+                    "kind": "call",
+                    "func": "buildChangeOutput",
+                    "args": [
+                      "t42",
+                      "t43"
+                    ]
+                  }
+                }
+              ],
+              "else": [
+                {
+                  "name": "t47",
+                  "value": {
+                    "kind": "load_const",
+                    "value": ""
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "name": "t49",
+            "value": {
+              "kind": "call",
+              "func": "cat",
+              "args": [
+                "t32",
+                "t41"
+              ]
+            }
+          },
+          {
+            "name": "t50",
+            "value": {
+              "kind": "call",
+              "func": "cat",
+              "args": [
+                "t49",
+                "t48"
+              ]
+            }
+          },
+          {
+            "name": "t51",
+            "value": {
+              "kind": "call",
+              "func": "hash256",
+              "args": [
+                "t50"
+              ]
+            }
+          },
+          {
+            "name": "t52",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t53",
+            "value": {
+              "kind": "call",
+              "func": "extractOutputHash",
+              "args": [
+                "t52"
+              ]
+            }
+          },
+          {
+            "name": "t54",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t51",
+              "right": "t53",
+              "result_type": "bytes"
+            }
+          },
+          {
+            "name": "t55",
+            "value": {
+              "kind": "assert",
+              "value": "t54",
+              "isAutoInjectedStateCheck": true
+            }
+          }
+        ],
+        "isPublic": true
+      },
+      {
+        "name": "send",
+        "params": [
+          {
+            "name": "sig",
+            "type": "Sig"
+          },
+          {
+            "name": "to",
+            "type": "PubKey"
+          },
+          {
+            "name": "outputSatoshis",
+            "type": "bigint"
+          },
+          {
+            "name": "_changePKH",
+            "type": "Ripemd160"
+          },
+          {
+            "name": "_changeAmount",
+            "type": "bigint"
+          },
+          {
+            "name": "txPreimage",
+            "type": "SigHashPreimage"
+          }
+        ],
+        "body": [
+          {
+            "name": "t0",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t1",
+            "value": {
+              "kind": "check_preimage",
+              "preimage": "t0"
+            }
+          },
+          {
+            "name": "t2",
+            "value": {
+              "kind": "assert",
+              "value": "t1"
+            }
+          },
+          {
+            "name": "t3",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t4",
+            "value": {
+              "kind": "call",
+              "func": "extractSigHashType",
+              "args": [
+                "t3"
+              ]
+            }
+          },
+          {
+            "name": "t5",
+            "value": {
+              "kind": "load_const",
+              "value": "65"
+            }
+          },
+          {
+            "name": "t6",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t4",
+              "right": "t5"
+            }
+          },
+          {
+            "name": "t7",
+            "value": {
+              "kind": "assert",
+              "value": "t6"
+            }
+          },
+          {
+            "name": "t8",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t9",
+            "value": {
+              "kind": "deserialize_state",
+              "preimage": "t8"
+            }
+          },
+          {
+            "name": "t10",
+            "value": {
+              "kind": "load_param",
+              "name": "sig"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 76,
+              "column": 4
+            }
+          },
+          {
+            "name": "t11",
+            "value": {
+              "kind": "load_prop",
+              "name": "owner"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 76,
+              "column": 4
+            }
+          },
+          {
+            "name": "t12",
+            "value": {
+              "kind": "call",
+              "func": "checkSig",
+              "args": [
+                "t10",
+                "t11"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 76,
+              "column": 4
+            }
+          },
+          {
+            "name": "t13",
+            "value": {
+              "kind": "assert",
+              "value": "t12"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 76,
+              "column": 4
+            }
+          },
+          {
+            "name": "t14",
+            "value": {
+              "kind": "load_param",
+              "name": "outputSatoshis"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 77,
+              "column": 4
+            }
+          },
+          {
+            "name": "t15",
+            "value": {
+              "kind": "load_const",
+              "value": "1"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 77,
+              "column": 4
+            }
+          },
+          {
+            "name": "t16",
+            "value": {
+              "kind": "bin_op",
+              "op": ">=",
+              "left": "t14",
+              "right": "t15"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 77,
+              "column": 4
+            }
+          },
+          {
+            "name": "t17",
+            "value": {
+              "kind": "assert",
+              "value": "t16"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 77,
+              "column": 4
+            }
+          },
+          {
+            "name": "t18",
+            "value": {
+              "kind": "load_param",
+              "name": "outputSatoshis"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t19",
+            "value": {
+              "kind": "load_param",
+              "name": "to"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t20",
+            "value": {
+              "kind": "load_prop",
+              "name": "balance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t21",
+            "value": {
+              "kind": "load_prop",
+              "name": "mergeBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t22",
+            "value": {
+              "kind": "bin_op",
+              "op": "+",
+              "left": "t20",
+              "right": "t21"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t23",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t24",
+            "value": {
+              "kind": "add_output",
+              "satoshis": "t18",
+              "stateValues": [
+                "t19",
+                "t22",
+                "t23"
+              ],
+              "preimage": ""
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 79,
+              "column": 4
+            }
+          },
+          {
+            "name": "t25",
+            "value": {
+              "kind": "load_param",
+              "name": "_changePKH"
+            }
+          },
+          {
+            "name": "t26",
+            "value": {
+              "kind": "load_param",
+              "name": "_changeAmount"
+            }
+          },
+          {
+            "name": "t27",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            }
+          },
+          {
+            "name": "t28",
+            "value": {
+              "kind": "bin_op",
+              "op": "!==",
+              "left": "t26",
+              "right": "t27"
+            }
+          },
+          {
+            "name": "t31",
+            "value": {
+              "kind": "if",
+              "cond": "t28",
+              "then": [
+                {
+                  "name": "t29",
+                  "value": {
+                    "kind": "call",
+                    "func": "buildChangeOutput",
+                    "args": [
+                      "t25",
+                      "t26"
+                    ]
+                  }
+                }
+              ],
+              "else": [
+                {
+                  "name": "t30",
+                  "value": {
+                    "kind": "load_const",
+                    "value": ""
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "name": "t32",
+            "value": {
+              "kind": "call",
+              "func": "cat",
+              "args": [
+                "t24",
+                "t31"
+              ]
+            }
+          },
+          {
+            "name": "t33",
+            "value": {
+              "kind": "call",
+              "func": "hash256",
+              "args": [
+                "t32"
+              ]
+            }
+          },
+          {
+            "name": "t34",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t35",
+            "value": {
+              "kind": "call",
+              "func": "extractOutputHash",
+              "args": [
+                "t34"
+              ]
+            }
+          },
+          {
+            "name": "t36",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t33",
+              "right": "t35",
+              "result_type": "bytes"
+            }
+          },
+          {
+            "name": "t37",
+            "value": {
+              "kind": "assert",
+              "value": "t36",
+              "isAutoInjectedStateCheck": true
+            }
+          }
+        ],
+        "isPublic": true
+      },
+      {
+        "name": "merge",
+        "params": [
+          {
+            "name": "sig",
+            "type": "Sig"
+          },
+          {
+            "name": "otherBalance",
+            "type": "bigint"
+          },
+          {
+            "name": "allPrevouts",
+            "type": "ByteString"
+          },
+          {
+            "name": "outputSatoshis",
+            "type": "bigint"
+          },
+          {
+            "name": "_changePKH",
+            "type": "Ripemd160"
+          },
+          {
+            "name": "_changeAmount",
+            "type": "bigint"
+          },
+          {
+            "name": "txPreimage",
+            "type": "SigHashPreimage"
+          }
+        ],
+        "body": [
+          {
+            "name": "t0",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t1",
+            "value": {
+              "kind": "check_preimage",
+              "preimage": "t0"
+            }
+          },
+          {
+            "name": "t2",
+            "value": {
+              "kind": "assert",
+              "value": "t1"
+            }
+          },
+          {
+            "name": "t3",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t4",
+            "value": {
+              "kind": "call",
+              "func": "extractSigHashType",
+              "args": [
+                "t3"
+              ]
+            }
+          },
+          {
+            "name": "t5",
+            "value": {
+              "kind": "load_const",
+              "value": "65"
+            }
+          },
+          {
+            "name": "t6",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t4",
+              "right": "t5"
+            }
+          },
+          {
+            "name": "t7",
+            "value": {
+              "kind": "assert",
+              "value": "t6"
+            }
+          },
+          {
+            "name": "t8",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t9",
+            "value": {
+              "kind": "deserialize_state",
+              "preimage": "t8"
+            }
+          },
+          {
+            "name": "t10",
+            "value": {
+              "kind": "load_param",
+              "name": "sig"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 115,
+              "column": 4
+            }
+          },
+          {
+            "name": "t11",
+            "value": {
+              "kind": "load_prop",
+              "name": "owner"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 115,
+              "column": 4
+            }
+          },
+          {
+            "name": "t12",
+            "value": {
+              "kind": "call",
+              "func": "checkSig",
+              "args": [
+                "t10",
+                "t11"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 115,
+              "column": 4
+            }
+          },
+          {
+            "name": "t13",
+            "value": {
+              "kind": "assert",
+              "value": "t12"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 115,
+              "column": 4
+            }
+          },
+          {
+            "name": "t14",
+            "value": {
+              "kind": "load_param",
+              "name": "outputSatoshis"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 116,
+              "column": 4
+            }
+          },
+          {
+            "name": "t15",
+            "value": {
+              "kind": "load_const",
+              "value": "1"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 116,
+              "column": 4
+            }
+          },
+          {
+            "name": "t16",
+            "value": {
+              "kind": "bin_op",
+              "op": ">=",
+              "left": "t14",
+              "right": "t15"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 116,
+              "column": 4
+            }
+          },
+          {
+            "name": "t17",
+            "value": {
+              "kind": "assert",
+              "value": "t16"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 116,
+              "column": 4
+            }
+          },
+          {
+            "name": "t18",
+            "value": {
+              "kind": "load_param",
+              "name": "otherBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 117,
+              "column": 4
+            }
+          },
+          {
+            "name": "t19",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 117,
+              "column": 4
+            }
+          },
+          {
+            "name": "t20",
+            "value": {
+              "kind": "bin_op",
+              "op": ">=",
+              "left": "t18",
+              "right": "t19"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 117,
+              "column": 4
+            }
+          },
+          {
+            "name": "t21",
+            "value": {
+              "kind": "assert",
+              "value": "t20"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 117,
+              "column": 4
+            }
+          },
+          {
+            "name": "t22",
+            "value": {
+              "kind": "load_param",
+              "name": "allPrevouts"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 120,
+              "column": 4
+            }
+          },
+          {
+            "name": "t23",
+            "value": {
+              "kind": "call",
+              "func": "hash256",
+              "args": [
+                "t22"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 120,
+              "column": 4
+            }
+          },
+          {
+            "name": "t24",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 120,
+              "column": 4
+            }
+          },
+          {
+            "name": "t25",
+            "value": {
+              "kind": "call",
+              "func": "extractHashPrevouts",
+              "args": [
+                "t24"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 120,
+              "column": 4
+            }
+          },
+          {
+            "name": "t26",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t23",
+              "right": "t25",
+              "result_type": "bytes"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 120,
+              "column": 4
+            }
+          },
+          {
+            "name": "t27",
+            "value": {
+              "kind": "assert",
+              "value": "t26"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 120,
+              "column": 4
+            }
+          },
+          {
+            "name": "t28",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 123,
+              "column": 4
+            }
+          },
+          {
+            "name": "t29",
+            "value": {
+              "kind": "call",
+              "func": "extractOutpoint",
+              "args": [
+                "t28"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 123,
+              "column": 4
+            }
+          },
+          {
+            "name": "myOutpoint",
+            "value": {
+              "kind": "load_const",
+              "value": "@ref:t29"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 123,
+              "column": 4
+            }
+          },
+          {
+            "name": "t30",
+            "value": {
+              "kind": "load_param",
+              "name": "allPrevouts"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 124,
+              "column": 4
+            }
+          },
+          {
+            "name": "t31",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 124,
+              "column": 4
+            }
+          },
+          {
+            "name": "t32",
+            "value": {
+              "kind": "load_const",
+              "value": "36"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 124,
+              "column": 4
+            }
+          },
+          {
+            "name": "t33",
+            "value": {
+              "kind": "call",
+              "func": "substr",
+              "args": [
+                "t30",
+                "t31",
+                "t32"
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 124,
+              "column": 4
+            }
+          },
+          {
+            "name": "firstOutpoint",
+            "value": {
+              "kind": "load_const",
+              "value": "@ref:t33"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 124,
+              "column": 4
+            }
+          },
+          {
+            "name": "t34",
+            "value": {
+              "kind": "load_prop",
+              "name": "balance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 125,
+              "column": 4
+            }
+          },
+          {
+            "name": "t35",
+            "value": {
+              "kind": "load_prop",
+              "name": "mergeBalance"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 125,
+              "column": 4
+            }
+          },
+          {
+            "name": "t36",
+            "value": {
+              "kind": "bin_op",
+              "op": "+",
+              "left": "t34",
+              "right": "t35"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 125,
+              "column": 4
+            }
+          },
+          {
+            "name": "myBalance",
+            "value": {
+              "kind": "load_const",
+              "value": "@ref:t36"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 125,
+              "column": 4
+            }
+          },
+          {
+            "name": "t37",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "myOutpoint",
+              "right": "firstOutpoint",
+              "result_type": "bytes"
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 127,
+              "column": 4
+            }
+          },
+          {
+            "name": "t46",
+            "value": {
+              "kind": "if",
+              "cond": "t37",
+              "then": [
+                {
+                  "name": "t38",
+                  "value": {
+                    "kind": "load_param",
+                    "name": "outputSatoshis"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 129,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t39",
+                  "value": {
+                    "kind": "load_prop",
+                    "name": "owner"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 129,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t40",
+                  "value": {
+                    "kind": "load_param",
+                    "name": "otherBalance"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 129,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t41",
+                  "value": {
+                    "kind": "add_output",
+                    "satoshis": "t38",
+                    "stateValues": [
+                      "t39",
+                      "myBalance",
+                      "t40"
+                    ],
+                    "preimage": ""
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 129,
+                    "column": 6
+                  }
+                }
+              ],
+              "else": [
+                {
+                  "name": "t42",
+                  "value": {
+                    "kind": "load_param",
+                    "name": "outputSatoshis"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 132,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t43",
+                  "value": {
+                    "kind": "load_prop",
+                    "name": "owner"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 132,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t44",
+                  "value": {
+                    "kind": "load_param",
+                    "name": "otherBalance"
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 132,
+                    "column": 6
+                  }
+                },
+                {
+                  "name": "t45",
+                  "value": {
+                    "kind": "add_output",
+                    "satoshis": "t42",
+                    "stateValues": [
+                      "t43",
+                      "t44",
+                      "myBalance"
+                    ],
+                    "preimage": ""
+                  },
+                  "sourceLoc": {
+                    "file": "FungibleTokenExample.runar.ts",
+                    "line": 132,
+                    "column": 6
+                  }
+                }
+              ]
+            },
+            "sourceLoc": {
+              "file": "FungibleTokenExample.runar.ts",
+              "line": 127,
+              "column": 4
+            }
+          },
+          {
+            "name": "t47",
+            "value": {
+              "kind": "load_param",
+              "name": "_changePKH"
+            }
+          },
+          {
+            "name": "t48",
+            "value": {
+              "kind": "load_param",
+              "name": "_changeAmount"
+            }
+          },
+          {
+            "name": "t49",
+            "value": {
+              "kind": "load_const",
+              "value": "0"
+            }
+          },
+          {
+            "name": "t50",
+            "value": {
+              "kind": "bin_op",
+              "op": "!==",
+              "left": "t48",
+              "right": "t49"
+            }
+          },
+          {
+            "name": "t53",
+            "value": {
+              "kind": "if",
+              "cond": "t50",
+              "then": [
+                {
+                  "name": "t51",
+                  "value": {
+                    "kind": "call",
+                    "func": "buildChangeOutput",
+                    "args": [
+                      "t47",
+                      "t48"
+                    ]
+                  }
+                }
+              ],
+              "else": [
+                {
+                  "name": "t52",
+                  "value": {
+                    "kind": "load_const",
+                    "value": ""
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "name": "t54",
+            "value": {
+              "kind": "call",
+              "func": "cat",
+              "args": [
+                "t46",
+                "t53"
+              ]
+            }
+          },
+          {
+            "name": "t55",
+            "value": {
+              "kind": "call",
+              "func": "hash256",
+              "args": [
+                "t54"
+              ]
+            }
+          },
+          {
+            "name": "t56",
+            "value": {
+              "kind": "load_param",
+              "name": "txPreimage"
+            }
+          },
+          {
+            "name": "t57",
+            "value": {
+              "kind": "call",
+              "func": "extractOutputHash",
+              "args": [
+                "t56"
+              ]
+            }
+          },
+          {
+            "name": "t58",
+            "value": {
+              "kind": "bin_op",
+              "op": "===",
+              "left": "t55",
+              "right": "t57",
+              "result_type": "bytes"
+            }
+          },
+          {
+            "name": "t59",
+            "value": {
+              "kind": "assert",
+              "value": "t58",
+              "isAutoInjectedStateCheck": true
+            }
+          }
+        ],
+        "isPublic": true
+      }
+    ]
+  },
+  "codeSeparatorIndex": 2058,
+  "codeSeparatorIndices": [
+    6,
+    1096,
+    2058
+  ],
+  "rawScriptSpans": [
+    {
+      "offset": 7,
+      "length": 760,
+      "inArity": 1,
+      "outArity": 1
+    },
+    {
+      "offset": 1097,
+      "length": 760,
+      "inArity": 1,
+      "outArity": 1
+    },
+    {
+      "offset": 2059,
+      "length": 760,
+      "inArity": 1,
+      "outArity": 1
+    }
+  ]
+}
