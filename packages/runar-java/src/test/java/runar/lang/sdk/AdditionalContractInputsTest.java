@@ -244,6 +244,81 @@ class AdditionalContractInputsTest {
     }
 
     @Test
+    void feeStillCoversTheTxWhenMoreThanOneFundingInputIsNeeded() throws Exception {
+        // The `allPrevouts` stand-in is sized for an ASSUMED input count
+        // (contract + extras + one funding input). Its real value is spliced in
+        // after the layout passes have already fixed the change output, so if
+        // coin selection pulls a different number of funding inputs the unlock
+        // grows by 36 bytes per extra input and the fee is short by that much —
+        // the same defect class as the 181-byte preimage stand-in.
+        //
+        // Force TWO funding inputs by seeding ONLY small UTXOs. The contracts
+        // are placed with setCurrentUtxo rather than deploy() so no large coin
+        // has to exist in the wallet — with one, largest-first selection would
+        // cover everything in a single input and the test would pass vacuously.
+        RunarArtifact artifact = tokenArtifact();
+        LocalSigner signer = new LocalSigner(PRIV);
+        MockProvider provider = new MockProvider();
+        String p2pkh = ScriptUtils.buildP2PKHScript(signer.address());
+        for (int i = 0; i < 8; i++) {
+            provider.addUtxo(signer.address(),
+                new UTXO("ab".repeat(31) + String.format("%02x", i), 0, 300L, p2pkh));
+        }
+
+        String ownerHex = ScriptUtils.bytesToHex(signer.pubKey());
+        List<Object> args1 = List.of(ownerHex, BigInteger.valueOf(400), BigInteger.ZERO, TOKEN_ID);
+        List<Object> args2 = List.of(ownerHex, BigInteger.valueOf(600), BigInteger.ZERO, TOKEN_ID);
+        RunarContract first = new RunarContract(artifact, args1);
+        RunarContract second = new RunarContract(artifact, args2);
+        UTXO primary = new UTXO("cc".repeat(32), 0, 1L,
+            ContractScript.renderLockingScript(artifact, args1, null));
+        UTXO other = new UTXO("dd".repeat(32), 0, 1L,
+            ContractScript.renderLockingScript(artifact, args2, null));
+        first.setCurrentUtxo(primary);
+        second.setCurrentUtxo(other);
+        CallOptions opts = new CallOptions(null, null, null)
+            .withAdditionalContractInputs(List.of(other))
+            .withAdditionalContractInputArgs(List.of(
+                java.util.Arrays.asList(null, BigInteger.valueOf(400), null, BigInteger.ONE)));
+        first.callWithOptions(
+            "merge",
+            java.util.Arrays.asList(null, BigInteger.valueOf(600), null, BigInteger.ONE),
+            opts, provider, signer);
+
+        List<String> txs = provider.getBroadcastedTxs();
+        String callTxHex = txs.get(txs.size() - 1);
+        RawTx callTx = RawTxParser.parse(callTxHex);
+
+        long inSats = 0;
+        int fundingInputs = 0;
+        for (RawTx.Input in : callTx.inputs) {
+            if (in.prevTxid.equals(primary.txid()) || in.prevTxid.equals(other.txid())) {
+                inSats += 1L; // contract UTXO
+            } else {
+                inSats += 300L; // one of the eight small coins
+                fundingInputs++;
+            }
+        }
+        // Guard against a vacuous pass: if coin selection happened to pull
+        // exactly one funding input, this test exercises the same shape as the
+        // one above and proves nothing about the stand-in's sizing assumption.
+        assertTrue(fundingInputs >= 2,
+            "this test must exercise MORE than one funding input to be meaningful, got "
+                + fundingInputs + " (total inputs " + callTx.inputs.size() + ")");
+        long outSats = 0;
+        for (RawTx.Output o : callTx.outputs) outSats += o.satoshis;
+        long paid = inSats - outSats;
+        long bytes = callTxHex.length() / 2;
+        long needed = Math.max(1L, (bytes * provider.getFeeRate() + 999) / 1000);
+
+        assertTrue(paid >= needed,
+            "merge tx must pay the relay fee for its own size regardless of how many "
+                + "funding inputs coin selection pulled: paid " + paid + " sat, needs "
+                + needed + " sat for " + bytes + " bytes, "
+                + callTx.inputs.size() + " inputs");
+    }
+
+    @Test
     void perInputArgsCountMustMatchTheInputCount() throws Exception {
         Setup s = deployPair();
         CallOptions opts = new CallOptions(null, null, null)

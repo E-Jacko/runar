@@ -813,6 +813,51 @@ public final class RunarContract {
                 : u.scriptHex());
         }
 
+        // `allPrevouts` is 36 bytes PER INPUT, and its real value is only known
+        // after coin selection — but it is spliced in after the layout passes
+        // have already fixed the change output. So its stand-in has to be the
+        // right LENGTH going in, exactly like the BIP-143 preimage above. A
+        // fixed guess of "contract + extras + one funding input" under-sizes
+        // every call that needs more than one funding coin: with 5 funding
+        // inputs the two unlocks are 288 bytes short and the tx under-pays.
+        // Converge on the real count by laying out, reading back how many
+        // funding inputs were actually selected, and re-sizing.
+        List<Integer> prevoutsIdx = prevoutsIndices(userParamsForExtra);
+        int assumedInputs = 1 + extraContractUtxos.size() + 1;
+        if (!prevoutsIdx.isEmpty()) {
+            boolean converged = false;
+            for (int attempt = 0; attempt < 4 && !converged; attempt++) {
+                setPrevoutsPlaceholder(resolved, extraResolved, prevoutsIdx, assumedInputs);
+                String probeUnlock = buildPushTxUnlock(
+                    m, methodName, resolved, "00".repeat(72),
+                    methodNeedsChange ? changePkhHex : null,
+                    0L, methodNeedsNewAmount, newSats, preimagePlaceholder, intentWitnessHex);
+                List<TransactionBuilder.ContractInput> probeExtras = buildExtraInputPlaceholders(
+                    m, methodName, extraContractUtxos, extraResolved, extraSubscripts,
+                    methodNeedsChange ? changePkhHex : null, methodNeedsNewAmount, newSats,
+                    intentWitnessHex);
+                TransactionBuilder.CallTxResult probe = orderedContractOutputs != null
+                    ? TransactionBuilder.buildCallTransactionFullOrdered(
+                        currentUtxo, probeUnlock, orderedContractOutputs,
+                        dataOutputs, additional, funderAddress, feeRate, locktime, probeExtras)
+                    : TransactionBuilder.buildCallTransactionFull(
+                        currentUtxo, probeUnlock, newLockingScript, newSats,
+                        dataOutputs, additional, funderAddress, feeRate, locktime, probeExtras);
+                int actualInputs = 1 + extraContractUtxos.size() + probe.fundingUtxos().size();
+                if (actualInputs == assumedInputs) converged = true;
+                else assumedInputs = actualInputs;
+            }
+            if (!converged) {
+                // Fail closed rather than broadcast a transaction whose fee was
+                // computed for a different size than the one it ships.
+                throw new IllegalStateException(
+                    "RunarContract.call(" + methodName + "): could not settle the input count "
+                        + "for the auto-computed 'allPrevouts' argument (last estimate "
+                        + assumedInputs + "). Pass an explicit allPrevouts value, or reduce "
+                        + "the number of funding UTXOs in play.");
+            }
+        }
+
         // First pass: build a placeholder unlock so we can size the tx,
         // estimate the fee, lay out outputs, and compute the change
         // amount that will be embedded in the real unlock.
@@ -826,17 +871,10 @@ public final class RunarContract {
 
         // Correctly-sized placeholder unlocks for the extra inputs, so the fee
         // covers their bytes too.
-        List<TransactionBuilder.ContractInput> extraInputs = new ArrayList<>();
-        for (int i = 0; i < extraContractUtxos.size(); i++) {
-            extraInputs.add(new TransactionBuilder.ContractInput(
-                extraContractUtxos.get(i),
-                buildPushTxUnlock(
-                    m, methodName, extraResolved.get(i), "00".repeat(72),
-                    methodNeedsChange ? changePkhHex : null,
-                    0L, methodNeedsNewAmount, newSats,
-                    "00".repeat(bip143PreimageLen(extraSubscripts.get(i))),
-                    intentWitnessHex)));
-        }
+        List<TransactionBuilder.ContractInput> extraInputs = buildExtraInputPlaceholders(
+            m, methodName, extraContractUtxos, extraResolved, extraSubscripts,
+            methodNeedsChange ? changePkhHex : null, methodNeedsNewAmount, newSats,
+            intentWitnessHex);
 
         // Thread CallOptions.locktime so contracts asserting
         // extractLocktime(preimage) can succeed. 0 → legacy. The rebuild path
@@ -918,7 +956,6 @@ public final class RunarContract {
         // they all commit to these bytes. Same length as the stand-in whenever
         // the funding estimate held; when it did not, the layout below still
         // reflects the real bytes because the unlocks are rebuilt from here.
-        List<Integer> prevoutsIdx = prevoutsIndices(userParamsForExtra);
         if (!prevoutsIdx.isEmpty()) {
             String prevouts = allPrevoutsHex(tx);
             for (int idx : prevoutsIdx) {
@@ -1622,6 +1659,46 @@ public final class RunarContract {
      * preimage of BIP-143's {@code hashPrevouts}, which is exactly what a
      * multi-input covenant re-hashes to prove it saw the whole input set.
      */
+    /**
+     * Re-size every auto-computed {@code allPrevouts} stand-in to
+     * {@code inputCount} inputs' worth of outpoints (36 bytes each), across the
+     * primary arg list and every extra input's. Length only — the real bytes go
+     * in once the layout is settled.
+     */
+    private static void setPrevoutsPlaceholder(
+        List<Object> resolved, List<List<Object>> extraResolved,
+        List<Integer> prevoutsIdx, int inputCount
+    ) {
+        String stub = "00".repeat(36 * inputCount);
+        for (int idx : prevoutsIdx) {
+            resolved.set(idx, stub);
+            for (List<Object> r : extraResolved) r.set(idx, stub);
+        }
+    }
+
+    /**
+     * Placeholder unlocks for the extra contract inputs, each sized against ITS
+     * OWN scriptCode so the fee covers the bytes the tx will actually carry.
+     */
+    private List<TransactionBuilder.ContractInput> buildExtraInputPlaceholders(
+        RunarArtifact.ABIMethod m, String methodName, List<UTXO> extraContractUtxos,
+        List<List<Object>> extraResolved, List<String> extraSubscripts,
+        String changePkhHex, boolean methodNeedsNewAmount, long newSats,
+        String intentWitnessHex
+    ) {
+        List<TransactionBuilder.ContractInput> out = new ArrayList<>();
+        for (int i = 0; i < extraContractUtxos.size(); i++) {
+            out.add(new TransactionBuilder.ContractInput(
+                extraContractUtxos.get(i),
+                buildPushTxUnlock(
+                    m, methodName, extraResolved.get(i), "00".repeat(72),
+                    changePkhHex, 0L, methodNeedsNewAmount, newSats,
+                    "00".repeat(bip143PreimageLen(extraSubscripts.get(i))),
+                    intentWitnessHex)));
+        }
+        return out;
+    }
+
     private static String allPrevoutsHex(RawTx tx) {
         StringBuilder sb = new StringBuilder();
         for (RawTx.Input in : tx.inputs) {
