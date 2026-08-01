@@ -943,29 +943,66 @@ test "FungibleToken_MergeDeflated" {
     defer allocator.free(deploy_txid2);
     std.log.info("FungibleToken contracts deployed for deflated merge test", .{});
 
-    // Negative otherBalance fails assert(otherBalance >= 0)
-    // Attacker claims otherBalance=100 but passes -100 to second input
+    // Attacker under-reports the counterparty's balance: input 0 claims its
+    // partner holds 100 (really 600), input 1 tells the truth about input 0.
+    //
+    // Input 0 is at position 0, so it writes (myBalance=400, otherBalance=100).
+    // Input 1 is not at position 0, so it writes (otherBalance=400, myBalance=600).
+    // hashOutputs forces both to commit to the SAME output set, so the lie
+    // cannot survive: the node rejects the spend.
+    //
+    // This test previously spent contract1 ALONE with a self-consistent
+    // new_state, which the covenant has no reason to reject — a single input at
+    // position 0 legitimately writes (400, 100). It passed only because the Zig
+    // SDK built the continuation at the input value (5000) instead of the
+    // explicit addOutput(outputSatoshis) (4000), so hashOutputs mismatched for
+    // a reason unrelated to the attack. Fixing that SDK bug removed the
+    // accidental failure and exposed the test as vacuous.
+    const utxo2 = contract2.getCurrentUtxo() orelse return error.TestUnexpectedResult;
     const result = contract1.call(
         "merge",
         &[_]runar.StateValue{
             .{ .int = 0 }, // sig: auto-sign
-            .{ .int = 100 }, // deflated otherBalance
+            .{ .int = 100 }, // deflated otherBalance (really 600)
             .{ .int = 0 }, // allPrevouts: auto-computed
             .{ .int = output_sats },
         },
         rpc_provider.provider(),
         local_signer.signer(),
-        .{ .new_state = &[_]runar.StateValue{
-            .{ .bytes = owner_pk },
-            .{ .int = balance1 },
-            .{ .int = 100 },
-        } },
+        .{
+            .outputs = &[_]runar.OutputSpec{
+                .{ .satoshis = output_sats, .state = &[_]runar.StateValue{
+                    .{ .bytes = owner_pk },
+                    .{ .int = balance1 },
+                    .{ .int = 100 },
+                } },
+            },
+            .additional_contract_inputs = &[_]runar.UTXO{utxo2},
+            .additional_contract_input_args = &[_][]const runar.StateValue{
+                &[_]runar.StateValue{
+                    .{ .int = 0 }, // sig (auto-sign for input 1)
+                    .{ .int = balance1 }, // input 1 reports input 0 honestly
+                    .{ .int = 0 }, // allPrevouts auto-fill
+                    .{ .int = output_sats },
+                },
+            },
+        },
     );
 
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // deflated otherBalance must be rejected
-    } else |_| {
+    } else |err| {
+        // `ContractError.CallFailed` is the SDK's catch-all: it also covers a
+        // UTXO-fetch or build failure, so on its own it does NOT prove the node
+        // rejected anything. What makes this test meaningful is the control:
+        // `FungibleToken_Merge` runs this EXACT setup and options shape with
+        // honest balances and succeeds. Since the only difference here is the
+        // lied-about balance, the failure cannot be the SDK declining to build.
+        try std.testing.expectEqual(error.CallFailed, err);
+        // And nothing was spent: the contract UTXO must survive the rejection.
+        const still = contract1.getCurrentUtxo() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(still.satoshis == deploy_sats);
         std.log.info("FungibleToken correctly rejected merge with deflated balance", .{});
     }
 }
@@ -1020,28 +1057,60 @@ test "FungibleToken_MergeInflatedTotal" {
     defer allocator.free(deploy_txid2);
     std.log.info("FungibleToken contracts deployed for inflated merge test", .{});
 
-    // Attacker claims inflated otherBalance=1600. hashOutputs mismatch should reject.
+    // Supply inflation: input 0 claims its partner holds 1600 (really 600) and
+    // input 1 claims ITS partner holds 1400 (really 400), so the two inputs
+    // would mint 1000 tokens out of nothing.
+    //
+    // Input 0 writes (myBalance=400, otherBalance=1600); input 1 writes
+    // (otherBalance=1400, myBalance=600). hashOutputs forces both inputs to
+    // commit to the same output set, so the mismatch rejects the spend. This
+    // mirrors the Go tier's TestFungibleToken_MergeInflatedOtherBalance.
+    //
+    // Previously this spent contract1 alone — see the note in
+    // FungibleToken_MergeDeflated: a lone input at position 0 writing
+    // (400, 1600) is self-consistent and the covenant rightly accepts it. The
+    // test only "passed" because of an unrelated continuation-satoshis bug.
+    const utxo2 = contract2.getCurrentUtxo() orelse return error.TestUnexpectedResult;
     const result = contract1.call(
         "merge",
         &[_]runar.StateValue{
             .{ .int = 0 }, // sig: auto-sign
-            .{ .int = 1600 }, // inflated otherBalance
+            .{ .int = 1600 }, // inflated otherBalance (really 600)
             .{ .int = 0 }, // allPrevouts: auto-computed
             .{ .int = output_sats },
         },
         rpc_provider.provider(),
         local_signer.signer(),
-        .{ .new_state = &[_]runar.StateValue{
-            .{ .bytes = owner_pk },
-            .{ .int = balance1 },
-            .{ .int = 1600 },
-        } },
+        .{
+            .outputs = &[_]runar.OutputSpec{
+                .{ .satoshis = output_sats, .state = &[_]runar.StateValue{
+                    .{ .bytes = owner_pk },
+                    .{ .int = balance1 },
+                    .{ .int = 1600 },
+                } },
+            },
+            .additional_contract_inputs = &[_]runar.UTXO{utxo2},
+            .additional_contract_input_args = &[_][]const runar.StateValue{
+                &[_]runar.StateValue{
+                    .{ .int = 0 }, // sig (auto-sign for input 1)
+                    .{ .int = 1400 }, // input 1 also lies (really 400)
+                    .{ .int = 0 }, // allPrevouts auto-fill
+                    .{ .int = output_sats },
+                },
+            },
+        },
     );
 
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // inflated total must be rejected by hashOutputs
-    } else |_| {
+    } else |err| {
+        // See the note in FungibleToken_MergeDeflated: the catch-all error is
+        // only meaningful because FungibleToken_Merge is the honest-balance
+        // control over the same setup and it succeeds.
+        try std.testing.expectEqual(error.CallFailed, err);
+        const still = contract1.getCurrentUtxo() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(still.satoshis == deploy_sats);
         std.log.info("FungibleToken correctly rejected merge with inflated total", .{});
     }
 }
