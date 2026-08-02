@@ -296,7 +296,12 @@ test "FungibleToken_WrongOwnerRejected" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have failed
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected wrong owner", .{});
     }
 }
@@ -511,7 +516,12 @@ test "FungibleToken_TransferDeflatedBalance" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // deflated balance must be rejected by hashOutputs
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected transfer with deflated balance", .{});
     }
 }
@@ -580,7 +590,12 @@ test "FungibleToken_TransferInflatedBalance" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // inflated balance must be rejected by hashOutputs
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected transfer with inflated balance", .{});
     }
 }
@@ -648,7 +663,12 @@ test "FungibleToken_TransferExceedsBalanceRejected" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have failed
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected transfer exceeding balance", .{});
     }
 }
@@ -725,7 +745,12 @@ test "FungibleToken_TransferWrongSigner" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have failed
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected transfer with wrong signer", .{});
     }
 }
@@ -793,7 +818,12 @@ test "FungibleToken_TransferZeroAmountRejected" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have failed
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected transfer of zero amount", .{});
     }
 }
@@ -1000,6 +1030,9 @@ test "FungibleToken_MergeDeflated" {
         // honest balances and succeeds. Since the only difference here is the
         // lied-about balance, the failure cannot be the SDK declining to build.
         try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node, so the rejection is consensus's
+        // and not a build-time refusal.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         // And nothing was spent: the contract UTXO must survive the rejection.
         const still = contract1.getCurrentUtxo() orelse return error.TestUnexpectedResult;
         try std.testing.expect(still.satoshis == deploy_sats);
@@ -1109,6 +1142,7 @@ test "FungibleToken_MergeInflatedTotal" {
         // only meaningful because FungibleToken_Merge is the honest-balance
         // control over the same setup and it succeeds.
         try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         const still = contract1.getCurrentUtxo() orelse return error.TestUnexpectedResult;
         try std.testing.expect(still.satoshis == deploy_sats);
         std.log.info("FungibleToken correctly rejected merge with inflated total", .{});
@@ -1194,7 +1228,12 @@ test "FungibleToken_MergeWrongSigner" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have failed
-    } else |_| {
+    } else |err| {
+        try std.testing.expectEqual(error.CallFailed, err);
+        // The SDK must have reached the node — otherwise this test would pass
+        // just as happily if the call had been refused before a transaction
+        // was ever built, which proves nothing about the covenant.
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         std.log.info("FungibleToken correctly rejected merge with wrong signer", .{});
     }
 }

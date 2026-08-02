@@ -314,6 +314,15 @@ pub fn fundWallet(allocator: std.mem.Allocator, wallet: *const Wallet, btc_amoun
 
 pub const RPCProvider = struct {
     allocator: std.mem.Allocator,
+    /// Number of times the SDK actually handed a transaction to the node.
+    ///
+    /// Negative tests assert on this. Without it, "the call returned an error"
+    /// is ambiguous: the SDK's own `ContractError.CallFailed` covers a
+    /// UTXO-fetch failure and a build-time refusal just as much as a node
+    /// rejection, so a negative test can pass while the transaction under
+    /// attack was never even constructed. Asserting `broadcast_attempts >= 1`
+    /// pins the rejection to consensus rather than to the SDK.
+    broadcast_attempts: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) RPCProvider {
         return .{ .allocator = allocator };
@@ -389,7 +398,11 @@ pub const RPCProvider = struct {
         };
     }
 
-    fn broadcastImpl(_: *anyopaque, allocator: std.mem.Allocator, tx_hex: []const u8) runar.sdk_provider.ProviderError![]u8 {
+    fn broadcastImpl(ptr: *anyopaque, allocator: std.mem.Allocator, tx_hex: []const u8) runar.sdk_provider.ProviderError![]u8 {
+        const self: *RPCProvider = @ptrCast(@alignCast(ptr));
+        // Count the ATTEMPT, before the node can reject it — that is exactly
+        // what distinguishes a consensus rejection from an SDK-side failure.
+        self.broadcast_attempts += 1;
         const txid = broadcastAndMine(allocator, tx_hex) catch return runar.sdk_provider.ProviderError.BroadcastFailed;
         return txid;
     }
