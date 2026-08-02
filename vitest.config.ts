@@ -13,6 +13,18 @@ export default defineConfig({
     },
   },
   test: {
-    exclude: ['**/node_modules/**', 'integration/**', '**/dist/**', '**/.claude/**'],
+    // `.worktrees/**` is excluded because CLAUDE.md tells contributors to do
+    // their work in a git worktree there. Without this, a root `vitest run`
+    // collects every test file from every checked-out worktree as well as the
+    // main tree — the same suite runs two, three or four times, results are
+    // attributed to the wrong tree, and removing a worktree mid-run fails a
+    // thousand files at collection time with no assertion having run.
+    exclude: [
+      '**/node_modules/**',
+      'integration/**',
+      '**/dist/**',
+      '**/.claude/**',
+      '**/.worktrees/**',
+    ],
   },
 });
