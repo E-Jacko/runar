@@ -436,15 +436,25 @@ public final class RunarContract {
         // no-op in that case, so the common path is byte-for-byte unchanged.
         List<AnfInterpreter.OrderedOutput> orderedOutputs = new ArrayList<>();
         if (isStateful && terminalOutputs == null) {
-            if (stateUpdates != null) {
-                state.putAll(stateUpdates);
-            } else if (artifact.anf() != null) {
+            // Run the interpreter even when the caller supplied explicit state.
+            // It produces TWO different things: the new state VALUES, and the
+            // output SHAPE (how many outputs, their satoshis, any data outputs).
+            // `stateUpdates` overrides only the former. Short-circuiting on it
+            // used to discard the latter too, so a method with an explicit
+            // `this.addOutput(<sats>, ...)` silently fell back to the spent
+            // input's value — the continuation was built at the wrong amount,
+            // the covenant's hashOutputs binding rejected the spend, and the
+            // funds were stranded. That is exactly how the on-chain merge test
+            // failed: state correct, continuation at 5000 instead of 4000.
+            if (artifact.anf() != null) {
                 Map<String, Object> namedArgs = buildNamedArgs(userParams, args);
                 try {
                     AnfInterpreter.ExecutionResult execResult = AnfInterpreter.computeNewStateAndDataOutputs(
                         artifact.anf(), methodName, state, namedArgs, constructorArgs
                     );
-                    state.putAll(execResult.newState);
+                    // Caller-supplied state wins; the interpreter's is the
+                    // fallback. The output shape below is taken either way.
+                    if (stateUpdates == null) state.putAll(execResult.newState);
                     for (AnfInterpreter.DataOutput d : execResult.dataOutputs) {
                         resolvedDataOutputs.add(
                             new TransactionBuilder.DataOutput(d.satoshis(), d.script())
@@ -455,6 +465,11 @@ public final class RunarContract {
                     // Best-effort — caller can pre-supply stateUpdates if
                     // the body uses primitives the interpreter can't run.
                 }
+            }
+            // Explicit state always applies, including when there is no ANF to
+            // interpret or the interpreter could not run the body.
+            if (stateUpdates != null) {
+                state.putAll(stateUpdates);
             }
         }
 
