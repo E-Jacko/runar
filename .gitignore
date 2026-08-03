@@ -61,3 +61,10 @@ conformance/sdk-output/tools/java-driver/build/
 _review/
 .planning/
 docs/superpowers/
+
+# tsc output must never land in source directories. A build run with a
+# mis-set rootDir emits .js/.js.map/.d.ts next to the .ts sources, and a
+# `git add -A` then commits them (happened once — 24 files).
+packages/*/src/**/*.js
+packages/*/src/**/*.js.map
+packages/*/src/**/*.d.ts
