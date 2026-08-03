@@ -109,7 +109,9 @@
       "cause": "go-only",
       "reason": "BabyBear field proof-system primitive is Go-only (compilers:[go]); no TypeScript Stack-IR codegen, compile() cannot emit deployed bytes",
       "coveredBy": {
-        "kind": "go-only-nocodegen"
+        "kind": "integration",
+        "path": "integration/zig/src/babybear_test.zig",
+        "note": "real deploy + spend on a live regtest node: BabyBear_FieldAdd_DeployAndCall and BabyBear_FieldInv_Identity (accept) plus BabyBear_FieldAdd_WrongResult_Rejected (reject). The Zig compiler's output for examples/zig/babybear/BabyBearDemo.runar.zig was verified byte-identical to this fixture's expected-script.hex (647 bytes), so the bytes the node executed ARE this fixture's bytes — notable given the fixture is compilers:[go], i.e. the Zig port agrees exactly with the Go golden here."
       }
     },
     {
@@ -136,8 +138,9 @@
       "cause": "crypto-witness-infeasible",
       "reason": "secp256k1 EC ops (ecAdd/ecMulGen/ecNegate) — EC point witness, not a checkSig",
       "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "ec"
+        "kind": "integration",
+        "path": "integration/zig/src/ec_isolation_test.zig",
+        "note": "real deploy on a live regtest node (ECIsolation_Compile_ConvergenceProof / _Deploy_DifferentPoints) alongside the ECDemo spends in the same file. Compiled output for examples/zig/convergence-proof/ConvergenceProof.runar.zig verified byte-identical to expected-script.hex (450,757 bytes)."
       }
     },
     {
@@ -155,8 +158,9 @@
       "cause": "crypto-witness-infeasible",
       "reason": "secp256k1 EC primitives — EC point witness",
       "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "ec"
+        "kind": "integration",
+        "path": "integration/zig/src/ec_isolation_test.zig",
+        "note": "real deploy + spend on a live regtest node: ECIsolation_Call_CheckOnCurve, _CheckMulGenOnCurve and _CheckNegateRoundtrip (accepts). Compiled output for examples/zig/ec-demo/ECDemo.runar.zig verified byte-identical to this fixture's expected-script.hex (1,328,331 bytes)."
       }
     },
     {
@@ -202,7 +206,9 @@
       "cause": "crypto-witness-infeasible",
       "reason": "SHA-256 Merkle root verification (Go-only proof-system primitive, compilers:[go]) — no TS codegen",
       "coveredBy": {
-        "kind": "go-only-nocodegen"
+        "kind": "integration",
+        "path": "integration/zig/src/merkle_proof_test.zig",
+        "note": "real deploy + spend on a live regtest node: MerkleProof_Sha256_LeafIndex0 (accept) and MerkleProof_Sha256_WrongLeaf_Rejected (reject). Compiled output verified byte-identical to expected-script.hex (201 bytes); fixture is compilers:[go] yet the Zig port matches the Go golden exactly."
       }
     },
     {
@@ -210,8 +216,9 @@
       "cause": "crypto-witness-infeasible",
       "reason": "Rabin signature (verifyRabinSig) + ECDSA checkSig — Rabin witness is not secp256k1; real signatures required",
       "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "rabin"
+        "kind": "integration",
+        "path": "integration/zig/src/oracle_price_test.zig",
+        "note": "real deploy + spend on a live regtest node: OraclePriceFeed_SpendValidPrice (accept) and OraclePriceFeed_BelowThresholdRejected (reject). Compiled output verified byte-identical to expected-script.hex (44 bytes)."
       }
     },
     {
@@ -334,8 +341,9 @@
       "cause": "crypto-witness-infeasible",
       "reason": "secp256k1 EC + hash256 Schnorr proof — EC/hash witness, not an ECDSA checkSig",
       "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "ec"
+        "kind": "integration",
+        "path": "integration/zig/src/schnorr_zkp_test.zig",
+        "note": "real deploy + spend on a live regtest node: SchnorrZKP_SpendValidProof (accept). Compiled output verified byte-identical to expected-script.hex (872,367 bytes)."
       }
     },
     {
@@ -374,7 +382,9 @@
       "cause": "crypto-witness-infeasible",
       "reason": "hash256 + SHA-256 Merkle covenant (Go-only, compilers:[go]) + stateful preimage — no TS codegen",
       "coveredBy": {
-        "kind": "go-only-nocodegen"
+        "kind": "integration",
+        "path": "integration/zig/src/state_covenant_test.zig",
+        "note": "real deploy + spend on a live regtest node: StateCovenant_AdvanceState and StateCovenant_ChainAdvances (accepts) plus four reject cases (wrong pre-state root, invalid block number, invalid BabyBear proof, invalid Merkle proof). Compiles examples/ts/state-covenant/StateCovenant.runar.ts — this fixture's own source — verified byte-identical to expected-script.hex (1196 bytes)."
       }
     },
     {

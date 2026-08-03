@@ -205,30 +205,42 @@ what happened in BUG-101 (BLAKE3 was byte-identical across all tiers and wrong i
 all of them, because nothing ever ran it against a KAT). "Parity-green-but-wrong"
 is a real, observed failure mode in this repo, not a hypothetical.
 
-**Current exposure — 15 fixtures.** Both categories are legitimate opt-outs, both
-are machine-verified as *claims* by `coverage-claims.test.ts`, and neither is
-execution:
+**Current exposure — 8 fixtures** (was 15; see the correction below). Both
+categories are legitimate opt-outs, both are machine-verified as *claims* by
+`coverage-claims.test.ts`, and neither is execution:
 
-- `codegen-golden` (11) — byte-golden only, executed by no engine:
-  `convergence-proof`, `ec-demo`, `ec-unit`, `oracle-price`,
-  `p256-primitives`, `p256-wallet`, `p384-primitives`, `p384-wallet`,
-  `post-quantum-wallet`, `schnorr-zkp`, `sphincs-wallet`.
-  Mostly EC / NIST-P / post-quantum verification scripts. They are unexecuted
-  because the accept path needs a real cryptographic witness the in-process
-  oracle cannot synthesise from plain args, and several compile to 200-900 KB of
+- `codegen-golden` (7) — byte-golden only, executed by no engine:
+  `ec-unit`, `p256-primitives`, `p256-wallet`, `p384-primitives`,
+  `p384-wallet`, `post-quantum-wallet`, `sphincs-wallet`.
+  EC / NIST-P / post-quantum verification scripts. They are unexecuted because
+  the accept path needs a real cryptographic witness the in-process oracle
+  cannot synthesise from plain args, and several compile to 200-900 KB of
   script. Their PRIMITIVES are covered elsewhere (`real-crypto/`, the Go
   `go-family-exec` markers, KAT vector tests) — it is these fixtures' own
-  composed bytes that nothing runs.
-- `go-only-nocodegen` (4) — `compilers:["go"]` proof-system fixtures:
-  `babybear`, `babybear-ext4`, `merkle-proof`, `state-covenant`. Single-tier by
-  project policy (see the EVM/STARK note in the root `CLAUDE.md`), so they have
-  no cross-tier agreement signal at all — a Go-only bug in these has neither an
-  execution check nor a parity check standing behind it.
+  composed bytes that nothing runs. Note the four `*-wallet` entries DO have
+  integration tests, but those only **deploy**; deploying does not execute a
+  locking script, so they buy no execution coverage. Closing them needs a spend.
+- `go-only-nocodegen` (1) — `compilers:["go"]` proof-system fixture:
+  `babybear-ext4`. Single-tier by project policy (see the EVM/STARK note in the
+  root `CLAUDE.md`), so it has no cross-tier agreement signal at all — a Go-only
+  bug in it has neither an execution check nor a parity check behind it.
 
-**What is actually guaranteed today.** For these 15: the bytes are stable
+**Correction (2026-08-03): seven fixtures were listed here that ARE executed.**
+`babybear`, `convergence-proof`, `ec-demo`, `merkle-proof`, `oracle-price`,
+`schnorr-zkp` and `state-covenant` are deployed AND SPENT on a live regtest node
+by the Zig integration suite, most with reject cases alongside the accept. They
+had been carried as unexecuted since before those tests existed. The claim was
+not taken on trust: each fixture's `expected-script.hex` was compared against
+the compiler output for the exact source the integration test compiles, and all
+seven match byte-for-byte — so the bytes the node executed are the fixture's own
+bytes. Two of them (`babybear`, `merkle-proof`) are `compilers:["go"]` fixtures
+where the Zig port nonetheless reproduces the Go golden exactly. Their ledger
+entries now carry `kind: "integration"` with the test path and that evidence.
+
+**What is actually guaranteed today.** For the remaining 8: the bytes are stable
 (a silent regeneration fails the golden-provenance gate), the fixture parses in
 all seven frontends (the parser-only matrix ignores the `compilers` allowlist),
-and for the 11 non-single-tier ones the seven compilers agree byte-for-byte.
+and for the 7 non-single-tier ones the seven compilers agree byte-for-byte.
 That is meaningful but it is *consistency*, not *correctness*.
 
 **What would actually close it.** Per family, one of: (a) an official KAT
