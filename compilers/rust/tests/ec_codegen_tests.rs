@@ -145,7 +145,7 @@ fn test_emit_reverse_32_deterministic() {
 #[test]
 fn test_ec_add_op_count_golden() {
     let ops = collect(|s| emit_ec_add(s));
-    assert_eq!(ops.len(), 8078, "ecAdd op count drift");
+    assert_eq!(ops.len(), 8202, "ecAdd op count drift");
 }
 
 #[test]

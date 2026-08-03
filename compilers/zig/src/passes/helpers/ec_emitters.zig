@@ -312,6 +312,10 @@ fn initialNames(builtin: registry.CryptoBuiltin) []const ?[]const u8 {
     };
 }
 
+fn emitNumEqualOpcode(t: *ECTracker) !void {
+    try t.emitOpcode("OP_NUMEQUAL");
+}
+
 fn emitAddOpcode(t: *ECTracker) !void {
     try t.emitOpcode("OP_ADD");
 }
@@ -567,13 +571,54 @@ fn composePoint(t: *ECTracker, x_name: []const u8, y_name: []const u8, result_na
 }
 
 fn affineAdd(t: *ECTracker) !void {
+    // The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+    // denominator is zero and the correct slope is the TANGENT, 3px^2 / (2py).
+    // Without this, ecAdd(P, P) silently produced a wrong point, so every
+    // contract that doubled deployed an unspendable script.
+    //
+    // Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
+    // selected and the single expensive fieldInv still runs exactly once.
+    // rx and ry below are already correct for doubling.
+    //
+    //   cond = (px == qx)
+    //   num  = cond ? 3*px^2 : (qy - py)
+    //   den  = cond ? 2*py   : (qx - px)
+    //
+    // selected as `b + cond*(a - b)`, which needs no branch and keeps the
+    // emitted op sequence identical on both paths.
+    //
+    // NOT handled: P == -Q, whose true result is the point at infinity, which
+    // affine coordinates cannot represent.
+    try t.copyToTop("px", "_px_eq");
+    try t.copyToTop("qx", "_qx_eq");
+    try t.rawBlock(2, "_cond", emitNumEqualOpcode);
+
     try t.copyToTop("qy", "_qy1");
     try t.copyToTop("py", "_py1");
-    try fieldSub(t, "_qy1", "_py1", "_s_num");
+    try fieldSub(t, "_qy1", "_py1", "_num_chord");
 
     try t.copyToTop("qx", "_qx1");
     try t.copyToTop("px", "_px1");
-    try fieldSub(t, "_qx1", "_px1", "_s_den");
+    try fieldSub(t, "_qx1", "_px1", "_den_chord");
+
+    try t.copyToTop("px", "_px_t");
+    try fieldSqr(t, "_px_t", "_px_sq");
+    try fieldMulConst(t, "_px_sq", 3, "_num_tan");
+    try t.copyToTop("py", "_py_t");
+    try fieldMulConst(t, "_py_t", 2, "_den_tan");
+
+    try t.copyToTop("_num_chord", "_num_chord_c");
+    try fieldSub(t, "_num_tan", "_num_chord_c", "_num_diff");
+    try t.copyToTop("_cond", "_cond_n");
+    try fieldMul(t, "_num_diff", "_cond_n", "_num_sel");
+    try fieldAdd(t, "_num_chord", "_num_sel", "_s_num");
+
+    try t.copyToTop("_den_chord", "_den_chord_c");
+    try fieldSub(t, "_den_tan", "_den_chord_c", "_den_diff");
+    try t.toTop("_cond");
+    t.renameTop("_cond_d");
+    try fieldMul(t, "_den_diff", "_cond_d", "_den_sel");
+    try fieldAdd(t, "_den_chord", "_den_sel", "_s_den");
 
     try fieldInv(t, "_s_den", "_s_den_inv");
     try fieldMul(t, "_s_num", "_s_den_inv", "_s");
@@ -887,7 +932,7 @@ test "ec add helper emits affine split and compose flow" {
 
 test "ec helper op-count goldens" {
     const cases = .{
-        .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8068) },
+        .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8183) },
         .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 59707) },
         .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 59709) },
         .{ registry.CryptoBuiltin.ec_negate, "ecNegate", @as(usize, 945) },

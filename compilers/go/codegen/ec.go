@@ -450,15 +450,59 @@ func ecEmitReverse32(e func(StackOp)) {
 // ecAffineAdd performs affine point addition.
 // Expects px, py, qx, qy on tracker. Produces rx, ry. Consumes all four inputs.
 func ecAffineAdd(t *ECTracker) {
-	// s_num = qy - py
+	// The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+	// denominator is zero and the correct slope is the TANGENT, 3px^2 / (2py).
+	// Without this, ecAdd(P, P) silently produced a wrong point, so every
+	// contract that doubled deployed an unspendable script.
+	//
+	// Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
+	// selected and the single expensive fieldInv still runs exactly once.
+	// rx and ry below are already correct for doubling.
+	//
+	//   cond = (px == qx)
+	//   num  = cond ? 3*px^2 : (qy - py)
+	//   den  = cond ? 2*py   : (qx - px)
+	//
+	// selected as `b + cond*(a - b)`, which needs no branch and keeps the
+	// emitted op sequence identical on both paths.
+	//
+	// NOT handled: P == -Q, whose true result is the point at infinity, which
+	// affine coordinates cannot represent.
+	t.copyToTop("px", "_px_eq")
+	t.copyToTop("qx", "_qx_eq")
+	t.rawBlock([]string{"_px_eq", "_qx_eq"}, "_cond", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+
+	// chord numerator / denominator
 	t.copyToTop("qy", "_qy1")
 	t.copyToTop("py", "_py1")
-	ecFieldSub(t, "_qy1", "_py1", "_s_num")
-
-	// s_den = qx - px
+	ecFieldSub(t, "_qy1", "_py1", "_num_chord")
 	t.copyToTop("qx", "_qx1")
 	t.copyToTop("px", "_px1")
-	ecFieldSub(t, "_qx1", "_px1", "_s_den")
+	ecFieldSub(t, "_qx1", "_px1", "_den_chord")
+
+	// tangent numerator / denominator: 3*px^2 and 2*py
+	t.copyToTop("px", "_px_t")
+	ecFieldSqr(t, "_px_t", "_px_sq")
+	ecFieldMulConst(t, "_px_sq", 3, "_num_tan")
+	t.copyToTop("py", "_py_t")
+	ecFieldMulConst(t, "_py_t", 2, "_den_tan")
+
+	// num = num_chord + cond*(num_tan - num_chord)
+	t.copyToTop("_num_chord", "_num_chord_c")
+	ecFieldSub(t, "_num_tan", "_num_chord_c", "_num_diff")
+	t.copyToTop("_cond", "_cond_n")
+	ecFieldMul(t, "_num_diff", "_cond_n", "_num_sel")
+	ecFieldAdd(t, "_num_chord", "_num_sel", "_s_num")
+
+	// den = den_chord + cond*(den_tan - den_chord)
+	t.copyToTop("_den_chord", "_den_chord_c")
+	ecFieldSub(t, "_den_tan", "_den_chord_c", "_den_diff")
+	t.toTop("_cond")
+	t.rename("_cond_d")
+	ecFieldMul(t, "_den_diff", "_cond_d", "_den_sel")
+	ecFieldAdd(t, "_den_chord", "_den_sel", "_s_den")
 
 	// s = s_num / s_den mod p
 	ecFieldInv(t, "_s_den", "_s_den_inv")

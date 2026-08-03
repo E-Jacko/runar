@@ -437,15 +437,61 @@ def _ec_affine_add(t: ECTracker) -> None:
 
     Expects px, py, qx, qy on tracker. Produces rx, ry. Consumes all four inputs.
     """
-    # s_num = qy - py
+    # The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+    # denominator is zero and the correct slope is the TANGENT, 3px^2 / (2py).
+    # Without this, ecAdd(P, P) silently produced a wrong point, so every
+    # contract that doubled deployed an unspendable script.
+    #
+    # Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
+    # selected and the single expensive field_inv still runs exactly once.
+    # rx and ry below are already correct for doubling.
+    #
+    #   cond = (px == qx)
+    #   num  = cond ? 3*px^2 : (qy - py)
+    #   den  = cond ? 2*py   : (qx - px)
+    #
+    # selected as `b + cond*(a - b)`, which needs no branch and keeps the
+    # emitted op sequence identical on both paths.
+    #
+    # NOT handled: P == -Q, whose true result is the point at infinity, which
+    # affine coordinates cannot represent.
+    t.copy_to_top("px", "_px_eq")
+    t.copy_to_top("qx", "_qx_eq")
+
+    def _eq(e: Callable[["StackOp"], None]) -> None:
+        e(_make_stack_op(op="opcode", code="OP_NUMEQUAL"))
+
+    t.raw_block(["_px_eq", "_qx_eq"], "_cond", _eq)
+
+    # chord numerator / denominator
     t.copy_to_top("qy", "_qy1")
     t.copy_to_top("py", "_py1")
-    _ec_field_sub(t, "_qy1", "_py1", "_s_num")
-
-    # s_den = qx - px
+    _ec_field_sub(t, "_qy1", "_py1", "_num_chord")
     t.copy_to_top("qx", "_qx1")
     t.copy_to_top("px", "_px1")
-    _ec_field_sub(t, "_qx1", "_px1", "_s_den")
+    _ec_field_sub(t, "_qx1", "_px1", "_den_chord")
+
+    # tangent numerator / denominator: 3*px^2 and 2*py
+    t.copy_to_top("px", "_px_t")
+    _ec_field_sqr(t, "_px_t", "_px_sq")
+    _ec_field_mul_const(t, "_px_sq", 3, "_num_tan")
+    t.copy_to_top("py", "_py_t")
+    _ec_field_mul_const(t, "_py_t", 2, "_den_tan")
+
+    # num = num_chord + cond*(num_tan - num_chord)
+    t.copy_to_top("_num_chord", "_num_chord_c")
+    _ec_field_sub(t, "_num_tan", "_num_chord_c", "_num_diff")
+    t.copy_to_top("_cond", "_cond_n")
+    _ec_field_mul(t, "_num_diff", "_cond_n", "_num_sel")
+    _ec_field_add(t, "_num_chord", "_num_sel", "_s_num")
+
+    # den = den_chord + cond*(den_tan - den_chord)
+    t.copy_to_top("_den_chord", "_den_chord_c")
+    _ec_field_sub(t, "_den_tan", "_den_chord_c", "_den_diff")
+    t.to_top("_cond")
+    t.rename("_cond_d")
+    _ec_field_mul(t, "_den_diff", "_cond_d", "_den_sel")
+    _ec_field_add(t, "_den_chord", "_den_sel", "_s_den")
 
     # s = s_num / s_den mod p
     _ec_field_inv(t, "_s_den", "_s_den_inv")

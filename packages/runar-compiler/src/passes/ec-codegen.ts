@@ -376,15 +376,64 @@ function emitReverse32(e: (op: StackOp) => void): void {
  * Produces rx, ry. Consumes all four inputs.
  */
 function affineAdd(t: ECTracker): void {
-  // s_num = qy - py
+  // The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+  // denominator is zero and the correct slope is the TANGENT, 3px^2 / (2py).
+  // Without this, ecAdd(P, P) silently produced a wrong point, so every
+  // contract that doubled deployed an unspendable script — byte-identically
+  // across all seven tiers, because they all shared the same omission.
+  //
+  // Both cases are the same shape, `s = num / den`, so only the NUMERATOR and
+  // DENOMINATOR are selected; the single expensive fieldInv is still performed
+  // exactly once. rx = s^2 - px - qx and ry = s*(px - rx) - py are already
+  // correct for doubling (px == qx makes the first s^2 - 2px).
+  //
+  //   cond = (px == qx)                      1 when doubling, else 0
+  //   num  = cond ? 3*px^2 : (qy - py)
+  //   den  = cond ? 2*py   : (qx - px)
+  //
+  // selected as `b + cond*(a - b)` over the field, which needs no branch and
+  // so keeps the emitted op sequence — and the tracker's static stack model —
+  // identical on both paths.
+  //
+  // NOT handled: P == -Q (px == qx, py == -qy), whose true result is the point
+  // at infinity. secp256k1 affine coordinates cannot represent it, so this
+  // returns a garbage point exactly as it did before this fix. Callers that
+  // can hit that case must guard it themselves.
+  t.copyToTop('px', '_px_eq');
+  t.copyToTop('qx', '_qx_eq');
+  t.rawBlock(['_px_eq', '_qx_eq'], '_cond', (e) => {
+    e({ op: 'opcode', code: 'OP_NUMEQUAL' });
+  });
+
+  // chord numerator / denominator
   t.copyToTop('qy', '_qy1');
   t.copyToTop('py', '_py1');
-  fieldSub(t, '_qy1', '_py1', '_s_num');
-
-  // s_den = qx - px
+  fieldSub(t, '_qy1', '_py1', '_num_chord');
   t.copyToTop('qx', '_qx1');
   t.copyToTop('px', '_px1');
-  fieldSub(t, '_qx1', '_px1', '_s_den');
+  fieldSub(t, '_qx1', '_px1', '_den_chord');
+
+  // tangent numerator / denominator: 3*px^2 and 2*py
+  t.copyToTop('px', '_px_t');
+  fieldSqr(t, '_px_t', '_px_sq');
+  fieldMulConst(t, '_px_sq', 3n, '_num_tan');
+  t.copyToTop('py', '_py_t');
+  fieldMulConst(t, '_py_t', 2n, '_den_tan');
+
+  // num = num_chord + cond*(num_tan - num_chord)
+  t.copyToTop('_num_chord', '_num_chord_c');
+  fieldSub(t, '_num_tan', '_num_chord_c', '_num_diff');
+  t.copyToTop('_cond', '_cond_n');
+  fieldMul(t, '_num_diff', '_cond_n', '_num_sel');
+  fieldAdd(t, '_num_chord', '_num_sel', '_s_num');
+
+  // den = den_chord + cond*(den_tan - den_chord)
+  t.copyToTop('_den_chord', '_den_chord_c');
+  fieldSub(t, '_den_tan', '_den_chord_c', '_den_diff');
+  t.toTop('_cond');
+  t.rename('_cond_d');
+  fieldMul(t, '_den_diff', '_cond_d', '_den_sel');
+  fieldAdd(t, '_den_chord', '_den_sel', '_s_den');
 
   // s = s_num / s_den mod p
   fieldInv(t, '_s_den', '_s_den_inv');

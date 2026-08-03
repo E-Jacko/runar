@@ -42,10 +42,10 @@ class EcTest {
     void ecAddShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcAdd(ops::add);
-        assertEquals(8078, ops.size(), "ecAdd op count drift");
+        assertEquals(8202, ops.size(), "ecAdd op count drift");
 
         String hex = emitHex(ops);
-        assertEquals(24984, hex.length() / 2, "ecAdd hex byte count drift");
+        assertEquals(25405, hex.length() / 2, "ecAdd hex byte count drift");
     }
 
     @Test

@@ -101,7 +101,7 @@ class TestEcCodegen < Minitest::Test
   # ---------------------------------------------------------------------------
 
   EC_OP_COUNT_GOLDENS = {
-    "ecAdd"              =>  8078,
+    "ecAdd"              =>  8202,
     "ecMul"              => 63828,
     "ecMulGen"           => 63830,
     "ecNegate"           =>   945,

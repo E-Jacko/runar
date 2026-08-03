@@ -29,7 +29,7 @@ from runar_compiler.codegen.stack import StackOp
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("ecAdd",              emit_ec_add,               8078),
+    ("ecAdd",              emit_ec_add,               8202),
     ("ecMul",              emit_ec_mul,              63828),
     ("ecMulGen",           emit_ec_mul_gen,          63830),
     ("ecNegate",           emit_ec_negate,             945),

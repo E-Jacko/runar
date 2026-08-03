@@ -1,0 +1,493 @@
+/**
+ * Pass 6: Emit — converts Stack IR to Bitcoin Script bytes (hex string).
+ *
+ * Walks the StackOp list and encodes each operation as one or more Bitcoin
+ * Script opcodes, producing both a hex-encoded script and a human-readable
+ * ASM representation.
+ */
+import { byteToHex, bytesToHex, encodeScriptNumber, encodePushData, encodePushBigIntHex, } from './push-encoding.js';
+// ---------------------------------------------------------------------------
+// Opcode table
+// ---------------------------------------------------------------------------
+export const OPCODES = {
+    'OP_0': 0x00,
+    'OP_FALSE': 0x00,
+    'OP_PUSHDATA1': 0x4c,
+    'OP_PUSHDATA2': 0x4d,
+    'OP_PUSHDATA4': 0x4e,
+    'OP_1NEGATE': 0x4f,
+    'OP_1': 0x51,
+    'OP_TRUE': 0x51,
+    'OP_2': 0x52,
+    'OP_3': 0x53,
+    'OP_4': 0x54,
+    'OP_5': 0x55,
+    'OP_6': 0x56,
+    'OP_7': 0x57,
+    'OP_8': 0x58,
+    'OP_9': 0x59,
+    'OP_10': 0x5a,
+    'OP_11': 0x5b,
+    'OP_12': 0x5c,
+    'OP_13': 0x5d,
+    'OP_14': 0x5e,
+    'OP_15': 0x5f,
+    'OP_16': 0x60,
+    'OP_NOP': 0x61,
+    'OP_IF': 0x63,
+    'OP_NOTIF': 0x64,
+    'OP_ELSE': 0x67,
+    'OP_ENDIF': 0x68,
+    'OP_VERIFY': 0x69,
+    'OP_RETURN': 0x6a,
+    'OP_TOALTSTACK': 0x6b,
+    'OP_FROMALTSTACK': 0x6c,
+    'OP_2DROP': 0x6d,
+    'OP_2DUP': 0x6e,
+    'OP_3DUP': 0x6f,
+    'OP_2OVER': 0x70,
+    'OP_2ROT': 0x71,
+    'OP_2SWAP': 0x72,
+    'OP_IFDUP': 0x73,
+    'OP_DEPTH': 0x74,
+    'OP_DROP': 0x75,
+    'OP_DUP': 0x76,
+    'OP_NIP': 0x77,
+    'OP_OVER': 0x78,
+    'OP_PICK': 0x79,
+    'OP_ROLL': 0x7a,
+    'OP_ROT': 0x7b,
+    'OP_SWAP': 0x7c,
+    'OP_TUCK': 0x7d,
+    'OP_CAT': 0x7e,
+    'OP_SPLIT': 0x7f,
+    'OP_NUM2BIN': 0x80,
+    'OP_BIN2NUM': 0x81,
+    'OP_SIZE': 0x82,
+    'OP_AND': 0x84,
+    'OP_OR': 0x85,
+    'OP_XOR': 0x86,
+    'OP_EQUAL': 0x87,
+    'OP_EQUALVERIFY': 0x88,
+    'OP_1ADD': 0x8b,
+    'OP_1SUB': 0x8c,
+    'OP_2MUL': 0x8d, // Chronicle: multiply by 2
+    'OP_2DIV': 0x8e, // Chronicle: divide by 2
+    'OP_NEGATE': 0x8f,
+    'OP_ABS': 0x90,
+    'OP_NOT': 0x91,
+    'OP_0NOTEQUAL': 0x92,
+    'OP_ADD': 0x93,
+    'OP_SUB': 0x94,
+    'OP_MUL': 0x95,
+    'OP_DIV': 0x96,
+    'OP_MOD': 0x97,
+    'OP_LSHIFT': 0x98,
+    'OP_RSHIFT': 0x99,
+    'OP_BOOLAND': 0x9a,
+    'OP_BOOLOR': 0x9b,
+    'OP_NUMEQUAL': 0x9c,
+    'OP_NUMEQUALVERIFY': 0x9d,
+    'OP_NUMNOTEQUAL': 0x9e,
+    'OP_LESSTHAN': 0x9f,
+    'OP_GREATERTHAN': 0xa0,
+    'OP_LESSTHANOREQUAL': 0xa1,
+    'OP_GREATERTHANOREQUAL': 0xa2,
+    'OP_MIN': 0xa3,
+    'OP_MAX': 0xa4,
+    'OP_WITHIN': 0xa5,
+    'OP_RIPEMD160': 0xa6,
+    'OP_SHA1': 0xa7,
+    'OP_SHA256': 0xa8,
+    'OP_HASH160': 0xa9,
+    'OP_HASH256': 0xaa,
+    'OP_CODESEPARATOR': 0xab,
+    'OP_CHECKSIG': 0xac,
+    'OP_CHECKSIGVERIFY': 0xad,
+    'OP_CHECKMULTISIG': 0xae,
+    'OP_CHECKMULTISIGVERIFY': 0xaf,
+    'OP_SUBSTR': 0xb3, // Chronicle: substring
+    'OP_LEFT': 0xb4, // Chronicle: left N chars
+    'OP_RIGHT': 0xb5, // Chronicle: right N chars
+    'OP_LSHIFTNUM': 0xb6, // Chronicle: numeric left-shift
+    'OP_RSHIFTNUM': 0xb7, // Chronicle: numeric right-shift
+    'OP_INVERT': 0x83,
+};
+// ---------------------------------------------------------------------------
+// Reverse lookup: opcode byte → name (for disassembly / ASM output)
+// ---------------------------------------------------------------------------
+const OPCODE_NAMES = new Map();
+// Populate with preferred names (avoid aliases like OP_FALSE/OP_TRUE)
+for (const [name, byte] of Object.entries(OPCODES)) {
+    // Skip aliases — prefer the numeric name for OP_0/OP_1
+    if (name === 'OP_FALSE' || name === 'OP_TRUE')
+        continue;
+    if (!OPCODE_NAMES.has(byte)) {
+        OPCODE_NAMES.set(byte, name);
+    }
+}
+// ---------------------------------------------------------------------------
+// Push-value encoding (re-exported from push-encoding.ts via local wrapper)
+// ---------------------------------------------------------------------------
+/**
+ * Encode a push value (bigint, boolean, or Uint8Array) as Bitcoin Script
+ * bytes plus a human-readable ASM disassembly tag.
+ *
+ * Uses the shared low-level encoders in `push-encoding.ts` so the array-
+ * form `asm({ body: [OP_DUP, push(...)] })` parser can produce byte-
+ * identical output to a hand-written hex string body.
+ */
+function encodePushValue(value) {
+    if (typeof value === 'boolean') {
+        if (value) {
+            return { hex: '51', asm: 'OP_TRUE' };
+        }
+        return { hex: '00', asm: 'OP_FALSE' };
+    }
+    if (typeof value === 'bigint') {
+        return encodePushBigInt(value);
+    }
+    // Uint8Array — raw data
+    if (value.length === 0) {
+        return { hex: '00', asm: 'OP_0' };
+    }
+    // MINIMALDATA: single-byte values 1-16 must use OP_1..OP_16, 0x81 must use OP_1NEGATE.
+    // Note: 0x00 is NOT converted to OP_0 because OP_0 pushes empty [] not [0x00].
+    if (value.length === 1) {
+        const b = value[0];
+        if (b >= 1 && b <= 16)
+            return { hex: byteToHex(0x50 + b), asm: `OP_${b}` };
+        if (b === 0x81)
+            return { hex: '4f', asm: 'OP_1NEGATE' };
+    }
+    const encoded = encodePushData(value);
+    const hex = bytesToHex(encoded);
+    return { hex, asm: `<${bytesToHex(value)}>` };
+}
+/**
+ * Encode a bigint push, using small integer opcodes where possible.
+ *
+ * Returns a `{ hex, asm }` tuple — the hex bytes come from the shared
+ * `encodePushBigIntHex` helper so the emit pass and the array-form
+ * parser both produce the same bytes for the same bigint.
+ */
+function encodePushBigInt(n) {
+    if (n === 0n) {
+        return { hex: '00', asm: 'OP_0' };
+    }
+    if (n === -1n) {
+        return { hex: '4f', asm: 'OP_1NEGATE' };
+    }
+    if (n >= 1n && n <= 16n) {
+        return { hex: encodePushBigIntHex(n), asm: `OP_${n}` };
+    }
+    const numBytes = encodeScriptNumber(n);
+    return { hex: encodePushBigIntHex(n), asm: `<${bytesToHex(numBytes)}>` };
+}
+// ---------------------------------------------------------------------------
+// Emit context — accumulates hex and ASM output
+// ---------------------------------------------------------------------------
+class EmitContext {
+    hexParts = [];
+    asmParts = [];
+    opcodeIndex = 0;
+    byteLength = 0;
+    sourceMap = [];
+    constructorSlots = [];
+    codeSepIndexSlots = [];
+    /** Byte offset of the last OP_CODESEPARATOR (undefined if none emitted) */
+    codeSeparatorIndex;
+    /** Per-method OP_CODESEPARATOR byte offsets (in method emission order) */
+    codeSeparatorIndices = [];
+    /** Byte ranges produced by raw_bytes StackOps (asm({...}) calls). */
+    rawScriptSpans = [];
+    appendHex(hex) {
+        this.hexParts.push(hex);
+        this.byteLength += hex.length / 2;
+    }
+    appendAsm(asm) {
+        this.asmParts.push(asm);
+    }
+    nextOpcodeIndex() {
+        return this.opcodeIndex++;
+    }
+    pendingSourceLoc;
+    /** Set source location to attach to the next emitted opcode(s). */
+    setSourceLoc(loc) {
+        this.pendingSourceLoc = loc;
+    }
+    recordSourceMapping() {
+        if (this.pendingSourceLoc) {
+            this.sourceMap.push({
+                opcodeIndex: this.opcodeIndex,
+                sourceFile: this.pendingSourceLoc.file,
+                line: this.pendingSourceLoc.line,
+                column: this.pendingSourceLoc.column,
+            });
+        }
+    }
+    emitOpcode(name) {
+        const byte = OPCODES[name];
+        if (byte === undefined) {
+            throw new Error(`Unknown opcode: ${name}`);
+        }
+        if (name === 'OP_CODESEPARATOR') {
+            this.codeSeparatorIndex = this.byteLength;
+            this.codeSeparatorIndices.push(this.byteLength);
+        }
+        this.recordSourceMapping();
+        this.appendHex(byteToHex(byte));
+        this.appendAsm(name);
+        this.nextOpcodeIndex();
+    }
+    emitPush(value) {
+        const { hex, asm } = encodePushValue(value);
+        this.recordSourceMapping();
+        this.appendHex(hex);
+        this.appendAsm(asm);
+        this.nextOpcodeIndex();
+    }
+    emitPlaceholder(paramIndex, _paramName) {
+        const byteOffset = this.byteLength;
+        this.recordSourceMapping();
+        this.appendHex('00'); // OP_0 placeholder byte
+        this.appendAsm('OP_0');
+        this.nextOpcodeIndex();
+        this.constructorSlots.push({ paramIndex, byteOffset });
+    }
+    emitCodeSepIndexPlaceholder() {
+        const byteOffset = this.byteLength;
+        const codeSepIndex = this.codeSeparatorIndex ?? 0;
+        this.recordSourceMapping();
+        this.appendHex('00'); // OP_0 placeholder byte
+        this.appendAsm('OP_0');
+        this.nextOpcodeIndex();
+        this.codeSepIndexSlots.push({ byteOffset, codeSepIndex });
+    }
+    /**
+     * Write a verbatim byte span emitted by a raw_bytes StackOp.
+     *
+     * No re-encoding takes place — the bytes go out as supplied. ASM column
+     * shows `<raw N bytes>` so the human-readable disassembly is honest about
+     * the opacity. Source-map gets a single entry for the whole span.
+     *
+     * Records a `RawScriptSpan` capturing the span's offset, length, and the
+     * declared stack-effect arities so the static analyzer can treat the
+     * span as one opaque stack-effect step.
+     */
+    emitRawBytes(bytes, inArity, outArity) {
+        if (bytes.length === 0)
+            return;
+        const offset = this.byteLength;
+        this.recordSourceMapping();
+        let hex = '';
+        for (let i = 0; i < bytes.length; i++) {
+            hex += bytes[i].toString(16).padStart(2, '0');
+        }
+        this.appendHex(hex);
+        this.appendAsm(`<raw ${bytes.length} bytes>`);
+        this.nextOpcodeIndex();
+        this.rawScriptSpans.push({
+            offset,
+            length: bytes.length,
+            inArity,
+            outArity,
+        });
+    }
+    getHex() {
+        return this.hexParts.join('');
+    }
+    getAsm() {
+        return this.asmParts.join(' ');
+    }
+}
+// ---------------------------------------------------------------------------
+// Emit a single StackOp
+// ---------------------------------------------------------------------------
+function emitStackOp(op, ctx) {
+    // Propagate source location from StackOp to the emit context
+    const loc = op.sourceLoc;
+    if (loc) {
+        ctx.setSourceLoc(loc);
+    }
+    switch (op.op) {
+        case 'push':
+            ctx.emitPush(op.value);
+            break;
+        case 'dup':
+            ctx.emitOpcode('OP_DUP');
+            break;
+        case 'swap':
+            ctx.emitOpcode('OP_SWAP');
+            break;
+        case 'roll':
+            ctx.emitOpcode('OP_ROLL');
+            break;
+        case 'pick':
+            ctx.emitOpcode('OP_PICK');
+            break;
+        case 'drop':
+            ctx.emitOpcode('OP_DROP');
+            break;
+        case 'nip':
+            ctx.emitOpcode('OP_NIP');
+            break;
+        case 'over':
+            ctx.emitOpcode('OP_OVER');
+            break;
+        case 'rot':
+            ctx.emitOpcode('OP_ROT');
+            break;
+        case 'tuck':
+            ctx.emitOpcode('OP_TUCK');
+            break;
+        case 'opcode':
+            ctx.emitOpcode(op.code);
+            break;
+        case 'if':
+            emitIf(op.then, op.else, ctx);
+            break;
+        case 'placeholder':
+            ctx.emitPlaceholder(op.paramIndex, op.paramName);
+            break;
+        case 'push_codesep_index':
+            // Emit an OP_0 placeholder that the SDK will replace with the adjusted
+            // codeSeparatorIndex at runtime. The adjustment accounts for constructor
+            // arg substitution which can shift byte offsets in the script.
+            ctx.emitCodeSepIndexPlaceholder();
+            break;
+        case 'raw_bytes':
+            // Opaque opcode-byte span from a raw_script ANF node. Written verbatim,
+            // no re-encoding. The peephole optimizer treats this op as a hard
+            // barrier so its bytes never get rewritten. The in/out arity declared
+            // on the StackOp is recorded into the artifact's rawScriptSpans so the
+            // analyzer can carry stack-effect across the span without walking it.
+            ctx.emitRawBytes(op.bytes, op.in_arity, op.out_arity);
+            break;
+    }
+    // Clear after emitting so the location doesn't leak to the next op
+    ctx.setSourceLoc(undefined);
+}
+/**
+ * Emit an if/else/endif structure.
+ */
+function emitIf(thenOps, elseOps, ctx) {
+    ctx.emitOpcode('OP_IF');
+    for (const op of thenOps) {
+        emitStackOp(op, ctx);
+    }
+    if (elseOps && elseOps.length > 0) {
+        ctx.emitOpcode('OP_ELSE');
+        for (const op of elseOps) {
+            emitStackOp(op, ctx);
+        }
+    }
+    ctx.emitOpcode('OP_ENDIF');
+}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+/**
+ * Emit a StackProgram as Bitcoin Script hex and ASM.
+ *
+ * For contracts with multiple public methods, the emitter generates a
+ * method dispatch preamble that checks a function selector (the first
+ * argument pushed by the spending transaction) and branches to the
+ * corresponding method body.
+ */
+export function emit(program) {
+    const ctx = new EmitContext();
+    const publicMethods = program.methods.filter(m => m.name !== 'constructor');
+    if (publicMethods.length === 0) {
+        // Only constructor — emit nothing (no spending paths)
+        return {
+            scriptHex: '',
+            scriptAsm: '',
+            sourceMap: [],
+            constructorSlots: [],
+            codeSepIndexSlots: [],
+        };
+    }
+    if (publicMethods.length === 1) {
+        // Single public method — no dispatch needed, emit its ops directly.
+        const method = publicMethods[0];
+        for (const op of method.ops) {
+            emitStackOp(op, ctx);
+        }
+    }
+    else {
+        // Multiple public methods — emit a dispatch table.
+        // The last scriptSig argument is the method index (0, 1, 2...).
+        // We use a chain of OP_IF / OP_ELSE to select the right method.
+        emitMethodDispatch(publicMethods, ctx);
+    }
+    return {
+        scriptHex: ctx.getHex(),
+        scriptAsm: ctx.getAsm(),
+        sourceMap: ctx.sourceMap,
+        constructorSlots: ctx.constructorSlots,
+        codeSepIndexSlots: ctx.codeSepIndexSlots,
+        codeSeparatorIndex: ctx.codeSeparatorIndex,
+        codeSeparatorIndices: ctx.codeSeparatorIndices.length > 0 ? ctx.codeSeparatorIndices : undefined,
+        rawScriptSpans: ctx.rawScriptSpans.length > 0 ? ctx.rawScriptSpans : undefined,
+    };
+}
+/**
+ * Emit method dispatch for multiple public methods.
+ *
+ * The spending transaction pushes the method index as the topmost
+ * scriptSig element. We compare against each index and branch.
+ *
+ * Pattern:
+ *   <methodIdx> OP_0 OP_NUMEQUAL OP_IF <method0_ops> OP_ELSE
+ *               OP_1 OP_NUMEQUAL OP_IF <method1_ops> OP_ELSE ...
+ */
+function emitMethodDispatch(methods, ctx) {
+    for (let i = 0; i < methods.length; i++) {
+        const method = methods[i];
+        const isLast = i === methods.length - 1;
+        if (!isLast) {
+            // Duplicate the method index for comparison
+            ctx.emitOpcode('OP_DUP');
+            ctx.emitPush(BigInt(i));
+            ctx.emitOpcode('OP_NUMEQUAL');
+            ctx.emitOpcode('OP_IF');
+            // Drop the method index since we matched
+            ctx.emitOpcode('OP_DROP');
+        }
+        else {
+            // Last method — verify the index matches (fail-closed for invalid selectors)
+            ctx.emitPush(BigInt(i));
+            ctx.emitOpcode('OP_NUMEQUALVERIFY');
+        }
+        for (const op of method.ops) {
+            emitStackOp(op, ctx);
+        }
+        if (!isLast) {
+            ctx.emitOpcode('OP_ELSE');
+        }
+    }
+    // Close all the nested OP_IF/OP_ELSE blocks
+    for (let i = 0; i < methods.length - 1; i++) {
+        ctx.emitOpcode('OP_ENDIF');
+    }
+}
+/**
+ * Emit a single method's ops and return the result.
+ * Useful for testing individual methods.
+ */
+export function emitMethod(method) {
+    const ctx = new EmitContext();
+    for (const op of method.ops) {
+        emitStackOp(op, ctx);
+    }
+    return {
+        scriptHex: ctx.getHex(),
+        scriptAsm: ctx.getAsm(),
+        sourceMap: ctx.sourceMap,
+        constructorSlots: ctx.constructorSlots,
+        codeSepIndexSlots: ctx.codeSepIndexSlots,
+        rawScriptSpans: ctx.rawScriptSpans.length > 0 ? ctx.rawScriptSpans : undefined,
+    };
+}
+//# sourceMappingURL=06-emit.js.map

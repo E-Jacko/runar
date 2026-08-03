@@ -209,7 +209,10 @@ class Bad extends SmartContract {
 
 describe('EC builtins — op-count goldens (T-11)', () => {
   const goldens: Array<[name: string, fn: (emit: (op: StackOp) => void) => void, expected: number]> = [
-    ['ecAdd',              emitEcAdd,                8078],
+    // 8078 -> 8202 (+124): affineAdd now selects the tangent numerator and
+    // denominator so ecAdd can DOUBLE a point. One fieldInv still, so the cost
+    // is +1.5%, not +100%.
+    ['ecAdd',              emitEcAdd,                8202],
     ['ecMul',              emitEcMul,               63828],
     ['ecMulGen',           emitEcMulGen,            63830],
     ['ecNegate',           emitEcNegate,              945],

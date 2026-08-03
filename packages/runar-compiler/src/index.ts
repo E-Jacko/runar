@@ -33,6 +33,15 @@ export type { ExpandFixedArraysResult } from './passes/03b-expand-fixed-arrays.j
 export { lowerToANF } from './passes/04-anf-lower.js';
 export { lowerToStack } from './passes/05-stack-lower.js';
 export { emit, emitMethod } from './passes/06-emit.js';
+// EC codegen emitters. Exported so the testing layer can execute a primitive's
+// emitted script directly against a real interpreter, rather than only reaching
+// it through a whole compiled contract — which is how `ecAdd`'s inability to
+// DOUBLE a point went unnoticed.
+export {
+  emitEcAdd, emitEcMul, emitEcMulGen, emitEcNegate, emitEcOnCurve,
+  emitEcModReduce, emitEcEncodeCompressed, emitEcMakePoint,
+  emitEcPointX, emitEcPointY,
+} from './passes/ec-codegen.js';
 export {
   emitCheckPreimageBinding,
   emitCheckPreimageBindingRaw,
