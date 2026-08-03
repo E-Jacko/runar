@@ -1,11 +1,11 @@
 {
   "_comment": [
-    "GOLDEN-REGENERATION INTEGRITY GATE \u2014 provenance allowlist (issue #122).",
+    "GOLDEN-REGENERATION INTEGRITY GATE — provenance allowlist (issue #122).",
     "Goldens/vectors are self-produced by the implementation-under-test. This file",
     "is how a PR carries an INDEPENDENT justification for changing one. Every entry",
     "pins a specific golden file to the exact NEW content it is authorizing, via a",
     "sha256 of that file's bytes. Because the pin is content-addressed, an entry can",
-    "only ever justify the ONE value it was reviewed for \u2014 a later, different",
+    "only ever justify the ONE value it was reviewed for — a later, different",
     "regeneration of the same file fails the gate again and forces a fresh entry.",
     "See conformance/README.md -> 'Golden-regeneration integrity gate' for the full",
     "design and the two ways to satisfy the gate.",
@@ -29,7 +29,7 @@
       "path": "conformance/runtime-vectors/blake3-official-kat.json",
       "sha256": "6bbc509a9e6dfa3a6a5cba24ba0f4b9744fe65e9df18f5edda101eaa60318c0a",
       "verified-against": "official-KAT",
-      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9\u2026. These ARE the independent oracle, not compiler-produced bytes \u2014 the fix for the BUG-101 self-golden gap.",
+      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9…. These ARE the independent oracle, not compiler-produced bytes — the fix for the BUG-101 self-golden gap.",
       "reviewer": "gh:icellan",
       "date": "2026-07-08"
     },
@@ -117,7 +117,7 @@
       "path": "conformance/tests/bounded-loop/expected-ir.json",
       "sha256": "35b23e46b5fbfbfdb56160d64599f7e5cb80fa4b0cee06cd6d4e506fbded5077",
       "verified-against": "intentional-spec-change",
-      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change \u2014 the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
+      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change — the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
       "reviewer": "gh:icellan",
       "date": "2026-07-09"
     },
@@ -150,14 +150,6 @@
       "sha256": "219ac1e28f82135f60bd3fdeaa81be47e104c1f64177ac623791c58b3e007a1d",
       "verified-against": "differential-oracle",
       "reason": "New fixture for deep-review finding C20 (see the expected-script.hex entry above). The ANF IR carries the re-emitted assert(cond0 || cond1) guard binding that the pre-fix liftBranchUpdateProps dropped for a terminal assert(false) else. Verified against conformance/witnesses/real-crypto/selector.json (deploy->call->@bsv/sdk Spend: two accepts + an out-of-range reject) and corroborated by 7-tier cross-compiler byte-identical Stack-IR + hex parity, fold-off and fold-on.",
-      "reviewer": "gh:icellan",
-      "date": "2026-07-26"
-    },
-    {
-      "path": "conformance/script-size-baseline.json",
-      "sha256": "30483d020e66d411b8b5bd7209e12cdd2b40cc39bf8bab00533591d3a9f398ee",
-      "verified-against": "intentional-spec-change",
-      "reason": "Re-stamped for the deep-review C20/C27 cluster: branched-readonly-len grew +5 bytes (1081->1086, C27 else-present N-field reconcile) and the new selector fixture was added at 985 bytes (C20 dispatch regression fixture). No other fixture's size moved (the C20/C27 codegen changes only affect the assert-false-else dispatch and else-present multi-field-write shapes). Both size changes are the intended, execution-verified consequence of the cluster — see the branched-readonly-len and selector golden entries above.",
       "reviewer": "gh:icellan",
       "date": "2026-07-26"
     },
@@ -448,6 +440,48 @@
       "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
       "reviewer": "gh:icellan",
       "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/convergence-proof/expected-script.hex",
+      "sha256": "ccc59a1ea7032b77b3d9f7bd4eaa1fef78f110e89eb53bf33524e0b2e5a2e866",
+      "verified-against": "differential-oracle",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reviewer": "gh:icellan"
+    },
+    {
+      "path": "conformance/tests/ec-demo/expected-script.hex",
+      "sha256": "cf7dac2c75d649b28d0ba7c29b719d96458b9e045a03aed291a96895a4703b90",
+      "verified-against": "differential-oracle",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reviewer": "gh:icellan"
+    },
+    {
+      "path": "conformance/tests/ec-primitives/expected-script.hex",
+      "sha256": "84f7c121db70927932f7313bd9bca9f7a2d69c9f2987ac7ef03d65748a61a97b",
+      "verified-against": "differential-oracle",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reviewer": "gh:icellan"
+    },
+    {
+      "path": "conformance/tests/ec-unit/expected-script.hex",
+      "sha256": "d543af1444b1cacbb763420a28108a63fd70f9db2bddb8da925a20ff168f9182",
+      "verified-against": "differential-oracle",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reviewer": "gh:icellan"
+    },
+    {
+      "path": "conformance/tests/schnorr-zkp/expected-script.hex",
+      "sha256": "7c7501b30f34e2dc256dfd4f59f6a47a718abdbd18b54ef03a670f0c3cba65b7",
+      "verified-against": "differential-oracle",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reviewer": "gh:icellan"
+    },
+    {
+      "path": "conformance/script-size-baseline.json",
+      "sha256": "d0ba1a09307b2c61b4d3e2370c9519a641b05444e587ee86dc9ab8dac2c1d894",
+      "verified-against": "intentional-spec-change",
+      "reason": "Re-stamped after the ecAdd doubling fix. Only the five EC fixtures moved, by +0.05%..+0.09% (convergence-proof, ec-demo, ec-primitives, ec-unit, schnorr-zkp) — the tangent-slope selection adds 124 ops and reuses the single existing fieldInv. All 60 other fixtures are byte-unchanged.",
+      "reviewer": "gh:icellan"
     }
   ]
 }
