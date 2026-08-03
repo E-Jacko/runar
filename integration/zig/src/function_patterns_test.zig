@@ -287,7 +287,13 @@ test "FunctionPatterns_WrongOwnerRejected" {
     if (result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have failed
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         // Expected: call was rejected on-chain due to wrong signer
         std.log.info("FunctionPatterns correctly rejected wrong owner", .{});
     }

@@ -86,9 +86,19 @@ class TestConvergenceProof:
         contract.deploy(provider, wallet["signer"], DeployOptions(satoshis=5000))
 
         import pytest
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_0 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "proveConvergence",
                 [test_data["wrongDelta"]],
                 provider, wallet["signer"],
             )
+
+        assert provider.broadcast_attempts > broadcasts_before_0, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )

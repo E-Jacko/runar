@@ -408,7 +408,13 @@ test "StateCovenant_WrongPreStateRootRejected" {
     if (result) |call_txid| {
         allocator.free(call_txid);
         return error.TestUnexpectedResult;
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(ctx.rpc_provider.broadcast_attempts >= 1);
         std.log.info("StateCovenant correctly rejected wrong pre-state root", .{});
     }
 }
@@ -473,7 +479,13 @@ test "StateCovenant_InvalidBlockNumberRejected" {
     if (result) |call_txid| {
         allocator.free(call_txid);
         return error.TestUnexpectedResult;
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(ctx.rpc_provider.broadcast_attempts >= 1);
         std.log.info("StateCovenant correctly rejected non-increasing block number", .{});
     }
 }
@@ -518,7 +530,13 @@ test "StateCovenant_InvalidBabyBearProofRejected" {
     if (result) |call_txid| {
         allocator.free(call_txid);
         return error.TestUnexpectedResult;
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(ctx.rpc_provider.broadcast_attempts >= 1);
         std.log.info("StateCovenant correctly rejected invalid Baby Bear proof", .{});
     }
 }
@@ -567,7 +585,13 @@ test "StateCovenant_InvalidMerkleProofRejected" {
     if (result) |call_txid| {
         allocator.free(call_txid);
         return error.TestUnexpectedResult;
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(ctx.rpc_provider.broadcast_attempts >= 1);
         std.log.info("StateCovenant correctly rejected invalid Merkle proof", .{});
     }
 }

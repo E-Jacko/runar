@@ -18,6 +18,7 @@ import runar.lang.sdk.RunarContract;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * FungibleToken integration test -- stateful contract with addOutput.
@@ -101,9 +102,16 @@ class TokenFtIntegrationTest extends IntegrationBase {
         args.add(null);
         args.add(recipient.pubKeyHex());
         args.add(BigInteger.valueOf(5000));
+        // A negative test must prove the NODE rejected this spend. The SDK
+        // throws the same RuntimeException for a build-time refusal or a
+        // UTXO-fetch failure, so record the broadcast count and assert the
+        // failing call actually reached consensus.
+        int broadcastsBefore0 = provider.broadcastAttempts();
         assertThrows(RuntimeException.class, () ->
             contract.call("send", args, null, provider, attacker.signer())
         );
+        assertTrue(provider.broadcastAttempts() > broadcastsBefore0,
+            "the rejected call must have been broadcast to the node, not refused by the SDK");
     }
 
     @Test
@@ -207,8 +215,15 @@ class TokenFtIntegrationTest extends IntegrationBase {
         // The `merge` test above is the honest-balance control over this exact
         // setup: it succeeds, so a failure here is the covenant rejecting the
         // lie rather than the SDK declining to build the transaction.
+        // A negative test must prove the NODE rejected this spend. The SDK
+        // throws the same RuntimeException for a build-time refusal or a
+        // UTXO-fetch failure, so record the broadcast count and assert the
+        // failing call actually reached consensus.
+        int broadcastsBefore1 = provider.broadcastAttempts();
         assertThrows(RuntimeException.class, () ->
             c1.callWithOptions("merge", args, opts, provider, owner.signer()));
+        assertTrue(provider.broadcastAttempts() > broadcastsBefore1,
+            "the rejected call must have been broadcast to the node, not refused by the SDK");
     }
 
     @Test

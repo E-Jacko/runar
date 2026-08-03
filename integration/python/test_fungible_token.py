@@ -137,6 +137,11 @@ class TestFungibleToken:
 
         contract.deploy(provider, owner_wallet["signer"], DeployOptions(satoshis=5000))
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_0 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "send",
@@ -146,6 +151,10 @@ class TestFungibleToken:
                     {"satoshis": 5000, "state": {"owner": recipient["pubKeyHex"], "balance": 1000, "mergeBalance": 0}},
                 ]),
             )
+        assert provider.broadcast_attempts > broadcasts_before_0, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_transfer(self):
         """Transfer using SDK multi-output support: split 1 UTXO into 2 outputs."""
@@ -215,6 +224,11 @@ class TestFungibleToken:
 
         utxo2 = contract2.get_utxo()
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_1 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract1.call(
                 "merge",
@@ -226,6 +240,10 @@ class TestFungibleToken:
                     outputs=[{"satoshis": 4000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 400, "mergeBalance": 1600}}],
                 ),
             )
+        assert provider.broadcast_attempts > broadcasts_before_1, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_merge_deflated(self):
         """Negative otherBalance fails assert(otherBalance >= 0)."""
@@ -242,6 +260,11 @@ class TestFungibleToken:
 
         utxo2 = contract2.get_utxo()
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_2 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract1.call(
                 "merge",
@@ -253,6 +276,10 @@ class TestFungibleToken:
                     outputs=[{"satoshis": 4000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 400, "mergeBalance": 100}}],
                 ),
             )
+        assert provider.broadcast_attempts > broadcasts_before_2, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_merge_zero_balance(self):
         """Edge case: one zero-balance UTXO merged with a non-zero one. Should succeed."""
@@ -298,6 +325,11 @@ class TestFungibleToken:
 
         utxo2 = contract2.get_utxo()
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_3 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract1.call(
                 "merge",
@@ -309,6 +341,10 @@ class TestFungibleToken:
                     outputs=[{"satoshis": 4000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 400, "mergeBalance": 600}}],
                 ),
             )
+        assert provider.broadcast_attempts > broadcasts_before_3, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_transfer_exact_balance(self):
         """Transfer entire balance to recipient. Should produce 1 output (no change)."""
@@ -348,6 +384,11 @@ class TestFungibleToken:
         contract.deploy(provider, owner_wallet["signer"], DeployOptions(satoshis=5000))
 
         # Claim recipient gets 800, sender keeps 500 = 1300 total (inflated from 1000)
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_4 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "transfer",
@@ -358,6 +399,10 @@ class TestFungibleToken:
                     {"satoshis": 2000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 500, "mergeBalance": 0}},
                 ]),
             )
+        assert provider.broadcast_attempts > broadcasts_before_4, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_transfer_deflated_balance(self):
         """Attacker deflates output balances to steal tokens. Should be rejected."""
@@ -373,6 +418,11 @@ class TestFungibleToken:
         contract.deploy(provider, owner_wallet["signer"], DeployOptions(satoshis=5000))
 
         # Claim recipient gets 300, sender keeps 200 = 500 total (deflated from 1000)
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_5 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "transfer",
@@ -383,6 +433,10 @@ class TestFungibleToken:
                     {"satoshis": 2000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 200, "mergeBalance": 0}},
                 ]),
             )
+        assert provider.broadcast_attempts > broadcasts_before_5, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_transfer_zero_amount_rejected(self):
         """Transfer of zero amount should fail assert(amount > 0)."""
@@ -397,6 +451,11 @@ class TestFungibleToken:
         ])
         contract.deploy(provider, owner_wallet["signer"], DeployOptions(satoshis=5000))
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_6 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "transfer",
@@ -407,6 +466,10 @@ class TestFungibleToken:
                     {"satoshis": 2000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 1000, "mergeBalance": 0}},
                 ]),
             )
+        assert provider.broadcast_attempts > broadcasts_before_6, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_transfer_exceeds_balance_rejected(self):
         """Transfer exceeding balance should fail assert(amount <= totalBalance)."""
@@ -421,6 +484,11 @@ class TestFungibleToken:
         ])
         contract.deploy(provider, owner_wallet["signer"], DeployOptions(satoshis=5000))
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_7 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "transfer",
@@ -430,6 +498,10 @@ class TestFungibleToken:
                     {"satoshis": 2000, "state": {"owner": recipient["pubKeyHex"], "balance": 2000, "mergeBalance": 0}},
                 ]),
             )
+        assert provider.broadcast_attempts > broadcasts_before_7, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_transfer_wrong_signer(self):
         """Wrong signer tries to transfer. Should fail checkSig."""
@@ -443,6 +515,11 @@ class TestFungibleToken:
         contract = RunarContract(artifact, [owner_wallet["pubKeyHex"], 1000, 0, token_id_hex])
         contract.deploy(provider, owner_wallet["signer"], DeployOptions(satoshis=5000))
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_8 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "transfer",
@@ -453,3 +530,8 @@ class TestFungibleToken:
                     {"satoshis": 2000, "state": {"owner": owner_wallet["pubKeyHex"], "balance": 700, "mergeBalance": 0}},
                 ]),
             )
+
+        assert provider.broadcast_attempts > broadcasts_before_8, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )

@@ -220,12 +220,21 @@ class TestTicTacToe:
         # It's Player X's turn (turn=1), but Player O tries to move
         # Passing playerO's pubkey with playerO's signer -- assertCorrectPlayer
         # will fail because turn==1 expects playerX's pubkey
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_0 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "move",
                 [4, player_o_wallet["pubKeyHex"], None],
                 provider, player_o_wallet["signer"],
             )
+        assert provider.broadcast_attempts > broadcasts_before_0, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_join_after_playing_rejected(self):
         """Calling join after the game has already started should be rejected."""
@@ -254,9 +263,19 @@ class TestTicTacToe:
         )
 
         # Another player tries to join again -- status is now 1, assert(status==0) fails
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_1 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "join",
                 [intruder_wallet["pubKeyHex"], None],
                 provider, intruder_wallet["signer"],
             )
+
+        assert provider.broadcast_attempts > broadcasts_before_1, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )

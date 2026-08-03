@@ -145,8 +145,17 @@ class TestStateCovenant:
         # Replace preStateRoot (index 3) with a wrong value
         args[3] = 'ff' + hex_zeros32()[2:]
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_0 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call('advanceState', args, provider, wallet['signer'])
+        assert provider.broadcast_attempts > broadcasts_before_0, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_invalid_block_number_rejected(self):
         """Should reject non-increasing block number."""
@@ -162,8 +171,17 @@ class TestStateCovenant:
         args2 = build_call_args(tree_root, get_proof, pre, 0)
         args2[1] = 0  # force block number 0
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_1 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call('advanceState', args2, provider, wallet['signer'])
+        assert provider.broadcast_attempts > broadcasts_before_1, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_invalid_babybear_proof_rejected(self):
         """Should reject invalid Baby Bear proof."""
@@ -173,8 +191,17 @@ class TestStateCovenant:
         args = build_call_args(tree_root, get_proof, hex_zeros32(), 1)
         args[6] = 99999  # wrong proofFieldC
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_2 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call('advanceState', args, provider, wallet['signer'])
+        assert provider.broadcast_attempts > broadcasts_before_2, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )
 
     def test_invalid_merkle_proof_rejected(self):
         """Should reject invalid Merkle proof."""
@@ -185,5 +212,15 @@ class TestStateCovenant:
         # wrong merkleLeaf
         args[7] = 'aa' + hex_zeros32()[2:]
 
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_3 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call('advanceState', args, provider, wallet['signer'])
+
+        assert provider.broadcast_attempts > broadcasts_before_3, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )

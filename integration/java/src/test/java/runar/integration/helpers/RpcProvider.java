@@ -27,6 +27,18 @@ public final class RpcProvider implements Provider {
     private final RpcClient rpc;
     private final boolean autoMine;
 
+    /**
+     * Number of times the SDK actually handed a transaction to the node.
+     *
+     * <p>Negative tests assert on this. Without it, {@code assertThrows} is
+     * ambiguous: the SDK throws the same {@code RuntimeException} for a
+     * build-time refusal, a UTXO-fetch failure and a consensus rejection, so a
+     * negative test can pass green while the transaction under attack was never
+     * constructed. Asserting {@code broadcastAttempts() >= 1} pins the
+     * rejection to the node.
+     */
+    private int broadcastAttempts;
+
     public RpcProvider(RpcClient rpc) {
         this(rpc, true);
     }
@@ -37,6 +49,9 @@ public final class RpcProvider implements Provider {
     }
 
     public RpcClient rpc() { return rpc; }
+
+    /** How many transactions the SDK has handed to the node through this provider. */
+    public int broadcastAttempts() { return broadcastAttempts; }
 
     @Override
     public List<UTXO> listUtxos(String address) {
@@ -70,6 +85,9 @@ public final class RpcProvider implements Provider {
 
     @Override
     public String broadcastRaw(String txHex) {
+        // Count the ATTEMPT, before the node can reject it — that is precisely
+        // what separates a consensus rejection from an SDK-side failure.
+        broadcastAttempts++;
         int sizeBytes = txHex == null ? 0 : txHex.length() / 2;
         System.out.println("[runar-integration] tx broadcast: " + sizeBytes + " bytes");
         String result = rpc.call("sendrawtransaction", txHex);

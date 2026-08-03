@@ -74,7 +74,17 @@ class TestP2PKH:
         contract.deploy(provider, wallet_a["signer"], DeployOptions(satoshis=5000))
 
         # Try to unlock with wallet_b's signer
+        # A negative test must prove the NODE rejected this spend.
+        # pytest.raises(Exception) catches anything at all, including the
+        # SDK declining to build the transaction, so record the broadcast
+        # count and assert the failing call actually reached consensus.
+        broadcasts_before_0 = provider.broadcast_attempts
         with pytest.raises(Exception):
             contract.call(
                 "unlock", [None, None], provider, wallet_b["signer"],
             )
+
+        assert provider.broadcast_attempts > broadcasts_before_0, (
+            "the rejected call must have been broadcast to the node, "
+            "not refused by the SDK before a transaction was built"
+        )

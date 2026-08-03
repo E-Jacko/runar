@@ -273,7 +273,13 @@ test "TicTacToe_WrongPlayerRejected" {
     if (move_result) |move_txid| {
         allocator.free(move_txid);
         return error.TestUnexpectedResult; // should have been rejected
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         // Expected: move was rejected because wrong player tried to move
         std.log.warn("TicTacToe correctly rejected wrong player move", .{});
     }
@@ -356,7 +362,13 @@ test "TicTacToe_JoinAfterPlayingRejected" {
     if (second_join_result) |txid| {
         allocator.free(txid);
         return error.TestUnexpectedResult; // should have been rejected
-    } else |_| {
+    } else |err| {
+        // A negative test must prove CONSENSUS rejected the spend, not merely
+        // that the call returned some error. `ContractError.CallFailed` is the
+        // SDK's catch-all — it also covers a UTXO-fetch failure or a build-time
+        // refusal — so assert the transaction actually reached the node.
+        try std.testing.expectEqual(error.CallFailed, err);
+        try std.testing.expect(rpc_provider.broadcast_attempts >= 1);
         // Expected: second join was rejected because status != 0
         std.log.warn("TicTacToe correctly rejected second join attempt", .{});
     }

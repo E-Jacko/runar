@@ -262,8 +262,16 @@ def _instrument_broadcast(provider: RPCProvider) -> RPCProvider:
     suite to give CI logs a uniform per-broadcast tx-size line.
     """
     original = provider.broadcast
+    provider.broadcast_attempts = 0
 
     def broadcast(tx, *args, **kwargs):
+        # Count the ATTEMPT, before the node can reject it. Negative tests
+        # assert on this: `pytest.raises(Exception)` catches anything at all,
+        # including the SDK refusing to build the transaction or a UTXO-fetch
+        # failure, so on its own it cannot show that CONSENSUS rejected the
+        # spend. `provider.broadcast_attempts` rising across the failing call
+        # is what pins the rejection to the node.
+        provider.broadcast_attempts += 1
         # ``tx`` may be either a Transaction-like object exposing ``to_hex()``
         # or already a hex string, depending on which SDK call path invoked
         # the provider. Handle both shapes defensively.
