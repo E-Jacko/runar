@@ -66,6 +66,8 @@ export type {
   ANFValue,
 } from './anf-ir.js';
 
+export { MERGED_LOCAL_TEMP_PREFIX } from './anf-ir.js';
+
 // Stack IR (Pass 5 output)
 export type {
   StackProgram,

@@ -50,6 +50,7 @@ from runar_compiler.ir.types import (
     ANFProgram,
     ANFProperty,
     ANFValue,
+    MERGED_LOCAL_TEMP_PREFIX,
     SourceLocation,
 )
 from runar_compiler.frontend.side_effect_summary import (
@@ -895,6 +896,35 @@ class _LowerCtx:
             _append_branch_output_concat(then_ctx)
             _append_branch_output_concat(else_ctx)
 
+        # Branch-merged locals (2 or more). An ``if`` expression carries exactly
+        # ONE value, so the alias below can only rewire post-branch references
+        # for a SINGLE merged local. With two or more -- or with the arms
+        # reassigning DIFFERENT locals -- every later reference kept naming the
+        # pre-branch binding, i.e. the dead initial value, and stack lowering
+        # then registered one stack-map slot for N physical results and resolved
+        # every later operand one slot off. Reported privately 2026-08-03; see
+        # packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+        #
+        # Fix: give both arms the SAME result set in the SAME order by appending
+        # an explicit rebind of every merged local to each arm.
+        merged_locals = self._collect_branch_merged_locals(then_ctx, else_ctx)
+        if len(merged_locals) >= 2:
+            if branch_has_outputs:
+                # The arms' single value is already spoken for: it is the output
+                # concat the continuation hash consumes. Refuse at compile time
+                # rather than emit the unspendable script this used to produce.
+                raise ValueError(
+                    "Cannot compile conditional that both declares outputs and "
+                    f"merges {len(merged_locals)} local variables "
+                    f"({', '.join(merged_locals)}). Move the addOutput/"
+                    "addRawOutput/addDataOutput call after the if-statement, or "
+                    "give each branch its own complete addOutput."
+                )
+            _append_merged_local_results(then_ctx, merged_locals)
+            self.sync_counter(then_ctx)
+            _append_merged_local_results(else_ctx, merged_locals)
+            self.sync_counter(else_ctx)
+
         if_name = self.emit(ANFValue(
             kind="if",
             cond=cond_ref,
@@ -921,13 +951,41 @@ class _LowerCtx:
             else:
                 self.add_data_output_ref(if_name)
 
-        # If both branches end by reassigning the same local variable,
-        # alias that variable to the if-expression result
-        if then_ctx.bindings and else_ctx.bindings:
+        # If both branches end by reassigning the same single local variable,
+        # alias that variable to the if-expression result.
+        #
+        # Skipped when the arms were normalised above: there the ``if`` has N
+        # results, not one, and each merged local keeps its OWN name through the
+        # reconcile in the stack lowerer.
+        if len(merged_locals) < 2 and then_ctx.bindings and else_ctx.bindings:
             then_last = then_ctx.bindings[-1]
             else_last = else_ctx.bindings[-1]
             if then_last.name == else_last.name and self.is_local(then_last.name):
                 self.set_local_alias(then_last.name, if_name)
+
+    def _collect_branch_merged_locals(self, then_ctx, else_ctx) -> list[str]:
+        """Locals from the enclosing scope that either arm of an if-statement
+        reassigns, in a canonical order both arms can agree on: the then-arm's
+        reassignments in order of last rebind, then the else-only ones in the
+        same order.
+
+        Only names the PARENT already knows as locals count -- ``sub_context``
+        copies the local-name set by value, so a local declared inside a branch
+        never reaches the parent's set and is correctly excluded (it is not live
+        after the if).
+        """
+        def last_rebind_order(branch) -> list[str]:
+            last_index: dict[str, int] = {}
+            for i, b in enumerate(branch.bindings):
+                if self.is_local(b.name):
+                    last_index[b.name] = i
+            return [n for n, _ in sorted(last_index.items(), key=lambda kv: kv[1])]
+
+        merged = last_rebind_order(then_ctx)
+        for name in last_rebind_order(else_ctx):
+            if name not in merged:
+                merged.append(name)
+        return merged
 
     def _lower_for_statement(self, stmt: ForStmt) -> None:
         # Resolve the loop's compile-time shape: start value, step direction,
@@ -1566,6 +1624,31 @@ def _make_call(func_name: str, args: list[str]) -> ANFValue:
         func=func_name,
         args=args,
     )
+
+
+def _append_merged_local_results(branch_ctx, merged_locals: list[str]) -> None:
+    """Append the canonical merged-local result block to one arm of an
+    if-statement: a copy of every merged local, in canonical order, rebound
+    under the local's own name.
+
+    Two passes on purpose. Pass 1 always COPIES: ``@ref:<local>`` resolves to
+    the arm's own new value if it rebound one, else to the enclosing scope's
+    value, and either way stack lowering picks (never rolls) it, because a local
+    live after the ``if`` is outer-protected. Pass 2 always CONSUMES, because
+    the temps are bound in this arm and this is their last use. The arm's stack
+    effect is therefore exactly +K regardless of which of the K locals it
+    reassigned.
+    """
+    for i, name in enumerate(merged_locals):
+        branch_ctx.emit_named(
+            f"{MERGED_LOCAL_TEMP_PREFIX}{i}",
+            _make_load_const_string(f"@ref:{name}"),
+        )
+    for i, name in enumerate(merged_locals):
+        branch_ctx.emit_named(
+            name,
+            _make_load_const_string(f"@ref:{MERGED_LOCAL_TEMP_PREFIX}{i}"),
+        )
 
 
 def _append_branch_output_concat(branch_ctx: "_LowerCtx") -> str:

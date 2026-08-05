@@ -342,6 +342,40 @@ module Runar
       # Encode a single state value to raw hex bytes (no push opcode wrapper).
       #
       # @param value  the Ruby value to encode
+      # Frame a hex-encoded byte string as a state-section field: <len><data>.
+      #
+      # Deliberately NOT the MINIMALDATA push encoding used by
+      # encode_push_data. The state section is raw data after OP_RETURN in the
+      # locking script; the interpreter never executes it, so
+      # SCRIPT_VERIFY_MINIMALDATA — a rule applied to push opcodes as they are
+      # executed — does not reach it. What does read it is the compiler's
+      # on-chain state codec (emitPushDataEncode in
+      # packages/runar-compiler/src/passes/05-stack-lower.ts), which writes and
+      # parses <len><data>. Both sides must agree byte for byte or the
+      # continuation hash check fails and the contract is unspendable.
+      #
+      # #110 applied the MINIMALDATA short-circuit here, in all seven SDKs and
+      # none of the seven compilers, so a 1-byte 0x05 state field serialised
+      # off-chain as "55" while the script rebuilt it as "0105".
+      # Byte-identical with the other six SDKs.
+      #
+      # @param data_hex [String] hex-encoded bytes to frame
+      # @return [String] hex-encoded length prefix + data
+      def encode_push_data_state(data_hex)
+        data_len = data_hex.length / 2
+
+        if data_len <= 75
+          format('%02x', data_len) + data_hex
+        elsif data_len <= 0xFF
+          '4c' + format('%02x', data_len) + data_hex
+        elsif data_len <= 0xFFFF
+          '4d' + [data_len].pack('v').unpack1('H*') + data_hex
+        else
+          '4e' + [data_len].pack('V').unpack1('H*') + data_hex
+        end
+      end
+      private_class_method :encode_push_data_state
+
       # @param field_type [String] Runar type name
       # @return [String] hex-encoded bytes
       def encode_state_value(value, field_type)
@@ -357,8 +391,8 @@ module Runar
             # Known fixed-width type — raw hex, no push opcode.
             hex
           else
-            # Variable-width type (ByteString, Sig, etc.) — push-data encoded.
-            encode_push_data(hex)
+            # Variable-width type (ByteString, Sig, etc.) — state framing.
+            encode_push_data_state(hex)
           end
         end
       end
@@ -399,12 +433,13 @@ module Runar
 
       # Decode a push-data item from hex_str at the given offset.
       #
-      # Inverse of encode_push_data's MINIMALDATA short-circuit: OP_1..OP_16
-      # (0x51..0x60) and OP_1NEGATE (0x4f) each push a single byte with no
-      # separate data bytes in the script — the opcode itself encodes the value
-      # (C9). OP_0 (0x00) falls through to the +opcode <= 75+ branch below and
-      # correctly decodes as the empty byte array (0-length push), since the
-      # encoder no longer emits OP_0 for a 1-byte 0x00 payload.
+      # Exact inverse of encode_push_data_state, and deliberately as strict as
+      # the compiler's on-chain state reader: only <len><data> framing is
+      # understood. OP_1..OP_16 (0x51..0x60) and OP_1NEGATE (0x4f) are NOT
+      # decoded as single-byte values — accepting them would let the SDK read a
+      # state section the contract's own script cannot parse. OP_0 (0x00) falls
+      # through to the +opcode <= 75+ branch below and correctly decodes as the
+      # empty byte array (0-length push).
       #
       # @param hex_str [String]
       # @param offset  [Integer]
@@ -414,13 +449,7 @@ module Runar
 
         opcode = hex_str[offset, 2].to_i(16)
 
-        if opcode >= 0x51 && opcode <= 0x60
-          # OP_1..OP_16
-          [format('%02x', opcode - 0x50), 2]
-        elsif opcode == 0x4F
-          # OP_1NEGATE
-          ['81', 2]
-        elsif opcode <= 75
+        if opcode <= 75
           data_len = opcode * 2
           [hex_str[offset + 2, data_len] || '', 2 + data_len]
         elsif opcode == 0x4C

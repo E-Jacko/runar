@@ -237,3 +237,22 @@ export type ANFValue =
   | AddDataOutput
   | ArrayLiteral
   | RawScript;
+
+/**
+ * Name prefix for the temporaries 04-anf-lower appends to BOTH arms of an
+ * if-statement that merges two or more locals (`appendMergedLocalResults`).
+ *
+ * An `if` carries one value, so post-branch references to a merged local can
+ * only be rewired by aliasing when there is exactly ONE of them. For two or
+ * more, both arms instead end with an identical K-binding block — K copies
+ * into `__merge$0..K-1`, then K rebinds of the locals from those temps — which
+ * leaves the merged values on top in the same canonical order whichever branch
+ * runs. Stack lowering recognises that trailing block by this prefix
+ * (`countMergedLocalResults` in 05-stack-lower.ts), trims each arm down to the
+ * K results, and adopts them by name, so a later reference resolves to the
+ * merged value rather than the dead pre-branch binding.
+ *
+ * The prefix is part of the ANF wire format: all seven compilers emit and
+ * recognise the same block.
+ */
+export const MERGED_LOCAL_TEMP_PREFIX = '__merge$';

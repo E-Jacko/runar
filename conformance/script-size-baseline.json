@@ -16,6 +16,7 @@
     "blake3": 22428,
     "boolean-logic": 15,
     "bounded-loop": 42,
+    "branch-merged-locals": 963,
     "branched-readonly-len": 1086,
     "cond-write-multi-field": 957,
     "conditional-data-output-stateful": 1015,

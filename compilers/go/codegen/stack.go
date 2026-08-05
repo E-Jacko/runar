@@ -329,6 +329,64 @@ func collectDeepBindingNames(bindings []ir.ANFBinding) map[string]bool {
 	return names
 }
 
+// countMergedLocalResults reports how many branch-merged locals an
+// if-statement's two arms carry as results.
+//
+// ANF lowering's appendMergedLocalResults ends both arms with the same
+// K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
+// merged values sit on top in the same canonical order whichever branch runs.
+// Counting the trailing block is how stack lowering learns K: it must trim
+// each arm down to exactly those K slots before the N>=2 reconcile compares
+// the arms, since everything beneath them is the arm's own (dead, and
+// arm-specific) working values.
+//
+// Returns 0 unless BOTH arms end with a block of the same size — anything else
+// is not a normalised merge and must not be trimmed.
+func countMergedLocalResults(thenBindings, elseBindings []ir.ANFBinding) int {
+	trailing := func(bindings []ir.ANFBinding) int {
+		n := 0
+		for i := len(bindings) - 1; i >= 0; i-- {
+			v := &bindings[i].Value
+			if v.Kind != "load_const" || v.ConstString == nil {
+				break
+			}
+			if !strings.HasPrefix(*v.ConstString, "@ref:"+ir.MergedLocalTempPrefix) {
+				break
+			}
+			n++
+		}
+		return n
+	}
+	thenCount := trailing(thenBindings)
+	if thenCount > 0 && thenCount == trailing(elseBindings) {
+		return thenCount
+	}
+	return 0
+}
+
+// dropSlotAtDepth physically removes the stack slot `depth` places below the
+// top.
+func (ctx *loweringContext) dropSlotAtDepth(depth int) {
+	if depth == 0 {
+		ctx.emitOp(StackOp{Op: "drop"})
+		ctx.sm.pop()
+		return
+	}
+	if depth == 1 {
+		ctx.emitOp(StackOp{Op: "nip"})
+		ctx.sm.removeAtDepth(1)
+		return
+	}
+	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(depth))})
+	ctx.sm.push("")
+	ctx.emitOp(StackOp{Op: "roll", Depth: depth})
+	ctx.sm.pop()
+	removed := ctx.sm.removeAtDepth(depth)
+	ctx.sm.push(removed)
+	ctx.emitOp(StackOp{Op: "drop"})
+	ctx.sm.pop()
+}
+
 func collectRefs(value *ir.ANFValue) []string {
 	var refs []string
 
@@ -1865,6 +1923,36 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
+	// Branch-merged locals: trim each arm down to exactly its K result slots.
+	//
+	// ANF lowering ends both arms with an identical K-binding block that
+	// rebinds every merged local from a `__merge$<i>` temp (see
+	// appendMergedLocalResults). That block leaves the K live values on top in
+	// the same canonical order in both arms — but BENEATH them each arm still
+	// holds whatever its own body produced, and those differ per arm, which is
+	// exactly what the N>=2 reconcile further down compares. Everything
+	// beneath the K results is dead: the block copied each merged local before
+	// rebinding it, and a branch-local binding is not visible after the `if`.
+	//
+	// Runs AFTER the phase-2 consumption drops, so both arms have given up the
+	// same parent slots and share one base depth.
+	mergedResultCount := countMergedLocalResults(thenBindings, elseBindings)
+	if mergedResultCount >= 2 {
+		stillHeld := thenCtx.sm.namedSlots()
+		consumedFromParent := 0
+		for name := range preIfNames {
+			if !stillHeld[name] && ctx.sm.has(name) {
+				consumedFromParent++
+			}
+		}
+		targetDepth := ctx.sm.depth() - consumedFromParent + mergedResultCount
+		for _, armCtx := range []*loweringContext{thenCtx, elseCtx} {
+			for armCtx.sm.depth() > targetDepth {
+				armCtx.dropSlotAtDepth(mergedResultCount)
+			}
+		}
+	}
+
 	// Phase 3: depth-balance reconciliation after ALL drops.
 	//
 	// Compensate the FULL depth difference between the branches — NOT just a
@@ -1946,17 +2034,6 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		for i := 0; i < nResults; i++ {
 			tn := thenCtx.sm.peekAtDepth(i)
 			if tn == "" || tn != elseCtx.sm.peekAtDepth(i) {
-				elseMatchesThenNResultLayout = false
-				break
-			}
-			isProperty := false
-			for _, p := range ctx.properties {
-				if p.Name == tn {
-					isProperty = true
-					break
-				}
-			}
-			if !isProperty {
 				elseMatchesThenNResultLayout = false
 				break
 			}

@@ -376,32 +376,37 @@ function encodeNum2Bin(n: bigint, width: number): string {
 }
 
 /**
- * Encode variable-length data as Bitcoin Script push data (with length prefix).
+ * Encode variable-length data as a length-prefixed state-section field.
  *
- * Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
- * pushes: a 1-byte payload whose value is in `{0x01..=0x10, 0x81}` MUST use
- * the corresponding minimal opcode (`OP_1..OP_16` / `OP_1NEGATE`) rather than
- * the direct push `01 NN`. Non-minimal direct pushes are rejected by ARC,
- * TAAL ARC, and WhatsOnChain at the relay layer with:
- * `non-mandatory-script-verify-flag (Data push larger than necessary)`.
+ * This is the `<len><data>` framing the COMPILER uses on-chain, and it is
+ * deliberately NOT the MINIMALDATA push encoding.
  *
- * NOTE: 0x00 is deliberately NOT in that set. `OP_0` pushes the EMPTY byte
- * array, not a 1-byte `0x00` — so the minimal encoding of a 1-byte `0x00`
- * payload is the direct push `01 00` (matching the compiler's
- * `encodePushBytesHex` in push-encoding.ts), not `OP_0` (C9 / S1).
+ * The state section is raw data living after `OP_RETURN` in the locking
+ * script. The interpreter never executes it, so `SCRIPT_VERIFY_MINIMALDATA`
+ * — a rule applied to push opcodes as they are executed — does not reach it.
+ * What does read it is the compiler's own on-chain state codec:
+ * `emitPushDataEncode` in packages/runar-compiler/src/passes/05-stack-lower.ts
+ * writes `<len><data>` when rebuilding the continuation, and the on-chain
+ * reader parses `<len><data>`. Both sides must agree byte for byte or the
+ * `hash256(outputs) == extractOutputHash(preimage)` check fails and the
+ * contract is unspendable.
+ *
+ * #110 briefly applied the MINIMALDATA short-circuit here (1-byte payloads in
+ * `{0x01..=0x10, 0x81}` -> `OP_1..OP_16` / `OP_1NEGATE`), changing all seven
+ * SDKs and none of the seven compilers. That desynchronised the two sides for
+ * exactly those values: a 1-byte `0x05` state field serialised off-chain as
+ * `55` while the script rebuilt it as `0105`, so any contract carrying such a
+ * value became permanently unspendable — on the WRITE path (continuation hash
+ * mismatch) and on the READ path (the on-chain reader takes `0x55` as a
+ * length-85 push and dies in OP_SPLIT).
+ *
+ * MINIMALDATA still applies — and is still enforced — where the interpreter
+ * really does execute the push: `encodePushData`/`encodeArg` in contract.ts,
+ * which build UNLOCKING scripts. That is the path #110's evidence came from
+ * (ByteString call args), and it is unchanged.
  */
 function encodePushDataState(dataHex: string): string {
   const len = dataHex.length / 2;
-  // MINIMALDATA: single-byte payloads in the OP_N range must use the
-  // corresponding minimal opcode. The `encodeScriptNumber` path for Int
-  // fields already short-circuits to OP_N; this brings the ByteString path
-  // to the same standard so a 1-byte ByteString state field does not emit a
-  // relay-rejected non-minimal direct push.
-  if (len === 1) {
-    const byte = parseInt(dataHex, 16);
-    if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0'); // OP_1..OP_16
-    if (byte === 0x81) return '4f'; // OP_1NEGATE
-  }
   if (len <= 75) {
     return len.toString(16).padStart(2, '0') + dataHex;
   } else if (len <= 0xff) {
@@ -481,15 +486,17 @@ function decodeNum2Bin(hex: string): bigint {
 }
 
 /**
- * Decode a Bitcoin Script push data at the given hex offset.
- * Returns the pushed data (hex) and the total number of hex chars consumed.
+ * Decode a state-section field at the given hex offset.
+ * Returns the field data (hex) and the total number of hex chars consumed.
  *
- * Inverse of `encodePushDataState`'s MINIMALDATA short-circuit: `OP_1..OP_16`
- * (0x51..0x60) and `OP_1NEGATE` (0x4f) each push a single byte with no
- * separate data bytes in the script — the opcode itself encodes the value
- * (C9). `OP_0` (0x00) falls through to the `opcode <= 75` branch below and
- * correctly decodes as the empty byte array (0-length push), since the
- * encoder no longer emits OP_0 for a 1-byte `0x00` payload.
+ * Exact inverse of `encodePushDataState`, and deliberately as strict as the
+ * compiler's on-chain state reader: only `<len><data>` framing is understood.
+ * `OP_1..OP_16` (0x51..0x60) and `OP_1NEGATE` (0x4f) are NOT decoded as
+ * single-byte values — accepting them here would let the SDK read a state
+ * section that the contract's own script cannot parse (the on-chain reader
+ * takes 0x55 as a length-85 push), restoring exactly the wrong-but-plausible
+ * state C28 exists to prevent. `OP_0` (0x00) falls through to the
+ * `opcode <= 75` branch below and correctly decodes as the empty byte array.
  */
 function decodePushData(
   hex: string,
@@ -515,13 +522,7 @@ function decodePushData(
     );
   }
 
-  if (opcode >= 0x51 && opcode <= 0x60) {
-    // OP_1..OP_16
-    return { data: (opcode - 0x50).toString(16).padStart(2, '0'), bytesRead: 2 };
-  } else if (opcode === 0x4f) {
-    // OP_1NEGATE
-    return { data: '81', bytesRead: 2 };
-  } else if (opcode <= 75) {
+  if (opcode <= 75) {
     // Direct push: opcode is the byte length
     const dataLen = opcode * 2;
     need(2 + dataLen, 'push payload');

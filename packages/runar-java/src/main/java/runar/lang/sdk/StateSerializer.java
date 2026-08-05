@@ -104,7 +104,7 @@ public final class StateSerializer {
             default -> {
                 String hex = String.valueOf(value);
                 if (hex.isEmpty()) yield "00";
-                yield ScriptUtils.encodePushData(hex);
+                yield ScriptUtils.encodePushDataState(hex);
             }
         };
     }
@@ -164,7 +164,7 @@ public final class StateSerializer {
                 yield s;
             }
             default -> {
-                ScriptUtils.DecodedPush dp = ScriptUtils.decodePushData(hex, offset[0]);
+                ScriptUtils.DecodedPush dp = ScriptUtils.decodePushDataState(hex, offset[0]);
                 offset[0] += dp.hexCharsConsumed();
                 yield dp.dataHex();
             }

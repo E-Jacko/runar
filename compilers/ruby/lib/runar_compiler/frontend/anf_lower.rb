@@ -1033,6 +1033,35 @@ module RunarCompiler
           Frontend._append_branch_output_concat(else_ctx)
         end
 
+        # Branch-merged locals (2 or more). An +if+ expression carries exactly
+        # ONE value, so the alias below can only rewire post-branch references
+        # for a SINGLE merged local. With two or more -- or with the arms
+        # reassigning DIFFERENT locals -- every later reference kept naming the
+        # pre-branch binding, i.e. the dead initial value, and stack lowering
+        # then registered one stack-map slot for N physical results and resolved
+        # every later operand one slot off. Reported privately 2026-08-03; see
+        # packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+        #
+        # Fix: give both arms the SAME result set in the SAME order by appending
+        # an explicit rebind of every merged local to each arm.
+        merged_locals = collect_branch_merged_locals(then_ctx, else_ctx)
+        if merged_locals.length >= 2
+          if branch_has_outputs
+            # The arms' single value is already spoken for: it is the output
+            # concat the continuation hash consumes. Refuse at compile time
+            # rather than emit the unspendable script this used to produce.
+            raise ArgumentError,
+                  "Cannot compile conditional that both declares outputs and merges " \
+                  "#{merged_locals.length} local variables (#{merged_locals.join(', ')}). " \
+                  "Move the addOutput/addRawOutput/addDataOutput call after the " \
+                  "if-statement, or give each branch its own complete addOutput."
+          end
+          Frontend._append_merged_local_results(then_ctx, merged_locals)
+          sync_counter(then_ctx)
+          Frontend._append_merged_local_results(else_ctx, merged_locals)
+          sync_counter(else_ctx)
+        end
+
         if_name = emit(IR::ANFValue.new(kind: "if").tap do |v|
           v.cond = cond_ref
           v.then = then_ctx.bindings
@@ -1059,15 +1088,43 @@ module RunarCompiler
           end
         end
 
-        # If both branches end by reassigning the same local variable,
-        # alias that variable to the if-expression result
-        if then_ctx.bindings.any? && else_ctx.bindings.any?
+        # If both branches end by reassigning the same SINGLE local variable,
+        # alias that variable to the if-expression result.
+        #
+        # Skipped when the arms were normalised above: there the +if+ has N
+        # results, not one, and each merged local keeps its OWN name through the
+        # reconcile in the stack lowerer.
+        if merged_locals.length < 2 && then_ctx.bindings.any? && else_ctx.bindings.any?
           then_last = then_ctx.bindings.last
           else_last = else_ctx.bindings.last
           if then_last.name == else_last.name && local?(then_last.name)
             set_local_alias(then_last.name, if_name)
           end
         end
+      end
+
+      # The locals from the enclosing scope that either arm of an if-statement
+      # reassigns, in a canonical order both arms can agree on: the then-arm's
+      # reassignments in order of last rebind, then the else-only ones in the
+      # same order.
+      #
+      # Only names the PARENT already knows as locals count -- +sub_context+
+      # copies the local-name set by value, so a local declared inside a branch
+      # never reaches the parent's set and is correctly excluded (it is not live
+      # after the if).
+      def collect_branch_merged_locals(then_ctx, else_ctx)
+        last_rebind_order = lambda do |branch|
+          last_index = {}
+          branch.bindings.each_with_index do |b, i|
+            last_index[b.name] = i if local?(b.name)
+          end
+          last_index.sort_by { |_, i| i }.map(&:first)
+        end
+        merged = last_rebind_order.call(then_ctx)
+        last_rebind_order.call(else_ctx).each do |name|
+          merged << name unless merged.include?(name)
+        end
+        merged
       end
 
       # @param stmt [ForStmt]
@@ -1660,6 +1717,28 @@ module RunarCompiler
     # +load_const+ so the branch still leaves one item on the stack —
     # required to balance the if's branch shapes when the OTHER
     # branch has outputs. 2026-04-30 audit finding F2 fix.
+    # Append the canonical merged-local result block to one arm of an
+    # if-statement: a copy of every merged local, in canonical order, rebound
+    # under the local's own name.
+    #
+    # Two passes on purpose. Pass 1 always COPIES: +@ref:<local>+ resolves to
+    # the arm's own new value if it rebound one, else to the enclosing scope's
+    # value, and either way stack lowering picks (never rolls) it, because a
+    # local live after the +if+ is outer-protected. Pass 2 always CONSUMES,
+    # because the temps are bound in this arm and this is their last use. The
+    # arm's stack effect is therefore exactly +K regardless of which of the K
+    # locals it reassigned.
+    def self._append_merged_local_results(branch_ctx, merged_locals)
+      merged_locals.each_with_index do |name, i|
+        branch_ctx.emit_named("#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}",
+                              _make_load_const_string("@ref:#{name}"))
+      end
+      merged_locals.each_with_index do |name, i|
+        branch_ctx.emit_named(name,
+                              _make_load_const_string("@ref:#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"))
+      end
+    end
+
     def self._append_branch_output_concat(branch_ctx)
       all_refs = branch_ctx.get_add_output_refs.dup
       all_refs.concat(branch_ctx.get_add_data_output_refs)

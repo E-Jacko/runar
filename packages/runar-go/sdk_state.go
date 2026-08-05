@@ -387,8 +387,44 @@ func encodeStateValue(value interface{}, fieldType string) string {
 		if len(hex) == 0 {
 			return "00" // OP_0
 		}
-		return EncodePushData(hex)
+		return encodePushDataState(hex)
 	}
+}
+
+// encodePushDataState frames a hex-encoded byte string as a state-section
+// field: <len><data>.
+//
+// This is deliberately NOT the MINIMALDATA push encoding used by
+// EncodePushData. The state section is raw data after OP_RETURN in the
+// locking script; the interpreter never executes it, so
+// SCRIPT_VERIFY_MINIMALDATA — a rule applied to push opcodes as they are
+// executed — does not reach it. What does read it is the compiler's on-chain
+// state codec (emitPushDataEncode in
+// packages/runar-compiler/src/passes/05-stack-lower.ts), which writes and
+// parses <len><data>. Both sides must agree byte for byte or the continuation
+// hash check fails and the contract is unspendable.
+//
+// #110 applied the MINIMALDATA short-circuit here, in all seven SDKs and none
+// of the seven compilers, so a 1-byte 0x05 state field serialised off-chain as
+// "55" while the script rebuilt it as "0105". Byte-identical with the other
+// six SDKs.
+func encodePushDataState(dataHex string) string {
+	dataLen := len(dataHex) / 2
+
+	if dataLen <= 75 {
+		return fmt.Sprintf("%02x", dataLen) + dataHex
+	} else if dataLen <= 0xff {
+		return "4c" + fmt.Sprintf("%02x", dataLen) + dataHex
+	} else if dataLen <= 0xffff {
+		lo := dataLen & 0xff
+		hi := (dataLen >> 8) & 0xff
+		return "4d" + fmt.Sprintf("%02x%02x", lo, hi) + dataHex
+	}
+	b0 := dataLen & 0xff
+	b1 := (dataLen >> 8) & 0xff
+	b2 := (dataLen >> 16) & 0xff
+	b3 := (dataLen >> 24) & 0xff
+	return "4e" + fmt.Sprintf("%02x%02x%02x%02x", b0, b1, b2, b3) + dataHex
 }
 
 // encodeNum2Bin encodes an integer as a fixed-width LE sign-magnitude byte
@@ -554,15 +590,15 @@ func decodeNum2Bin(hex string) int64 {
 	return result
 }
 
-// DecodePushData decodes a Bitcoin Script push data at the given hex offset.
-// Returns the pushed data (hex) and the total number of hex chars consumed.
+// DecodePushData decodes a state-section field at the given hex offset.
+// Returns the field data (hex) and the total number of hex chars consumed.
 //
-// Inverse of EncodePushData's MINIMALDATA short-circuit: OP_1..OP_16
-// (0x51..0x60) and OP_1NEGATE (0x4f) each push a single byte with no
-// separate data bytes in the script — the opcode itself encodes the value
-// (C9). OP_0 (0x00) falls through to the opcode<=75 branch below and
-// correctly decodes as the empty byte array (0-length push), since the
-// encoder no longer emits OP_0 for a 1-byte 0x00 payload.
+// Exact inverse of encodePushDataState, and deliberately as strict as the
+// compiler's on-chain state reader: only <len><data> framing is understood.
+// OP_1..OP_16 (0x51..0x60) and OP_1NEGATE (0x4f) are NOT decoded as
+// single-byte values — accepting them would let the SDK read a state section
+// the contract's own script cannot parse. OP_0 (0x00) falls through to the
+// opcode<=75 branch below and correctly decodes as the empty byte array.
 func DecodePushData(hex string, offset int) (string, int) {
 	if offset >= len(hex) {
 		return "", 0
@@ -570,13 +606,7 @@ func DecodePushData(hex string, offset int) (string, int) {
 
 	opcode, _ := strconv.ParseUint(hex[offset:offset+2], 16, 8)
 
-	if opcode >= 0x51 && opcode <= 0x60 {
-		// OP_1..OP_16
-		return fmt.Sprintf("%02x", opcode-0x50), 2
-	} else if opcode == 0x4f {
-		// OP_1NEGATE
-		return "81", 2
-	} else if opcode <= 75 {
+	if opcode <= 75 {
 		dataLen := int(opcode) * 2
 		return hex[offset+2 : offset+2+dataLen], 2 + dataLen
 	} else if opcode == 0x4c {

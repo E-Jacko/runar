@@ -76,6 +76,41 @@ public final class StackLower {
     private static final int MAX_STACK_DEPTH = 800;
 
     /**
+     * How many branch-merged locals an if-statement's two arms carry as
+     * results.
+     *
+     * <p>ANF lowering's {@code appendMergedLocalResults} ends both arms with
+     * the same K-binding block — {@code <local> = @ref:__merge$<i>} for i in
+     * 0..K-1 — so the merged values sit on top in the same canonical order
+     * whichever branch runs. Counting the trailing block is how stack lowering
+     * learns K: it must trim each arm down to exactly those K slots before the
+     * N&gt;=2 reconcile compares the arms, since everything beneath them is the
+     * arm's own (dead, and arm-specific) working values.
+     *
+     * <p>Returns 0 unless BOTH arms end with a block of the same size —
+     * anything else is not a normalised merge and must not be trimmed.
+     */
+    private static int countMergedLocalResults(List<AnfBinding> thenBindings,
+                                               List<AnfBinding> elseBindings) {
+        int thenCount = trailingMergedLocalResults(thenBindings);
+        return thenCount > 0 && thenCount == trailingMergedLocalResults(elseBindings)
+            ? thenCount : 0;
+    }
+
+    private static int trailingMergedLocalResults(List<AnfBinding> bindings) {
+        String prefix = "@ref:" + AnfValue.MERGED_LOCAL_TEMP_PREFIX;
+        int n = 0;
+        for (int i = bindings.size() - 1; i >= 0; i--) {
+            AnfValue v = bindings.get(i).value();
+            if (!(v instanceof LoadConst lc)) break;
+            if (!(lc.value() instanceof BytesConst bc)) break;
+            if (!bc.hex().startsWith(prefix)) break;
+            n++;
+        }
+        return n;
+    }
+
+    /**
      * OP_PUSH_TX on-chain signature derivation (BUG-100 fix).
      *
      * <p>The insecure legacy checkPreimage accepted a witness signature over the
@@ -821,6 +856,28 @@ public final class StackLower {
          * {@code preIfNames} are kept. Process deepest-first so removing a
          * deeper slot doesn't shift a shallower slot's depth-from-top.
          */
+        /** Physically remove the stack slot {@code depth} places below the top. */
+        void dropSlotAtDepth(int depth) {
+            if (depth == 0) {
+                emitOp(new DropOp());
+                sm.pop();
+                return;
+            }
+            if (depth == 1) {
+                emitOp(new NipOp());
+                sm.removeAtDepth(1);
+                return;
+            }
+            emitOp(new PushOp(PushValue.of(depth)));
+            sm.push("");
+            emitOp(new RollOp(depth));
+            sm.pop();
+            String rolled = sm.removeAtDepth(depth);
+            sm.push(rolled);
+            emitOp(new DropOp());
+            sm.pop();
+        }
+
         void drainBranchPrivateResidue(Set<String> preIfNames) {
             List<Integer> drainDepths = new ArrayList<>();
             for (int d = 1; d < sm.depth(); d++) {
@@ -2116,6 +2173,36 @@ public final class StackLower {
                 for (int d : depths) dropAtDepth(thenCtx, d);
             }
 
+            // Branch-merged locals: trim each arm down to exactly its K
+            // result slots.
+            //
+            // ANF lowering ends both arms with an identical K-binding block
+            // that rebinds every merged local from a `__merge$<i>` temp (see
+            // appendMergedLocalResults). That block leaves the K live values on
+            // top in the same canonical order in both arms — but BENEATH them
+            // each arm still holds whatever its own body produced, and those
+            // differ per arm, which is exactly what the N>=2 reconcile further
+            // down compares. Everything beneath the K results is dead: the
+            // block copied each merged local before rebinding it, and a
+            // branch-local binding is not visible after the `if`.
+            //
+            // Runs AFTER the phase-2 consumption drops, so both arms have given
+            // up the same parent slots and share one base depth.
+            int mergedResultCount = countMergedLocalResults(thenB, elseB);
+            if (mergedResultCount >= 2) {
+                Set<String> stillHeld = thenCtx.sm.namedSlots();
+                int consumedFromParent = 0;
+                for (String n : preIfNames) {
+                    if (!stillHeld.contains(n) && sm.has(n)) consumedFromParent++;
+                }
+                int targetDepth = sm.depth() - consumedFromParent + mergedResultCount;
+                for (LoweringContext armCtx : List.of(thenCtx, elseCtx)) {
+                    while (armCtx.sm.depth() > targetDepth) {
+                        armCtx.dropSlotAtDepth(mergedResultCount);
+                    }
+                }
+            }
+
             // Phase 3: depth-balance reconciliation after ALL drops.
             //
             // Compensate the FULL depth difference between the branches — NOT
@@ -2210,11 +2297,7 @@ public final class StackLower {
             if (elseMatchesThenNResultLayout) {
                 for (int i = 0; i < nResults; i++) {
                     String tn = thenCtx.sm.peekAtDepth(i);
-                    boolean isProp = false;
-                    if (tn != null && !tn.isEmpty()) {
-                        for (AnfProperty p : properties) if (p.name().equals(tn)) { isProp = true; break; }
-                    }
-                    if (tn == null || tn.isEmpty() || !tn.equals(elseCtx.sm.peekAtDepth(i)) || !isProp) {
+                    if (tn == null || tn.isEmpty() || !tn.equals(elseCtx.sm.peekAtDepth(i))) {
                         elseMatchesThenNResultLayout = false;
                         break;
                     }

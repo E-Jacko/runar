@@ -44,6 +44,11 @@ const ADDR = '751e76e8199196d454941c45d1b3a323f1433bd6';
 const HASH32 = '0000000000000000000000000000000000000000000000000000000000000001';
 const POINT = '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8';
 const HELLO = '48656c6c6f';
+// A 1-byte ByteString whose value is in the OP_1..OP_16 range. Serialised into
+// the state section it must stay the direct push `01 05`, NOT the MINIMALDATA
+// opcode `55` — the state section is raw data after OP_RETURN, never executed,
+// and the compiler's on-chain reader only understands <len><data>.
+const ONE_BYTE_OP_N = '05';
 // NIST P-256 generator point (64 bytes: x[32] || y[32], big-endian).
 const P256_POINT = '6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5';
 // NIST P-384 generator point (96 bytes: x[48] || y[48], big-endian).
@@ -369,9 +374,35 @@ const TEST_SPECS: TestSpec[] = [
     ],
   },
   {
+    // The branch-merged-local regression fixture. Deployed-locking-script
+    // parity across all seven SDKs for a contract whose compiled script
+    // exercises the merged-local result block.
+    name: 'branch-merged-locals',
+    constructorArgs: [
+      { type: 'bigint', value: '0' },
+      { type: 'bigint', value: '0' },
+    ],
+  },
+  {
     name: 'stateful-bytestring',
     constructorArgs: [
       { type: 'ByteString', value: HELLO },
+      { type: 'PubKey', value: PK },
+    ],
+  },
+  {
+    // Same contract as `stateful-bytestring`, but the ByteString state field
+    // holds a SINGLE byte in the OP_1..OP_16 range. That is the one value
+    // class where the state serializer used to disagree with the compiler's
+    // on-chain state codec: #110 taught all seven SDKs the MINIMALDATA push
+    // rule (0x05 -> OP_5 = "55"), while every compiler kept writing and
+    // parsing <len><data> ("0105"). Any contract carrying such a value became
+    // permanently unspendable, and #110's own commit note recorded that no
+    // fixture covered it. This is that fixture.
+    name: 'stateful-bytestring-op-n-state',
+    source: 'examples/ts/message-board/MessageBoard.runar.ts',
+    constructorArgs: [
+      { type: 'ByteString', value: ONE_BYTE_OP_N },
       { type: 'PubKey', value: PK },
     ],
   },

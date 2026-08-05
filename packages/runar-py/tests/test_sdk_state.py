@@ -199,10 +199,17 @@ class TestPushDataRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# MINIMALDATA-correct single-byte push encoding (SCRIPT_VERIFY_MINIMALDATA).
+# MINIMALDATA-correct single-byte push encoding (SCRIPT_VERIFY_MINIMALDATA)
+# — for EXECUTED pushes only, i.e. `encode_push_data`, which builds unlocking
+# scripts and splices constructor args.
+#
 # A 1-byte payload in {0x01..0x10, 0x81} must use the minimal opcode
 # (OP_1..OP_16 / OP_1NEGATE), not a direct push "01 NN". Byte-identical
 # with the other six SDKs.
+#
+# The STATE serializer is the opposite — see TestStatePushFraming below. The
+# state section is raw data after OP_RETURN, never executed, and framed
+# <len><data> to match the compiler's on-chain state codec.
 #
 # 0x00 is deliberately EXCLUDED from that set (C9 / S1): OP_0 pushes the EMPTY
 # byte array, not a 1-byte 0x00, so the minimal encoding of a 1-byte 0x00
@@ -234,6 +241,51 @@ class TestPushDataMinimalData:
 
     def test_two_byte_payload_still_direct_push(self):
         assert encode_push_data('0011') == '020011'
+
+
+# ---------------------------------------------------------------------------
+# The state section is framed <len><data>, never MINIMALDATA.
+#
+# It is raw data after OP_RETURN in the locking script: never executed, never
+# MINIMALDATA-checked, and read back by the compiler's on-chain state codec
+# (emitPushDataEncode in 05-stack-lower.ts), which understands only
+# <len><data>.
+#
+# #110 applied the MINIMALDATA short-circuit to the state serializer in all
+# seven SDKs and none of the seven compilers. A 1-byte 0x05 state field then
+# serialised off-chain as "55" while the script rebuilt it as "0105", so the
+# continuation hash never matched (unspendable), and a contract DEPLOYED with
+# such a value could not be spent at all (the on-chain reader takes 0x55 as a
+# length-85 push).
+# ---------------------------------------------------------------------------
+
+class TestStatePushFraming:
+    fields = [StateField(name='b', type='ByteString', index=0)]
+
+    def _encode(self, payload: str) -> str:
+        return serialize_state(self.fields, {'b': payload})
+
+    def test_op_n_range_stays_a_direct_push(self):
+        for n in range(1, 17):
+            assert self._encode(f'{n:02x}') == f'01{n:02x}'
+
+    def test_0x81_is_not_op_1negate(self):
+        assert self._encode('81') == '0181'
+
+    def test_single_zero_byte_is_a_direct_push(self):
+        assert self._encode('00') == '0100'
+
+    def test_empty_is_a_zero_length_push(self):
+        assert self._encode('') == '00'
+
+    def test_values_outside_the_op_n_range_are_unchanged(self):
+        assert self._encode('11') == '0111'
+        assert self._encode('0011') == '020011'
+
+    def test_round_trips_for_every_single_byte_value(self):
+        for b in range(0x100):
+            payload = f'{b:02x}'
+            assert deserialize_state(self.fields, self._encode(payload)) == {'b': payload}
 
 
 # ---------------------------------------------------------------------------

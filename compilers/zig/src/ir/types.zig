@@ -781,3 +781,18 @@ test "StateField with initial_value" {
     const field = StateField{ .name = "c", .type_name = "bigint", .index = 0, .initial_value = .{ .integer = 0 } };
     try std.testing.expect(field.initial_value != null);
 }
+
+/// Name prefix for the temporaries ANF lowering appends to BOTH arms of an
+/// if-statement that merges two or more locals.
+///
+/// An `if` carries one value, so post-branch references to a merged local can
+/// only be rewired by aliasing when there is exactly ONE of them. For two or
+/// more, both arms instead end with an identical K-binding block — K copies
+/// into `__merge$0..K-1`, then K rebinds of the locals from those temps —
+/// which leaves the merged values on top in the same canonical order whichever
+/// branch runs. Stack lowering recognises that trailing block by this prefix,
+/// trims each arm down to the K results, and adopts them by name.
+///
+/// The prefix is part of the ANF wire format: all seven compilers emit and
+/// recognise the same block.
+pub const merged_local_temp_prefix = "__merge$";

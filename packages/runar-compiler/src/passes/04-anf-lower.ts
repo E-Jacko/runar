@@ -31,6 +31,7 @@ import type {
   BinOp,
   ANFUnaryOp,
 } from '../ir/index.js';
+import { MERGED_LOCAL_TEMP_PREFIX } from '../ir/index.js';
 import { computeSideEffectSummary, continuationShape } from './side-effect-summary.js';
 import type { SideEffectSummary } from './side-effect-summary.js';
 import { SIGHASH_DEFAULT } from './sighash-directive.js';
@@ -888,6 +889,45 @@ function lowerIfStatement(
     appendBranchOutputConcat(elseCtx);
   }
 
+  // Branch-merged locals (2 or more). An `if` expression carries exactly ONE
+  // value, so the alias trick further down can only rewire post-branch
+  // references for a SINGLE merged local. With two or more — or with the arms
+  // reassigning DIFFERENT locals — every later reference kept naming the
+  // pre-branch binding, i.e. the dead initial value, and stack lowering then
+  // registered one stackMap slot for N physical results and resolved every
+  // later operand one slot off. Both faces produced a script the real
+  // interpreter rejects (OP_NUM2BIN / OP_ADD landing on a pubkey) or, worse,
+  // a continuation committing stale state that the off-chain interpreter
+  // agreed with. Reported privately 2026-08-03; see
+  // packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+  //
+  // Fix: give both arms the SAME result set in the SAME order by appending an
+  // explicit rebind of every merged local to each arm. In an arm that already
+  // reassigned the local this re-binds its own new value (stack lowering rolls
+  // the slot up); in an arm that did not, it re-binds the outer value (stack
+  // lowering picks a copy). Both arms then leave exactly N equally-named
+  // results, which `lowerIf`'s N>=2 reconcile adopts by name — so a reference
+  // after the `if` resolves to the merged value whichever branch ran.
+  const mergedLocals = collectBranchMergedLocals(thenCtx, elseCtx, ctx);
+  if (mergedLocals.length >= 2) {
+    if (branchHasOutputs) {
+      // The arms' single value is already spoken for: it is the output concat
+      // the continuation hash consumes. Normalising merged locals on top of
+      // that would need a multi-result `if` node. Refuse at compile time
+      // rather than emit the unspendable script this used to produce.
+      throw new Error(
+        `Cannot compile conditional that both declares outputs and merges ` +
+        `${mergedLocals.length} local variables (${mergedLocals.join(', ')}). ` +
+        `Move the addOutput/addRawOutput/addDataOutput call after the ` +
+        `if-statement, or give each branch its own complete addOutput.`,
+      );
+    }
+    appendMergedLocalResults(thenCtx, mergedLocals);
+    ctx.syncCounter(thenCtx);
+    appendMergedLocalResults(elseCtx, mergedLocals);
+    ctx.syncCounter(elseCtx);
+  }
+
   const ifName = ctx.emit({
     kind: 'if',
     cond: condRef,
@@ -922,16 +962,89 @@ function lowerIfStatement(
     }
   }
 
-  // If both branches end by reassigning the same local variable,
+  // If both branches end by reassigning the same single local variable,
   // alias that variable to the if-expression result so that subsequent
   // references resolve to the branch output, not the dead initial value.
-  const thenLast = thenCtx.bindings[thenCtx.bindings.length - 1];
-  const elseLast = elseCtx.bindings[elseCtx.bindings.length - 1];
-  if (thenLast && elseLast &&
-      thenLast.name === elseLast.name &&
-      ctx.isLocal(thenLast.name)) {
-    ctx.setLocalAlias(thenLast.name, ifName);
+  //
+  // Skipped when the arms were normalised above: there the `if` has N results,
+  // not one, and each merged local keeps its OWN name through the reconcile in
+  // `lowerIf`. Aliasing here would point every merged local at the single
+  // if-binding name — the last result slot — so N-1 of them would silently
+  // read the wrong value.
+  if (mergedLocals.length < 2) {
+    const thenLast = thenCtx.bindings[thenCtx.bindings.length - 1];
+    const elseLast = elseCtx.bindings[elseCtx.bindings.length - 1];
+    if (thenLast && elseLast &&
+        thenLast.name === elseLast.name &&
+        ctx.isLocal(thenLast.name)) {
+      ctx.setLocalAlias(thenLast.name, ifName);
+    }
   }
+}
+
+/**
+ * Append the canonical merged-local result block to one arm of an
+ * if-statement: a copy of every merged local, in canonical order, rebound
+ * under the local's own name.
+ *
+ * Done in two passes on purpose. The first pass copies each live value to a
+ * fresh branch-local temp; the second rebinds each local from its temp. That
+ * makes the arm's stack effect exactly +K regardless of which of the K locals
+ * this particular arm reassigned:
+ *
+ *   - pass 1 always COPIES. `@ref:<local>` resolves to the arm's own new value
+ *     if it rebound one, else to the enclosing scope's value, and either way
+ *     stack lowering picks (never rolls) it, because a local live after the
+ *     `if` is in `outerProtectedRefs`.
+ *   - pass 2 always CONSUMES, because the temps are bound in this arm and this
+ *     is their last use, so each rolls into place.
+ *
+ * A single-pass `<local> = @ref:<local>` cannot do this: the same protection
+ * that stops an arm from rolling away a still-needed parent slot also forces a
+ * copy when the arm is rebinding its OWN value, so arms that reassigned
+ * different locals ended up at different depths with the results in different
+ * orders — which is what `lowerIf`'s reconcile compares.
+ */
+function appendMergedLocalResults(branchCtx: LoweringContext, mergedLocals: string[]): void {
+  mergedLocals.forEach((name, i) => {
+    branchCtx.emitNamed(`${MERGED_LOCAL_TEMP_PREFIX}${i}`, { kind: 'load_const', value: `@ref:${name}` });
+  });
+  mergedLocals.forEach((name, i) => {
+    branchCtx.emitNamed(name, {
+      kind: 'load_const',
+      value: `@ref:${MERGED_LOCAL_TEMP_PREFIX}${i}`,
+    });
+  });
+}
+
+/**
+ * The locals from the enclosing scope that either arm of an if-statement
+ * reassigns, in a canonical order both arms can agree on: the then-arm's
+ * reassignments in order of last rebind, then the else-only ones in the same
+ * order.
+ *
+ * Only names the PARENT already knows as locals count — `ctx.subContext()`
+ * copies `localNames` by value, so a `let` declared inside a branch never
+ * reaches the parent's set and is correctly excluded (it is not live after
+ * the if).
+ */
+function collectBranchMergedLocals(
+  thenCtx: LoweringContext,
+  elseCtx: LoweringContext,
+  ctx: LoweringContext,
+): string[] {
+  const lastRebindOrder = (branch: LoweringContext): string[] => {
+    const seen = new Map<string, number>();
+    branch.bindings.forEach((b, i) => {
+      if (ctx.isLocal(b.name)) seen.set(b.name, i);
+    });
+    return [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([name]) => name);
+  };
+  const merged = lastRebindOrder(thenCtx);
+  for (const name of lastRebindOrder(elseCtx)) {
+    if (!merged.includes(name)) merged.push(name);
+  }
+  return merged;
 }
 
 /**

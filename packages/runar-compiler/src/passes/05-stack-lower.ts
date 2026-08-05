@@ -19,6 +19,7 @@ import type {
   StackMethod,
   StackOp,
 } from '../ir/index.js';
+import { MERGED_LOCAL_TEMP_PREFIX } from '../ir/index.js';
 import { UnknownANFKindError } from 'runar-ir-schema';
 import { emitVerifySLHDSA } from './slh-dsa-codegen.js';
 import { emitVerifyWOTS } from './wots-codegen.js';
@@ -272,6 +273,35 @@ class StackMap {
 // ---------------------------------------------------------------------------
 // Use analysis — determine last-use sites for each variable
 // ---------------------------------------------------------------------------
+
+/**
+ * How many branch-merged locals an if-statement's two arms carry as results.
+ *
+ * 04-anf-lower's `appendMergedLocalResults` ends both arms with the same
+ * K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
+ * merged values sit on top in the same canonical order whichever branch runs.
+ * Counting the trailing block is how stack lowering learns K: it must trim
+ * each arm down to exactly those K slots before the N>=2 reconcile compares
+ * the arms, since everything beneath them is the arm's own (dead, and
+ * arm-specific) working values.
+ *
+ * Returns 0 unless BOTH arms end with a block of the same size — anything else
+ * is not a normalised merge and must not be trimmed.
+ */
+function countMergedLocalResults(thenBindings: ANFBinding[], elseBindings: ANFBinding[]): number {
+  const trailing = (bindings: ANFBinding[]): number => {
+    let n = 0;
+    for (let i = bindings.length - 1; i >= 0; i--) {
+      const value = bindings[i]!.value;
+      if (value.kind !== 'load_const' || typeof value.value !== 'string') break;
+      if (!value.value.startsWith(`@ref:${MERGED_LOCAL_TEMP_PREFIX}`)) break;
+      n++;
+    }
+    return n;
+  };
+  const thenCount = trailing(thenBindings);
+  return thenCount > 0 && thenCount === trailing(elseBindings) ? thenCount : 0;
+}
 
 function computeLastUses(bindings: ANFBinding[]): Map<string, number> {
   const lastUse = new Map<string, number>();
@@ -1940,6 +1970,28 @@ class LoweringContext {
     }
   }
 
+  /** Physically remove the stack slot `depth` places below the top. */
+  private dropSlotAtDepth(depth: number): void {
+    if (depth === 0) {
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+      return;
+    }
+    if (depth === 1) {
+      this.emitOp({ op: 'nip' });
+      this.stackMap.removeAtDepth(1);
+      return;
+    }
+    this.emitOp({ op: 'push', value: BigInt(depth) });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'roll', depth });
+    this.stackMap.pop();
+    const rolled = this.stackMap.removeAtDepth(depth);
+    this.stackMap.push(rolled);
+    this.emitOp({ op: 'drop' });
+    this.stackMap.pop();
+  }
+
   private lowerIf(
     bindingName: string,
     cond: string,
@@ -2072,6 +2124,38 @@ class LoweringContext {
       }
     }
 
+    // Branch-merged locals: trim each arm down to exactly its K result slots.
+    //
+    // 04-anf-lower ends both arms with an identical K-binding block that
+    // rebinds every merged local from a `__merge$<i>` temp (see
+    // `appendMergedLocalResults`). That block leaves the K live values on top
+    // in the same canonical order in both arms — but BENEATH them each arm
+    // still holds whatever its own body produced, and those differ per arm
+    // (the then-arm's rebind of `a`, the else-arm's rebind of `b`), which is
+    // exactly what the N>=2 reconcile further down compares. Everything
+    // beneath the K results is dead: the block copied each merged local before
+    // rebinding it, and a branch-local binding is not visible after the `if`.
+    //
+    // Runs AFTER the phase-2 consumption drops, so both arms have given up the
+    // same parent slots and share one base depth. Measuring the base from the
+    // parent's raw depth instead would be wrong for any arm that consumed a
+    // parent value (`na = bidAmount` rolls `bidAmount` away when the parent has
+    // no later use for it), which is the shape the filed reproducer hits.
+    const mergedResultCount = countMergedLocalResults(thenBindings, elseBindings);
+    if (mergedResultCount >= 2) {
+      const stillHeld = thenCtx.stackMap.namedSlots();
+      let consumedFromParent = 0;
+      for (const name of preIfNames) {
+        if (!stillHeld.has(name) && this.stackMap.has(name)) consumedFromParent++;
+      }
+      const targetDepth = this.stackMap.depth - consumedFromParent + mergedResultCount;
+      for (const ctx of [thenCtx, elseCtx]) {
+        while (ctx.stackMap.depth > targetDepth) {
+          ctx.dropSlotAtDepth(mergedResultCount);
+        }
+      }
+    }
+
     // Phase 3: depth-balance reconciliation after ALL drops.
     //
     // Compensate the FULL depth difference between the branches — NOT just a
@@ -2147,17 +2231,24 @@ class LoweringContext {
     }
 
     // C27: the N>=2 result reconcile below also applies when the else-branch is
-    // PRESENT and BOTH arms wrote the same N mutable fields (e.g. each branch
-    // runs `this.a = ...; this.b = ...`). This is the else-present twin of the
-    // empty-else fix (#99 Bug 1). Without it, lowerIf falls through to
-    // `push(bindingName)` further down — registering ONE stackMap name for N
-    // physical results — so the state serialization emits against the wrong
-    // slot (OP_NUM2BIN on a byte string) and the continuation is unspendable (a
-    // funds-safety bug). Only fire when both arms leave the identical top-N
-    // property names in the identical order, so a single post-ENDIF reconcile
-    // is valid regardless of which branch the spender takes. The single-field
-    // same-property case (N==1, "turn flip") is unaffected — it still takes the
-    // dedicated path below.
+    // PRESENT and BOTH arms wrote the same N names (e.g. each branch runs
+    // `this.a = ...; this.b = ...`, or each rebinds the same N locals). This is
+    // the else-present twin of the empty-else fix (#99 Bug 1). Without it,
+    // lowerIf falls through to `push(bindingName)` further down — registering
+    // ONE stackMap name for N physical results — so the state serialization
+    // emits against the wrong slot (OP_NUM2BIN on a byte string) and the
+    // continuation is unspendable (a funds-safety bug). Only fire when both
+    // arms leave the identical top-N names in the identical order, so a single
+    // post-ENDIF reconcile is valid regardless of which branch the spender
+    // takes. The single-field same-property case (N==1, "turn flip") is
+    // unaffected — it still takes the dedicated path below.
+    //
+    // The names do NOT have to be contract properties. Branch-merged LOCALS
+    // reach here in exactly the same shape: 04-anf-lower appends an explicit
+    // rebind of every merged local to both arms precisely so that this
+    // reconcile can adopt them by name. Requiring `_properties` membership was
+    // what dropped merged locals into the broken single-slot fallback (see
+    // packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts).
     const nResults = thenCtx.stackMap.depth - this.stackMap.depth;
     const elseMatchesThenNResultLayout =
       elseBindings.length > 0 &&
@@ -2165,9 +2256,7 @@ class LoweringContext {
       elseCtx.stackMap.depth - this.stackMap.depth === nResults &&
       Array.from({ length: nResults }).every((_unused, i) => {
         const tn = thenCtx.stackMap.peekAtDepth(i);
-        return tn !== null &&
-          tn === elseCtx.stackMap.peekAtDepth(i) &&
-          this._properties.some(p => p.name === tn);
+        return tn !== null && tn === elseCtx.stackMap.peekAtDepth(i);
       });
 
     // The if expression may produce a result value on top.
