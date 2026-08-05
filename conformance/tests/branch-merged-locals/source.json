@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "../../../examples/ts/branch-merged-locals/BranchMergedLocals.runar.ts",
+    ".runar.sol": "../../../examples/sol/branch-merged-locals/BranchMergedLocals.runar.sol",
+    ".runar.move": "../../../examples/move/branch-merged-locals/BranchMergedLocals.runar.move",
+    ".runar.go": "../../../examples/go/branch-merged-locals/BranchMergedLocals.runar.go",
+    ".runar.rs": "../../../examples/rust/branch-merged-locals/BranchMergedLocals.runar.rs",
+    ".runar.py": "../../../examples/python/branch-merged-locals/BranchMergedLocals.runar.py",
+    ".runar.zig": "../../../examples/zig/branch-merged-locals/BranchMergedLocals.runar.zig",
+    ".runar.rb": "../../../examples/ruby/branch-merged-locals/BranchMergedLocals.runar.rb",
+    ".runar.java": "../../../examples/java/src/main/java/runar/examples/branch-merged-locals/BranchMergedLocals.runar.java"
+  }
+}

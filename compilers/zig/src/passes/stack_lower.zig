@@ -4097,6 +4097,39 @@ const LowerCtx = struct {
             try removeBranchValueAtDepth(&then_ctx, depth);
         }
 
+        // Branch-merged locals: trim each arm down to exactly its K result slots.
+        //
+        // ANF lowering ends both arms with an identical K-binding block that
+        // rebinds every merged local from a `__merge$<i>` temp (see
+        // appendMergedLocalResults). That block leaves the K live values on top
+        // in the same canonical order in both arms — but BENEATH them each arm
+        // still holds whatever its own body produced, and those differ per arm,
+        // which is exactly what the N>=2 reconcile further down compares.
+        // Everything beneath the K results is dead: the block copied each
+        // merged local before rebinding it, and a branch-local binding is not
+        // visible after the `if`.
+        //
+        // Runs AFTER the phase-2 consumption drops, so both arms have given up
+        // the same parent slots and share one base depth.
+        const merged_result_count = countMergedLocalResults(ie.then_bindings, else_bindings);
+        if (merged_result_count >= 2) {
+            var still_held = try then_ctx.stack.namedSlots(self.allocator);
+            defer still_held.deinit(self.allocator);
+            var consumed_from_parent: usize = 0;
+            var merge_it = pre_if_names.iterator();
+            while (merge_it.next()) |entry| {
+                if (!still_held.contains(entry.key_ptr.*) and self.stack.findDepth(entry.key_ptr.*) != null) {
+                    consumed_from_parent += 1;
+                }
+            }
+            const target_depth = self.stack.depth() - consumed_from_parent + merged_result_count;
+            for ([_]*LowerCtx{ &then_ctx, &else_ctx }) |arm_ctx| {
+                while (arm_ctx.stack.depth() > target_depth) {
+                    try removeBranchValueAtDepth(arm_ctx, merged_result_count);
+                }
+            }
+        }
+
         // Phase 3: depth-balance reconciliation after ALL drops (issue #99 Bug 1).
         // Compensate the FULL depth difference between the branches — NOT just a
         // single item. A conditional write of N state fields leaves N result
@@ -4181,17 +4214,6 @@ const LowerCtx = struct {
                 const tn = then_ctx.stack.peekAtDepth(mi);
                 const en = else_ctx.stack.peekAtDepth(mi);
                 if (tn == null or en == null or !std.mem.eql(u8, tn.?, en.?)) {
-                    else_matches_then_n_result_layout = false;
-                    break;
-                }
-                var is_prop = false;
-                for (self.program.properties) |prop| {
-                    if (std.mem.eql(u8, prop.name, tn.?)) {
-                        is_prop = true;
-                        break;
-                    }
-                }
-                if (!is_prop) {
                     else_matches_then_n_result_layout = false;
                     break;
                 }
@@ -4938,6 +4960,49 @@ pub fn methodUsesCodePartFull(
 ) bool {
     return methodUsesCheckPreimage(bindings, methods) and
         (methodUsesCodePart(bindings) or methodReadsVarLenState(bindings, properties, methods));
+}
+
+/// How many branch-merged locals an if-statement's two arms carry as results.
+///
+/// ANF lowering's appendMergedLocalResults ends both arms with the same
+/// K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
+/// merged values sit on top in the same canonical order whichever branch runs.
+/// Counting the trailing block is how stack lowering learns K: it must trim
+/// each arm down to exactly those K slots before the N>=2 reconcile compares
+/// the arms, since everything beneath them is the arm's own (dead, and
+/// arm-specific) working values.
+///
+/// Returns 0 unless BOTH arms end with a block of the same size — anything
+/// else is not a normalised merge and must not be trimmed.
+fn countMergedLocalResults(
+    then_bindings: []const types.ANFBinding,
+    else_bindings: []const types.ANFBinding,
+) usize {
+    const trailing = struct {
+        fn count(bindings: []const types.ANFBinding) usize {
+            var n: usize = 0;
+            var i: usize = bindings.len;
+            while (i > 0) {
+                i -= 1;
+                const value = bindings[i].value;
+                const const_str = switch (value) {
+                    .load_const => |lc| switch (lc.value) {
+                        .string => |str| str,
+                        else => return n,
+                    },
+                    else => return n,
+                };
+                if (!std.mem.startsWith(u8, const_str, "@ref:" ++ types.merged_local_temp_prefix)) {
+                    return n;
+                }
+                n += 1;
+            }
+            return n;
+        }
+    }.count;
+    const then_count = trailing(then_bindings);
+    if (then_count > 0 and then_count == trailing(else_bindings)) return then_count;
+    return 0;
 }
 
 fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.ANFMethod {

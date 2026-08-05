@@ -13,7 +13,88 @@ public final class ScriptUtils {
     private ScriptUtils() {}
 
     /**
-     * Encodes {@code dataHex} as a push-data opcode + payload in hex.
+     * Frames {@code dataHex} as a state-section field: {@code <len><data>}.
+     *
+     * <p>Deliberately NOT the MINIMALDATA push encoding used by
+     * {@link #encodePushData}. The state section is raw data after
+     * {@code OP_RETURN} in the locking script; the interpreter never executes
+     * it, so {@code SCRIPT_VERIFY_MINIMALDATA} — a rule applied to push opcodes
+     * as they are executed — does not reach it. What does read it is the
+     * compiler's on-chain state codec ({@code emitPushDataEncode} in
+     * packages/runar-compiler/src/passes/05-stack-lower.ts), which writes and
+     * parses {@code <len><data>}. Both sides must agree byte for byte or the
+     * continuation hash check fails and the contract is unspendable.
+     *
+     * <p>#110 applied the MINIMALDATA short-circuit here, in all seven SDKs and
+     * none of the seven compilers, so a 1-byte {@code 0x05} state field
+     * serialised off-chain as {@code 55} while the script rebuilt it as
+     * {@code 0105}. Byte-identical with the other six SDKs.
+     */
+    public static String encodePushDataState(String dataHex) {
+        int dataLen = dataHex.length() / 2;
+        if (dataLen <= 75) {
+            return String.format("%02x", dataLen) + dataHex;
+        }
+        if (dataLen <= 0xff) {
+            return "4c" + String.format("%02x", dataLen) + dataHex;
+        }
+        if (dataLen <= 0xffff) {
+            int lo = dataLen & 0xff;
+            int hi = (dataLen >> 8) & 0xff;
+            return "4d" + String.format("%02x%02x", lo, hi) + dataHex;
+        }
+        int b0 = dataLen & 0xff;
+        int b1 = (dataLen >> 8) & 0xff;
+        int b2 = (dataLen >> 16) & 0xff;
+        int b3 = (dataLen >> 24) & 0xff;
+        return "4e" + String.format("%02x%02x%02x%02x", b0, b1, b2, b3) + dataHex;
+    }
+
+    /**
+     * Decodes a state-section field at {@code offset} in hex. Returns
+     * {@code [fieldHex, hexCharsConsumed]}.
+     *
+     * <p>Exact inverse of {@link #encodePushDataState}, and deliberately as
+     * strict as the compiler's on-chain state reader: only
+     * {@code <len><data>} framing is understood. {@code OP_1..OP_16}
+     * (0x51..0x60) and {@code OP_1NEGATE} (0x4f) are NOT decoded as
+     * single-byte values — accepting them would let the SDK read a state
+     * section the contract's own script cannot parse.
+     */
+    public static DecodedPush decodePushDataState(String hex, int offset) {
+        int opcode = Integer.parseInt(hex.substring(offset, offset + 2), 16);
+        if (opcode <= 75) {
+            int dataLen = opcode * 2;
+            return new DecodedPush(hex.substring(offset + 2, offset + 2 + dataLen), 2 + dataLen);
+        }
+        if (opcode == 0x4c) {
+            int length = Integer.parseInt(hex.substring(offset + 2, offset + 4), 16);
+            int dataLen = length * 2;
+            return new DecodedPush(hex.substring(offset + 4, offset + 4 + dataLen), 4 + dataLen);
+        }
+        if (opcode == 0x4d) {
+            int lo = Integer.parseInt(hex.substring(offset + 2, offset + 4), 16);
+            int hi = Integer.parseInt(hex.substring(offset + 4, offset + 6), 16);
+            int length = lo | (hi << 8);
+            int dataLen = length * 2;
+            return new DecodedPush(hex.substring(offset + 6, offset + 6 + dataLen), 6 + dataLen);
+        }
+        if (opcode == 0x4e) {
+            int b0 = Integer.parseInt(hex.substring(offset + 2, offset + 4), 16);
+            int b1 = Integer.parseInt(hex.substring(offset + 4, offset + 6), 16);
+            int b2 = Integer.parseInt(hex.substring(offset + 6, offset + 8), 16);
+            int b3 = Integer.parseInt(hex.substring(offset + 8, offset + 10), 16);
+            int length = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            int dataLen = length * 2;
+            return new DecodedPush(hex.substring(offset + 10, offset + 10 + dataLen), 10 + dataLen);
+        }
+        return new DecodedPush("", 2);
+    }
+
+    /**
+     * Encodes {@code dataHex} as a push-data opcode + payload in hex, for
+     * pushes the interpreter will EXECUTE (unlocking scripts, spliced
+     * constructor args).
      *
      * <p>Applies BSV consensus rule {@code SCRIPT_VERIFY_MINIMALDATA} for
      * single-byte pushes: a 1-byte payload whose value is in

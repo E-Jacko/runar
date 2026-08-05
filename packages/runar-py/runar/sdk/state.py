@@ -254,6 +254,36 @@ def _decode_num2bin(hex_str: str) -> int:
     return -result if negative else result
 
 
+def encode_push_data_state(data_hex: str) -> str:
+    """Frame hex data as a state-section field: ``<len><data>``.
+
+    Deliberately NOT the MINIMALDATA push encoding used by
+    :func:`encode_push_data`. The state section is raw data after ``OP_RETURN``
+    in the locking script; the interpreter never executes it, so
+    ``SCRIPT_VERIFY_MINIMALDATA`` — a rule applied to push opcodes as they are
+    executed — does not reach it. What does read it is the compiler's on-chain
+    state codec (``emitPushDataEncode`` in
+    packages/runar-compiler/src/passes/05-stack-lower.ts), which writes and
+    parses ``<len><data>``. Both sides must agree byte for byte or the
+    continuation hash check fails and the contract is unspendable.
+
+    #110 applied the MINIMALDATA short-circuit here, in all seven SDKs and none
+    of the seven compilers, so a 1-byte ``0x05`` state field serialised
+    off-chain as ``55`` while the script rebuilt it as ``0105``.
+    Byte-identical with the other six SDKs.
+    """
+    data_len = len(data_hex) // 2
+
+    if data_len <= 75:
+        return f'{data_len:02x}' + data_hex
+    elif data_len <= 0xFF:
+        return '4c' + f'{data_len:02x}' + data_hex
+    elif data_len <= 0xFFFF:
+        return '4d' + data_len.to_bytes(2, 'little').hex() + data_hex
+    else:
+        return '4e' + data_len.to_bytes(4, 'little').hex() + data_hex
+
+
 def encode_push_data(data_hex: str) -> str:
     """Wrap hex data in a Bitcoin Script push data opcode.
 
@@ -298,26 +328,20 @@ def decode_push_data(hex_str: str, offset: int) -> tuple[str, int]:
 
     Returns (data_hex, hex_chars_consumed).
 
-    Inverse of ``encode_push_data``'s MINIMALDATA short-circuit:
-    ``OP_1..OP_16`` (0x51..0x60) and ``OP_1NEGATE`` (0x4f) each push a single
-    byte with no separate data bytes in the script — the opcode itself encodes
-    the value (C9). ``OP_0`` (0x00) falls through to the ``opcode <= 75``
-    branch below and correctly decodes as the empty byte array (0-length
-    push), since the encoder no longer emits OP_0 for a 1-byte ``0x00``
-    payload.
+    Exact inverse of :func:`encode_push_data_state`, and deliberately as
+    strict as the compiler's on-chain state reader: only ``<len><data>``
+    framing is understood. ``OP_1..OP_16`` (0x51..0x60) and ``OP_1NEGATE``
+    (0x4f) are NOT decoded as single-byte values — accepting them would let
+    the SDK read a state section the contract's own script cannot parse.
+    ``OP_0`` (0x00) falls through to the ``opcode <= 75`` branch below and
+    correctly decodes as the empty byte array (0-length push).
     """
     if offset >= len(hex_str):
         return '', 0
 
     opcode = int(hex_str[offset:offset + 2], 16)
 
-    if 0x51 <= opcode <= 0x60:
-        # OP_1..OP_16
-        return f'{opcode - 0x50:02x}', 2
-    elif opcode == 0x4F:
-        # OP_1NEGATE
-        return '81', 2
-    elif opcode <= 75:
+    if opcode <= 75:
         data_len = opcode * 2
         return hex_str[offset + 2:offset + 2 + data_len], 2 + data_len
     elif opcode == 0x4C:
@@ -374,7 +398,7 @@ def _encode_state_value(value, field_type: str) -> str:
         hex_val = value if isinstance(value, str) else ''
         if not hex_val:
             return '00'  # OP_0
-        return encode_push_data(hex_val)
+        return encode_push_data_state(hex_val)
 
 
 def _decode_state_value(hex_str: str, offset: int, field_type: str) -> tuple:

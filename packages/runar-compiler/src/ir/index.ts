@@ -61,6 +61,8 @@ export type {
   AddRawOutput,
 } from './anf-ir.js';
 
+export { MERGED_LOCAL_TEMP_PREFIX } from './anf-ir.js';
+
 // Stack IR types
 export type {
   StackProgram,

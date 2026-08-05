@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
+	"strings"
 
 	"github.com/icellan/runar/compilers/go/ir"
 )
@@ -1024,6 +1026,36 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 		appendBranchOutputConcat(elseCtx)
 	}
 
+	// Branch-merged locals (2 or more). An `if` expression carries exactly ONE
+	// value, so the alias trick further down can only rewire post-branch
+	// references for a SINGLE merged local. With two or more — or with the
+	// arms reassigning DIFFERENT locals — every later reference kept naming
+	// the pre-branch binding, i.e. the dead initial value, and stack lowering
+	// then registered one stackMap slot for N physical results and resolved
+	// every later operand one slot off. Reported privately 2026-08-03; see
+	// packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+	//
+	// Fix: give both arms the SAME result set in the SAME order by appending
+	// an explicit rebind of every merged local to each arm.
+	mergedLocals := ctx.collectBranchMergedLocals(thenCtx, elseCtx)
+	if len(mergedLocals) >= 2 {
+		if branchHasOutputs {
+			// The arms' single value is already spoken for: it is the output
+			// concat the continuation hash consumes. Refuse at compile time
+			// rather than emit the unspendable script this used to produce.
+			panic(fmt.Sprintf(
+				"Cannot compile conditional that both declares outputs and merges "+
+					"%d local variables (%s). Move the addOutput/addRawOutput/"+
+					"addDataOutput call after the if-statement, or give each branch "+
+					"its own complete addOutput.",
+				len(mergedLocals), strings.Join(mergedLocals, ", ")))
+		}
+		appendMergedLocalResults(thenCtx, mergedLocals)
+		ctx.syncCounter(thenCtx)
+		appendMergedLocalResults(elseCtx, mergedLocals)
+		ctx.syncCounter(elseCtx)
+	}
+
 	elseBindings := elseCtx.bindings
 	if elseBindings == nil {
 		elseBindings = []ir.ANFBinding{}
@@ -1056,15 +1088,82 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 		}
 	}
 
-	// If both branches end by reassigning the same local variable,
+	// If both branches end by reassigning the same single local variable,
 	// alias that variable to the if-expression result so that subsequent
 	// references resolve to the branch output, not the dead initial value.
-	if len(thenCtx.bindings) > 0 && len(elseCtx.bindings) > 0 {
+	//
+	// Skipped when the arms were normalised above: there the `if` has N
+	// results, not one, and each merged local keeps its OWN name through the
+	// reconcile in the stack lowerer.
+	if len(mergedLocals) < 2 && len(thenCtx.bindings) > 0 && len(elseCtx.bindings) > 0 {
 		thenLast := thenCtx.bindings[len(thenCtx.bindings)-1]
 		elseLast := elseCtx.bindings[len(elseCtx.bindings)-1]
 		if thenLast.Name == elseLast.Name && ctx.isLocal(thenLast.Name) {
 			ctx.setLocalAlias(thenLast.Name, ifName)
 		}
+	}
+}
+
+// collectBranchMergedLocals returns the locals from the enclosing scope that
+// either arm of an if-statement reassigns, in a canonical order both arms can
+// agree on: the then-arm's reassignments in order of last rebind, then the
+// else-only ones in the same order.
+//
+// Only names the PARENT already knows as locals count — subContext copies the
+// local-name set by value, so a local declared inside a branch never reaches
+// the parent's set and is correctly excluded (it is not live after the if).
+func (ctx *lowerCtx) collectBranchMergedLocals(thenCtx, elseCtx *lowerCtx) []string {
+	lastRebindOrder := func(branch *lowerCtx) []string {
+		lastIndex := make(map[string]int)
+		var order []string
+		for i, b := range branch.bindings {
+			if !ctx.isLocal(b.Name) {
+				continue
+			}
+			if _, seen := lastIndex[b.Name]; !seen {
+				order = append(order, b.Name)
+			}
+			lastIndex[b.Name] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool {
+			return lastIndex[order[a]] < lastIndex[order[b]]
+		})
+		return order
+	}
+	merged := lastRebindOrder(thenCtx)
+	for _, name := range lastRebindOrder(elseCtx) {
+		found := false
+		for _, existing := range merged {
+			if existing == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			merged = append(merged, name)
+		}
+	}
+	return merged
+}
+
+// appendMergedLocalResults appends the canonical merged-local result block to
+// one arm of an if-statement: a copy of every merged local, in canonical
+// order, rebound under the local's own name.
+//
+// Two passes on purpose. Pass 1 always COPIES: `@ref:<local>` resolves to the
+// arm's own new value if it rebound one, else to the enclosing scope's value,
+// and either way stack lowering picks (never rolls) it, because a local live
+// after the `if` is outer-protected. Pass 2 always CONSUMES, because the temps
+// are bound in this arm and this is their last use. The arm's stack effect is
+// therefore exactly +K regardless of which of the K locals it reassigned.
+func appendMergedLocalResults(branchCtx *lowerCtx, mergedLocals []string) {
+	for i, name := range mergedLocals {
+		branchCtx.emitNamed(fmt.Sprintf("%s%d", ir.MergedLocalTempPrefix, i),
+			makeLoadConstString("@ref:"+name))
+	}
+	for i, name := range mergedLocals {
+		branchCtx.emitNamed(name,
+			makeLoadConstString(fmt.Sprintf("@ref:%s%d", ir.MergedLocalTempPrefix, i)))
 	}
 }
 

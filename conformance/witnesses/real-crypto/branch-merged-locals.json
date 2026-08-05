@@ -1,0 +1,52 @@
+{
+  "fixture": "branch-merged-locals",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "Branch-merged locals: two locals initialised from state, the arms of an `if` reassigning DIFFERENT ones, both feeding the continuation. Reported privately 2026-08-03. Both arms must produce a spendable continuation carrying the MERGED value, not the dead pre-branch binding — the pre-fix script was rejected outright by the real interpreter on one arm and committed stale state on the other.",
+  "constructorArgs": [
+    "0n",
+    "0n"
+  ],
+  "spends": [
+    {
+      "method": "bid",
+      "args": [
+        "7n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "toFirst>0: then-arm reassigns na, else-arm's nb must be preserved",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "7n",
+        "b": "0n"
+      }
+    },
+    {
+      "method": "bid",
+      "args": [
+        "7n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "toFirst==0: else-arm reassigns nb, then-arm's na must be preserved",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "0n",
+        "b": "7n"
+      }
+    },
+    {
+      "method": "bid",
+      "args": [
+        "7n",
+        "1n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the merged-local result block must still be committed to by hashOutputs",
+      "satoshis": 1000
+    }
+  ]
+}

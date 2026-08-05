@@ -420,7 +420,7 @@ fn encode_state_value(value: &SdkValue, field_type: &str) -> String {
             if hex.is_empty() {
                 "00".to_string() // OP_0
             } else {
-                encode_push_data(hex)
+                encode_push_data_state(hex)
             }
         }
     }
@@ -446,7 +446,38 @@ fn encode_num2bin(n: i64, width: usize) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Wrap a hex-encoded byte string in a Bitcoin Script push data opcode.
+/// Frame a hex-encoded byte string as a state-section field: `<len><data>`.
+///
+/// This is deliberately NOT the MINIMALDATA push encoding used by
+/// `encode_push_data`. The state section is raw data after `OP_RETURN` in the
+/// locking script; the interpreter never executes it, so
+/// `SCRIPT_VERIFY_MINIMALDATA` — a rule applied to push opcodes as they are
+/// executed — does not reach it. What does read it is the compiler's on-chain
+/// state codec (`emitPushDataEncode` in
+/// packages/runar-compiler/src/passes/05-stack-lower.ts), which writes and
+/// parses `<len><data>`. Both sides must agree byte for byte or the
+/// continuation hash check fails and the contract is unspendable.
+///
+/// #110 applied the MINIMALDATA short-circuit here, in all seven SDKs and none
+/// of the seven compilers, so a 1-byte `0x05` state field serialised off-chain
+/// as `55` while the script rebuilt it as `0105`. Byte-identical with the
+/// other six SDKs.
+pub(crate) fn encode_push_data_state(data_hex: &str) -> String {
+    let len = data_hex.len() / 2;
+
+    if len <= 75 {
+        format!("{:02x}{}", len, data_hex)
+    } else if len <= 0xff {
+        format!("4c{:02x}{}", len, data_hex)
+    } else if len <= 0xffff {
+        format!("4d{}{}", to_little_endian_16(len), data_hex)
+    } else {
+        format!("4e{}{}", to_little_endian_32(len as u32), data_hex)
+    }
+}
+
+/// Wrap a hex-encoded byte string in a Bitcoin Script push data opcode, for
+/// pushes the interpreter will EXECUTE (unlocking scripts, spliced ctor args).
 ///
 /// Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
 /// pushes: a 1-byte payload whose value is in `{0x01..=0x10, 0x81}` MUST use
@@ -585,15 +616,16 @@ fn decode_num2bin(hex: &str) -> i64 {
     if negative { -result } else { result }
 }
 
-/// Decode a Bitcoin Script push data at the given hex offset.
-/// Returns the pushed data (hex) and the total number of hex chars consumed.
+/// Decode a state-section field at the given hex offset.
+/// Returns the field data (hex) and the total number of hex chars consumed.
 ///
-/// Inverse of `encode_push_data`'s MINIMALDATA short-circuit: `OP_1..OP_16`
-/// (0x51..=0x60) and `OP_1NEGATE` (0x4f) each push a single byte with no
-/// separate data bytes in the script — the opcode itself encodes the value
-/// (C9). `OP_0` (0x00) falls through to the `opcode <= 75` branch below and
-/// correctly decodes as the empty byte array (0-length push), since the
-/// encoder no longer emits OP_0 for a 1-byte `0x00` payload.
+/// Exact inverse of `encode_push_data_state`, and deliberately as strict as
+/// the compiler's on-chain state reader: only `<len><data>` framing is
+/// understood. `OP_1..OP_16` (0x51..=0x60) and `OP_1NEGATE` (0x4f) are NOT
+/// decoded as single-byte values — accepting them would let the SDK read a
+/// state section the contract's own script cannot parse. `OP_0` (0x00) falls
+/// through to the `opcode <= 75` branch below and correctly decodes as the
+/// empty byte array (0-length push).
 pub(crate) fn decode_push_data(hex: &str, offset: usize) -> (String, usize) {
     if offset + 2 > hex.len() {
         return (String::new(), 2);
@@ -601,13 +633,7 @@ pub(crate) fn decode_push_data(hex: &str, offset: usize) -> (String, usize) {
 
     let opcode = u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap_or(0);
 
-    if (0x51..=0x60).contains(&opcode) {
-        // OP_1..OP_16 — the opcode carries the value; no data bytes follow.
-        (format!("{:02x}", opcode - 0x50), 2)
-    } else if opcode == 0x4f {
-        // OP_1NEGATE — pushes the single byte 0x81.
-        ("81".to_string(), 2)
-    } else if opcode <= 75 {
+    if opcode <= 75 {
         let data_len = opcode as usize * 2;
         let data = if offset + 2 + data_len <= hex.len() {
             hex[offset + 2..offset + 2 + data_len].to_string()

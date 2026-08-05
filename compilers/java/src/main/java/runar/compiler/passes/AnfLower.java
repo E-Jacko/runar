@@ -772,6 +772,38 @@ public final class AnfLower {
                 appendBranchOutputConcat(elseCtx);
             }
 
+            // Branch-merged locals (2 or more). An `if` expression carries
+            // exactly ONE value, so the alias below can only rewire
+            // post-branch references for a SINGLE merged local. With two or
+            // more — or with the arms reassigning DIFFERENT locals — every
+            // later reference kept naming the pre-branch binding, i.e. the dead
+            // initial value, and stack lowering then registered one stack-map
+            // slot for N physical results and resolved every later operand one
+            // slot off. Reported privately 2026-08-03; see
+            // packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+            //
+            // Fix: give both arms the SAME result set in the SAME order by
+            // appending an explicit rebind of every merged local to each arm.
+            List<String> mergedLocals = collectBranchMergedLocals(thenCtx, elseCtx);
+            if (mergedLocals.size() >= 2) {
+                if (branchHasOutputs) {
+                    // The arms' single value is already spoken for: it is the
+                    // output concat the continuation hash consumes. Refuse at
+                    // compile time rather than emit the unspendable script this
+                    // used to produce.
+                    throw new IllegalStateException(
+                        "Cannot compile conditional that both declares outputs and merges "
+                        + mergedLocals.size() + " local variables ("
+                        + String.join(", ", mergedLocals) + "). Move the addOutput/"
+                        + "addRawOutput/addDataOutput call after the if-statement, or give "
+                        + "each branch its own complete addOutput.");
+                }
+                appendMergedLocalResults(thenCtx, mergedLocals);
+                syncCounter(thenCtx);
+                appendMergedLocalResults(elseCtx, mergedLocals);
+                syncCounter(elseCtx);
+            }
+
             String ifName = emit(new If(condRef, thenCtx.bindings, elseCtx.bindings));
 
             if (branchHasOutputs) {
@@ -796,14 +828,79 @@ public final class AnfLower {
                 }
             }
 
-            // If both branches end by reassigning the same local variable,
-            // alias that variable to the if-expression result
-            if (!thenCtx.bindings.isEmpty() && !elseCtx.bindings.isEmpty()) {
+            // If both branches end by reassigning the same SINGLE local
+            // variable, alias that variable to the if-expression result.
+            //
+            // Skipped when the arms were normalised above: there the `if` has N
+            // results, not one, and each merged local keeps its OWN name
+            // through the reconcile in the stack lowerer.
+            if (mergedLocals.size() < 2
+                && !thenCtx.bindings.isEmpty() && !elseCtx.bindings.isEmpty()) {
                 AnfBinding thenLast = thenCtx.bindings.get(thenCtx.bindings.size() - 1);
                 AnfBinding elseLast = elseCtx.bindings.get(elseCtx.bindings.size() - 1);
                 if (thenLast.name().equals(elseLast.name()) && isLocal(thenLast.name())) {
                     setLocalAlias(thenLast.name(), ifName);
                 }
+            }
+        }
+
+        /**
+         * The locals from the enclosing scope that either arm of an
+         * if-statement reassigns, in a canonical order both arms can agree on:
+         * the then-arm's reassignments in order of last rebind, then the
+         * else-only ones in the same order.
+         *
+         * <p>Only names the PARENT already knows as locals count —
+         * {@code subContext} copies the local-name set by value, so a local
+         * declared inside a branch never reaches the parent's set and is
+         * correctly excluded (it is not live after the if).
+         */
+        private List<String> collectBranchMergedLocals(LowerCtx thenCtx, LowerCtx elseCtx) {
+            List<String> merged = new ArrayList<>(lastRebindOrder(thenCtx));
+            for (String name : lastRebindOrder(elseCtx)) {
+                if (!merged.contains(name)) {
+                    merged.add(name);
+                }
+            }
+            return merged;
+        }
+
+        private List<String> lastRebindOrder(LowerCtx branch) {
+            LinkedHashMap<String, Integer> lastIndex = new LinkedHashMap<>();
+            for (int i = 0; i < branch.bindings.size(); i++) {
+                String name = branch.bindings.get(i).name();
+                if (isLocal(name)) {
+                    lastIndex.put(name, i);
+                }
+            }
+            return lastIndex.entrySet().stream()
+                .sorted(java.util.Map.Entry.comparingByValue())
+                .map(java.util.Map.Entry::getKey)
+                .collect(java.util.stream.Collectors.toList());
+        }
+
+        /**
+         * Append the canonical merged-local result block to one arm of an
+         * if-statement: a copy of every merged local, in canonical order,
+         * rebound under the local's own name.
+         *
+         * <p>Two passes on purpose. Pass 1 always COPIES: {@code @ref:<local>}
+         * resolves to the arm's own new value if it rebound one, else to the
+         * enclosing scope's value, and either way stack lowering picks (never
+         * rolls) it, because a local live after the {@code if} is
+         * outer-protected. Pass 2 always CONSUMES, because the temps are bound
+         * in this arm and this is their last use. The arm's stack effect is
+         * therefore exactly +K regardless of which of the K locals it
+         * reassigned.
+         */
+        private void appendMergedLocalResults(LowerCtx branchCtx, List<String> mergedLocals) {
+            for (int i = 0; i < mergedLocals.size(); i++) {
+                branchCtx.emitNamed(AnfValue.MERGED_LOCAL_TEMP_PREFIX + i,
+                    makeLoadConstString("@ref:" + mergedLocals.get(i)));
+            }
+            for (int i = 0; i < mergedLocals.size(); i++) {
+                branchCtx.emitNamed(mergedLocals.get(i),
+                    makeLoadConstString("@ref:" + AnfValue.MERGED_LOCAL_TEMP_PREFIX + i));
             }
         }
 

@@ -19,6 +19,7 @@ from runar_compiler.ir.types import (
     ANFProgram,
     ANFProperty,
     ANFValue,
+    MERGED_LOCAL_TEMP_PREFIX,
     SourceLocation,
 )
 
@@ -374,6 +375,39 @@ def collect_deep_binding_names(bindings: list[ANFBinding]) -> set[str]:
 
     walk(bindings)
     return names
+
+
+def count_merged_local_results(
+    then_bindings: list[ANFBinding], else_bindings: list[ANFBinding]
+) -> int:
+    """How many branch-merged locals an if-statement's two arms carry as results.
+
+    ANF lowering's ``_append_merged_local_results`` ends both arms with the same
+    K-binding block -- ``<local> = @ref:__merge$<i>`` for i in 0..K-1 -- so the
+    merged values sit on top in the same canonical order whichever branch runs.
+    Counting the trailing block is how stack lowering learns K: it must trim
+    each arm down to exactly those K slots before the N>=2 reconcile compares
+    the arms, since everything beneath them is the arm's own (dead, and
+    arm-specific) working values.
+
+    Returns 0 unless BOTH arms end with a block of the same size -- anything
+    else is not a normalised merge and must not be trimmed.
+    """
+    prefix = f"@ref:{MERGED_LOCAL_TEMP_PREFIX}"
+
+    def trailing(bindings: list[ANFBinding]) -> int:
+        n = 0
+        for b in reversed(bindings):
+            v = b.value
+            if v.kind != "load_const" or not isinstance(v.const_string, str):
+                break
+            if not v.const_string.startswith(prefix):
+                break
+            n += 1
+        return n
+
+    then_count = trailing(then_bindings)
+    return then_count if then_count > 0 and then_count == trailing(else_bindings) else 0
 
 
 def collect_refs(value: ANFValue) -> list[str]:
@@ -856,6 +890,25 @@ class _LoweringContext:
                 self.sm.push(picked)
 
         self._track_depth()
+
+    def drop_slot_at_depth(self, depth: int) -> None:
+        """Physically remove the stack slot ``depth`` places below the top."""
+        if depth == 0:
+            self.emit_op(StackOp(op="drop"))
+            self.sm.pop()
+            return
+        if depth == 1:
+            self.emit_op(StackOp(op="nip"))
+            self.sm.remove_at_depth(1)
+            return
+        self.emit_op(StackOp(op="push", value=big_int_push(depth)))
+        self.sm.push("")
+        self.emit_op(StackOp(op="roll", depth=depth))
+        self.sm.pop()
+        rolled = self.sm.remove_at_depth(depth)
+        self.sm.push(rolled)
+        self.emit_op(StackOp(op="drop"))
+        self.sm.pop()
 
     def drain_branch_private_residue(self, pre_if_names: set[str]) -> None:
         """Drain branch-private residue from below TOS at the end of a branch
@@ -1645,6 +1698,32 @@ class _LoweringContext:
                     then_ctx.emit_op(StackOp(op="drop"))
                     then_ctx.sm.pop()
 
+        # Branch-merged locals: trim each arm down to exactly its K result slots.
+        #
+        # ANF lowering ends both arms with an identical K-binding block that
+        # rebinds every merged local from a ``__merge$<i>`` temp (see
+        # _append_merged_local_results). That block leaves the K live values on
+        # top in the same canonical order in both arms — but BENEATH them each
+        # arm still holds whatever its own body produced, and those differ per
+        # arm, which is exactly what the N>=2 reconcile further down compares.
+        # Everything beneath the K results is dead: the block copied each merged
+        # local before rebinding it, and a branch-local binding is not visible
+        # after the ``if``.
+        #
+        # Runs AFTER the phase-2 consumption drops, so both arms have given up
+        # the same parent slots and share one base depth.
+        merged_result_count = count_merged_local_results(then_bindings, else_bindings)
+        if merged_result_count >= 2:
+            still_held = then_ctx.sm.named_slots()
+            consumed_from_parent = sum(
+                1 for name in pre_if_names
+                if name not in still_held and self.sm.has(name)
+            )
+            target_depth = self.sm.depth() - consumed_from_parent + merged_result_count
+            for arm_ctx in (then_ctx, else_ctx):
+                while arm_ctx.sm.depth() > target_depth:
+                    arm_ctx.drop_slot_at_depth(merged_result_count)
+
         # Phase 3: depth-balance reconciliation after ALL drops.
         #
         # Compensate the FULL depth difference between the branches — NOT just a
@@ -1723,7 +1802,6 @@ class _LoweringContext:
             and all(
                 then_ctx.sm.peek_at_depth(i) != ""
                 and then_ctx.sm.peek_at_depth(i) == else_ctx.sm.peek_at_depth(i)
-                and any(p.name == then_ctx.sm.peek_at_depth(i) for p in self.properties)
                 for i in range(n_results)
             )
         )

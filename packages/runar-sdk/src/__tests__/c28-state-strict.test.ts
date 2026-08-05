@@ -159,11 +159,23 @@ describe('C28: well-formed state still round-trips', () => {
     expect(deserializeState(fields, hex)).toEqual(values);
   });
 
-  it('round-trips a 1-byte ByteString that encodes as OP_1..OP_16', () => {
+  it('round-trips a 1-byte ByteString in the OP_1..OP_16 value range', () => {
     const fields = makeFields({ name: 'blob', type: 'ByteString', index: 0 });
     const hex = serializeState(fields, { blob: '05' });
-    expect(hex).toBe('55'); // OP_5, minimal push
+    // <len><data>, matching the compiler's on-chain state codec. NOT the
+    // MINIMALDATA opcode form (OP_5 = '55'): the state section lives after
+    // OP_RETURN and is never executed, and a '55' here is unreadable to the
+    // contract's own script.
+    expect(hex).toBe('0105');
     expect(deserializeState(fields, hex)).toEqual({ blob: '05' });
+  });
+
+  it('rejects an OP_N-framed state field — the on-chain reader cannot parse it', () => {
+    const fields = makeFields({ name: 'blob', type: 'ByteString', index: 0 });
+    // '55' is what pre-fix SDKs wrote for a 1-byte 0x05. On-chain it reads as
+    // a length-85 push, so it must fail closed here too rather than decode to
+    // a plausible-looking '05' the contract can never actually spend.
+    expect(() => deserializeState(fields, '55')).toThrow(/is not a push opcode/);
   });
 
   it('round-trips an empty ByteString', () => {

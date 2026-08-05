@@ -47,6 +47,11 @@ pub const LowerError = error{
     OutOfMemory,
     UnsupportedExpression,
     UnsupportedStatement,
+    /// A conditional both declares outputs and merges two or more locals. The
+    /// arms' single value is already the output concat the continuation hash
+    /// consumes, so the merged-local result block has nowhere to go. Refused
+    /// rather than emitting an unspendable script.
+    MergedLocalsWithBranchOutputs,
 };
 
 /// Lower a type-checked ContractNode AST into an ANFProgram IR.
@@ -1010,6 +1015,31 @@ fn lowerIfStatementFull(ctx: *LowerCtx, condition: Expression, then_body: []cons
         _ = try appendBranchOutputConcat(&else_ctx);
     }
 
+    // Branch-merged locals (2 or more). An `if` expression carries exactly ONE
+    // value, so the alias below can only rewire post-branch references for a
+    // SINGLE merged local. With two or more — or with the arms reassigning
+    // DIFFERENT locals — every later reference kept naming the pre-branch
+    // binding, i.e. the dead initial value, and stack lowering then registered
+    // one stack-map slot for N physical results and resolved every later
+    // operand one slot off. Reported privately 2026-08-03; see
+    // packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+    //
+    // Fix: give both arms the SAME result set in the SAME order by appending an
+    // explicit rebind of every merged local to each arm.
+    const merged_locals = try collectBranchMergedLocals(ctx, &then_ctx, &else_ctx);
+    if (merged_locals.len >= 2) {
+        if (branch_has_outputs) {
+            // The arms' single value is already spoken for: it is the output
+            // concat the continuation hash consumes. Refuse rather than emit
+            // the unspendable script this used to produce.
+            return LowerError.MergedLocalsWithBranchOutputs;
+        }
+        try appendMergedLocalResults(&then_ctx, merged_locals);
+        ctx.syncCounter(&then_ctx);
+        try appendMergedLocalResults(&else_ctx, merged_locals);
+        ctx.syncCounter(&else_ctx);
+    }
+
     const if_val = try ctx.allocator.create(types.ANFIf);
     if_val.* = .{
         .cond = cond_ref,
@@ -1038,8 +1068,11 @@ fn lowerIfStatementFull(ctx: *LowerCtx, condition: Expression, then_body: []cons
         }
     }
 
-    // Alias detection: if both branches end by reassigning same local variable
-    if (if_val.then.len > 0 and if_val.@"else".len > 0) {
+    // Alias detection: if both branches end by reassigning the same SINGLE
+    // local variable. Skipped when the arms were normalised above: there the
+    // `if` has N results, not one, and each merged local keeps its OWN name
+    // through the reconcile in the stack lowerer.
+    if (merged_locals.len < 2 and if_val.then.len > 0 and if_val.@"else".len > 0) {
         const then_last = if_val.then[if_val.then.len - 1];
         const else_last = if_val.@"else"[if_val.@"else".len - 1];
         if (std.mem.eql(u8, then_last.name, else_last.name) and ctx.isLocal(then_last.name)) {
@@ -1767,6 +1800,86 @@ fn makeLoadConstBigInt(decimal: []const u8) ANFValue {
 
 fn makeLoadConstBool(val: bool) ANFValue {
     return .{ .load_const = .{ .value = .{ .boolean = val } } };
+}
+
+/// The locals from the enclosing scope that either arm of an if-statement
+/// reassigns, in a canonical order both arms can agree on: the then-arm's
+/// reassignments in order of last rebind, then the else-only ones in the same
+/// order.
+///
+/// Only names the PARENT already knows as locals count — subContext copies the
+/// local-name set by value, so a local declared inside a branch never reaches
+/// the parent's set and is correctly excluded (it is not live after the if).
+fn collectBranchMergedLocals(
+    ctx: *LowerCtx,
+    then_ctx: *LowerCtx,
+    else_ctx: *LowerCtx,
+) LowerError![]const []const u8 {
+    var merged: std.ArrayListUnmanaged([]const u8) = .empty;
+    for ([_]*LowerCtx{ then_ctx, else_ctx }) |branch| {
+        var arm: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer arm.deinit(ctx.allocator);
+        for (branch.bindings.items) |b| {
+            if (!ctx.isLocal(b.name)) continue;
+            var seen = false;
+            for (arm.items, 0..) |existing, i| {
+                if (std.mem.eql(u8, existing, b.name)) {
+                    // Move to the back: canonical order is last rebind.
+                    _ = arm.orderedRemove(i);
+                    try arm.append(ctx.allocator, b.name);
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try arm.append(ctx.allocator, b.name);
+        }
+        for (arm.items) |name| {
+            var dup = false;
+            for (merged.items) |existing| {
+                if (std.mem.eql(u8, existing, name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) try merged.append(ctx.allocator, name);
+        }
+    }
+    return merged.toOwnedSlice(ctx.allocator);
+}
+
+/// Append the canonical merged-local result block to one arm of an
+/// if-statement: a copy of every merged local, in canonical order, rebound
+/// under the local's own name.
+///
+/// Two passes on purpose. Pass 1 always COPIES: `@ref:<local>` resolves to the
+/// arm's own new value if it rebound one, else to the enclosing scope's value,
+/// and either way stack lowering picks (never rolls) it, because a local live
+/// after the `if` is outer-protected. Pass 2 always CONSUMES, because the temps
+/// are bound in this arm and this is their last use. The arm's stack effect is
+/// therefore exactly +K regardless of which of the K locals it reassigned.
+fn appendMergedLocalResults(branch_ctx: *LowerCtx, merged_locals: []const []const u8) LowerError!void {
+    for (merged_locals, 0..) |name, i| {
+        const temp = try std.fmt.allocPrint(
+            branch_ctx.allocator,
+            "{s}{d}",
+            .{ types.merged_local_temp_prefix, i },
+        );
+        try branch_ctx.emitNamed(temp, makeLoadConstString(
+            branch_ctx.allocator,
+            try refString(branch_ctx.allocator, name),
+        ));
+    }
+    for (merged_locals, 0..) |name, i| {
+        const temp = try std.fmt.allocPrint(
+            branch_ctx.allocator,
+            "{s}{d}",
+            .{ types.merged_local_temp_prefix, i },
+        );
+        try branch_ctx.emitNamed(name, makeLoadConstString(
+            branch_ctx.allocator,
+            try refString(branch_ctx.allocator, temp),
+        ));
+    }
 }
 
 fn makeLoadConstString(allocator: Allocator, val: []const u8) ANFValue {

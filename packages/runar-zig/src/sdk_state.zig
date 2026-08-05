@@ -184,7 +184,62 @@ fn encodeStateValue(
         if (hex.len == 0) {
             return allocator.dupe(u8, "00");
         }
-        return encodePushData(allocator, hex);
+        return encodePushDataState(allocator, hex);
+    }
+}
+
+/// encodePushDataState frames a hex-encoded byte string as a state-section
+/// field: <len><data>.
+///
+/// Deliberately NOT the MINIMALDATA push encoding used by encodePushData. The
+/// state section is raw data after OP_RETURN in the locking script; the
+/// interpreter never executes it, so SCRIPT_VERIFY_MINIMALDATA — a rule
+/// applied to push opcodes as they are executed — does not reach it. What does
+/// read it is the compiler's on-chain state codec (emitPushDataEncode in
+/// packages/runar-compiler/src/passes/05-stack-lower.ts), which writes and
+/// parses <len><data>. Both sides must agree byte for byte or the continuation
+/// hash check fails and the contract is unspendable.
+///
+/// #110 applied the MINIMALDATA short-circuit here, in all seven SDKs and none
+/// of the seven compilers, so a 1-byte 0x05 state field serialised off-chain
+/// as "55" while the script rebuilt it as "0105". Byte-identical with the
+/// other six SDKs.
+pub fn encodePushDataState(allocator: std.mem.Allocator, data_hex: []const u8) ![]u8 {
+    const data_len = data_hex.len / 2;
+
+    if (data_len <= 75) {
+        var result = try allocator.alloc(u8, 2 + data_hex.len);
+        _ = std.fmt.bufPrint(result[0..2], "{x:0>2}", .{data_len}) catch unreachable;
+        @memcpy(result[2..], data_hex);
+        return result;
+    } else if (data_len <= 0xff) {
+        var result = try allocator.alloc(u8, 4 + data_hex.len);
+        @memcpy(result[0..2], "4c");
+        _ = std.fmt.bufPrint(result[2..4], "{x:0>2}", .{data_len}) catch unreachable;
+        @memcpy(result[4..], data_hex);
+        return result;
+    } else if (data_len <= 0xffff) {
+        var result = try allocator.alloc(u8, 6 + data_hex.len);
+        @memcpy(result[0..2], "4d");
+        const lo = data_len & 0xff;
+        const hi = (data_len >> 8) & 0xff;
+        _ = std.fmt.bufPrint(result[2..4], "{x:0>2}", .{lo}) catch unreachable;
+        _ = std.fmt.bufPrint(result[4..6], "{x:0>2}", .{hi}) catch unreachable;
+        @memcpy(result[6..], data_hex);
+        return result;
+    } else {
+        var result = try allocator.alloc(u8, 10 + data_hex.len);
+        @memcpy(result[0..2], "4e");
+        const b0 = data_len & 0xff;
+        const b1 = (data_len >> 8) & 0xff;
+        const b2 = (data_len >> 16) & 0xff;
+        const b3 = (data_len >> 24) & 0xff;
+        _ = std.fmt.bufPrint(result[2..4], "{x:0>2}", .{b0}) catch unreachable;
+        _ = std.fmt.bufPrint(result[4..6], "{x:0>2}", .{b1}) catch unreachable;
+        _ = std.fmt.bufPrint(result[6..8], "{x:0>2}", .{b2}) catch unreachable;
+        _ = std.fmt.bufPrint(result[8..10], "{x:0>2}", .{b3}) catch unreachable;
+        @memcpy(result[10..], data_hex);
+        return result;
     }
 }
 
@@ -440,20 +495,12 @@ const PushDataResult = struct {
     bytes_consumed: usize,
 };
 
-/// Static hex for the single byte each of OP_1..OP_16 pushes. `PushDataResult.data`
-/// is a non-owned slice (normally borrowed from the input hex), and OP_N carries
-/// no data bytes in the script, so the value must come from a static table.
-const OP_N_BYTE_HEX = [16][]const u8{
-    "01", "02", "03", "04", "05", "06", "07", "08",
-    "09", "0a", "0b", "0c", "0d", "0e", "0f", "10",
-};
-
-/// Inverse of `encodePushData`'s MINIMALDATA short-circuit: OP_1..OP_16
-/// (0x51..0x60) and OP_1NEGATE (0x4f) each push a single byte with no separate
-/// data bytes in the script — the opcode itself encodes the value (C9). OP_0
-/// (0x00) falls through to the `opcode <= 75` branch and correctly decodes as
-/// the empty byte array (0-length push), since the encoder no longer emits
-/// OP_0 for a 1-byte 0x00 payload.
+/// Exact inverse of `encodePushDataState`, and deliberately as strict as the
+/// compiler's on-chain state reader: only <len><data> framing is understood.
+/// OP_1..OP_16 (0x51..0x60) and OP_1NEGATE (0x4f) are NOT decoded as
+/// single-byte values — accepting them would let the SDK read a state section
+/// the contract's own script cannot parse. OP_0 (0x00) falls through to the
+/// `opcode <= 75` branch and correctly decodes as the empty byte array.
 pub fn decodePushData(hex: []const u8, offset: usize) PushDataResult {
     if (offset >= hex.len) {
         return .{ .data = "", .bytes_consumed = 0 };
@@ -461,13 +508,7 @@ pub fn decodePushData(hex: []const u8, offset: usize) PushDataResult {
 
     const opcode = hexByteAt(hex, offset) orelse return .{ .data = "", .bytes_consumed = 2 };
 
-    if (opcode >= 0x51 and opcode <= 0x60) {
-        // OP_1..OP_16 — the opcode IS the single-byte value.
-        return .{ .data = OP_N_BYTE_HEX[opcode - 0x51], .bytes_consumed = 2 };
-    } else if (opcode == 0x4f) {
-        // OP_1NEGATE
-        return .{ .data = "81", .bytes_consumed = 2 };
-    } else if (opcode <= 75) {
+    if (opcode <= 75) {
         const data_len = @as(usize, opcode) * 2;
         const start = offset + 2;
         if (start + data_len > hex.len) return .{ .data = "", .bytes_consumed = 2 };
@@ -936,4 +977,83 @@ test "serializeState and deserializeState roundtrip" {
 
     try std.testing.expectEqual(@as(i64, 42), deserialized[0].int);
     try std.testing.expect(deserialized[1].boolean);
+}
+
+// ---------------------------------------------------------------------------
+// The state section is framed <len><data>, never MINIMALDATA.
+//
+// SCRIPT_VERIFY_MINIMALDATA applies to pushes the interpreter EXECUTES —
+// unlocking scripts and spliced constructor args, which encodePushData still
+// handles (see the "encodePushData MINIMALDATA ..." tests above). The state
+// section is raw data after OP_RETURN in the locking script: never executed,
+// never MINIMALDATA-checked, and read back by the compiler's on-chain state
+// codec (emitPushDataEncode in 05-stack-lower.ts), which understands only
+// <len><data>.
+//
+// #110 applied the MINIMALDATA short-circuit to the state serializer in all
+// seven SDKs and none of the seven compilers. A 1-byte 0x05 state field then
+// serialised off-chain as "55" while the script rebuilt it as "0105", so the
+// continuation hash never matched (unspendable), and a contract DEPLOYED with
+// such a value could not be spent at all (the on-chain reader takes 0x55 as a
+// length-85 push).
+// ---------------------------------------------------------------------------
+
+fn expectStateByteStringFraming(payload: []const u8, want: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const fields = &[_]types.StateField{
+        .{ .name = "b", .type_name = "ByteString", .index = 0 },
+    };
+    const values = &[_]types.StateValue{.{ .bytes = payload }};
+    const serialized = try serializeState(allocator, fields, values);
+    defer allocator.free(serialized);
+    try std.testing.expectEqualStrings(want, serialized);
+}
+
+test "state ByteString: OP_N-range single bytes stay direct pushes" {
+    var in_buf: [2]u8 = undefined;
+    var want_buf: [4]u8 = undefined;
+    var n: u8 = 1;
+    while (n <= 0x10) : (n += 1) {
+        _ = std.fmt.bufPrint(&in_buf, "{x:0>2}", .{n}) catch unreachable;
+        _ = std.fmt.bufPrint(&want_buf, "01{x:0>2}", .{n}) catch unreachable;
+        try expectStateByteStringFraming(&in_buf, &want_buf);
+    }
+}
+
+test "state ByteString: 0x81 is not OP_1NEGATE" {
+    try expectStateByteStringFraming("81", "0181");
+}
+
+test "state ByteString: single zero byte is a direct push" {
+    try expectStateByteStringFraming("00", "0100");
+}
+
+test "state ByteString: empty is a zero-length push" {
+    try expectStateByteStringFraming("", "00");
+}
+
+test "state ByteString: values outside the OP_N range are unchanged" {
+    try expectStateByteStringFraming("11", "0111");
+    try expectStateByteStringFraming("0011", "020011");
+}
+
+test "state ByteString: round-trips for every single-byte value" {
+    const allocator = std.testing.allocator;
+    const fields = &[_]types.StateField{
+        .{ .name = "b", .type_name = "ByteString", .index = 0 },
+    };
+    var in_buf: [2]u8 = undefined;
+    var b: u16 = 0;
+    while (b <= 0xff) : (b += 1) {
+        _ = std.fmt.bufPrint(&in_buf, "{x:0>2}", .{@as(u8, @intCast(b))}) catch unreachable;
+        const values = &[_]types.StateValue{.{ .bytes = &in_buf }};
+        const serialized = try serializeState(allocator, fields, values);
+        defer allocator.free(serialized);
+        const decoded = try deserializeState(allocator, fields, serialized);
+        defer {
+            for (decoded) |*v| v.deinit(allocator);
+            allocator.free(decoded);
+        }
+        try std.testing.expectEqualStrings(&in_buf, decoded[0].bytes);
+    }
 }

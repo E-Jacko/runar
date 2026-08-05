@@ -344,6 +344,39 @@ module RunarCompiler::Codegen
   # Helpers
   # -----------------------------------------------------------------------
 
+  # How many branch-merged locals an if-statement's two arms carry as results.
+  #
+  # ANF lowering's _append_merged_local_results ends both arms with the same
+  # K-binding block -- +<local> = @ref:__merge$<i>+ for i in 0..K-1 -- so the
+  # merged values sit on top in the same canonical order whichever branch runs.
+  # Counting the trailing block is how stack lowering learns K: it must trim
+  # each arm down to exactly those K slots before the N>=2 reconcile compares
+  # the arms, since everything beneath them is the arm's own (dead, and
+  # arm-specific) working values.
+  #
+  # Returns 0 unless BOTH arms end with a block of the same size -- anything
+  # else is not a normalised merge and must not be trimmed.
+  #
+  # @param then_bindings [Array<IR::ANFBinding>]
+  # @param else_bindings [Array<IR::ANFBinding>]
+  # @return [Integer]
+  def self.count_merged_local_results(then_bindings, else_bindings)
+    prefix = "@ref:#{RunarCompiler::IR::MERGED_LOCAL_TEMP_PREFIX}"
+    trailing = lambda do |bindings|
+      n = 0
+      bindings.reverse_each do |b|
+        v = b.value
+        break unless v.kind == "load_const" && v.const_string.is_a?(String)
+        break unless v.const_string.start_with?(prefix)
+
+        n += 1
+      end
+      n
+    end
+    then_count = trailing.call(then_bindings)
+    then_count.positive? && then_count == trailing.call(else_bindings) ? then_count : 0
+  end
+
   # @param n [Integer]
   # @return [Hash] PushValue hash for a big integer
   def self.big_int_push(n)
@@ -1092,6 +1125,28 @@ module RunarCompiler::Codegen
     # shallower slot's depth-from-top.
     #
     # @param pre_if_names [Set<String>] parent named slots before the branch
+    # Physically remove the stack slot +depth+ places below the top.
+    def drop_slot_at_depth(depth)
+      if depth == 0
+        emit_op({ op: "drop" })
+        @sm.pop
+        return
+      end
+      if depth == 1
+        emit_op({ op: "nip" })
+        @sm.remove_at_depth(1)
+        return
+      end
+      emit_op({ op: "push", value: RunarCompiler::Codegen.big_int_push(depth) })
+      @sm.push("")
+      emit_op({ op: "roll", depth: depth })
+      @sm.pop
+      rolled = @sm.remove_at_depth(depth)
+      @sm.push(rolled)
+      emit_op({ op: "drop" })
+      @sm.pop
+    end
+
     def drain_branch_private_residue(pre_if_names)
       drain_depths = []
       d = 1
@@ -1962,6 +2017,30 @@ module RunarCompiler::Codegen
         end
       end
 
+      # Branch-merged locals: trim each arm down to exactly its K result slots.
+      #
+      # ANF lowering ends both arms with an identical K-binding block that
+      # rebinds every merged local from a +__merge$<i>+ temp (see
+      # _append_merged_local_results). That block leaves the K live values on
+      # top in the same canonical order in both arms -- but BENEATH them each
+      # arm still holds whatever its own body produced, and those differ per
+      # arm, which is exactly what the N>=2 reconcile further down compares.
+      # Everything beneath the K results is dead: the block copied each merged
+      # local before rebinding it, and a branch-local binding is not visible
+      # after the +if+.
+      #
+      # Runs AFTER the phase-2 consumption drops, so both arms have given up the
+      # same parent slots and share one base depth.
+      merged_result_count = RunarCompiler::Codegen.count_merged_local_results(then_bindings, else_bindings)
+      if merged_result_count >= 2
+        still_held = then_ctx.sm.named_slots
+        consumed_from_parent = pre_if_names.count { |n| !still_held.include?(n) && @sm.has?(n) }
+        target_depth = @sm.depth - consumed_from_parent + merged_result_count
+        [then_ctx, else_ctx].each do |arm_ctx|
+          arm_ctx.drop_slot_at_depth(merged_result_count) while arm_ctx.sm.depth > target_depth
+        end
+      end
+
       # Phase 3: depth-balance reconciliation after ALL drops.
       #
       # Compensate the FULL depth difference between the branches -- NOT just a
@@ -2041,8 +2120,7 @@ module RunarCompiler::Codegen
         (0...n_results).all? { |i|
           tn = then_ctx.sm.peek_at_depth(i)
           !tn.nil? && !tn.empty? &&
-            tn == else_ctx.sm.peek_at_depth(i) &&
-            @properties.any? { |p| p.name == tn }
+            tn == else_ctx.sm.peek_at_depth(i)
         }
 
       # The if expression may produce a result value on top.

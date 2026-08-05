@@ -15,7 +15,7 @@
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue};
+use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue, MERGED_LOCAL_TEMP_PREFIX};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -365,6 +365,44 @@ fn collect_deep_binding_names(bindings: &[ANFBinding]) -> HashSet<String> {
     let mut names = HashSet::new();
     walk(bindings, &mut names);
     names
+}
+
+/// How many branch-merged locals an if-statement's two arms carry as results.
+///
+/// ANF lowering's `append_merged_local_results` ends both arms with the same
+/// K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
+/// merged values sit on top in the same canonical order whichever branch runs.
+/// Counting the trailing block is how stack lowering learns K: it must trim
+/// each arm down to exactly those K slots before the N>=2 reconcile compares
+/// the arms, since everything beneath them is the arm's own (dead, and
+/// arm-specific) working values.
+///
+/// Returns 0 unless BOTH arms end with a block of the same size — anything
+/// else is not a normalised merge and must not be trimmed.
+fn count_merged_local_results(then_bindings: &[ANFBinding], else_bindings: &[ANFBinding]) -> usize {
+    fn trailing(bindings: &[ANFBinding]) -> usize {
+        let prefix = format!("@ref:{}", MERGED_LOCAL_TEMP_PREFIX);
+        let mut n = 0;
+        for b in bindings.iter().rev() {
+            let is_merge_temp = match &b.value {
+                ANFValue::LoadConst { value } => {
+                    value.as_str().is_some_and(|s| s.starts_with(&prefix))
+                }
+                _ => false,
+            };
+            if !is_merge_temp {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+    let then_count = trailing(then_bindings);
+    if then_count > 0 && then_count == trailing(else_bindings) {
+        then_count
+    } else {
+        0
+    }
 }
 
 fn collect_refs(value: &ANFValue) -> Vec<String> {
@@ -961,6 +999,28 @@ impl LoweringContext {
     /// Slots whose name was already in `pre_if_names` are kept — including
     /// duplicates created by reassigning an outer-scope local from inside the
     /// branch. The TOS slot is also kept regardless.
+    /// Physically remove the stack slot `depth` places below the top.
+    fn drop_slot_at_depth(&mut self, depth: usize) {
+        if depth == 0 {
+            self.emit_op(StackOp::Drop);
+            self.sm.pop();
+            return;
+        }
+        if depth == 1 {
+            self.emit_op(StackOp::Nip);
+            self.sm.remove_at_depth(1);
+            return;
+        }
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
+        self.sm.push("");
+        self.emit_op(StackOp::Roll { depth });
+        self.sm.pop();
+        let rolled = self.sm.remove_at_depth(depth);
+        self.sm.push(&rolled);
+        self.emit_op(StackOp::Drop);
+        self.sm.pop();
+    }
+
     fn drain_branch_private_residue(&mut self, pre_if_names: &HashSet<String>) {
         let mut drain_depths: Vec<usize> = Vec::new();
         for d in 1..self.sm.depth() {
@@ -1925,6 +1985,35 @@ impl LoweringContext {
             }
         }
 
+        // Branch-merged locals: trim each arm down to exactly its K result slots.
+        //
+        // ANF lowering ends both arms with an identical K-binding block that
+        // rebinds every merged local from a `__merge$<i>` temp (see
+        // append_merged_local_results). That block leaves the K live values on
+        // top in the same canonical order in both arms — but BENEATH them each
+        // arm still holds whatever its own body produced, and those differ per
+        // arm, which is exactly what the N>=2 reconcile further down compares.
+        // Everything beneath the K results is dead: the block copied each
+        // merged local before rebinding it, and a branch-local binding is not
+        // visible after the `if`.
+        //
+        // Runs AFTER the phase-2 consumption drops, so both arms have given up
+        // the same parent slots and share one base depth.
+        let merged_result_count = count_merged_local_results(then_bindings, else_bindings);
+        if merged_result_count >= 2 {
+            let still_held = then_ctx.sm.named_slots();
+            let consumed_from_parent = pre_if_names
+                .iter()
+                .filter(|name| !still_held.contains(*name) && self.sm.has(name))
+                .count();
+            let target_depth = self.sm.depth() - consumed_from_parent + merged_result_count;
+            for arm_ctx in [&mut then_ctx, &mut else_ctx] {
+                while arm_ctx.sm.depth() > target_depth {
+                    arm_ctx.drop_slot_at_depth(merged_result_count);
+                }
+            }
+        }
+
         // Phase 3: depth-balance reconciliation after ALL drops.
         //
         // Compensate the FULL depth difference between the branches — NOT just a
@@ -2014,7 +2103,6 @@ impl LoweringContext {
                 let tn = then_ctx.sm.peek_at_depth(i);
                 !tn.is_empty()
                     && tn == else_ctx.sm.peek_at_depth(i)
-                    && self.properties.iter().any(|p| p.name == tn)
             });
 
         // The if expression may produce a result value on top.

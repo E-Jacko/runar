@@ -31,7 +31,7 @@ use super::sighash_directive::SIGHASH_DEFAULT;
 use super::side_effect_summary::{
     compute_side_effect_summary, ContinuationShape, SideEffectSummary,
 };
-use crate::ir::{ANFBinding, ANFMethod, ANFParam, ANFProgram, ANFProperty, ANFSyntheticArrayLevel, ANFValue, SourceLocation};
+use crate::ir::{ANFBinding, ANFMethod, ANFParam, ANFProgram, ANFProperty, ANFSyntheticArrayLevel, ANFValue, SourceLocation, MERGED_LOCAL_TEMP_PREFIX};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -1100,16 +1100,54 @@ fn lower_if_statement(
         append_branch_output_concat(&mut else_ctx);
     }
 
+    // Branch-merged locals (2 or more). An `if` expression carries exactly ONE
+    // value, so the alias below can only rewire post-branch references for a
+    // SINGLE merged local. With two or more — or with the arms reassigning
+    // DIFFERENT locals — every later reference kept naming the pre-branch
+    // binding, i.e. the dead initial value, and stack lowering then registered
+    // one stack-map slot for N physical results and resolved every later
+    // operand one slot off. Reported privately 2026-08-03; see
+    // packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts.
+    //
+    // Fix: give both arms the SAME result set in the SAME order by appending
+    // an explicit rebind of every merged local to each arm.
+    let merged_locals = collect_branch_merged_locals(&then_ctx, &else_ctx, ctx);
+    if merged_locals.len() >= 2 {
+        if branch_has_outputs {
+            // The arms' single value is already spoken for: it is the output
+            // concat the continuation hash consumes. Refuse at compile time
+            // rather than emit the unspendable script this used to produce.
+            panic!(
+                "Cannot compile conditional that both declares outputs and merges {} \
+                 local variables ({}). Move the addOutput/addRawOutput/addDataOutput \
+                 call after the if-statement, or give each branch its own complete \
+                 addOutput.",
+                merged_locals.len(),
+                merged_locals.join(", ")
+            );
+        }
+        append_merged_local_results(&mut then_ctx, &merged_locals);
+        ctx.sync_counter(&then_ctx);
+        append_merged_local_results(&mut else_ctx, &merged_locals);
+        ctx.sync_counter(&else_ctx);
+    }
+
     let then_bindings = then_ctx.bindings;
     let else_bindings = else_ctx.bindings;
 
-    // If both branches end by reassigning the same local variable,
+    // If both branches end by reassigning the same single local variable,
     // alias that variable to the if-expression result so that subsequent
     // references resolve to the branch output, not the dead initial value.
+    //
+    // Skipped when the arms were normalised above: there the `if` has N
+    // results, not one, and each merged local keeps its OWN name through the
+    // reconcile in the stack lowerer.
     let then_last = then_bindings.last();
     let else_last = else_bindings.last();
     let alias_local = match (then_last, else_last) {
-        (Some(tl), Some(el)) if tl.name == el.name && ctx.is_local(&tl.name) => {
+        (Some(tl), Some(el))
+            if merged_locals.len() < 2 && tl.name == el.name && ctx.is_local(&tl.name) =>
+        {
             Some(tl.name.clone())
         }
         _ => None,
@@ -1143,6 +1181,76 @@ fn lower_if_statement(
 
     if let Some(local_name) = alias_local {
         ctx.set_local_alias(&local_name, &if_name);
+    }
+}
+
+/// The locals from the enclosing scope that either arm of an if-statement
+/// reassigns, in a canonical order both arms can agree on: the then-arm's
+/// reassignments in order of last rebind, then the else-only ones in the same
+/// order.
+///
+/// Only names the PARENT already knows as locals count — `sub_context` copies
+/// the local-name set by value, so a local declared inside a branch never
+/// reaches the parent's set and is correctly excluded (it is not live after
+/// the if).
+fn collect_branch_merged_locals(
+    then_ctx: &LoweringContext,
+    else_ctx: &LoweringContext,
+    ctx: &LoweringContext,
+) -> Vec<String> {
+    let last_rebind_order = |branch: &LoweringContext| -> Vec<String> {
+        let mut order: Vec<(String, usize)> = Vec::new();
+        for (i, b) in branch.bindings.iter().enumerate() {
+            if !ctx.is_local(&b.name) {
+                continue;
+            }
+            match order.iter_mut().find(|(n, _)| *n == b.name) {
+                Some(entry) => entry.1 = i,
+                None => order.push((b.name.clone(), i)),
+            }
+        }
+        order.sort_by_key(|(_, i)| *i);
+        order.into_iter().map(|(n, _)| n).collect()
+    };
+    let mut merged = last_rebind_order(then_ctx);
+    for name in last_rebind_order(else_ctx) {
+        if !merged.contains(&name) {
+            merged.push(name);
+        }
+    }
+    merged
+}
+
+/// Append the canonical merged-local result block to one arm of an
+/// if-statement: a copy of every merged local, in canonical order, rebound
+/// under the local's own name.
+///
+/// Two passes on purpose. Pass 1 always COPIES: `@ref:<local>` resolves to the
+/// arm's own new value if it rebound one, else to the enclosing scope's value,
+/// and either way stack lowering picks (never rolls) it, because a local live
+/// after the `if` is outer-protected. Pass 2 always CONSUMES, because the
+/// temps are bound in this arm and this is their last use. The arm's stack
+/// effect is therefore exactly +K regardless of which of the K locals it
+/// reassigned.
+fn append_merged_local_results(branch_ctx: &mut LoweringContext, merged_locals: &[String]) {
+    for (i, name) in merged_locals.iter().enumerate() {
+        branch_ctx.emit_named(
+            &format!("{}{}", MERGED_LOCAL_TEMP_PREFIX, i),
+            ANFValue::LoadConst {
+                value: serde_json::Value::String(format!("@ref:{}", name)),
+            },
+        );
+    }
+    for (i, name) in merged_locals.iter().enumerate() {
+        branch_ctx.emit_named(
+            name,
+            ANFValue::LoadConst {
+                value: serde_json::Value::String(format!(
+                    "@ref:{}{}",
+                    MERGED_LOCAL_TEMP_PREFIX, i
+                )),
+            },
+        );
     }
 }
 
