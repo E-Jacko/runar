@@ -170,6 +170,12 @@ const LowerError = error{
     /// constructor argument's placeholder into the locking script, so we fail
     /// loudly instead.
     LoadPropNoConstructorSlot,
+    /// Layer C: after `lowerIf` returns, the parent stackMap must describe the
+    /// physical stack exactly. When it names FEWER slots than the arms left,
+    /// every later operand resolves to the wrong slot — the signature of the
+    /// whole 2026-08 branch/loop miscompile family. Silent until the UTXO is
+    /// already locked, so we fail loudly at compile time instead.
+    BranchResultDepthMismatch,
 };
 
 const LowerCtx = struct {
@@ -4219,6 +4225,46 @@ const LowerCtx = struct {
             const target_depth = self.stack.depth() - consumed_from_parent + merged_result_count;
             for ([_]*LowerCtx{ &then_ctx, &else_ctx }) |arm_ctx| {
                 while (arm_ctx.stack.depth() > target_depth) {
+                    // Layer C (second half) — check the trim's stated premise
+                    // instead of assuming it.
+                    //
+                    // "Everything beneath the K results is dead" is true for
+                    // merged LOCALS: ANF lowering copied each one into a
+                    // __merge$ temp before rebinding, so the slot underneath
+                    // really is a spent working value. It is NOT true for a
+                    // contract PROPERTY written inside the arm. update_prop in a
+                    // branch leaves the new value as an extra slot named after
+                    // the property (the old value is deliberately kept beneath
+                    // for the same-property reconcile), and properties get no
+                    // __merge$ normalisation at all -- merging is a locals-only
+                    // transform. So the arm's property write sits beneath the K
+                    // results and this loop would silently DROP it, leaving the
+                    // stale pre-`if` value in place. The arms still end at equal
+                    // depth and the parent stackMap still names the right slots,
+                    // so neither Layer B nor the depth invariant below can see it
+                    // -- the only symptom is that the emitted script serialises
+                    // the OLD property value while the interpreter serialises the
+                    // new one, which fails the state-continuation hash check and
+                    // locks the UTXO.
+                    //
+                    // Emits no opcodes; it only refuses to emit wrong ones.
+                    if (arm_ctx.stack.peekAtDepth(merged_result_count)) |doomed| {
+                        for (self.program.properties) |prop| {
+                            if (std.mem.eql(u8, prop.name, doomed)) {
+                                std.log.warn(
+                                    "stack lowering: branch result depth mismatch -- an arm of " ++
+                                        "the conditional writes contract property '{s}' AND rebinds " ++
+                                        "{d} branch-merged local(s), but only the locals are carried " ++
+                                        "as results. The property write sits beneath them and would " ++
+                                        "be discarded, so the script would serialise the stale value " ++
+                                        "of '{s}' and the state continuation would be unspendable. " ++
+                                        "binding='{s}'.",
+                                    .{ doomed, merged_result_count, doomed, bind_name },
+                                );
+                                return LowerError.BranchResultDepthMismatch;
+                            }
+                        }
+                    }
                     try removeBranchValueAtDepth(arm_ctx, merged_result_count);
                 }
             }
@@ -4272,6 +4318,14 @@ const LowerCtx = struct {
         then_ctx.owned_push_data.clearRetainingCapacity();
         try self.owned_push_data.appendSlice(self.allocator, else_ctx.owned_push_data.items);
         else_ctx.owned_push_data.clearRetainingCapacity();
+
+        // Physical slots this function drops AFTER OP_ENDIF, while reconciling
+        // the parent stackMap against the arms' results. Counted because the
+        // invariant at the end of lowerIf cannot compare the two depths
+        // directly: the post-ENDIF reconcile legitimately ROLL/DROPs stale slots
+        // out from under the results, so those drops have to be added back
+        // before comparing.
+        var post_endif_drops: usize = 0;
 
         var post_branch_names = try then_ctx.stack.namedSlots(self.allocator);
         defer post_branch_names.deinit(self.allocator);
@@ -4333,6 +4387,7 @@ const LowerCtx = struct {
                     if (self.stack.peekAtDepth(d)) |nm2| {
                         if (std.mem.eql(u8, nm2, name)) {
                             try removeStalePropertyAtDepth(self, d);
+                            post_endif_drops += 1;
                             break;
                         }
                     }
@@ -4358,6 +4413,7 @@ const LowerCtx = struct {
                     if (self.stack.peekAtDepth(d)) |name| {
                         if (std.mem.eql(u8, name, then_top.?)) {
                             try removeStalePropertyAtDepth(self, d);
+                            post_endif_drops += 1;
                             break;
                         }
                     }
@@ -4369,6 +4425,7 @@ const LowerCtx = struct {
                     if (self.stack.peekAtDepth(d)) |name| {
                         if (std.mem.eql(u8, name, then_top.?)) {
                             try removeStalePropertyAtDepth(self, d);
+                            post_endif_drops += 1;
                             break;
                         }
                     }
@@ -4411,6 +4468,45 @@ const LowerCtx = struct {
             // used to fail.
             try self.stack.renameAtDepth(self.allocator, in_place_depth, bind_name);
         }
+
+        // Layer C — branch result-depth invariant.
+        //
+        // The stackMap is the compiler's ONLY model of the stack, so a stackMap
+        // that names FEWER slots than the arms physically left is not detectable
+        // anywhere downstream: every later operand silently resolves N slots
+        // off. That single failure mode produced the whole 2026-08 branch/loop
+        // miscompile family -- wrong-but-accepted state continuations at best,
+        // and scripts the interpreter rejects outright (locked funds) at worst.
+        //
+        // What must hold when lowerIf returns: the parent stackMap describes
+        // exactly the physical stack. Both arms ended at arm_depth (Layer B
+        // above proves they agree), OP_ENDIF changes nothing, and the only
+        // physical effect after it is the post_endif_drops stale-slot drops the
+        // reconcile emitted. So:
+        //
+        //     self.stack.depth() + post_endif_drops == arm_depth
+        //
+        // The naive self.stack.depth() == arm_depth is WRONG -- the reconcile
+        // legitimately ROLL/DROPs stale slots out from under the results, which
+        // is exactly what post_endif_drops counts.
+        //
+        // A failure here is always a codegen bug, never a user error. Emits no
+        // opcodes: byte-neutral by construction. Same genre as Layer B (#99),
+        // added for the same reason.
+        const arm_depth = then_ctx.stack.depth();
+        if (self.stack.depth() + post_endif_drops != arm_depth) {
+            std.log.warn(
+                "stack lowering: branch result depth mismatch -- the parent stack " ++
+                    "model does not describe the physical stack after OP_ENDIF " ++
+                    "(stackMap depth {d} + {d} post-ENDIF drop(s) != arm depth {d}). " ++
+                    "The arms leave more physical slots than the compiler recorded, " ++
+                    "so every later operand would resolve to the wrong slot and the " ++
+                    "script would be wrong or unspendable. binding='{s}'.",
+                .{ self.stack.depth(), post_endif_drops, arm_depth, bind_name },
+            );
+            return LowerError.BranchResultDepthMismatch;
+        }
+
         self.trackDepth();
 
         if (then_ctx.max_depth > self.max_depth) self.max_depth = then_ctx.max_depth;

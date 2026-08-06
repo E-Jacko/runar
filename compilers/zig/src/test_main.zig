@@ -40,6 +40,7 @@ test {
     _ = @import("tests/check_multisig.zig");
     _ = @import("tests/language_constructs.zig");
     _ = @import("tests/frontend.zig");
+    _ = @import("tests/zig_readonly_inference.zig");
     _ = @import("tests/embed_always.zig");
     _ = @import("tests/sighash_codegen.zig");
     _ = @import("tests/sighash_validate_test.zig");

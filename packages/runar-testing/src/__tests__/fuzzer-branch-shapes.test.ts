@@ -448,6 +448,22 @@ describe('IR generator loop shapes: structure', () => {
 // draws a null property-write statement. That is a generator misuse, not a
 // compiler limit: `STATEFUL_BRANCH_SHAPES` is the stateless set plus that one
 // shape.
+//
+// `prop-write-in-arm` is the ONE shape that does not compile, and that is
+// deliberate. An arm that writes a property AND rebinds a merged local carries
+// two result kinds against a single-result `if` node; every tier used to emit
+// an UNSPENDABLE script for it, and since 2026-08-06 every tier REFUSES it via
+// the Layer C branch result-depth invariant. Asserting `success === true` here
+// would be asserting the miscompile back into existence, so the shape is
+// asserted to be REFUSED instead — see
+// packages/runar-testing/src/__tests__/branch-prop-write-with-merged-local-vm.test.ts
+// for the full defect record and
+// packages/runar-compiler/docs/multi-result-branch-node.md for the fix that
+// would make it compile. Move it back into the compiles-clean list in the same
+// change that lands that node.
+const REFUSED_BRANCH_SHAPES: readonly BranchShape[] = ['prop-write-in-arm'];
+const COMPILING_STATEFUL_BRANCH_SHAPES: readonly BranchShape[] =
+  STATEFUL_BRANCH_SHAPES.filter((s) => !REFUSED_BRANCH_SHAPES.includes(s));
 
 describe('IR generator branch shapes: the widened space compiles', () => {
   it.each([...BRANCH_SHAPES])(
@@ -471,7 +487,7 @@ describe('IR generator branch shapes: the widened space compiles', () => {
     },
   );
 
-  it.each([...STATEFUL_BRANCH_SHAPES])(
+  it.each([...COMPILING_STATEFUL_BRANCH_SHAPES])(
     '%s compiles in both folding modes (stateful)',
     (shape) => {
       const contracts = fc.sample(
@@ -489,6 +505,49 @@ describe('IR generator branch shapes: the widened space compiles', () => {
           ).toBe(true);
         }
       }
+    },
+  );
+
+  // The refused shape, pinned from the other side.
+  //
+  // Not every sample of it is refused: when the arm's property write is
+  // rendered dead by a later unconditional write of the same property, or when
+  // `liftBranchUpdateProps` hoists the write out of the arm entirely, the `if`
+  // is left with a single result kind and lowers correctly. So this asserts the
+  // two things that are actually invariant:
+  //
+  //   1. at least one sample IS refused — if that drops to zero, either a tier
+  //      has started accepting the miscompile again or the multi-result branch
+  //      node has landed, and both need a human to look;
+  //   2. every refusal is the branch result-depth invariant and nothing else —
+  //      any other diagnostic would be a different, unexamined bug.
+  it.each([...REFUSED_BRANCH_SHAPES])(
+    '%s is REFUSED, and only for the result-depth reason — see multi-result-branch-node.md',
+    (shape) => {
+      const contracts = fc.sample(
+        arbGeneratedStatefulContractWithShape(shape),
+        { numRuns: 10, seed: SEED },
+      );
+      let refused = 0;
+      for (const c of contracts) {
+        const source = renderTypeScript(c);
+        for (const disableConstantFolding of [false, true]) {
+          const r = compile(source, { fileName: `${c.name}.runar.ts`, disableConstantFolding });
+          if (r.success) continue;
+          refused++;
+          expect(
+            r.diagnostics.map((d) => d.message).join('\n'),
+            `${shape} (fold ${disableConstantFolding ? 'OFF' : 'ON'}) was rejected ` +
+              `for an unexpected reason\n${source}`,
+          ).toMatch(/branch result depth mismatch/i);
+        }
+      }
+      expect(
+        refused,
+        `no sample of ${shape} was refused — either a tier regressed to emitting ` +
+          'the unspendable script, or the multi-result branch node landed and this ' +
+          'shape should move back into the compiles-clean list',
+      ).toBeGreaterThan(0);
     },
   );
 

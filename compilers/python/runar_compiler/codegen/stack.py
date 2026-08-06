@@ -1946,8 +1946,45 @@ class _LoweringContext:
                 if name not in still_held and self.sm.has(name)
             )
             target_depth = self.sm.depth() - consumed_from_parent + merged_result_count
+            property_names = {p.name for p in self.properties}
             for arm_ctx in (then_ctx, else_ctx):
                 while arm_ctx.sm.depth() > target_depth:
+                    # Layer C (second half) — check the trim's stated premise
+                    # instead of assuming it.
+                    #
+                    # "Everything beneath the K results is dead" is true for
+                    # merged LOCALS: ANF lowering copied each one into a
+                    # __merge$ temp before rebinding, so the slot underneath
+                    # really is a spent working value.  It is NOT true for a
+                    # contract PROPERTY written inside the arm.  update_prop in
+                    # a branch leaves the new value as an extra slot named after
+                    # the property (the old value is deliberately kept beneath
+                    # for the same-property reconcile), and properties get no
+                    # __merge$ normalisation at all -- merging is a locals-only
+                    # transform.  So the arm's property write sits beneath the K
+                    # results and this loop would silently DROP it, leaving the
+                    # stale pre-`if` value in place.  The arms still end at
+                    # equal depth and the parent stackMap still names the right
+                    # slots, so neither the branch-balance guard nor the depth
+                    # invariant below can see it -- the only symptom is that the
+                    # emitted script serialises the OLD property value while the
+                    # interpreter serialises the new one, which fails the
+                    # state-continuation hash check and locks the UTXO.
+                    #
+                    # Emits no opcodes; it only refuses to emit wrong ones.
+                    doomed = arm_ctx.sm.peek_at_depth(merged_result_count)
+                    if doomed and doomed in property_names:
+                        raise RuntimeError(
+                            "internal codegen error: branch result depth "
+                            "mismatch — an arm of the conditional writes "
+                            f"contract property {doomed!r} AND rebinds "
+                            f"{merged_result_count} branch-merged local(s), but "
+                            "only the locals are carried as results; the "
+                            "property write sits beneath them and would be "
+                            "discarded, so the script would serialise the stale "
+                            f"value of {doomed!r} and the state continuation "
+                            f"would be unspendable; binding={binding_name!r}"
+                        )
                     arm_ctx.drop_slot_at_depth(merged_result_count)
 
         # Phase 3: depth-balance reconciliation after ALL drops.
@@ -1999,6 +2036,14 @@ class _LoweringContext:
         if else_ops:
             if_op.else_ops = else_ops
         self.emit_op(if_op)
+
+        # Physical slots this method drops AFTER OP_ENDIF, while reconciling the
+        # parent stackMap against the arms' results.  Counted because the
+        # invariant at the end of lower_if cannot compare the two depths
+        # directly: the post-ENDIF reconcile legitimately ROLL/DROPs stale slots
+        # out from under the results, so those drops have to be added back
+        # before comparing.
+        post_endif_drops = 0
 
         # Reconcile parent stackMap: remove items consumed by the branches.
         post_branch_names = then_ctx.sm.named_slots()
@@ -2059,6 +2104,7 @@ class _LoweringContext:
                         self.sm.push(rolled)
                         self.emit_op(StackOp(op="drop"))
                         self.sm.pop()
+                        post_endif_drops += 1
                         break
                     d += 1
         elif then_ctx.sm.depth() > self.sm.depth():
@@ -2083,6 +2129,7 @@ class _LoweringContext:
                             self.sm.push(rolled)
                             self.emit_op(StackOp(op="drop"))
                             self.sm.pop()
+                        post_endif_drops += 1
                         break
             elif (then_top and not is_property and len(else_bindings) == 0
                     and then_top != binding_name and self.sm.has(then_top)):
@@ -2104,6 +2151,7 @@ class _LoweringContext:
                             self.sm.push(rolled)
                             self.emit_op(StackOp(op="drop"))
                             self.sm.pop()
+                        post_endif_drops += 1
                         break
             else:
                 self.sm.push(binding_name)
@@ -2139,6 +2187,44 @@ class _LoweringContext:
             self.sm.rename_at_depth(in_place_depth, binding_name)
         else:
             pass  # Void if — don't push phantom
+
+        # Layer C — branch result-depth invariant.
+        #
+        # The stackMap is the compiler's ONLY model of the stack, so a stackMap
+        # that names FEWER slots than the arms physically left is not detectable
+        # anywhere downstream: every later operand silently resolves N slots
+        # off.  That single failure mode produced the whole 2026-08 branch/loop
+        # miscompile family -- wrong-but-accepted state continuations at best,
+        # and scripts the interpreter rejects outright (locked funds) at worst.
+        #
+        # What must hold when lower_if returns: the parent stackMap describes
+        # exactly the physical stack.  Both arms ended at arm_depth (the
+        # branch-balance guard above proves they agree), OP_ENDIF changes
+        # nothing, and the only physical effect after it is the
+        # post_endif_drops stale-slot drops the reconcile emitted.  So:
+        #
+        #     self.sm.depth() + post_endif_drops == arm_depth
+        #
+        # The naive self.sm.depth() == arm_depth is WRONG -- the reconcile
+        # legitimately ROLL/DROPs stale slots out from under the results, which
+        # is exactly what post_endif_drops counts.
+        #
+        # A failure here is always a codegen bug, never a user error.  Emits no
+        # opcodes: byte-neutral by construction.  Same genre as the
+        # branch-balance guard (#99), added for the same reason.
+        arm_depth = then_ctx.sm.depth()
+        if self.sm.depth() + post_endif_drops != arm_depth:
+            raise RuntimeError(
+                "internal codegen error: branch result depth mismatch — the "
+                "parent stack model does not describe the physical stack after "
+                f"OP_ENDIF (stackMap depth {self.sm.depth()} + "
+                f"{post_endif_drops} post-ENDIF drop(s) != arm depth "
+                f"{arm_depth}); the arms leave "
+                f"{arm_depth - self.sm.depth() - post_endif_drops} more "
+                "physical slot(s) than the compiler recorded, so every later "
+                "operand would resolve to the wrong slot and the script would "
+                f"be wrong or unspendable; binding={binding_name!r}"
+            )
 
         self._track_depth()
 

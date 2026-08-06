@@ -2379,6 +2379,39 @@ class LoweringContext {
       const targetDepth = this.stackMap.depth - consumedFromParent + mergedResultCount;
       for (const ctx of [thenCtx, elseCtx]) {
         while (ctx.stackMap.depth > targetDepth) {
+          // Layer C (second half) — check the trim's stated premise instead of
+          // assuming it.
+          //
+          // "Everything beneath the K results is dead" is true for merged
+          // LOCALS: `appendMergedLocalResults` copied each one into a
+          // `__merge$` temp before rebinding, so the slot underneath really is
+          // a spent working value. It is NOT true for a contract PROPERTY
+          // written inside the arm. `update_prop` in a branch leaves the new
+          // value as an extra slot named after the property (the old value is
+          // deliberately kept beneath for the same-property reconcile), and
+          // properties get no `__merge$` normalisation at all — merging is a
+          // locals-only transform. So the arm's property write sits beneath
+          // the K results and this loop would silently DROP it, leaving the
+          // stale pre-`if` value in place. The arms still end at equal depth
+          // and the parent stackMap still names the right slots, so neither
+          // Layer B nor the depth invariant below can see it — the only
+          // symptom is that the emitted script serialises the OLD property
+          // value while the interpreter serialises the new one, which fails
+          // the state-continuation hash check and locks the UTXO.
+          //
+          // Emits no opcodes; it only refuses to emit wrong ones.
+          const doomed = ctx.stackMap.peekAtDepth(mergedResultCount);
+          if (doomed !== null && this._properties.some((p) => p.name === doomed)) {
+            throw new Error(
+              `Internal codegen error: branch result depth mismatch — an arm of ` +
+              `the conditional writes contract property '${doomed}' AND rebinds ` +
+              `${mergedResultCount} branch-merged local(s), but only the locals are ` +
+              `carried as results. The property write sits beneath them and would ` +
+              `be discarded, so the script would serialise the stale value of ` +
+              `'${doomed}' and the state continuation would be unspendable. ` +
+              `binding='${bindingName}'.`,
+            );
+          }
           ctx.dropSlotAtDepth(mergedResultCount);
         }
       }
@@ -2447,6 +2480,13 @@ class LoweringContext {
       then: thenOps,
       else: elseOps.length > 0 ? elseOps : undefined,
     });
+
+    // Physical slots this method drops AFTER OP_ENDIF, while reconciling the
+    // parent stackMap against the arms' results. Counted because the invariant
+    // at the end of `lowerIf` cannot compare the two depths directly: the
+    // post-ENDIF reconcile legitimately ROLL/DROPs stale slots out from under
+    // the results, so those drops have to be added back before comparing.
+    let postEndifDrops = 0;
 
     // Reconcile parent stackMap: remove items consumed by the branches.
     // Use thenCtx as the reference (both branches must consume the same items).
@@ -2523,6 +2563,7 @@ class LoweringContext {
             this.stackMap.push(rolled);
             this.emitOp({ op: 'drop' });
             this.stackMap.pop();
+            postEndifDrops++;
             break;
           }
         }
@@ -2552,6 +2593,7 @@ class LoweringContext {
               this.emitOp({ op: 'drop' });
               this.stackMap.pop();
             }
+            postEndifDrops++;
             break;
           }
         }
@@ -2578,6 +2620,7 @@ class LoweringContext {
               this.emitOp({ op: 'drop' });
               this.stackMap.pop();
             }
+            postEndifDrops++;
             break;
           }
         }
@@ -2617,6 +2660,45 @@ class LoweringContext {
       // are empty). Don't push a phantom — there is no extra value on the
       // actual stack.
     }
+
+    // Layer C — branch result-depth invariant.
+    //
+    // The stackMap is the compiler's ONLY model of the stack, so a stackMap
+    // that names FEWER slots than the arms physically left is not detectable
+    // anywhere downstream: every later operand silently resolves N slots off.
+    // That single failure mode produced the whole 2026-08 branch/loop
+    // miscompile family — wrong-but-accepted state continuations at best, and
+    // scripts `Spend` rejects outright (locked funds) at worst.
+    //
+    // What must hold when `lowerIf` returns: the parent stackMap describes
+    // exactly the physical stack. Both arms ended at `armDepth` (Layer B above
+    // proves they agree), OP_ENDIF changes nothing, and the only physical
+    // effect after it is the `postEndifDrops` stale-slot drops the reconcile
+    // emitted. So:
+    //
+    //     this.stackMap.depth + postEndifDrops === armDepth
+    //
+    // The naive `this.stackMap.depth === armDepth` is WRONG — the reconcile
+    // legitimately ROLL/DROPs stale slots out from under the results, which is
+    // exactly what `postEndifDrops` counts.
+    //
+    // A failure here is always a codegen bug, never a user error, and is
+    // reported as such. Emits no opcodes: byte-neutral by construction. Same
+    // genre as Layer B (#99), added for the same reason.
+    const armDepth = thenCtx.stackMap.depth;
+    if (this.stackMap.depth + postEndifDrops !== armDepth) {
+      throw new Error(
+        `Internal codegen error: branch result depth mismatch — the parent ` +
+        `stack model does not describe the physical stack after OP_ENDIF ` +
+        `(stackMap depth ${this.stackMap.depth} + ${postEndifDrops} post-ENDIF ` +
+        `drop(s) != arm depth ${armDepth}). The arms leave ` +
+        `${armDepth - this.stackMap.depth - postEndifDrops} more physical slot(s) ` +
+        `than the compiler recorded, so every later operand would resolve to the ` +
+        `wrong slot and the script would be wrong or unspendable. ` +
+        `binding='${bindingName}'.`,
+      );
+    }
+
     this.trackDepth();
 
     // Track max depth from sub-contexts

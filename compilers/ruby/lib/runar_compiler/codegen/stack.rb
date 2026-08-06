@@ -2254,8 +2254,44 @@ module RunarCompiler::Codegen
         still_held = then_ctx.sm.named_slots
         consumed_from_parent = pre_if_names.count { |n| !still_held.include?(n) && @sm.has?(n) }
         target_depth = @sm.depth - consumed_from_parent + merged_result_count
+        property_names = @properties.map(&:name)
         [then_ctx, else_ctx].each do |arm_ctx|
-          arm_ctx.drop_slot_at_depth(merged_result_count) while arm_ctx.sm.depth > target_depth
+          while arm_ctx.sm.depth > target_depth
+            # Layer C (second half) -- check the trim's stated premise instead
+            # of assuming it.
+            #
+            # "Everything beneath the K results is dead" is true for merged
+            # LOCALS: ANF lowering copied each one into a __merge$ temp before
+            # rebinding, so the slot underneath really is a spent working value.
+            # It is NOT true for a contract PROPERTY written inside the arm.
+            # update_prop in a branch leaves the new value as an extra slot
+            # named after the property (the old value is deliberately kept
+            # beneath for the same-property reconcile), and properties get no
+            # __merge$ normalisation at all -- merging is a locals-only
+            # transform. So the arm's property write sits beneath the K results
+            # and this loop would silently DROP it, leaving the stale pre-`if`
+            # value in place. The arms still end at equal depth and the parent
+            # stackMap still names the right slots, so neither the
+            # branch-balance guard nor the depth invariant below can see it --
+            # the only symptom is that the emitted script serialises the OLD
+            # property value while the interpreter serialises the new one, which
+            # fails the state-continuation hash check and locks the UTXO.
+            #
+            # Emits no opcodes; it only refuses to emit wrong ones.
+            doomed = arm_ctx.sm.peek_at_depth(merged_result_count)
+            if !doomed.nil? && !doomed.empty? && property_names.include?(doomed)
+              raise "internal codegen error: branch result depth mismatch -- " \
+                    "an arm of the conditional writes contract property " \
+                    "#{doomed.inspect} AND rebinds #{merged_result_count} " \
+                    "branch-merged local(s), but only the locals are carried " \
+                    "as results; the property write sits beneath them and " \
+                    "would be discarded, so the script would serialise the " \
+                    "stale value of #{doomed.inspect} and the state " \
+                    "continuation would be unspendable; " \
+                    "binding=#{binding_name.inspect}"
+            end
+            arm_ctx.drop_slot_at_depth(merged_result_count)
+          end
         end
       end
 
@@ -2308,6 +2344,13 @@ module RunarCompiler::Codegen
       if_op = { op: "if", then: then_ops }
       if_op[:else_ops] = else_ops if else_ops.any?
       emit_op(if_op)
+
+      # Physical slots this method drops AFTER OP_ENDIF, while reconciling the
+      # parent stackMap against the arms' results. Counted because the invariant
+      # at the end of _lower_if cannot compare the two depths directly: the
+      # post-ENDIF reconcile legitimately ROLL/DROPs stale slots out from under
+      # the results, so those drops have to be added back before comparing.
+      post_endif_drops = 0
 
       # Reconcile parent stackMap
       post_branch_names = then_ctx.sm.named_slots
@@ -2368,6 +2411,7 @@ module RunarCompiler::Codegen
               @sm.push(rolled)
               emit_op({ op: "drop" })
               @sm.pop
+              post_endif_drops += 1
               break
             end
             d += 1
@@ -2396,6 +2440,7 @@ module RunarCompiler::Codegen
               emit_op({ op: "drop" })
               @sm.pop
             end
+            post_endif_drops += 1
             break
           end
         elsif then_top && !is_property && else_bindings.empty? && then_top != binding_name && @sm.has?(then_top)
@@ -2417,6 +2462,7 @@ module RunarCompiler::Codegen
               emit_op({ op: "drop" })
               @sm.pop
             end
+            post_endif_drops += 1
             break
           end
         else
@@ -2456,6 +2502,42 @@ module RunarCompiler::Codegen
           @sm.rename_at_depth(in_place_depth, binding_name)
         end
         # Otherwise a void if -- don't push phantom
+      end
+
+      # Layer C -- branch result-depth invariant.
+      #
+      # The stackMap is the compiler's ONLY model of the stack, so a stackMap
+      # that names FEWER slots than the arms physically left is not detectable
+      # anywhere downstream: every later operand silently resolves N slots off.
+      # That single failure mode produced the whole 2026-08 branch/loop
+      # miscompile family -- wrong-but-accepted state continuations at best, and
+      # scripts the interpreter rejects outright (locked funds) at worst.
+      #
+      # What must hold when _lower_if returns: the parent stackMap describes
+      # exactly the physical stack. Both arms ended at arm_depth (the
+      # branch-balance guard above proves they agree), OP_ENDIF changes nothing,
+      # and the only physical effect after it is the post_endif_drops stale-slot
+      # drops the reconcile emitted. So:
+      #
+      #     @sm.depth + post_endif_drops == arm_depth
+      #
+      # The naive @sm.depth == arm_depth is WRONG -- the reconcile legitimately
+      # ROLL/DROPs stale slots out from under the results, which is exactly what
+      # post_endif_drops counts.
+      #
+      # A failure here is always a codegen bug, never a user error. Emits no
+      # opcodes: byte-neutral by construction. Same genre as the branch-balance
+      # guard (#99), added for the same reason.
+      arm_depth = then_ctx.sm.depth
+      if @sm.depth + post_endif_drops != arm_depth
+        raise "internal codegen error: branch result depth mismatch -- the " \
+              "parent stack model does not describe the physical stack after " \
+              "OP_ENDIF (stackMap depth #{@sm.depth} + #{post_endif_drops} " \
+              "post-ENDIF drop(s) != arm depth #{arm_depth}); the arms leave " \
+              "#{arm_depth - @sm.depth - post_endif_drops} more physical " \
+              "slot(s) than the compiler recorded, so every later operand " \
+              "would resolve to the wrong slot and the script would be wrong " \
+              "or unspendable; binding=#{binding_name.inspect}"
       end
 
       _track_depth

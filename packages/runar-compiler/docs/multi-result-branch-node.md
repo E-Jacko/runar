@@ -239,3 +239,51 @@ The concrete next action is (a): add the depth invariant to `lowerIf` in all
 seven tiers, verify byte-neutrality by the usual sweep, and let it turn P7 —
 and any future member of this family — into a compile error instead of a locked
 UTXO.
+
+---
+
+## 9. Outcome of acting on §7(a) — 2026-08-06
+
+§7(a) (the `stackMap`-vs-physical-depth invariant) **landed in all seven
+tiers**. §2 (the multi-result node) **did not**. What the attempt measured:
+
+**The invariant needs TWO halves, not one.** The depth form this note proposed
+catches P7 only at K=1. At K>=2 the depths stay *consistent* — the merged-local
+trim quietly drops the arm's property write on its "everything beneath the K
+results is dead" premise, which is false for a property (properties get no
+`__merge$` normalisation). So the trim's premise is now checked directly,
+beside the depth comparison. Both are pure asserts; neither emits an opcode.
+
+**P7 has a third sub-shape, and it is still open.** When the written property is
+READ AGAIN after the `if`, the arm's slots are *reordered* rather than
+*miscounted*: the arm leaves `[ ..., p(new), local(new) ]` while the parent
+models `[ ..., local, <if> ]`. Depths agree exactly; only the LAYOUT is wrong.
+Neither half of the invariant can see it, and it still compiles to an
+unspendable script. Pinned as case `E` in
+`packages/runar-testing/src/__tests__/branch-prop-write-with-merged-local-vm.test.ts`.
+
+**A layout invariant does catch it, and cannot be landed as-is.** "The parent
+stack model must equal the arms' model minus the result slots" was prototyped
+and measured against the full suite: **37 failures across 18 files**, all
+legitimate. The K=1 alias rebind deliberately moves the local's slot to the top
+and repairs the naming *afterwards*, so parent and arm layouts differ by design
+there. Separating the two means re-deriving what the reconcile intended — which
+is §2 itself. That is a second, independent argument for §2, on top of P7.
+
+**§3's blast radius re-measured and confirmed:** 70 `expected-ir.json` + 70
+`expected-script.hex` goldens; exactly 4 fixtures carry `__merge$` blocks
+(`branch-merged-locals`, `merge-locals-prop-updates`, `merge-locals-shapes`,
+`loop-if-merged-locals`); exactly 2 carry an `update_prop` inside an `if` arm
+(`cond-write-multi-field`, `branched-readonly-len`); the seven SDK ANF
+interpreters run 1038–3421 lines each.
+
+**Byte neutrality of (a), measured not assumed:** conformance **630/630 in both
+fold modes**, full TS suite **8750 passed / 194 skipped / 0 failed**, and every
+tier's own suite green. The seven diffs are pure insertions apart from two
+semantically-identical restructures (Ruby's `while` modifier becomes a block;
+Java's `rebalanceDuplicate` returns its drop count).
+
+**Containment, not a fix.** The two caught sub-shapes are now *refused* at
+compile time. The source is legal Rúnar; a correct compiler accepts it. The
+workaround is the one `merge-locals-prop-updates` already uses — write the
+property AFTER the `if`.

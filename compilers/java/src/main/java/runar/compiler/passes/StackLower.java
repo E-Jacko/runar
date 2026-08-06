@@ -2439,6 +2439,46 @@ public final class StackLower {
                 int targetDepth = sm.depth() - consumedFromParent + mergedResultCount;
                 for (LoweringContext armCtx : List.of(thenCtx, elseCtx)) {
                     while (armCtx.sm.depth() > targetDepth) {
+                        // Layer C (second half) — check the trim's stated
+                        // premise instead of assuming it.
+                        //
+                        // "Everything beneath the K results is dead" is true for
+                        // merged LOCALS: ANF lowering copied each one into a
+                        // __merge$ temp before rebinding, so the slot underneath
+                        // really is a spent working value. It is NOT true for a
+                        // contract PROPERTY written inside the arm. update_prop
+                        // in a branch leaves the new value as an extra slot
+                        // named after the property (the old value is
+                        // deliberately kept beneath for the same-property
+                        // reconcile), and properties get no __merge$
+                        // normalisation at all — merging is a locals-only
+                        // transform. So the arm's property write sits beneath
+                        // the K results and this loop would silently DROP it,
+                        // leaving the stale pre-`if` value in place. The arms
+                        // still end at equal depth and the parent stackMap still
+                        // names the right slots, so neither the branch-balance
+                        // guard nor the depth invariant below can see it — the
+                        // only symptom is that the emitted script serialises the
+                        // OLD property value while the interpreter serialises
+                        // the new one, which fails the state-continuation hash
+                        // check and locks the UTXO.
+                        //
+                        // Emits no opcodes; it only refuses to emit wrong ones.
+                        String doomed = armCtx.sm.peekAtDepth(mergedResultCount);
+                        if (doomed != null && !doomed.isEmpty()) {
+                            for (AnfProperty p : properties) {
+                                if (p.name().equals(doomed)) {
+                                    throw new IllegalStateException(
+                                        "Internal codegen error: branch result depth mismatch — an arm of "
+                                        + "the conditional writes contract property '" + doomed + "' AND "
+                                        + "rebinds " + mergedResultCount + " branch-merged local(s), but only "
+                                        + "the locals are carried as results. The property write sits beneath "
+                                        + "them and would be discarded, so the script would serialise the "
+                                        + "stale value of '" + doomed + "' and the state continuation would be "
+                                        + "unspendable. binding='" + bindingName + "'.");
+                                }
+                            }
+                        }
                         armCtx.dropSlotAtDepth(mergedResultCount);
                     }
                 }
@@ -2505,6 +2545,14 @@ public final class StackLower {
                 ifOp = new IfOp(thenCtx.ops);
             }
             emitOp(ifOp);
+
+            // Physical slots this method drops AFTER OP_ENDIF, while
+            // reconciling the parent stackMap against the arms' results.
+            // Counted because the invariant at the end of lowerIf cannot compare
+            // the two depths directly: the post-ENDIF reconcile legitimately
+            // ROLL/DROPs stale slots out from under the results, so those drops
+            // have to be added back before comparing.
+            int postEndifDrops = 0;
 
             // Reconcile parent stackMap with consumed names in both branches.
             Set<String> postBranchNames = thenCtx.sm.namedSlots();
@@ -2573,6 +2621,7 @@ public final class StackLower {
                             sm.push(rolled);
                             emitOp(new DropOp());
                             sm.pop();
+                            postEndifDrops++;
                             break;
                         }
                     }
@@ -2585,11 +2634,11 @@ public final class StackLower {
                 if (isProperty && thenTop != null && !thenTop.isEmpty() && thenTop.equals(elseTop)
                     && !thenTop.equals(bindingName) && sm.has(thenTop)) {
                     sm.push(thenTop);
-                    rebalanceDuplicate(thenTop);
+                    postEndifDrops += rebalanceDuplicate(thenTop);
                 } else if (thenTop != null && !thenTop.isEmpty() && !isProperty
                     && elseB.isEmpty() && !thenTop.equals(bindingName) && sm.has(thenTop)) {
                     sm.push(thenTop);
-                    rebalanceDuplicate(thenTop);
+                    postEndifDrops += rebalanceDuplicate(thenTop);
                 } else {
                     sm.push(bindingName);
                 }
@@ -2626,13 +2675,53 @@ public final class StackLower {
                 // Otherwise a void if — don't push a phantom.
             }
 
+            // Layer C — branch result-depth invariant.
+            //
+            // The stackMap is the compiler's ONLY model of the stack, so a
+            // stackMap that names FEWER slots than the arms physically left is
+            // not detectable anywhere downstream: every later operand silently
+            // resolves N slots off. That single failure mode produced the whole
+            // 2026-08 branch/loop miscompile family — wrong-but-accepted state
+            // continuations at best, and scripts the interpreter rejects
+            // outright (locked funds) at worst.
+            //
+            // What must hold when lowerIf returns: the parent stackMap describes
+            // exactly the physical stack. Both arms ended at armDepth (the
+            // branch-balance guard above proves they agree), OP_ENDIF changes
+            // nothing, and the only physical effect after it is the
+            // postEndifDrops stale-slot drops the reconcile emitted. So:
+            //
+            //     sm.depth() + postEndifDrops == armDepth
+            //
+            // The naive sm.depth() == armDepth is WRONG — the reconcile
+            // legitimately ROLL/DROPs stale slots out from under the results,
+            // which is exactly what postEndifDrops counts.
+            //
+            // A failure here is always a codegen bug, never a user error. Emits
+            // no opcodes: byte-neutral by construction. Same genre as the
+            // branch-balance guard (#99), added for the same reason.
+            int armDepth = thenCtx.sm.depth();
+            if (sm.depth() + postEndifDrops != armDepth) {
+                throw new IllegalStateException(
+                    "Internal codegen error: branch result depth mismatch — the parent stack "
+                    + "model does not describe the physical stack after OP_ENDIF (stackMap depth "
+                    + sm.depth() + " + " + postEndifDrops + " post-ENDIF drop(s) != arm depth "
+                    + armDepth + "). The arms leave " + (armDepth - sm.depth() - postEndifDrops)
+                    + " more physical slot(s) than the compiler recorded, so every later operand "
+                    + "would resolve to the wrong slot and the script would be wrong or "
+                    + "unspendable. binding='" + bindingName + "'.");
+            }
+
             trackDepth();
 
             if (thenCtx.maxDepth > maxDepth) maxDepth = thenCtx.maxDepth;
             if (elseCtx.maxDepth > maxDepth) maxDepth = elseCtx.maxDepth;
         }
 
-        private void rebalanceDuplicate(String name) {
+        /** Drops the stale duplicate of {@code name}; returns the number of
+         *  physical slots removed (0 or 1) so lowerIf can count post-ENDIF
+         *  drops for its result-depth invariant. */
+        private int rebalanceDuplicate(String name) {
             for (int d = 1; d < sm.depth(); d++) {
                 if (name.equals(sm.peekAtDepth(d))) {
                     if (d == 1) {
@@ -2648,9 +2737,10 @@ public final class StackLower {
                         emitOp(new DropOp());
                         sm.pop();
                     }
-                    break;
+                    return 1;
                 }
             }
+            return 0;
         }
 
         private static void dropAtDepth(LoweringContext ctx, int depth) {
