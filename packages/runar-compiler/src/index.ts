@@ -42,6 +42,15 @@ export {
   emitEcModReduce, emitEcEncodeCompressed, emitEcMakePoint,
   emitEcPointX, emitEcPointY,
 } from './passes/ec-codegen.js';
+// NIST P-256 / P-384 emitters, exported for the same reason: the interpreter
+// MOCKED these primitives, so nothing ever executed their emitted script and
+// both `pNNNAdd(P, P)` and `pNNNMul(P, 2)` were wrong.
+export {
+  emitP256Add, emitP256Mul, emitP256MulGen, emitP256Negate, emitP256OnCurve,
+  emitP256EncodeCompressed,
+  emitP384Add, emitP384Mul, emitP384MulGen, emitP384Negate, emitP384OnCurve,
+  emitP384EncodeCompressed,
+} from './passes/p256-p384-codegen.js';
 export {
   emitCheckPreimageBinding,
   emitCheckPreimageBindingRaw,

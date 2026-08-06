@@ -314,7 +314,7 @@ fn test_blake3_hash_op_count_golden() {
 #[test]
 fn test_p256_add_op_count_golden() {
     let ops = collect(|s| emit_p256_add(s));
-    assert_eq!(ops.len(), 6505, "p256_add op count drift");
+    assert_eq!(ops.len(), 6642, "p256_add op count drift");
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn test_verify_ecdsa_p256_op_count_golden() {
     let ops = collect(|s| emit_verify_ecdsa_p256(s));
     // Rust emits 8 fewer raw StackOps than Python/Java peers (a verify
     // computes two mul/mul_gen invocations × the 4-op divergence).
-    assert_eq!(ops.len(), 163581, "verify_ecdsa_p256 op count drift");
+    assert_eq!(ops.len(), 163718, "verify_ecdsa_p256 op count drift");
 }
 
 // -- P-384 -----------------------------------------------------------------
@@ -364,7 +364,7 @@ fn test_verify_ecdsa_p256_op_count_golden() {
 #[test]
 fn test_p384_add_op_count_golden() {
     let ops = collect(|s| emit_p384_add(s));
-    assert_eq!(ops.len(), 11311, "p384_add op count drift");
+    assert_eq!(ops.len(), 11448, "p384_add op count drift");
 }
 
 #[test]

@@ -548,8 +548,18 @@ function jacobianToAffine(t: ECTracker, rxName: string, ryName: string): void {
  */
 function buildJacobianAddAffineInline(e: (op: StackOp) => void, t: ECTracker): void {
   // Create inner tracker with cloned stack state
-  const it = new ECTracker([...t.nm], e);
+  jacobianAddAffineBody(new ECTracker([...t.nm], e), false);
+}
 
+/**
+ * The mixed-add itself, emitting through an ECTracker the caller owns.
+ *
+ * `keepHR` additionally leaves copies of H and R on the stack. They are the
+ * exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when
+ * the Jacobian accumulator is the same curve point as the affine operand, the
+ * one case these formulas cannot compute (see buildJacobianAddOrDoubleInline).
+ */
+function jacobianAddAffineBody(it: ECTracker, keepHR: boolean): void {
   // Save copies of values that get consumed but are needed later
   it.copyToTop('jz', '_jz_for_z1cu');   // consumed by Z1sq, needed for Z1cu
   it.copyToTop('jz', '_jz_for_z3');     // needed for Z3
@@ -576,6 +586,11 @@ function buildJacobianAddAffineInline(e: (op: StackOp) => void, t: ECTracker): v
 
   // R = S2 - jy
   fieldSub(it, '_S2', 'jy', '_R');
+
+  if (keepHR) {
+    it.copyToTop('_H', '_H_keep');
+    it.copyToTop('_R', '_R_keep');
+  }
 
   // Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
   it.copyToTop('_H', '_H_for_h3');
@@ -618,6 +633,108 @@ function buildJacobianAddAffineInline(e: (op: StackOp) => void, t: ECTracker): v
   it.toTop('_X3'); it.rename('jx');
   it.toTop('_Y3'); it.rename('jy');
   it.toTop('_Z3'); it.rename('jz');
+}
+
+/**
+ * Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+ * Same shape as the numerator/denominator select in affineAdd, so both paths
+ * emit the identical op sequence and the tracker's static stack model holds.
+ * Consumes addName, dblName and condName.
+ */
+function selectCoord(t: ECTracker, addName: string, dblName: string, condName: string, resultName: string): void {
+  t.copyToTop(addName, '_sel_add_c');
+  fieldSub(t, dblName, '_sel_add_c', '_sel_diff');
+  fieldMul(t, '_sel_diff', condName, '_sel_scaled');
+  fieldAdd(t, addName, '_sel_scaled', resultName);
+}
+
+/**
+ * The ladder's LAST conditional step: mixed-add, but correct when the
+ * accumulator already equals the point being added.
+ *
+ * The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+ * two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+ * infinity — and since fieldInv is Fermat (inv(0) = 0), jacobianToAffine turns
+ * that into the ALL-ZERO point instead of 2P. `ecMul(P, 2n)` and
+ * `ecMulGen(2n)` returned 64 zero bytes.
+ *
+ * WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+ * c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+ * (c_i - 1)*P. Every curve here has cofactor 1, so P has order n and the
+ * degenerate cases are exactly c_i ≡ 2 (mod n) — accumulator == P — and
+ * c_i ≡ 0 or 1 (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS
+ * interval determined only by i, so this is decidable by interval arithmetic
+ * rather than by sampling, and over the whole domain k ∈ [0, n-1] only two
+ * steps qualify, both at i = 0:
+ *
+ *   k = 2  ->  c_0 = 3n+2 ≡ 2, odd, so the add runs: accumulator == P.  <- bug
+ *   k = 0  ->  c_0 = 3n   ≡ 0, odd, so the add runs: accumulator == -P,
+ *              true result the point at infinity, which affine coordinates
+ *              cannot represent; it stays the all-zero point, as before.
+ *
+ * At i ≥ 1, c_i lies in [(3n+1)>>i, (4n-1)>>i], which contains no value
+ * ≡ 0, 1 or 2 (mod n) that is also odd — c_256 = 2 is even, so no add runs.
+ * Handling H == 0 at every one of the 257 steps would cost ~62% more script
+ * bytes; handling it here costs 0.24%.
+ *
+ * This is NOT a "no honest input hits it" argument: the operand P is caller-
+ * supplied and cannot move the exception, because the condition depends only
+ * on c_i mod ord(P) and ord(P) = n for every point on the curve. A point that
+ * is NOT on the curve has no such guarantee — but nor does any other part of
+ * this codegen; callers who accept untrusted points must gate them on
+ * `ecOnCurve` first.
+ *
+ * Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+ */
+function buildJacobianAddOrDoubleInline(e: (op: StackOp) => void, t: ECTracker): void {
+  const it = new ECTracker([...t.nm], e);
+
+  // Keep the pre-add accumulator: it is what must be DOUBLED in the
+  // exceptional case, and the add below consumes jx/jy/jz.
+  it.copyToTop('jx', '_sx');
+  it.copyToTop('jy', '_sy');
+  it.copyToTop('jz', '_sz');
+
+  jacobianAddAffineBody(it, true);
+
+  // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+  // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+  // signals the point at infinity.
+  it.toTop('_H_keep');
+  it.pushInt('_zero_h', 0n);
+  it.rawBlock(['_H_keep', '_zero_h'], '_h_is0', (e2) => {
+    e2({ op: 'opcode', code: 'OP_NUMEQUAL' });
+  });
+  it.toTop('_R_keep');
+  it.pushInt('_zero_r', 0n);
+  it.rawBlock(['_R_keep', '_zero_r'], '_r_is0', (e2) => {
+    e2({ op: 'opcode', code: 'OP_NUMEQUAL' });
+  });
+  it.toTop('_h_is0');
+  it.toTop('_r_is0');
+  it.rawBlock(['_h_is0', '_r_is0'], '_cond', (e2) => {
+    e2({ op: 'opcode', code: 'OP_BOOLAND' });
+  });
+
+  // Move the add result aside so jacobianDouble can work on jx/jy/jz again,
+  // this time holding the saved accumulator.
+  it.toTop('jx'); it.rename('_add_x');
+  it.toTop('jy'); it.rename('_add_y');
+  it.toTop('jz'); it.rename('_add_z');
+  it.toTop('_sx'); it.rename('jx');
+  it.toTop('_sy'); it.rename('jy');
+  it.toTop('_sz'); it.rename('jz');
+  jacobianDouble(it);
+  it.toTop('jx'); it.rename('_dbl_x');
+  it.toTop('jy'); it.rename('_dbl_y');
+  it.toTop('jz'); it.rename('_dbl_z');
+
+  it.copyToTop('_cond', '_cond_x');
+  selectCoord(it, '_add_x', '_dbl_x', '_cond_x', 'jx');
+  it.copyToTop('_cond', '_cond_y');
+  selectCoord(it, '_add_y', '_dbl_y', '_cond_y', 'jy');
+  it.toTop('_cond'); it.rename('_cond_z');
+  selectCoord(it, '_add_z', '_dbl_z', '_cond_z', 'jz');
 }
 
 // ===========================================================================
@@ -706,7 +823,10 @@ export function emitEcMul(emit: (op: StackOp) => void): void {
     t.nm.pop(); // _bit consumed by IF
     const addOps: StackOp[] = [];
     const addEmit = (op: StackOp) => addOps.push(op);
-    buildJacobianAddAffineInline(addEmit, t);
+    // Only the final step can be handed two equal operands — see
+    // buildJacobianAddOrDoubleInline for why, and for what it costs not to.
+    if (bit === 0) buildJacobianAddOrDoubleInline(addEmit, t);
+    else buildJacobianAddAffineInline(addEmit, t);
     emit({ op: 'if', then: addOps, else: [] });
   }
 

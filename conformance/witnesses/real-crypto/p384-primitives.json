@@ -1,0 +1,34 @@
+{
+  "fixture": "p384-primitives",
+  "kind": "stateless-signed",
+  "note": "P-384 point arithmetic needs no signature, so the fixture's ACTUAL compiled locking script runs on @bsv/sdk's Spend engine with concrete points. Every expected point is OpenSSL's (crypto.createECDH('secp384r1') with the scalar as private key), NOT compiler output. The k=2 and P+P spends are the two defects fixed here: p384Mul(G,2n) returned 96 zero bytes and p384Add(G,G) returned a wrong point.",
+  "constructorArgs": {
+    "expectedPoint": "0x08d999057ba3d2d969260045c55b97f089025959a6f434d651d207d19fb96e9e4fe0e86ebe0e64f85b96a9c75295df618e80f1fa5b1b3cedb7bfe8dffd6dba74b275d875bc6cc43e904e505f256ab4255ffd43e94d39e22d61501e700a940e80"
+  },
+  "spends": [
+    {
+      "method": "verify",
+      "args": ["2n", "0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"],
+      "expect": "accept",
+      "note": "p384Mul(G, 2) == 2G — the scalar that returned the all-zero point"
+    },
+    {
+      "method": "verifyMulGen",
+      "args": ["2n"],
+      "expect": "accept",
+      "note": "p384MulGen(2) == 2G — same ladder, generator entry point"
+    },
+    {
+      "method": "verifyAdd",
+      "args": ["0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f", "0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"],
+      "expect": "accept",
+      "note": "p384Add(G, G) == 2G — the affine doubling case that returned a wrong point"
+    },
+    {
+      "method": "verify",
+      "args": ["3n", "0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"],
+      "expect": "reject",
+      "note": "p384Mul(G, 3) == 3G != the committed 2G — proves the accepts are not vacuous"
+    }
+  ]
+}

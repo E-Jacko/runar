@@ -705,14 +705,66 @@ fn groupInv(t: *NistTracker, a_name: []const u8, exp_be: []const u8, n_be: []con
 // Affine point addition (for use in ECDSA and addition operations)
 // ===========================================================================
 
+/// Affine point addition.
+///
+/// The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+/// denominator is zero and the correct slope is the TANGENT, (3px^2 + a)/(2py)
+/// — and a = -3 on both NIST curves, so the numerator is 3px^2 - 3. The
+/// secp256k1 fix (a = 0) was never ported here, so p256Add(P, P) and
+/// p384Add(P, P) produced a wrong point and every contract that doubled
+/// deployed an unspendable script.
+///
+/// Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
+/// selected and the single expensive fieldInv still runs exactly once.
+/// rx and ry below are already correct for doubling.
+///
+///   cond = (px == qx)
+///   num  = cond ? 3*px^2 - 3 : (qy - py)
+///   den  = cond ? 2*py       : (qx - px)
+///
+/// selected as `b + cond*(a - b)`, which needs no branch and keeps the emitted
+/// op sequence identical on both paths.
+///
+/// NOT handled: P == -Q, whose true result is the point at infinity, which
+/// affine coordinates cannot represent.
 fn affineAdd(t: *NistTracker, p_be: []const u8) !void {
+    try t.copyToTop("px", "_px_eq");
+    try t.copyToTop("qx", "_qx_eq");
+    t.popNames(2);
+    try t.emitOpcode("OP_NUMEQUAL");
+    try t.names.append(t.allocator, "_cond");
+
+    // chord numerator / denominator
     try t.copyToTop("qy", "_qy1");
     try t.copyToTop("py", "_py1");
-    try fieldSub(t, "_qy1", "_py1", p_be, "_s_num");
-
+    try fieldSub(t, "_qy1", "_py1", p_be, "_num_chord");
     try t.copyToTop("qx", "_qx1");
     try t.copyToTop("px", "_px1");
-    try fieldSub(t, "_qx1", "_px1", p_be, "_s_den");
+    try fieldSub(t, "_qx1", "_px1", p_be, "_den_chord");
+
+    // tangent numerator / denominator: 3*px^2 + a (a = -3) and 2*py
+    try t.copyToTop("px", "_px_t");
+    try fieldSqr(t, "_px_t", p_be, "_px_sq");
+    try fieldMulConst(t, "_px_sq", 3, p_be, "_3px_sq");
+    try t.pushInt("_a_neg", 3);
+    try fieldSub(t, "_3px_sq", "_a_neg", p_be, "_num_tan");
+    try t.copyToTop("py", "_py_t");
+    try fieldMulConst(t, "_py_t", 2, p_be, "_den_tan");
+
+    // num = num_chord + cond*(num_tan - num_chord)
+    try t.copyToTop("_num_chord", "_num_chord_c");
+    try fieldSub(t, "_num_tan", "_num_chord_c", p_be, "_num_diff");
+    try t.copyToTop("_cond", "_cond_n");
+    try fieldMul(t, "_num_diff", "_cond_n", p_be, "_num_sel");
+    try fieldAdd(t, "_num_chord", "_num_sel", p_be, "_s_num");
+
+    // den = den_chord + cond*(den_tan - den_chord)
+    try t.copyToTop("_den_chord", "_den_chord_c");
+    try fieldSub(t, "_den_tan", "_den_chord_c", p_be, "_den_diff");
+    try t.toTop("_cond");
+    t.renameTop("_cond_d");
+    try fieldMul(t, "_den_diff", "_cond_d", p_be, "_den_sel");
+    try fieldAdd(t, "_den_chord", "_den_sel", p_be, "_s_den");
 
     try fieldInv(t, "_s_den", t.params.field_p_minus_2_be, p_be, "_s_den_inv");
     try fieldMul(t, "_s_num", "_s_den_inv", p_be, "_s");
@@ -835,7 +887,18 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     var inner = try NistTracker.init(allocator, base_names, params);
     errdefer inner.deinit();
 
-    const p_be = params.field_p_be;
+    try jacobianAddAffineBody(&inner, false);
+    return inner.takeBundle();
+}
+
+/// The mixed-add itself, emitting through a tracker the caller owns.
+///
+/// `keep_hr` additionally leaves copies of H and R on the stack: both are zero
+/// exactly when the Jacobian accumulator is the same curve point as the affine
+/// operand, the one case these formulas cannot compute. See
+/// buildJacobianAddOrDoubleInline.
+fn jacobianAddAffineBody(inner: *NistTracker, keep_hr: bool) !void {
+    const p_be = inner.params.field_p_be;
 
     try inner.copyToTop("jz", "_jz_for_z1cu");
     try inner.copyToTop("jz", "_jz_for_z3");
@@ -843,56 +906,61 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     try inner.copyToTop("jx", "_jx_for_u1h2");
 
     // Z1sq = jz^2
-    try fieldSqr(&inner, "jz", p_be, "_Z1sq");
+    try fieldSqr(inner, "jz", p_be, "_Z1sq");
     try inner.copyToTop("_Z1sq", "_Z1sq_for_u2");
-    try fieldMul(&inner, "_jz_for_z1cu", "_Z1sq", p_be, "_Z1cu");
+    try fieldMul(inner, "_jz_for_z1cu", "_Z1sq", p_be, "_Z1cu");
 
     // U2 = ax * Z1sq_for_u2
     try inner.copyToTop("ax", "_ax_c");
-    try fieldMul(&inner, "_ax_c", "_Z1sq_for_u2", p_be, "_U2");
+    try fieldMul(inner, "_ax_c", "_Z1sq_for_u2", p_be, "_U2");
 
     // S2 = ay * Z1cu
     try inner.copyToTop("ay", "_ay_c");
-    try fieldMul(&inner, "_ay_c", "_Z1cu", p_be, "_S2");
+    try fieldMul(inner, "_ay_c", "_Z1cu", p_be, "_S2");
 
     // H = U2 - jx
-    try fieldSub(&inner, "_U2", "jx", p_be, "_H");
+    try fieldSub(inner, "_U2", "jx", p_be, "_H");
 
     // R = S2 - jy
-    try fieldSub(&inner, "_S2", "jy", p_be, "_R");
+    try fieldSub(inner, "_S2", "jy", p_be, "_R");
+
+    if (keep_hr) {
+        try inner.copyToTop("_H", "_H_keep");
+        try inner.copyToTop("_R", "_R_keep");
+    }
 
     try inner.copyToTop("_H", "_H_for_h3");
     try inner.copyToTop("_H", "_H_for_z3");
 
     // H2 = H^2
-    try fieldSqr(&inner, "_H", p_be, "_H2");
+    try fieldSqr(inner, "_H", p_be, "_H2");
     try inner.copyToTop("_H2", "_H2_for_u1h2");
 
     // H3 = H_for_h3 * H2
-    try fieldMul(&inner, "_H_for_h3", "_H2", p_be, "_H3");
+    try fieldMul(inner, "_H_for_h3", "_H2", p_be, "_H3");
 
     // U1H2 = _jx_for_u1h2 * H2_for_u1h2
-    try fieldMul(&inner, "_jx_for_u1h2", "_H2_for_u1h2", p_be, "_U1H2");
+    try fieldMul(inner, "_jx_for_u1h2", "_H2_for_u1h2", p_be, "_U1H2");
 
     try inner.copyToTop("_R", "_R_for_y3");
     try inner.copyToTop("_U1H2", "_U1H2_for_y3");
     try inner.copyToTop("_H3", "_H3_for_y3");
 
     // X3 = R^2 - H3 - 2*U1H2
-    try fieldSqr(&inner, "_R", p_be, "_R2");
-    try fieldSub(&inner, "_R2", "_H3", p_be, "_x3_tmp");
-    try fieldMulConst(&inner, "_U1H2", 2, p_be, "_2U1H2");
-    try fieldSub(&inner, "_x3_tmp", "_2U1H2", p_be, "_X3");
+    try fieldSqr(inner, "_R", p_be, "_R2");
+    try fieldSub(inner, "_R2", "_H3", p_be, "_x3_tmp");
+    try fieldMulConst(inner, "_U1H2", 2, p_be, "_2U1H2");
+    try fieldSub(inner, "_x3_tmp", "_2U1H2", p_be, "_X3");
 
     // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
     try inner.copyToTop("_X3", "_X3_c");
-    try fieldSub(&inner, "_U1H2_for_y3", "_X3_c", p_be, "_u_minus_x");
-    try fieldMul(&inner, "_R_for_y3", "_u_minus_x", p_be, "_r_tmp");
-    try fieldMul(&inner, "_jy_for_y3", "_H3_for_y3", p_be, "_jy_h3");
-    try fieldSub(&inner, "_r_tmp", "_jy_h3", p_be, "_Y3");
+    try fieldSub(inner, "_U1H2_for_y3", "_X3_c", p_be, "_u_minus_x");
+    try fieldMul(inner, "_R_for_y3", "_u_minus_x", p_be, "_r_tmp");
+    try fieldMul(inner, "_jy_for_y3", "_H3_for_y3", p_be, "_jy_h3");
+    try fieldSub(inner, "_r_tmp", "_jy_h3", p_be, "_Y3");
 
     // Z3 = _jz_for_z3 * _H_for_z3
-    try fieldMul(&inner, "_jz_for_z3", "_H_for_z3", p_be, "_Z3");
+    try fieldMul(inner, "_jz_for_z3", "_H_for_z3", p_be, "_Z3");
 
     try inner.toTop("_X3");
     inner.renameTop("jx");
@@ -900,6 +968,117 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     inner.renameTop("jy");
     try inner.toTop("_Z3");
     inner.renameTop("jz");
+}
+
+/// Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+/// Consumes add_name, dbl_name and cond_name.
+fn selectCoord(
+    t: *NistTracker,
+    add_name: []const u8,
+    dbl_name: []const u8,
+    cond_name: []const u8,
+    result_name: []const u8,
+) !void {
+    const p_be = t.params.field_p_be;
+    try t.copyToTop(add_name, "_sel_add_c");
+    try fieldSub(t, dbl_name, "_sel_add_c", p_be, "_sel_diff");
+    try fieldMul(t, "_sel_diff", cond_name, p_be, "_sel_scaled");
+    try fieldAdd(t, add_name, "_sel_scaled", p_be, result_name);
+}
+
+/// The ladder's LAST conditional step: mixed-add, but correct when the
+/// accumulator already equals the point being added.
+///
+/// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+/// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+/// infinity — and since fieldInv is Fermat (inv(0) = 0), jacobianToAffine turns
+/// that into the ALL-ZERO point instead of 2P. p256Mul(P, 2n) and
+/// p384Mul(P, 2n) returned 64 / 96 zero bytes.
+///
+/// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+/// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+/// (c_i - 1)*P. P-256 and P-384 both have cofactor 1, so P has order n and the
+/// degenerate cases are exactly c_i == 2 (mod n) — accumulator == P — and
+/// c_i == 0 or 1 (mod n) — accumulator == -P or O. c_i ranges over a
+/// CONTIGUOUS interval determined only by i, so this is decidable by interval
+/// arithmetic rather than by sampling, and over the whole domain k in [0, n-1]
+/// only two steps qualify, both at i = 0:
+///
+///   k = 2  ->  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P. <- bug
+///   k = 0  ->  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+///              true result the point at infinity, which affine coordinates
+///              cannot represent; it stays the all-zero point, as before.
+///
+/// Handling H == 0 at every step would cost ~75% more script bytes — on P-384
+/// that is another 600 KB; handling it here costs ~0.2%. The operand P is
+/// caller-supplied but cannot move the exception, because the condition depends
+/// only on c_i mod ord(P) and ord(P) = n for every point on these curves.
+/// Points that are NOT on the curve carry no such guarantee — gate untrusted
+/// input on p256OnCurve / p384OnCurve first.
+///
+/// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+fn buildJacobianAddOrDoubleInline(allocator: Allocator, base_names: []const ?[]const u8, params: *const NistCurveParams) !EcOpBundle {
+    var inner = try NistTracker.init(allocator, base_names, params);
+    errdefer inner.deinit();
+
+    const p_be = params.field_p_be;
+
+    // Keep the pre-add accumulator: it is what must be DOUBLED in the
+    // exceptional case, and the add below consumes jx/jy/jz.
+    try inner.copyToTop("jx", "_sx");
+    try inner.copyToTop("jy", "_sy");
+    try inner.copyToTop("jz", "_sz");
+
+    try jacobianAddAffineBody(&inner, true);
+
+    // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+    // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+    // signals the point at infinity.
+    try inner.toTop("_H_keep");
+    try inner.pushInt("_zero_h", 0);
+    inner.popNames(2);
+    try inner.emitOpcode("OP_NUMEQUAL");
+    try inner.names.append(inner.allocator, "_h_is0");
+    try inner.toTop("_R_keep");
+    try inner.pushInt("_zero_r", 0);
+    inner.popNames(2);
+    try inner.emitOpcode("OP_NUMEQUAL");
+    try inner.names.append(inner.allocator, "_r_is0");
+    try inner.toTop("_h_is0");
+    try inner.toTop("_r_is0");
+    inner.popNames(2);
+    try inner.emitOpcode("OP_BOOLAND");
+    try inner.names.append(inner.allocator, "_cond");
+
+    // Move the add result aside so jacobianDouble can work on jx/jy/jz again,
+    // this time holding the saved accumulator.
+    try inner.toTop("jx");
+    inner.renameTop("_add_x");
+    try inner.toTop("jy");
+    inner.renameTop("_add_y");
+    try inner.toTop("jz");
+    inner.renameTop("_add_z");
+    try inner.toTop("_sx");
+    inner.renameTop("jx");
+    try inner.toTop("_sy");
+    inner.renameTop("jy");
+    try inner.toTop("_sz");
+    inner.renameTop("jz");
+    try jacobianDouble(&inner, p_be);
+    try inner.toTop("jx");
+    inner.renameTop("_dbl_x");
+    try inner.toTop("jy");
+    inner.renameTop("_dbl_y");
+    try inner.toTop("jz");
+    inner.renameTop("_dbl_z");
+
+    try inner.copyToTop("_cond", "_cond_x");
+    try selectCoord(&inner, "_add_x", "_dbl_x", "_cond_x", "jx");
+    try inner.copyToTop("_cond", "_cond_y");
+    try selectCoord(&inner, "_add_y", "_dbl_y", "_cond_y", "jy");
+    try inner.toTop("_cond");
+    inner.renameTop("_cond_z");
+    try selectCoord(&inner, "_add_z", "_dbl_z", "_cond_z", "jz");
 
     return inner.takeBundle();
 }
@@ -970,7 +1149,12 @@ fn emitScalarMulOnTracker(t: *NistTracker) !void {
         try t.toTop("_bit");
         t.popNames(1);
 
-        var add_bundle = try buildJacobianAddAffineInline(t.allocator, t.names.items, c);
+        // Only the final step can be handed two equal operands — see
+        // buildJacobianAddOrDoubleInline for why, and for what it costs not to.
+        var add_bundle = if (bit == 0)
+            try buildJacobianAddOrDoubleInline(t.allocator, t.names.items, c)
+        else
+            try buildJacobianAddAffineInline(t.allocator, t.names.items, c);
         errdefer add_bundle.deinit();
 
         try t.owned_bytes.appendSlice(t.allocator, add_bundle.owned_bytes);
@@ -1553,13 +1737,13 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
 
 test "nist_ec helper op-count goldens" {
     const cases = .{
-        .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6495) },
+        .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6623) },
         .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 69185) },
         .{ registry.CryptoBuiltin.p256_mul_gen, "p256MulGen", @as(usize, 69187) },
         .{ registry.CryptoBuiltin.p256_negate, "p256Negate", @as(usize, 945) },
         .{ registry.CryptoBuiltin.p256_on_curve, "p256OnCurve", @as(usize, 543) },
         .{ registry.CryptoBuiltin.p256_encode_compressed, "p256EncodeCompressed", @as(usize, 14) },
-        .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11301) },
+        .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11429) },
         .{ registry.CryptoBuiltin.p384_mul, "p384Mul", @as(usize, 105255) },
         .{ registry.CryptoBuiltin.p384_mul_gen, "p384MulGen", @as(usize, 105257) },
         .{ registry.CryptoBuiltin.p384_negate, "p384Negate", @as(usize, 1393) },

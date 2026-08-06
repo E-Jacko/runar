@@ -53,7 +53,7 @@ class EcTest {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMul(ops::add);
         assertEquals(63828, ops.size(), "ecMul op count drift");
-        assertEquals(427470, emitHex(ops).length() / 2);
+        assertEquals(428634, emitHex(ops).length() / 2);
     }
 
     @Test
@@ -61,7 +61,7 @@ class EcTest {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMulGen(ops::add);
         assertEquals(63830, ops.size(), "ecMulGen op count drift");
-        assertEquals(427536, emitHex(ops).length() / 2);
+        assertEquals(428700, emitHex(ops).length() / 2);
     }
 
     @Test

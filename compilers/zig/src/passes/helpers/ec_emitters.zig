@@ -708,49 +708,65 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     var inner = try ECTracker.init(allocator, base_names);
     errdefer inner.deinit();
 
+    try jacobianAddAffineBody(&inner, false);
+    return inner.takeBundle();
+}
+
+/// The mixed-add itself, emitting through a tracker the caller owns.
+///
+/// `keep_hr` additionally leaves copies of H and R on the stack. They are the
+/// exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when
+/// the Jacobian accumulator is the same curve point as the affine operand, the
+/// one case these formulas cannot compute (see buildJacobianAddOrDoubleInline).
+fn jacobianAddAffineBody(inner: *ECTracker, keep_hr: bool) !void {
     try inner.copyToTop("jz", "_jz_for_z1cu");
     try inner.copyToTop("jz", "_jz_for_z3");
     try inner.copyToTop("jy", "_jy_for_y3");
     try inner.copyToTop("jx", "_jx_for_u1h2");
 
-    try fieldSqr(&inner, "jz", "_Z1sq");
+    try fieldSqr(inner, "jz", "_Z1sq");
     try inner.copyToTop("_Z1sq", "_Z1sq_for_u2");
-    try fieldMul(&inner, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
+    try fieldMul(inner, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
 
     try inner.copyToTop("ax", "_ax_c");
-    try fieldMul(&inner, "_ax_c", "_Z1sq_for_u2", "_U2");
+    try fieldMul(inner, "_ax_c", "_Z1sq_for_u2", "_U2");
 
     try inner.copyToTop("ay", "_ay_c");
-    try fieldMul(&inner, "_ay_c", "_Z1cu", "_S2");
+    try fieldMul(inner, "_ay_c", "_Z1cu", "_S2");
 
-    try fieldSub(&inner, "_U2", "jx", "_H");
-    try fieldSub(&inner, "_S2", "jy", "_R");
+    try fieldSub(inner, "_U2", "jx", "_H");
+    try fieldSub(inner, "_S2", "jy", "_R");
+
+    if (keep_hr) {
+        try inner.copyToTop("_H", "_H_keep");
+        try inner.copyToTop("_R", "_R_keep");
+    }
 
     try inner.copyToTop("_H", "_H_for_h3");
     try inner.copyToTop("_H", "_H_for_z3");
 
-    try fieldSqr(&inner, "_H", "_H2");
+    try fieldSqr(inner, "_H", "_H2");
     try inner.copyToTop("_H2", "_H2_for_u1h2");
 
-    try fieldMul(&inner, "_H_for_h3", "_H2", "_H3");
-    try fieldMul(&inner, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
+    try fieldMul(inner, "_H_for_h3", "_H2", "_H3");
+    try fieldMul(inner, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
 
     try inner.copyToTop("_R", "_R_for_y3");
     try inner.copyToTop("_U1H2", "_U1H2_for_y3");
     try inner.copyToTop("_H3", "_H3_for_y3");
 
-    try fieldSqr(&inner, "_R", "_R2");
-    try fieldSub(&inner, "_R2", "_H3", "_x3_tmp");
-    try fieldMulConst(&inner, "_U1H2", 2, "_2U1H2");
-    try fieldSub(&inner, "_x3_tmp", "_2U1H2", "_X3");
+    try fieldSqr(inner, "_R", "_R2");
+    try fieldSub(inner, "_R2", "_H3", "_x3_tmp");
+    try fieldMulConst(inner, "_U1H2", 2, "_2U1H2");
+    try fieldSub(inner, "_x3_tmp", "_2U1H2", "_X3");
 
     try inner.copyToTop("_X3", "_X3_c");
-    try fieldSub(&inner, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
-    try fieldMul(&inner, "_R_for_y3", "_u_minus_x", "_r_tmp");
-    try fieldMul(&inner, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
-    try fieldSub(&inner, "_r_tmp", "_jy_h3", "_Y3");
+    try fieldSub(inner, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
+    try fieldMul(inner, "_R_for_y3", "_u_minus_x", "_r_tmp");
+    try fieldMul(inner, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
+    try fieldSub(inner, "_r_tmp", "_jy_h3", "_Y3");
 
-    try fieldMul(&inner, "_jz_for_z3", "_H_for_z3", "_Z3");
+    try fieldMul(inner, "_jz_for_z3", "_H_for_z3", "_Z3");
 
     try inner.toTop("_X3");
     inner.renameTop("jx");
@@ -758,6 +774,110 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     inner.renameTop("jy");
     try inner.toTop("_Z3");
     inner.renameTop("jz");
+}
+
+/// Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+/// Same shape as the numerator/denominator select in affineAdd, so both paths
+/// emit the identical op sequence and the tracker's static stack model holds.
+/// Consumes add_name, dbl_name and cond_name.
+fn selectCoord(
+    t: *ECTracker,
+    add_name: []const u8,
+    dbl_name: []const u8,
+    cond_name: []const u8,
+    result_name: []const u8,
+) !void {
+    try t.copyToTop(add_name, "_sel_add_c");
+    try fieldSub(t, dbl_name, "_sel_add_c", "_sel_diff");
+    try fieldMul(t, "_sel_diff", cond_name, "_sel_scaled");
+    try fieldAdd(t, add_name, "_sel_scaled", result_name);
+}
+
+/// The ladder's LAST conditional step: mixed-add, but correct when the
+/// accumulator already equals the point being added.
+///
+/// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+/// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+/// infinity — and since fieldInv is Fermat (inv(0) = 0), jacobianToAffine turns
+/// that into the ALL-ZERO point instead of 2P. ecMul(P, 2n) and ecMulGen(2n)
+/// returned 64 zero bytes.
+///
+/// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+/// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+/// (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the degenerate
+/// cases are exactly c_i == 2 (mod n) — accumulator == P — and c_i == 0 or 1
+/// (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS interval
+/// determined only by i, so this is decidable by interval arithmetic rather
+/// than by sampling, and over the whole domain k in [0, n-1] only two steps
+/// qualify, both at i = 0:
+///
+///   k = 2  ->  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P. <- bug
+///   k = 0  ->  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+///              true result the point at infinity, which affine coordinates
+///              cannot represent; it stays the all-zero point, as before.
+///
+/// Handling H == 0 at every one of the 257 steps would cost ~70% more script
+/// bytes; handling it here costs 0.26%. The operand P is caller-supplied but
+/// cannot move the exception, because the condition depends only on
+/// c_i mod ord(P) and ord(P) = n for every point on the curve. Points that are
+/// NOT on the curve carry no such guarantee — gate untrusted input on
+/// ecOnCurve first.
+///
+/// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+fn buildJacobianAddOrDoubleInline(allocator: Allocator, base_names: []const ?[]const u8) !EcOpBundle {
+    var inner = try ECTracker.init(allocator, base_names);
+    errdefer inner.deinit();
+
+    // Keep the pre-add accumulator: it is what must be DOUBLED in the
+    // exceptional case, and the add below consumes jx/jy/jz.
+    try inner.copyToTop("jx", "_sx");
+    try inner.copyToTop("jy", "_sy");
+    try inner.copyToTop("jz", "_sz");
+
+    try jacobianAddAffineBody(&inner, true);
+
+    // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+    // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+    // signals the point at infinity.
+    try inner.toTop("_H_keep");
+    try inner.pushInt("_zero_h", 0);
+    try inner.rawBlock(2, "_h_is0", emitNumEqualOpcode);
+    try inner.toTop("_R_keep");
+    try inner.pushInt("_zero_r", 0);
+    try inner.rawBlock(2, "_r_is0", emitNumEqualOpcode);
+    try inner.toTop("_h_is0");
+    try inner.toTop("_r_is0");
+    try inner.rawBlock(2, "_cond", emitBoolAndOpcode);
+
+    // Move the add result aside so jacobianDouble can work on jx/jy/jz again,
+    // this time holding the saved accumulator.
+    try inner.toTop("jx");
+    inner.renameTop("_add_x");
+    try inner.toTop("jy");
+    inner.renameTop("_add_y");
+    try inner.toTop("jz");
+    inner.renameTop("_add_z");
+    try inner.toTop("_sx");
+    inner.renameTop("jx");
+    try inner.toTop("_sy");
+    inner.renameTop("jy");
+    try inner.toTop("_sz");
+    inner.renameTop("jz");
+    try jacobianDouble(&inner);
+    try inner.toTop("jx");
+    inner.renameTop("_dbl_x");
+    try inner.toTop("jy");
+    inner.renameTop("_dbl_y");
+    try inner.toTop("jz");
+    inner.renameTop("_dbl_z");
+
+    try inner.copyToTop("_cond", "_cond_x");
+    try selectCoord(&inner, "_add_x", "_dbl_x", "_cond_x", "jx");
+    try inner.copyToTop("_cond", "_cond_y");
+    try selectCoord(&inner, "_add_y", "_dbl_y", "_cond_y", "jy");
+    try inner.toTop("_cond");
+    inner.renameTop("_cond_z");
+    try selectCoord(&inner, "_add_z", "_dbl_z", "_cond_z", "jz");
 
     return inner.takeBundle();
 }
@@ -802,7 +922,12 @@ fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !vo
         try t.toTop("_bit");
         t.popNames(1);
 
-        var add_bundle = try buildJacobianAddAffineInline(t.allocator, t.names.items);
+        // Only the final step can be handed two equal operands — see
+        // buildJacobianAddOrDoubleInline for why, and for what it costs not to.
+        var add_bundle = if (bit == 0)
+            try buildJacobianAddOrDoubleInline(t.allocator, t.names.items)
+        else
+            try buildJacobianAddAffineInline(t.allocator, t.names.items);
         errdefer add_bundle.deinit();
 
         try t.owned_bytes.appendSlice(t.allocator, add_bundle.owned_bytes);

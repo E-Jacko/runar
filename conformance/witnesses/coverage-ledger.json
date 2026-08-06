@@ -174,15 +174,6 @@
       }
     },
     {
-      "fixture": "ec-unit",
-      "cause": "crypto-witness-infeasible",
-      "reason": "ROOT-CAUSED 2026-08-03, PARTIALLY FIXED. testOps() takes no arguments and needs no cryptographic witness, so it was spent on a live regtest node and REJECTED with 'Script failed an OP_VERIFY operation'. Two independent codegen defects, both the same shape — a degenerate EC case the codegen never handled: (1) FIXED — ecAdd could not DOUBLE a point; the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q and the tangent 3px^2/(2py) is required. affineAdd now selects numerator and denominator so one fieldInv still suffices; ecAdd(G,G)==2G and ecAdd(2G,2G)==4G are pinned by packages/runar-testing/src/__tests__/ec-add-doubling.test.ts. (2) STILL OPEN — ecMul and ecMulGen both return an all-zero point for scalar k=2 exactly (k=1,3,4 are correct). The Jacobian ladder's add-affine step hits the same degenerate case when the accumulator equals the point being added, and it cannot double either. testOps() calls ecMul(g, 2n), so this fixture still cannot spend. Fixing it means branching inside a 257-iteration loop, which is a materially larger change than the affine fix. Do NOT mark covered until ecMul k=2 is fixed and the spend passes.",
-      "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "ec"
-      }
-    },
-    {
       "fixture": "intent-output-p2pkh",
       "cause": "stateful-harness-gap",
       "reason": "payBond() is a TERMINAL StatefulSmartContract method that asserts output 0 is a bond P2PKH via requireOutputP2PKH(0, ...) with no state mutation, so there is no state continuation and output 0 is free. The SDK deploy->call->Spend path does not compose an external bond output, so there is no go-script-exec accept/reject differential; covered instead by the ANF interpreter (1 accept + 2 reject: correct witness, wrong PKH bytes, wrong hashOutputs) across all 7 tiers. NOTE: the earlier variant that mixed requireOutputP2PKH(0) with a state mutation (the implicit single-output continuation ALSO claiming output 0, making it permanently unspendable) is now a COMPILE-TIME ERROR — see the guard in packages/runar-compiler/src/passes/03-typecheck.ts and TestIntentOutputP2PKH_GuardRejectsMutatingVariant in conformance/script_execution_test.go.",
@@ -222,30 +213,12 @@
       }
     },
     {
-      "fixture": "p256-primitives",
-      "cause": "crypto-witness-infeasible",
-      "reason": "NIST P-256 EC primitives — non-secp256k1 EC witness",
-      "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "p256"
-      }
-    },
-    {
       "fixture": "p256-wallet",
       "cause": "crypto-witness-infeasible",
       "reason": "NIST P-256 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "p256"
-      }
-    },
-    {
-      "fixture": "p384-primitives",
-      "cause": "crypto-witness-infeasible",
-      "reason": "NIST P-384 EC primitives — non-secp256k1 EC witness",
-      "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "p384"
       }
     },
     {

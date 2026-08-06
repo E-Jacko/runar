@@ -336,16 +336,69 @@ public final class P256P384 {
     // Affine point addition
     // ===================================================================
 
+    /**
+     * Affine point addition.
+     *
+     * <p>The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+     * denominator is zero and the correct slope is the TANGENT, (3px^2 + a)/(2py) — and
+     * a = -3 on both NIST curves, so the numerator is 3px^2 - 3. The secp256k1 fix
+     * (a = 0) was never ported here, so {@code p256Add(P, P)} and {@code p384Add(P, P)}
+     * produced a wrong point and every contract that doubled deployed an unspendable
+     * script.
+     *
+     * <p>Both cases are {@code s = num / den}, so only the NUMERATOR and DENOMINATOR are
+     * selected and the single expensive cFieldInv still runs exactly once. rx and ry
+     * below are already correct for doubling.
+     *
+     * <pre>
+     *   cond = (px == qx)
+     *   num  = cond ? 3*px^2 - 3 : (qy - py)
+     *   den  = cond ? 2*py       : (qx - px)
+     * </pre>
+     *
+     * <p>selected as {@code b + cond*(a - b)}, which needs no branch and keeps the
+     * emitted op sequence identical on both paths.
+     *
+     * <p>NOT handled: P == -Q, whose true result is the point at infinity, which affine
+     * coordinates cannot represent.
+     */
     private static void cAffineAdd(ECTracker t, BigInteger fieldP, BigInteger pMinus2) {
-        // s_num = qy - py
+        t.copyToTop("px", "_px_eq");
+        t.copyToTop("qx", "_qx_eq");
+        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_cond",
+                e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+
+        // chord numerator / denominator
         t.copyToTop("qy", "_qy1");
         t.copyToTop("py", "_py1");
-        cFieldSub(t, "_qy1", "_py1", "_s_num", fieldP);
-
-        // s_den = qx - px
+        cFieldSub(t, "_qy1", "_py1", "_num_chord", fieldP);
         t.copyToTop("qx", "_qx1");
         t.copyToTop("px", "_px1");
-        cFieldSub(t, "_qx1", "_px1", "_s_den", fieldP);
+        cFieldSub(t, "_qx1", "_px1", "_den_chord", fieldP);
+
+        // tangent numerator / denominator: 3*px^2 + a (a = -3) and 2*py
+        t.copyToTop("px", "_px_t");
+        cFieldSqr(t, "_px_t", "_px_sq", fieldP);
+        cFieldMulConst(t, "_px_sq", 3, "_3px_sq", fieldP);
+        t.pushInt("_a_neg", 3);
+        cFieldSub(t, "_3px_sq", "_a_neg", "_num_tan", fieldP);
+        t.copyToTop("py", "_py_t");
+        cFieldMulConst(t, "_py_t", 2, "_den_tan", fieldP);
+
+        // num = num_chord + cond*(num_tan - num_chord)
+        t.copyToTop("_num_chord", "_num_chord_c");
+        cFieldSub(t, "_num_tan", "_num_chord_c", "_num_diff", fieldP);
+        t.copyToTop("_cond", "_cond_n");
+        cFieldMul(t, "_num_diff", "_cond_n", "_num_sel", fieldP);
+        cFieldAdd(t, "_num_chord", "_num_sel", "_s_num", fieldP);
+
+        // den = den_chord + cond*(den_tan - den_chord)
+        t.copyToTop("_den_chord", "_den_chord_c");
+        cFieldSub(t, "_den_tan", "_den_chord_c", "_den_diff", fieldP);
+        t.toTop("_cond");
+        t.rename("_cond_d");
+        cFieldMul(t, "_den_diff", "_cond_d", "_den_sel", fieldP);
+        cFieldAdd(t, "_den_chord", "_den_sel", "_s_den", fieldP);
 
         // s = s_num / s_den mod p
         cFieldInv(t, "_s_den", "_s_den_inv", fieldP, pMinus2);
@@ -460,8 +513,19 @@ public final class P256P384 {
 
     private static void cBuildJacobianAddAffineInline(Consumer<StackOp> e, ECTracker t,
                                                        BigInteger fieldP, BigInteger pMinus2) {
-        ECTracker it = new ECTracker(t.nm, e);
+        cJacobianAddAffineBody(new ECTracker(t.nm, e), false, fieldP, pMinus2);
+    }
 
+    /**
+     * The mixed-add itself, emitting through an ECTracker the caller owns.
+     *
+     * <p>{@code keepHR} additionally leaves copies of H and R on the stack: both are zero
+     * exactly when the Jacobian accumulator is the same curve point as the affine
+     * operand, the one case these formulas cannot compute. See
+     * cBuildJacobianAddOrDoubleInline.
+     */
+    private static void cJacobianAddAffineBody(ECTracker it, boolean keepHR,
+                                               BigInteger fieldP, BigInteger pMinus2) {
         it.copyToTop("jz", "_jz_for_z1cu");
         it.copyToTop("jz", "_jz_for_z3");
         it.copyToTop("jy", "_jy_for_y3");
@@ -487,6 +551,11 @@ public final class P256P384 {
 
         // R = S2 - jy
         cFieldSub(it, "_S2", "jy", "_R", fieldP);
+
+        if (keepHR) {
+            it.copyToTop("_H", "_H_keep");
+            it.copyToTop("_R", "_R_keep");
+        }
 
         it.copyToTop("_H", "_H_for_h3");
         it.copyToTop("_H", "_H_for_z3");
@@ -525,6 +594,101 @@ public final class P256P384 {
         it.toTop("_X3"); it.rename("jx");
         it.toTop("_Y3"); it.rename("jy");
         it.toTop("_Z3"); it.rename("jz");
+    }
+
+    /**
+     * Branchless select of one Jacobian coordinate: {@code add + cond*(dbl - add)}.
+     * Consumes addName, dblName and condName.
+     */
+    private static void cSelectCoord(ECTracker t, String addName, String dblName,
+                                     String condName, String resultName, BigInteger fieldP) {
+        t.copyToTop(addName, "_sel_add_c");
+        cFieldSub(t, dblName, "_sel_add_c", "_sel_diff", fieldP);
+        cFieldMul(t, "_sel_diff", condName, "_sel_scaled", fieldP);
+        cFieldAdd(t, addName, "_sel_scaled", resultName, fieldP);
+    }
+
+    /**
+     * The ladder's LAST conditional step: mixed-add, but correct when the accumulator
+     * already equals the point being added.
+     *
+     * <p>The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the two
+     * operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at infinity —
+     * and since cFieldInv is Fermat (inv(0) = 0), cJacobianToAffine turns that into the
+     * ALL-ZERO point instead of 2P. {@code p256Mul(P, 2n)} and {@code p384Mul(P, 2n)}
+     * returned 64 / 96 zero bytes.
+     *
+     * <p>WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+     * c_i = k' &gt;&gt; i and k' = k + 3n, so the conditional step adds P to (c_i - 1)*P.
+     * P-256 and P-384 both have cofactor 1, so P has order n and the degenerate cases are
+     * exactly c_i == 2 (mod n) — accumulator == P — and c_i == 0 or 1 (mod n) —
+     * accumulator == -P or O. c_i ranges over a CONTIGUOUS interval determined only by i,
+     * so this is decidable by interval arithmetic rather than by sampling, and over the
+     * whole domain k in [0, n-1] only two steps qualify, both at i = 0:
+     *
+     * <pre>
+     *   k = 2  -&gt;  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P.  &lt;- bug
+     *   k = 0  -&gt;  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+     *              true result the point at infinity, which affine coordinates
+     *              cannot represent; it stays the all-zero point, as before.
+     * </pre>
+     *
+     * <p>Handling H == 0 at every step would cost ~75% more script bytes — on P-384 that
+     * is another 600 KB; handling it here costs ~0.2%. The operand P is caller-supplied
+     * but cannot move the exception, because the condition depends only on
+     * c_i mod ord(P) and ord(P) = n for every point on these curves. Points that are NOT
+     * on the curve carry no such guarantee — gate untrusted input on
+     * {@code p256OnCurve} / {@code p384OnCurve} first.
+     *
+     * <p>Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+     */
+    private static void cBuildJacobianAddOrDoubleInline(Consumer<StackOp> e, ECTracker t,
+                                                        BigInteger fieldP, BigInteger pMinus2) {
+        ECTracker it = new ECTracker(t.nm, e);
+
+        // Keep the pre-add accumulator: it is what must be DOUBLED in the
+        // exceptional case, and the add below consumes jx/jy/jz.
+        it.copyToTop("jx", "_sx");
+        it.copyToTop("jy", "_sy");
+        it.copyToTop("jz", "_sz");
+
+        cJacobianAddAffineBody(it, true, fieldP, pMinus2);
+
+        // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+        // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+        // signals the point at infinity.
+        it.toTop("_H_keep");
+        it.pushInt("_zero_h", 0);
+        it.rawBlock(List.of("_H_keep", "_zero_h"), "_h_is0",
+                e2 -> e2.accept(new OpcodeOp("OP_NUMEQUAL")));
+        it.toTop("_R_keep");
+        it.pushInt("_zero_r", 0);
+        it.rawBlock(List.of("_R_keep", "_zero_r"), "_r_is0",
+                e2 -> e2.accept(new OpcodeOp("OP_NUMEQUAL")));
+        it.toTop("_h_is0");
+        it.toTop("_r_is0");
+        it.rawBlock(List.of("_h_is0", "_r_is0"), "_cond",
+                e2 -> e2.accept(new OpcodeOp("OP_BOOLAND")));
+
+        // Move the add result aside so cJacobianDouble can work on jx/jy/jz again,
+        // this time holding the saved accumulator.
+        it.toTop("jx"); it.rename("_add_x");
+        it.toTop("jy"); it.rename("_add_y");
+        it.toTop("jz"); it.rename("_add_z");
+        it.toTop("_sx"); it.rename("jx");
+        it.toTop("_sy"); it.rename("jy");
+        it.toTop("_sz"); it.rename("jz");
+        cJacobianDouble(it, fieldP, pMinus2);
+        it.toTop("jx"); it.rename("_dbl_x");
+        it.toTop("jy"); it.rename("_dbl_y");
+        it.toTop("jz"); it.rename("_dbl_z");
+
+        it.copyToTop("_cond", "_cond_x");
+        cSelectCoord(it, "_add_x", "_dbl_x", "_cond_x", "jx", fieldP);
+        it.copyToTop("_cond", "_cond_y");
+        cSelectCoord(it, "_add_y", "_dbl_y", "_cond_y", "jy", fieldP);
+        it.toTop("_cond"); it.rename("_cond_z");
+        cSelectCoord(it, "_add_z", "_dbl_z", "_cond_z", "jz", fieldP);
     }
 
     // ===================================================================
@@ -583,7 +747,13 @@ public final class P256P384 {
             t.toTop("_bit");
             t.nm.remove(t.nm.size() - 1); // _bit consumed by IF
             List<StackOp> addOps = new ArrayList<>();
-            cBuildJacobianAddAffineInline(addOps::add, t, fieldP, pMinus2);
+            // Only the final step can be handed two equal operands — see
+            // cBuildJacobianAddOrDoubleInline for why, and for what it costs not to.
+            if (bit == 0) {
+                cBuildJacobianAddOrDoubleInline(addOps::add, t, fieldP, pMinus2);
+            } else {
+                cBuildJacobianAddAffineInline(addOps::add, t, fieldP, pMinus2);
+            }
             emit.accept(new IfOp(addOps, List.of()));
         }
 

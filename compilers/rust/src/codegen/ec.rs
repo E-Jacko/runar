@@ -640,7 +640,17 @@ fn build_jacobian_add_affine_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker) {
     let cloned_nm: Vec<String> = t.nm.clone();
     let init_strs: Vec<&str> = cloned_nm.iter().map(|s| s.as_str()).collect();
     let mut it = ECTracker::new(&init_strs, e);
+    jacobian_add_affine_body(&mut it, false);
+}
 
+/// The mixed-add itself, emitting through an ECTracker the caller owns.
+///
+/// `keep_hr` additionally leaves copies of H and R on the stack. They are the
+/// exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when
+/// the Jacobian accumulator is the same curve point as the affine operand, the
+/// one case these formulas cannot compute (see
+/// `build_jacobian_add_or_double_inline`).
+fn jacobian_add_affine_body(it: &mut ECTracker, keep_hr: bool) {
     // Save copies of values that get consumed but are needed later
     it.copy_to_top("jz", "_jz_for_z1cu");   // consumed by Z1sq, needed for Z1cu
     it.copy_to_top("jz", "_jz_for_z3");     // needed for Z3
@@ -648,41 +658,46 @@ fn build_jacobian_add_affine_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker) {
     it.copy_to_top("jx", "_jx_for_u1h2");   // consumed by H, needed for U1H2
 
     // Z1sq = jz^2
-    field_sqr(&mut it, "jz", "_Z1sq");
+    field_sqr(it, "jz", "_Z1sq");
 
     // Z1cu = _jz_for_z1cu * Z1sq (copy Z1sq for U2)
     it.copy_to_top("_Z1sq", "_Z1sq_for_u2");
-    field_mul(&mut it, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
+    field_mul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
 
     // U2 = ax * Z1sq_for_u2
     it.copy_to_top("ax", "_ax_c");
-    field_mul(&mut it, "_ax_c", "_Z1sq_for_u2", "_U2");
+    field_mul(it, "_ax_c", "_Z1sq_for_u2", "_U2");
 
     // S2 = ay * Z1cu
     it.copy_to_top("ay", "_ay_c");
-    field_mul(&mut it, "_ay_c", "_Z1cu", "_S2");
+    field_mul(it, "_ay_c", "_Z1cu", "_S2");
 
     // H = U2 - jx
-    field_sub(&mut it, "_U2", "jx", "_H");
+    field_sub(it, "_U2", "jx", "_H");
 
     // R = S2 - jy
-    field_sub(&mut it, "_S2", "jy", "_R");
+    field_sub(it, "_S2", "jy", "_R");
+
+    if keep_hr {
+        it.copy_to_top("_H", "_H_keep");
+        it.copy_to_top("_R", "_R_keep");
+    }
 
     // Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
     it.copy_to_top("_H", "_H_for_h3");
     it.copy_to_top("_H", "_H_for_z3");
 
     // H2 = H^2
-    field_sqr(&mut it, "_H", "_H2");
+    field_sqr(it, "_H", "_H2");
 
     // Save H2 for U1H2
     it.copy_to_top("_H2", "_H2_for_u1h2");
 
     // H3 = H_for_h3 * H2
-    field_mul(&mut it, "_H_for_h3", "_H2", "_H3");
+    field_mul(it, "_H_for_h3", "_H2", "_H3");
 
     // U1H2 = _jx_for_u1h2 * H2_for_u1h2
-    field_mul(&mut it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
+    field_mul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
 
     // Save R, U1H2, H3 for Y3 computation
     it.copy_to_top("_R", "_R_for_y3");
@@ -690,25 +705,121 @@ fn build_jacobian_add_affine_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker) {
     it.copy_to_top("_H3", "_H3_for_y3");
 
     // X3 = R^2 - H3 - 2*U1H2
-    field_sqr(&mut it, "_R", "_R2");
-    field_sub(&mut it, "_R2", "_H3", "_x3_tmp");
-    field_mul_const(&mut it, "_U1H2", 2, "_2U1H2");
-    field_sub(&mut it, "_x3_tmp", "_2U1H2", "_X3");
+    field_sqr(it, "_R", "_R2");
+    field_sub(it, "_R2", "_H3", "_x3_tmp");
+    field_mul_const(it, "_U1H2", 2, "_2U1H2");
+    field_sub(it, "_x3_tmp", "_2U1H2", "_X3");
 
     // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
     it.copy_to_top("_X3", "_X3_c");
-    field_sub(&mut it, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
-    field_mul(&mut it, "_R_for_y3", "_u_minus_x", "_r_tmp");
-    field_mul(&mut it, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
-    field_sub(&mut it, "_r_tmp", "_jy_h3", "_Y3");
+    field_sub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
+    field_mul(it, "_R_for_y3", "_u_minus_x", "_r_tmp");
+    field_mul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
+    field_sub(it, "_r_tmp", "_jy_h3", "_Y3");
 
     // Z3 = _jz_for_z3 * _H_for_z3
-    field_mul(&mut it, "_jz_for_z3", "_H_for_z3", "_Z3");
+    field_mul(it, "_jz_for_z3", "_H_for_z3", "_Z3");
 
     // Rename results to jx/jy/jz
     it.to_top("_X3"); it.rename("jx");
     it.to_top("_Y3"); it.rename("jy");
     it.to_top("_Z3"); it.rename("jz");
+}
+
+/// Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+/// Same shape as the numerator/denominator select in `affine_add`, so both
+/// paths emit the identical op sequence and the tracker's static stack model
+/// holds. Consumes `add_name`, `dbl_name` and `cond_name`.
+fn select_coord(t: &mut ECTracker, add_name: &str, dbl_name: &str, cond_name: &str, result_name: &str) {
+    t.copy_to_top(add_name, "_sel_add_c");
+    field_sub(t, dbl_name, "_sel_add_c", "_sel_diff");
+    field_mul(t, "_sel_diff", cond_name, "_sel_scaled");
+    field_add(t, add_name, "_sel_scaled", result_name);
+}
+
+/// The ladder's LAST conditional step: mixed-add, but correct when the
+/// accumulator already equals the point being added.
+///
+/// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+/// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+/// infinity — and since `field_inv` is Fermat (inv(0) = 0), `jacobian_to_affine`
+/// turns that into the ALL-ZERO point instead of 2P. `ecMul(P, 2n)` and
+/// `ecMulGen(2n)` returned 64 zero bytes.
+///
+/// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+/// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+/// (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the degenerate
+/// cases are exactly c_i ≡ 2 (mod n) — accumulator == P — and c_i ≡ 0 or 1
+/// (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS interval
+/// determined only by i, so this is decidable by interval arithmetic rather
+/// than by sampling, and over the whole domain k ∈ [0, n-1] only two steps
+/// qualify, both at i = 0:
+///
+///   k = 2  ->  c_0 = 3n+2 ≡ 2, odd, so the add runs: accumulator == P.  <- bug
+///   k = 0  ->  c_0 = 3n   ≡ 0, odd, so the add runs: accumulator == -P,
+///              true result the point at infinity, which affine coordinates
+///              cannot represent; it stays the all-zero point, as before.
+///
+/// Handling H == 0 at every one of the 257 steps would cost ~70% more script
+/// bytes; handling it here costs 0.26%. The operand P is caller-supplied but
+/// cannot move the exception, because the condition depends only on
+/// c_i mod ord(P) and ord(P) = n for every point on the curve. Points that are
+/// NOT on the curve carry no such guarantee — gate untrusted input on
+/// `ecOnCurve` first.
+///
+/// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+fn build_jacobian_add_or_double_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker) {
+    let cloned_nm: Vec<String> = t.nm.clone();
+    let init_strs: Vec<&str> = cloned_nm.iter().map(|s| s.as_str()).collect();
+    let mut it = ECTracker::new(&init_strs, e);
+    let it = &mut it;
+
+    // Keep the pre-add accumulator: it is what must be DOUBLED in the
+    // exceptional case, and the add below consumes jx/jy/jz.
+    it.copy_to_top("jx", "_sx");
+    it.copy_to_top("jy", "_sy");
+    it.copy_to_top("jz", "_sz");
+
+    jacobian_add_affine_body(it, true);
+
+    // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+    // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+    // signals the point at infinity.
+    it.to_top("_H_keep");
+    it.push_int("_zero_h", 0);
+    it.raw_block(&["_H_keep", "_zero_h"], Some("_h_is0"), |e2| {
+        e2(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    it.to_top("_R_keep");
+    it.push_int("_zero_r", 0);
+    it.raw_block(&["_R_keep", "_zero_r"], Some("_r_is0"), |e2| {
+        e2(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    it.to_top("_h_is0");
+    it.to_top("_r_is0");
+    it.raw_block(&["_h_is0", "_r_is0"], Some("_cond"), |e2| {
+        e2(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
+    // Move the add result aside so jacobian_double can work on jx/jy/jz again,
+    // this time holding the saved accumulator.
+    it.to_top("jx"); it.rename("_add_x");
+    it.to_top("jy"); it.rename("_add_y");
+    it.to_top("jz"); it.rename("_add_z");
+    it.to_top("_sx"); it.rename("jx");
+    it.to_top("_sy"); it.rename("jy");
+    it.to_top("_sz"); it.rename("jz");
+    jacobian_double(it);
+    it.to_top("jx"); it.rename("_dbl_x");
+    it.to_top("jy"); it.rename("_dbl_y");
+    it.to_top("jz"); it.rename("_dbl_z");
+
+    it.copy_to_top("_cond", "_cond_x");
+    select_coord(it, "_add_x", "_dbl_x", "_cond_x", "jx");
+    it.copy_to_top("_cond", "_cond_y");
+    select_coord(it, "_add_y", "_dbl_y", "_cond_y", "jy");
+    it.to_top("_cond"); it.rename("_cond_z");
+    select_coord(it, "_add_z", "_dbl_z", "_cond_z", "jz");
 }
 
 // ===========================================================================
@@ -782,8 +893,15 @@ pub fn emit_ec_mul(emit: &mut dyn FnMut(StackOp)) {
         // because OP_IF consumes _bit and the add ops run with _bit already gone.
         t.to_top("_bit");
         t.nm.pop(); // _bit consumed by IF
+        // Only the final step can be handed two equal operands — see
+        // build_jacobian_add_or_double_inline for why, and for what it costs
+        // not to.
         let add_ops = collect_ops(|add_emit| {
-            build_jacobian_add_affine_inline(add_emit, &t);
+            if bit == 0 {
+                build_jacobian_add_or_double_inline(add_emit, &t);
+            } else {
+                build_jacobian_add_affine_inline(add_emit, &t);
+            }
         });
         (t.e)(StackOp::If {
             then_ops: add_ops,

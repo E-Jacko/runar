@@ -622,8 +622,17 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 	// Create inner tracker with cloned stack state
 	initNm := make([]string, len(t.nm))
 	copy(initNm, t.nm)
-	it := NewECTracker(initNm, e)
+	ecJacobianAddAffineBody(NewECTracker(initNm, e), false)
+}
 
+// ecJacobianAddAffineBody is the mixed-add itself, emitting through a tracker
+// the caller owns.
+//
+// keepHR additionally leaves copies of H and R on the stack. They are the
+// exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when
+// the Jacobian accumulator is the same curve point as the affine operand, the
+// one case these formulas cannot compute (see ecBuildJacobianAddOrDoubleInline).
+func ecJacobianAddAffineBody(it *ECTracker, keepHR bool) {
 	// Save copies of values that get consumed but are needed later
 	it.copyToTop("jz", "_jz_for_z1cu")  // consumed by Z1sq, needed for Z1cu
 	it.copyToTop("jz", "_jz_for_z3")    // needed for Z3
@@ -650,6 +659,11 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 
 	// R = S2 - jy
 	ecFieldSub(it, "_S2", "jy", "_R")
+
+	if keepHR {
+		it.copyToTop("_H", "_H_keep")
+		it.copyToTop("_R", "_R_keep")
+	}
 
 	// Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
 	it.copyToTop("_H", "_H_for_h3")
@@ -695,6 +709,112 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 	it.rename("jy")
 	it.toTop("_Z3")
 	it.rename("jz")
+}
+
+// ecSelectCoord is a branchless select of one Jacobian coordinate:
+// `add + cond*(dbl - add)`. Same shape as the numerator/denominator select in
+// ecAffineAdd, so both paths emit the identical op sequence and the tracker's
+// static stack model holds. Consumes addName, dblName and condName.
+func ecSelectCoord(t *ECTracker, addName, dblName, condName, resultName string) {
+	t.copyToTop(addName, "_sel_add_c")
+	ecFieldSub(t, dblName, "_sel_add_c", "_sel_diff")
+	ecFieldMul(t, "_sel_diff", condName, "_sel_scaled")
+	ecFieldAdd(t, addName, "_sel_scaled", resultName)
+}
+
+// ecBuildJacobianAddOrDoubleInline is the ladder's LAST conditional step:
+// mixed-add, but correct when the accumulator already equals the point being
+// added.
+//
+// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+// infinity — and since ecFieldInv is Fermat (inv(0) = 0), ecJacobianToAffine
+// turns that into the ALL-ZERO point instead of 2P. ecMul(P, 2n) and
+// ecMulGen(2n) returned 64 zero bytes.
+//
+// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+// (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the degenerate
+// cases are exactly c_i ≡ 2 (mod n) — accumulator == P — and c_i ≡ 0 or 1
+// (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS interval
+// determined only by i, so this is decidable by interval arithmetic rather
+// than by sampling, and over the whole domain k ∈ [0, n-1] only two steps
+// qualify, both at i = 0:
+//
+//	k = 2  ->  c_0 = 3n+2 ≡ 2, odd, so the add runs: accumulator == P.  <- bug
+//	k = 0  ->  c_0 = 3n   ≡ 0, odd, so the add runs: accumulator == -P,
+//	           true result the point at infinity, which affine coordinates
+//	           cannot represent; it stays the all-zero point, as before.
+//
+// Handling H == 0 at every one of the 257 steps would cost ~70% more script
+// bytes; handling it here costs 0.26%. The operand P is caller-supplied but
+// cannot move the exception, because the condition depends only on
+// c_i mod ord(P) and ord(P) = n for every point on the curve. Points that are
+// NOT on the curve carry no such guarantee — gate untrusted input on
+// ecOnCurve first.
+//
+// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+func ecBuildJacobianAddOrDoubleInline(e func(StackOp), t *ECTracker) {
+	initNm := make([]string, len(t.nm))
+	copy(initNm, t.nm)
+	it := NewECTracker(initNm, e)
+
+	// Keep the pre-add accumulator: it is what must be DOUBLED in the
+	// exceptional case, and the add below consumes jx/jy/jz.
+	it.copyToTop("jx", "_sx")
+	it.copyToTop("jy", "_sy")
+	it.copyToTop("jz", "_sz")
+
+	ecJacobianAddAffineBody(it, true)
+
+	// cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+	// accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+	// signals the point at infinity.
+	it.toTop("_H_keep")
+	it.pushInt("_zero_h", 0)
+	it.rawBlock([]string{"_H_keep", "_zero_h"}, "_h_is0", func(e2 func(StackOp)) {
+		e2(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+	it.toTop("_R_keep")
+	it.pushInt("_zero_r", 0)
+	it.rawBlock([]string{"_R_keep", "_zero_r"}, "_r_is0", func(e2 func(StackOp)) {
+		e2(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+	it.toTop("_h_is0")
+	it.toTop("_r_is0")
+	it.rawBlock([]string{"_h_is0", "_r_is0"}, "_cond", func(e2 func(StackOp)) {
+		e2(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
+	})
+
+	// Move the add result aside so ecJacobianDouble can work on jx/jy/jz
+	// again, this time holding the saved accumulator.
+	it.toTop("jx")
+	it.rename("_add_x")
+	it.toTop("jy")
+	it.rename("_add_y")
+	it.toTop("jz")
+	it.rename("_add_z")
+	it.toTop("_sx")
+	it.rename("jx")
+	it.toTop("_sy")
+	it.rename("jy")
+	it.toTop("_sz")
+	it.rename("jz")
+	ecJacobianDouble(it)
+	it.toTop("jx")
+	it.rename("_dbl_x")
+	it.toTop("jy")
+	it.rename("_dbl_y")
+	it.toTop("jz")
+	it.rename("_dbl_z")
+
+	it.copyToTop("_cond", "_cond_x")
+	ecSelectCoord(it, "_add_x", "_dbl_x", "_cond_x", "jx")
+	it.copyToTop("_cond", "_cond_y")
+	ecSelectCoord(it, "_add_y", "_dbl_y", "_cond_y", "jy")
+	it.toTop("_cond")
+	it.rename("_cond_z")
+	ecSelectCoord(it, "_add_z", "_dbl_z", "_cond_z", "jz")
 }
 
 // ===========================================================================
@@ -778,7 +898,13 @@ func EmitEcMul(emit func(StackOp)) {
 		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
-		ecBuildJacobianAddAffineInline(addEmit, t)
+		// Only the final step can be handed two equal operands — see
+		// ecBuildJacobianAddOrDoubleInline for why, and for what it costs not to.
+		if bit == 0 {
+			ecBuildJacobianAddOrDoubleInline(addEmit, t)
+		} else {
+			ecBuildJacobianAddAffineInline(addEmit, t)
+		}
 		emit(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 

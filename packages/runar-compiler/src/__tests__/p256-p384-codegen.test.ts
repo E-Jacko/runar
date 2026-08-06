@@ -38,20 +38,20 @@ function countOps(fn: (emit: (op: StackOp) => void) => void): number {
 
 describe('NIST P-256 / P-384 codegen — op-count goldens (T-006)', () => {
   const goldens: Array<[name: string, fn: (emit: (op: StackOp) => void) => void, expected: number]> = [
-    ['p256Add',               emitP256Add,                6505],
+    ['p256Add',               emitP256Add,                6642],
     ['p256Mul',               emitP256Mul,               73306],
     ['p256MulGen',            emitP256MulGen,            73308],
     ['p256Negate',            emitP256Negate,              945],
     ['p256OnCurve',           emitP256OnCurve,             546],
     ['p256EncodeCompressed',  emitP256EncodeCompressed,     14],
-    ['verifyECDSA_P256',      emitVerifyECDSA_P256,     163589],
-    ['p384Add',               emitP384Add,               11311],
+    ['verifyECDSA_P256',      emitVerifyECDSA_P256,     163726],
+    ['p384Add',               emitP384Add,               11448],
     ['p384Mul',               emitP384Mul,              111424],
     ['p384MulGen',            emitP384MulGen,           111426],
     ['p384Negate',            emitP384Negate,             1393],
     ['p384OnCurve',           emitP384OnCurve,             770],
     ['p384EncodeCompressed',  emitP384EncodeCompressed,     14],
-    ['verifyECDSA_P384',      emitVerifyECDSA_P384,     253263],
+    ['verifyECDSA_P384',      emitVerifyECDSA_P384,     253400],
   ];
 
   for (const [name, fn, expected] of goldens) {

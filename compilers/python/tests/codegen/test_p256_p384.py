@@ -22,13 +22,13 @@ from runar_compiler.codegen.stack import StackOp
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("p256Add",              emit_p256_add,               6505),
+    ("p256Add",              emit_p256_add,               6642),
     ("p256Mul",              emit_p256_mul,              73306),
     ("p256MulGen",           emit_p256_mul_gen,          73308),
     ("p256Negate",           emit_p256_negate,             945),
     ("p256OnCurve",          emit_p256_on_curve,           546),
     ("p256EncodeCompressed", emit_p256_encode_compressed,   14),
-    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    163589),
+    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    163726),
 ])
 def test_p256_op_count(name, fn, expected):
     ops: list[StackOp] = []
@@ -41,7 +41,7 @@ def test_p256_op_count(name, fn, expected):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("p384Add",              emit_p384_add,              11311),
+    ("p384Add",              emit_p384_add,              11448),
     ("p384Mul",              emit_p384_mul,             111424),
     ("p384MulGen",           emit_p384_mul_gen,         111426),
     ("p384Negate",           emit_p384_negate,            1393),

@@ -154,13 +154,13 @@ class TestP256P384Codegen < Minitest::Test
   # ---------------------------------------------------------------------------
 
   P256_GOLDENS = {
-    "p256Add"              =>   6505,
+    "p256Add"              =>   6642,
     "p256Mul"              =>  73306,
     "p256MulGen"           =>  73308,
     "p256Negate"           =>    945,
     "p256OnCurve"          =>    546,
     "p256EncodeCompressed" =>     14,
-    "verifyECDSA_P256"     => 163589,
+    "verifyECDSA_P256"     => 163726,
   }.freeze
 
   P256_EMITTERS = {
@@ -174,7 +174,7 @@ class TestP256P384Codegen < Minitest::Test
   }.freeze
 
   P384_GOLDENS = {
-    "p384Add"    =>  11311,
+    "p384Add"    =>  11448,
     "p384Mul"    => 111424,
     "p384MulGen" => 111426,
     "p384Negate" =>   1393,

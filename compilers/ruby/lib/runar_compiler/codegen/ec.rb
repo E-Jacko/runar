@@ -755,8 +755,17 @@ module RunarCompiler
       # @param t [ECTracker]
       def self.ec_build_jacobian_add_affine_inline(e, t)
         # Create inner tracker with cloned stack state
-        it = ECTracker.new(t.nm.dup, e)
+        ec_jacobian_add_affine_body(ECTracker.new(t.nm.dup, e), false)
+      end
 
+      # The mixed-add itself, emitting through a tracker the caller owns.
+      #
+      # +keep_hr+ additionally leaves copies of H and R on the stack. They are
+      # the exception detector: H = U2 - X1 and R = S2 - Y1 are both zero
+      # exactly when the Jacobian accumulator is the same curve point as the
+      # affine operand, the one case these formulas cannot compute (see
+      # ec_build_jacobian_add_or_double_inline).
+      def self.ec_jacobian_add_affine_body(it, keep_hr)
         # Save copies of values that get consumed but are needed later
         it.copy_to_top("jz", "_jz_for_z1cu")   # consumed by Z1sq, needed for Z1cu
         it.copy_to_top("jz", "_jz_for_z3")     # needed for Z3
@@ -783,6 +792,11 @@ module RunarCompiler
 
         # R = S2 - jy
         ec_field_sub(it, "_S2", "jy", "_R")
+
+        if keep_hr
+          it.copy_to_top("_H", "_H_keep")
+          it.copy_to_top("_R", "_R_keep")
+        end
 
         # Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
         it.copy_to_top("_H", "_H_for_h3")
@@ -828,6 +842,106 @@ module RunarCompiler
         it.rename("jy")
         it.to_top("_Z3")
         it.rename("jz")
+      end
+
+      # Branchless select of one Jacobian coordinate: +add + cond*(dbl - add)+.
+      # Same shape as the numerator/denominator select in ec_affine_add, so both
+      # paths emit the identical op sequence and the tracker's static stack
+      # model holds. Consumes add_name, dbl_name and cond_name.
+      def self.ec_select_coord(t, add_name, dbl_name, cond_name, result_name)
+        t.copy_to_top(add_name, "_sel_add_c")
+        ec_field_sub(t, dbl_name, "_sel_add_c", "_sel_diff")
+        ec_field_mul(t, "_sel_diff", cond_name, "_sel_scaled")
+        ec_field_add(t, add_name, "_sel_scaled", result_name)
+      end
+
+      # The ladder's LAST conditional step: mixed-add, but correct when the
+      # accumulator already equals the point being added.
+      #
+      # The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when
+      # the two operands are the same curve point H = 0, so Z3 = Z1*H = 0 -- the
+      # point at infinity -- and since ec_field_inv is Fermat (inv(0) = 0),
+      # ec_jacobian_to_affine turns that into the ALL-ZERO point instead of 2P.
+      # ecMul(P, 2n) and ecMulGen(2n) returned 64 zero bytes.
+      #
+      # WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+      # c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+      # (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the
+      # degenerate cases are exactly c_i == 2 (mod n) -- accumulator == P -- and
+      # c_i == 0 or 1 (mod n) -- accumulator == -P or O. c_i ranges over a
+      # CONTIGUOUS interval determined only by i, so this is decidable by
+      # interval arithmetic rather than by sampling, and over the whole domain
+      # k in [0, n-1] only two steps qualify, both at i = 0:
+      #
+      #   k = 2  -> c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P.
+      #   k = 0  -> c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+      #             true result the point at infinity, which affine coordinates
+      #             cannot represent; it stays the all-zero point, as before.
+      #
+      # Handling H == 0 at every one of the 257 steps would cost ~70% more
+      # script bytes; handling it here costs 0.26%. The operand P is
+      # caller-supplied but cannot move the exception, because the condition
+      # depends only on c_i mod ord(P) and ord(P) = n for every point on the
+      # curve. Points that are NOT on the curve carry no such guarantee -- gate
+      # untrusted input on ecOnCurve first.
+      #
+      # Stack layout: [..., ax, ay, _k, jx, jy, jz] -- same in and out.
+      def self.ec_build_jacobian_add_or_double_inline(e, t)
+        it = ECTracker.new(t.nm.dup, e)
+
+        # Keep the pre-add accumulator: it is what must be DOUBLED in the
+        # exceptional case, and the add below consumes jx/jy/jz.
+        it.copy_to_top("jx", "_sx")
+        it.copy_to_top("jy", "_sy")
+        it.copy_to_top("jz", "_sz")
+
+        ec_jacobian_add_affine_body(it, true)
+
+        # cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+        # accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+        # signals the point at infinity.
+        it.to_top("_H_keep")
+        it.push_int("_zero_h", 0)
+        it.raw_block(["_H_keep", "_zero_h"], "_h_is0",
+                     ->(e2) { e2.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+        it.to_top("_R_keep")
+        it.push_int("_zero_r", 0)
+        it.raw_block(["_R_keep", "_zero_r"], "_r_is0",
+                     ->(e2) { e2.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+        it.to_top("_h_is0")
+        it.to_top("_r_is0")
+        it.raw_block(["_h_is0", "_r_is0"], "_cond",
+                     ->(e2) { e2.call(make_stack_op(op: "opcode", code: "OP_BOOLAND")) })
+
+        # Move the add result aside so ec_jacobian_double can work on jx/jy/jz
+        # again, this time holding the saved accumulator.
+        it.to_top("jx")
+        it.rename("_add_x")
+        it.to_top("jy")
+        it.rename("_add_y")
+        it.to_top("jz")
+        it.rename("_add_z")
+        it.to_top("_sx")
+        it.rename("jx")
+        it.to_top("_sy")
+        it.rename("jy")
+        it.to_top("_sz")
+        it.rename("jz")
+        ec_jacobian_double(it)
+        it.to_top("jx")
+        it.rename("_dbl_x")
+        it.to_top("jy")
+        it.rename("_dbl_y")
+        it.to_top("jz")
+        it.rename("_dbl_z")
+
+        it.copy_to_top("_cond", "_cond_x")
+        ec_select_coord(it, "_add_x", "_dbl_x", "_cond_x", "jx")
+        it.copy_to_top("_cond", "_cond_y")
+        ec_select_coord(it, "_add_y", "_dbl_y", "_cond_y", "jy")
+        it.to_top("_cond")
+        it.rename("_cond_z")
+        ec_select_coord(it, "_add_z", "_dbl_z", "_cond_z", "jz")
       end
 
       # =================================================================
@@ -905,7 +1019,14 @@ module RunarCompiler
           t.nm.pop # _bit consumed by IF
           add_ops = []
           add_emit = ->(op) { add_ops.push(op) }
-          ec_build_jacobian_add_affine_inline(add_emit, t)
+          # Only the final step can be handed two equal operands -- see
+          # ec_build_jacobian_add_or_double_inline for why, and for what it
+          # costs not to.
+          if bit.zero?
+            ec_build_jacobian_add_or_double_inline(add_emit, t)
+          else
+            ec_build_jacobian_add_affine_inline(add_emit, t)
+          end
           emit.call(make_stack_op(op: "if", then: add_ops, else_ops: []))
         end
 

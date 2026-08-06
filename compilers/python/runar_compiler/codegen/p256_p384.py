@@ -326,14 +326,64 @@ def _c_affine_add(t: ECTracker, field_p: int, p_minus_2: int) -> None:
     """Perform affine point addition.
 
     Expects px, py, qx, qy on tracker. Produces rx, ry. Consumes all four inputs.
+
+    The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+    denominator is zero and the correct slope is the TANGENT, (3px^2 + a)/(2py)
+    -- and a = -3 on both NIST curves, so the numerator is 3px^2 - 3. The
+    secp256k1 fix (a = 0) was never ported here, so p256Add(P, P) and
+    p384Add(P, P) produced a wrong point and every contract that doubled
+    deployed an unspendable script.
+
+    Both cases are ``s = num / den``, so only the NUMERATOR and DENOMINATOR are
+    selected and the single expensive _c_field_inv still runs exactly once.
+    rx and ry below are already correct for doubling.
+
+      cond = (px == qx)
+      num  = cond ? 3*px^2 - 3 : (qy - py)
+      den  = cond ? 2*py       : (qx - px)
+
+    selected as ``b + cond*(a - b)``, which needs no branch and keeps the
+    emitted op sequence identical on both paths.
+
+    NOT handled: P == -Q, whose true result is the point at infinity, which
+    affine coordinates cannot represent.
     """
+    t.copy_to_top("px", "_px_eq")
+    t.copy_to_top("qx", "_qx_eq")
+    t.raw_block(["_px_eq", "_qx_eq"], "_cond",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_NUMEQUAL")))
+
+    # chord numerator / denominator
     t.copy_to_top("qy", "_qy1")
     t.copy_to_top("py", "_py1")
-    _c_field_sub(t, "_qy1", "_py1", "_s_num", field_p)
-
+    _c_field_sub(t, "_qy1", "_py1", "_num_chord", field_p)
     t.copy_to_top("qx", "_qx1")
     t.copy_to_top("px", "_px1")
-    _c_field_sub(t, "_qx1", "_px1", "_s_den", field_p)
+    _c_field_sub(t, "_qx1", "_px1", "_den_chord", field_p)
+
+    # tangent numerator / denominator: 3*px^2 + a (a = -3) and 2*py
+    t.copy_to_top("px", "_px_t")
+    _c_field_sqr(t, "_px_t", "_px_sq", field_p)
+    _c_field_mul_const(t, "_px_sq", 3, "_3px_sq", field_p)
+    t.push_int("_a_neg", 3)
+    _c_field_sub(t, "_3px_sq", "_a_neg", "_num_tan", field_p)
+    t.copy_to_top("py", "_py_t")
+    _c_field_mul_const(t, "_py_t", 2, "_den_tan", field_p)
+
+    # num = num_chord + cond*(num_tan - num_chord)
+    t.copy_to_top("_num_chord", "_num_chord_c")
+    _c_field_sub(t, "_num_tan", "_num_chord_c", "_num_diff", field_p)
+    t.copy_to_top("_cond", "_cond_n")
+    _c_field_mul(t, "_num_diff", "_cond_n", "_num_sel", field_p)
+    _c_field_add(t, "_num_chord", "_num_sel", "_s_num", field_p)
+
+    # den = den_chord + cond*(den_tan - den_chord)
+    t.copy_to_top("_den_chord", "_den_chord_c")
+    _c_field_sub(t, "_den_tan", "_den_chord_c", "_den_diff", field_p)
+    t.to_top("_cond")
+    t.rename("_cond_d")
+    _c_field_mul(t, "_den_diff", "_cond_d", "_den_sel", field_p)
+    _c_field_add(t, "_den_chord", "_den_sel", "_s_den", field_p)
 
     _c_field_inv(t, "_s_den", "_s_den_inv", field_p, p_minus_2)
     _c_field_mul(t, "_s_num", "_s_den_inv", "_s", field_p)
@@ -467,8 +517,22 @@ def _c_build_jacobian_add_affine_inline(
     p_minus_2: int,
 ) -> None:
     """Build Jacobian mixed-add ops for use inside OP_IF."""
-    it = ECTracker(list(t.nm), e)
+    _c_jacobian_add_affine_body(ECTracker(list(t.nm), e), False, field_p, p_minus_2)
 
+
+def _c_jacobian_add_affine_body(
+    it: ECTracker,
+    keep_hr: bool,
+    field_p: int,
+    p_minus_2: int,
+) -> None:
+    """The mixed-add itself, emitting through a tracker the caller owns.
+
+    ``keep_hr`` additionally leaves copies of H and R on the stack: both are
+    zero exactly when the Jacobian accumulator is the same curve point as the
+    affine operand, the one case these formulas cannot compute. See
+    _c_build_jacobian_add_or_double_inline.
+    """
     it.copy_to_top("jz", "_jz_for_z1cu")
     it.copy_to_top("jz", "_jz_for_z3")
     it.copy_to_top("jy", "_jy_for_y3")
@@ -487,6 +551,10 @@ def _c_build_jacobian_add_affine_inline(
 
     _c_field_sub(it, "_U2", "jx", "_H", field_p)
     _c_field_sub(it, "_S2", "jy", "_R", field_p)
+
+    if keep_hr:
+        it.copy_to_top("_H", "_H_keep")
+        it.copy_to_top("_R", "_R_keep")
 
     it.copy_to_top("_H", "_H_for_h3")
     it.copy_to_top("_H", "_H_for_z3")
@@ -521,6 +589,119 @@ def _c_build_jacobian_add_affine_inline(
     it.rename("jy")
     it.to_top("_Z3")
     it.rename("jz")
+
+
+def _c_select_coord(
+    t: ECTracker,
+    add_name: str,
+    dbl_name: str,
+    cond_name: str,
+    result_name: str,
+    field_p: int,
+) -> None:
+    """Branchless select of one Jacobian coordinate: ``add + cond*(dbl - add)``.
+
+    Consumes add_name, dbl_name and cond_name.
+    """
+    t.copy_to_top(add_name, "_sel_add_c")
+    _c_field_sub(t, dbl_name, "_sel_add_c", "_sel_diff", field_p)
+    _c_field_mul(t, "_sel_diff", cond_name, "_sel_scaled", field_p)
+    _c_field_add(t, add_name, "_sel_scaled", result_name, field_p)
+
+
+def _c_build_jacobian_add_or_double_inline(
+    e: Callable,
+    t: ECTracker,
+    field_p: int,
+    p_minus_2: int,
+) -> None:
+    """The ladder's LAST conditional step: mixed-add, but correct when the
+    accumulator already equals the point being added.
+
+    The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+    two operands are the same curve point H = 0, so Z3 = Z1*H = 0 -- the point
+    at infinity -- and since _c_field_inv is Fermat (inv(0) = 0),
+    _c_jacobian_to_affine turns that into the ALL-ZERO point instead of 2P.
+    p256Mul(P, 2n) and p384Mul(P, 2n) returned 64 / 96 zero bytes.
+
+    WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+    c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+    (c_i - 1)*P. P-256 and P-384 both have cofactor 1, so P has order n and the
+    degenerate cases are exactly c_i == 2 (mod n) -- accumulator == P -- and
+    c_i == 0 or 1 (mod n) -- accumulator == -P or O. c_i ranges over a
+    CONTIGUOUS interval determined only by i, so this is decidable by interval
+    arithmetic rather than by sampling, and over the whole domain k in [0, n-1]
+    only two steps qualify, both at i = 0:
+
+      k = 2  ->  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P. <- bug
+      k = 0  ->  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+                 true result the point at infinity, which affine coordinates
+                 cannot represent; it stays the all-zero point, as before.
+
+    Handling H == 0 at every step would cost ~75% more script bytes -- on P-384
+    that is another 600 KB; handling it here costs ~0.2%. The operand P is
+    caller-supplied but cannot move the exception, because the condition depends
+    only on c_i mod ord(P) and ord(P) = n for every point on these curves.
+    Points that are NOT on the curve carry no such guarantee -- gate untrusted
+    input on p256OnCurve / p384OnCurve first.
+
+    Stack layout: [..., ax, ay, _k, jx, jy, jz] -- same in and out.
+    """
+    it = ECTracker(list(t.nm), e)
+
+    # Keep the pre-add accumulator: it is what must be DOUBLED in the
+    # exceptional case, and the add below consumes jx/jy/jz.
+    it.copy_to_top("jx", "_sx")
+    it.copy_to_top("jy", "_sy")
+    it.copy_to_top("jz", "_sz")
+
+    _c_jacobian_add_affine_body(it, True, field_p, p_minus_2)
+
+    # cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+    # accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+    # signals the point at infinity.
+    it.to_top("_H_keep")
+    it.push_int("_zero_h", 0)
+    it.raw_block(["_H_keep", "_zero_h"], "_h_is0",
+                 lambda e2: e2(_make_stack_op(op="opcode", code="OP_NUMEQUAL")))
+    it.to_top("_R_keep")
+    it.push_int("_zero_r", 0)
+    it.raw_block(["_R_keep", "_zero_r"], "_r_is0",
+                 lambda e2: e2(_make_stack_op(op="opcode", code="OP_NUMEQUAL")))
+    it.to_top("_h_is0")
+    it.to_top("_r_is0")
+    it.raw_block(["_h_is0", "_r_is0"], "_cond",
+                 lambda e2: e2(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
+    # Move the add result aside so _c_jacobian_double can work on jx/jy/jz
+    # again, this time holding the saved accumulator.
+    it.to_top("jx")
+    it.rename("_add_x")
+    it.to_top("jy")
+    it.rename("_add_y")
+    it.to_top("jz")
+    it.rename("_add_z")
+    it.to_top("_sx")
+    it.rename("jx")
+    it.to_top("_sy")
+    it.rename("jy")
+    it.to_top("_sz")
+    it.rename("jz")
+    _c_jacobian_double(it, field_p, p_minus_2)
+    it.to_top("jx")
+    it.rename("_dbl_x")
+    it.to_top("jy")
+    it.rename("_dbl_y")
+    it.to_top("jz")
+    it.rename("_dbl_z")
+
+    it.copy_to_top("_cond", "_cond_x")
+    _c_select_coord(it, "_add_x", "_dbl_x", "_cond_x", "jx", field_p)
+    it.copy_to_top("_cond", "_cond_y")
+    _c_select_coord(it, "_add_y", "_dbl_y", "_cond_y", "jy", field_p)
+    it.to_top("_cond")
+    it.rename("_cond_z")
+    _c_select_coord(it, "_add_z", "_dbl_z", "_cond_z", "jz", field_p)
 
 
 # ===========================================================================
@@ -582,7 +763,13 @@ def _c_emit_mul(
         def _add_emit(op: object, _t: ECTracker = t, _fp: int = field_p, _pm2: int = p_minus_2) -> None:
             add_ops.append(op)
 
-        _c_build_jacobian_add_affine_inline(_add_emit, t, field_p, p_minus_2)
+        # Only the final step can be handed two equal operands -- see
+        # _c_build_jacobian_add_or_double_inline for why, and for what it
+        # costs not to.
+        if bit == 0:
+            _c_build_jacobian_add_or_double_inline(_add_emit, t, field_p, p_minus_2)
+        else:
+            _c_build_jacobian_add_affine_inline(_add_emit, t, field_p, p_minus_2)
         emit(_make_stack_op(op="if", then=add_ops, else_=[]))
 
     _c_jacobian_to_affine(t, "_rx", "_ry", field_p, p_minus_2)
