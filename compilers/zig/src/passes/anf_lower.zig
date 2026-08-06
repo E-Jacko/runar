@@ -59,6 +59,13 @@ pub const LowerError = error{
     /// rather than emitting a script that deploys and can never be spent. See
     /// `checkStateBigintMagnitude`.
     UnrepresentableStateBigint,
+    /// A local variable shares a contract property's name and a conditional
+    /// assigns BOTH. The branch's declared result slots are identified by name,
+    /// so the two cannot be told apart: both entries take the property path and
+    /// the local's value is silently replaced by the property's, with the
+    /// layout assertion satisfied by coincidence. Refused rather than
+    /// miscompiled.
+    ShadowedResultName,
 };
 
 /// Name set used for the "what does the code after this statement still read"
@@ -796,6 +803,12 @@ const LowerCtx = struct {
     /// keeping the pinned binding blob unchanged. Propagated into sub-contexts
     /// so a manual call inside an if/for body picks it up.
     sighash_flag: ?i32 = null,
+    /// True in every context produced by `subContext()` — inside an if arm, a
+    /// loop body, or an inlined helper's block — and false only in the context
+    /// a method's own body is lowered into. `liftBranchUpdateProps` walks
+    /// `method.body` and does NOT recurse, so an `if` its recogniser accepts is
+    /// only actually REWRITTEN at method top level.
+    nested: bool = false,
     /// Optional sink for the detail behind a refusal (see `LowerDiagnostic`).
     /// Null when the caller used `lowerToANF`. Propagated into sub-contexts so
     /// a refusal raised inside an if/for body still reaches the caller.
@@ -930,6 +943,7 @@ const LowerCtx = struct {
         sub.counter = self.counter;
         // #123: nested manual checkPreimage inherits the method's mode.
         sub.sighash_flag = self.sighash_flag;
+        sub.nested = true;
         // A refusal raised inside the branch must reach the same sink.
         sub.diagnostic = self.diagnostic;
         // Copy local names
@@ -1299,6 +1313,27 @@ fn lowerIfStatementFull(ctx: *LowerCtx, condition: Expression, then_body: []cons
         }
     }
 
+    // The result list is keyed by NAME everywhere downstream, so a local that
+    // shares a contract property's name appears TWICE and both entries take the
+    // PROPERTY path — the local's value is silently replaced by the property's,
+    // and the layout assertion cannot see it because both slots are legitimately
+    // named the same. Refuse the exact collision only.
+    for (merged_locals) |local_name| {
+        for (arm_props.items) |written| {
+            if (std.mem.eql(u8, written, local_name)) {
+                ctx.setDiagnostic(
+                    "Local variable '{s}' shadows contract property 'this.{s}', and " ++
+                        "the conditional assigns both. The branch's result slots are " ++
+                        "identified by name, so the two cannot be told apart and the " ++
+                        "local's value would be silently replaced by the property's. " ++
+                        "Rename the local.",
+                    .{ local_name, local_name },
+                );
+                return LowerError.ShadowedResultName;
+            }
+        }
+    }
+
     // When to materialise the contract instead of leaving the arms to the
     // stack-lowerer's inference:
     //
@@ -1330,13 +1365,27 @@ fn lowerIfStatementFull(ctx: *LowerCtx, condition: Expression, then_body: []cons
     // adds a second update_prop behind it. TicTacToe's position dispatch is
     // exactly that shape, and losing the lift there produced an unspendable
     // `move` script.
-    const liftable = (try collectUpdateBranches(
+    //
+    // The exclusion must be exactly "the lift WILL rewrite this `if`", which is
+    // narrower than "the lift's recogniser accepts it" in TWO ways — both were
+    // live defects producing an unspendable UTXO: the lift only rewrites chains
+    // of TWO OR MORE branches (`collectUpdateBranches` returns a ONE-element
+    // list for the assert-false-else guard), and it only walks `method.body`,
+    // passing loop bodies and surviving arms through untouched, while
+    // `declares_results` is evaluated at EVERY nesting depth.
+    //
+    // A chain's DEEPEST `if` is never at top level, so it now declares results
+    // and carries a normalisation block — which is why `collectUpdateBranches`
+    // strips a declared block before matching (`stripDeclaredResults`).
+    const lifted_maybe = try collectUpdateBranches(
         ctx.allocator,
         cond_ref,
         then_ctx.bindings.items,
         else_ctx.bindings.items,
-    )) != null;
-    const declares_results = !branch_has_outputs and !liftable and
+    );
+    const will_be_lifted = !ctx.nested and
+        (if (lifted_maybe) |l| l.len >= 2 else false);
+    const declares_results = !branch_has_outputs and !will_be_lifted and
         (merged_locals.len >= 2 or
             (result_names.items.len >= 1 and else_ctx.bindings.items.len > 0));
 
@@ -2786,6 +2835,21 @@ fn isAssertFalseElse(bindings: []const ANFBinding) bool {
     return false;
 }
 
+/// An arm with its declared-results block removed.
+///
+/// `appendBranchResults` adds exactly `2 * results.len` trailing bindings to
+/// each arm of an `if` that declares results. They are a materialisation
+/// mechanism, not program logic, and they hide the arm's real shape from this
+/// pass. A dispatch chain's deepest `if` is nested by definition, so it declares
+/// results; without this the enclosing chain stops being recognised and
+/// TicTacToe's position dispatch loses the C20 lift (an unspendable script).
+fn stripDeclaredResults(bindings: []const ANFBinding, results: []const []const u8) []const ANFBinding {
+    if (results.len == 0) return bindings;
+    const drop = 2 * results.len;
+    if (bindings.len <= drop) return bindings[0..0];
+    return bindings[0 .. bindings.len - drop];
+}
+
 /// Recursively collect update branches from a nested if-else chain.
 /// Returns null if the chain cannot be flattened.
 fn collectUpdateBranches(
@@ -2823,8 +2887,8 @@ fn collectUpdateBranches(
             const inner_maybe = try collectUpdateBranches(
                 allocator,
                 inner_if.cond,
-                inner_if.then,
-                inner_if.@"else",
+                stripDeclaredResults(inner_if.then, inner_if.results),
+                stripDeclaredResults(inner_if.@"else", inner_if.results),
             );
             const inner = inner_maybe orelse {
                 branches.deinit(allocator);
@@ -3015,8 +3079,8 @@ fn liftBranchUpdateProps(
         const branches_maybe = try collectUpdateBranches(
             allocator,
             if_val.cond,
-            if_val.then,
-            if_val.@"else",
+            stripDeclaredResults(if_val.then, if_val.results),
+            stripDeclaredResults(if_val.@"else", if_val.results),
         );
         const branches = branches_maybe orelse {
             try result.append(allocator, binding);

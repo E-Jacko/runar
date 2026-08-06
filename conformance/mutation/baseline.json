@@ -14,7 +14,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "stacklower-sub-to-add",
@@ -28,7 +29,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "stacklower-mul-to-add",
@@ -42,7 +44,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "stacklower-gt-to-lt",
@@ -56,7 +59,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "stacklower-numeq-to-numneq",
@@ -70,7 +74,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "emit-add-opcode-to-sub",
@@ -86,7 +91,8 @@
         "differential-witness",
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "emit-numequal-to-numnotequal",
@@ -100,7 +106,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "emit-lessthan-to-greaterthan",
@@ -114,7 +121,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "emit-if-without-else-threshold",
@@ -128,7 +136,8 @@
       "expectCaughtBy": [
         "differential-witness"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "peephole-equalverify-drop",
@@ -142,7 +151,8 @@
       "expectCaughtBy": [
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "peephole-numequalverify-drop",
@@ -156,7 +166,8 @@
       "expectCaughtBy": [
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "peephole-1add-to-1sub",
@@ -170,7 +181,8 @@
       "expectCaughtBy": [
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "peephole-numequal-to-not-corrupt",
@@ -184,7 +196,8 @@
       "expectCaughtBy": [
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "peephole-rot-to-swap",
@@ -198,7 +211,8 @@
       "expectCaughtBy": [
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "peephole-pick1-over-to-dup",
@@ -212,7 +226,8 @@
       "expectCaughtBy": [
         "peephole-exhaustive"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "constantfold-add-to-sub",
@@ -226,7 +241,8 @@
       "expectCaughtBy": [
         "fold-execution"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "anflower-merge-locals-single-only",
@@ -235,12 +251,15 @@
       "caught": true,
       "survived": false,
       "caughtBy": [
-        "branch-merged-locals-vm"
+        "branch-merged-locals-vm",
+        "real-crypto-branch-merged-locals"
       ],
       "expectCaughtBy": [
-        "branch-merged-locals-vm"
+        "branch-merged-locals-vm",
+        "real-crypto-branch-merged-locals"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "stacklower-merge-locals-property-only",
@@ -249,12 +268,17 @@
       "caught": true,
       "survived": false,
       "caughtBy": [
-        "branch-merged-locals-vm"
+        "branch-merged-locals-vm",
+        "branch-result-depth-invariant",
+        "real-crypto-branch-merged-locals"
       ],
       "expectCaughtBy": [
-        "branch-merged-locals-vm"
+        "branch-merged-locals-vm",
+        "branch-result-depth-invariant",
+        "real-crypto-branch-merged-locals"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "sdkstate-encode-minimaldata-opn",
@@ -270,7 +294,8 @@
         "state-push-framing-vm",
         "c28-state-strict"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "sdkstate-decode-opn-as-length",
@@ -285,7 +310,8 @@
         "state-push-framing-vm",
         "c28-state-strict"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "sdksplice-constructor-slot-wrong-length",
@@ -299,7 +325,8 @@
       "expectCaughtBy": [
         "sdk-vertical-constructor-slots"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     },
     {
       "id": "sdksplice-codeseparator-off-by-one",
@@ -313,7 +340,8 @@
       "expectCaughtBy": [
         "sdk-vertical-codeseparator"
       ],
-      "documentedSurvivor": false
+      "documentedSurvivor": false,
+      "stale": false
     }
   ]
 }

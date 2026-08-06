@@ -486,13 +486,15 @@ The golden-provenance gate above asks *"you changed a golden — prove the new b
 **The rule (enforced, not advisory).**
 
 ```text
-changed ∩ wire-format paths ≠ ∅   ∧   changed ∩ pin paths = ∅   ⇒   CI fails
+changed ∩ wire-format paths ≠ ∅   ∧   changed ∩ STRONG pin paths = ∅   ⇒   CI fails
 ```
+
+**Why "strong" (2026-08-06).** The rule used to accept *any* pin, weak ones included, and only print a `⚠` when every pin was weak. Replaying the literal changed set of `bd7ec284` — the incident commit this whole section exists for — through the gate exited **0**: that commit co-added `packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts`, whose name matches the `*minimaldata*` tier-local pin glob, and one weak pin was enough. A round-trip-class test added in the *same* commit as the encoder it exercises is not independent evidence of anything — it is the encoder graded against its own inverse, and it asserted the wrong framing as correct. The weak-pin allowance had been granted because `conformance/sdk-vertical/**` did not exist yet; it does now (39 cases × 7 tiers of absolute compiler↔SDK pins), so a strong pin is available to every wire-format change. `conformance/scripts/__tests__/wire-format-pr-audit.test.ts` carries the replay as a named regression (`bd7ec284 (the incident this gate exists for)`).
 
 **Before you push a change to any wire-format path, do one of these:**
 
 1. **Move a pinned byte artifact** (preferred) — `conformance/tests/<fixture>/expected-script.hex`, `conformance/sdk-output/tests/*/expected-*.hex`, `conformance/sdk-vertical/cases/*/expected-*`, `conformance/anf-interpreter/expected*/*.json`, `conformance/sdk-bip143/fixtures.json`, or a `conformance/witnesses/real-crypto/*.json` witness. If no existing fixture exercises the value class you changed, **add one**. "No fixture covers it" is the hole, not the excuse — that is precisely why the 1-byte OP_N-range ByteString state bug shipped.
-2. **Add a cross-component pin** for the primitive you touched — a byte comparison against the **other** implementation of the format (compiler ↔ SDK, or SDK ↔ peer SDK). Never `deserialize(serialize(x)) === x` alone; see the plan's design principle P3. A tier-local unit test satisfies the gate but is reported as a **weak pin**, because it is usually the encoder graded against its own inverse.
+2. **Add a cross-component pin** for the primitive you touched — a byte comparison against the **other** implementation of the format (compiler ↔ SDK, or SDK ↔ peer SDK). Never `deserialize(serialize(x)) === x` alone; see the plan's design principle P3. A tier-local unit test is recorded as a **weak pin** and named in the report, but it does **not** satisfy the gate on its own — write it *and* move a strong pin.
 3. **Record an explicit, dated `UNCOVERED`** — strongly discouraged for wire format. Add an entry to `conformance/wire-format-exceptions.json`:
 
    ```json
@@ -527,6 +529,7 @@ The pin list lives beside it: `BYTE_ARTIFACT_PIN_GLOBS` (content **is** the byte
 - **Liveness.** Every glob in both lists is liveness-checked by `scripts/__tests__/wire-format-pr-audit.test.ts`: a glob that matches no file is a **hard test failure**, because a gate whose globs match nothing reports green forever.
 - **Anchors.** Liveness proves a *path* exists, not that the encoding logic still lives in it. `WIRE_FORMAT_ANCHORS` pins byte tokens (`1976a914`, `88ac`, `STATE_FIELD_WIDTHS`, …) to the files that must still contain them, so extracting an encoder into a new file turns the gate's own test red until the new file is globbed.
 - **Pin ≠ any file under `conformance/`.** A *strong* pin means the file's content **is** the wire bytes. Inputs (`input.json`), runners, generators, contracts and prose are **not** pins, and a witness diff that touches only free-text `note`/`description` fields does **not** count — the gate reads the merge-base blob and compares the note-stripped evidence.
+- **Weak ≠ sufficient.** Tier-local framing tests and `construct-ledger.json` stay *classified* as pins (they are listed in the report, and a doc merely *named* `*codesep*` is still not a pin at all), but a changed set whose pins are all weak now **fails**. See "Why 'strong'" above.
 
 **Known limitation.** Comment/doc-only diff detection is **not** implemented for *implementation* files. Classifying a hunk as "comments only" across seven grammars (line comments, block comments, docstrings, strings containing comment markers) fails **open** when it gets it wrong — a real byte change misread as a comment would pass silently, which is the one failure mode this gate must not have. Use an exceptions entry for the rare comment-only touch of a wire file. (Free-text detection *is* implemented for the JSON witness pins, where the format is known and the failure direction is safe: an unparseable or non-JSON diff is always treated as material.)
 

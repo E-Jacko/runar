@@ -154,6 +154,18 @@ pub const StackMap = struct {
 
 const LowerError = error{
     OutOfMemory,
+    /// The ANF carries a `__merge$` block in a branch arm but the `if` node
+    /// declares no results — the pre-multi-result wire format. `--ir` /
+    /// `--ir-parity` are documented surfaces and ANF has no version field, so a
+    /// stored ANF from before the node landed deserialises cleanly and the
+    /// result count silently falls back to counting the arm's untrimmed block
+    /// residue. Refused rather than miscompiled.
+    StaleMergedLocalAnf,
+    /// The `if` node declares the same result name twice. Result slots are
+    /// matched by name, so duplicates cannot be told apart and one value would
+    /// silently replace the other while the layout assertion passes by
+    /// coincidence.
+    DuplicateDeclaredResults,
     VariableNotFound,
     InvalidBuiltin,
     UnsupportedOperation,
@@ -4011,6 +4023,41 @@ const LowerCtx = struct {
     }
 
     fn lowerIfExprImpl(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr, terminal_assert: bool) !void {
+        // The ANF wire format has no version field, and `--ir` / `--ir-parity`
+        // are documented surfaces that feed a checked-in ANF JSON straight into
+        // this pass. An ANF produced BEFORE the multi-result node carries the
+        // trailing `__merge$` block WITHOUT results — back then the block was a
+        // naming CONVENTION this pass recognised, and no tier recognises it any
+        // more. Refuse it: the block can only be emitted by
+        // `appendBranchResults`, which only runs for an `if` that declares
+        // results. Emits no opcodes.
+        if (ie.results.len == 0) {
+            for (ie.then_bindings) |b| {
+                if (std.mem.startsWith(u8, b.name, types.merged_local_temp_prefix)) {
+                    return LowerError.StaleMergedLocalAnf;
+                }
+            }
+            if (ie.else_bindings) |eb| {
+                for (eb) |b| {
+                    if (std.mem.startsWith(u8, b.name, types.merged_local_temp_prefix)) {
+                        return LowerError.StaleMergedLocalAnf;
+                    }
+                }
+            }
+        }
+
+        // Result slots are identified BY NAME — two identically-named results
+        // are indistinguishable, so the layout assertion would be satisfied by
+        // coincidence while one value silently replaced the other. ANF lowering
+        // refuses the source shape; this guards the `--ir` path.
+        if (ie.results.len > 1) {
+            for (ie.results, 0..) |a, i| {
+                for (ie.results[i + 1 ..]) |b| {
+                    if (std.mem.eql(u8, a, b)) return LowerError.DuplicateDeclaredResults;
+                }
+            }
+        }
+
         try self.bringToTopAuto(ie.condition);
         _ = self.stack.pop();
         var base_stack = try self.stack.clone(self.allocator);

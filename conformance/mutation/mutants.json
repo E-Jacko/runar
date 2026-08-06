@@ -209,26 +209,29 @@
     {
       "id": "anflower-merge-locals-single-only",
       "file": "packages/runar-compiler/src/passes/04-anf-lower.ts",
-      "find": "if (mergedLocals.length >= 2) {",
-      "replace": "if (mergedLocals.length >= 1000) {",
+      "find": "  for (const name of lastRebindOrder(elseCtx)) {\n    if (!merged.includes(name)) merged.push(name);\n  }\n  return merged;",
+      "replace": "  for (const name of lastRebindOrder(elseCtx)) {\n    if (!merged.includes(name)) merged.push(name);\n  }\n  return merged.slice(0, 1);",
       "class": "branch-merge regression",
       "stage": "anf-lower",
       "expectCaughtBy": [
-        "branch-merged-locals-vm"
+        "branch-merged-locals-vm",
+        "real-crypto-branch-merged-locals"
       ],
-      "finding": "PALMER-1 inversion: disables the >=2 branch-merged-locals normalisation added in 23ef2d2b, reproducing the pre-fix behaviour where an `if` whose two arms rebind DIFFERENT locals (or >=2 of them) leaves every post-branch reference pointing at the dead pre-branch binding. Caught by branch-merged-locals-vm.test.ts (real @bsv/sdk Spend + expectedState pins, not just accept/reject)."
+      "finding": "PALMER-1 inversion, RE-DERIVED 2026-08-06 against 4b0f688f (multi-result branch node). MEASURED per-gate firing (2026-08-06, each gate run separately against the applied patch): branch-merged-locals-vm 5/9 shapes fail (S3 k=2 same-set, S6 k=3, S7 k=2 mixed types, S8 the filed 4-local asymmetric reproducer, S9 nested — S1/S2 k=1 and S4/S5 are untouched by a list truncated to its FIRST entry); real-crypto-branch-merged-locals 1/3 spends fail (the toFirst==0 accept, where the else-arm reassigns nb and na must survive); branch-result-depth-invariant does NOT fire (18/18 still pass) and is deliberately NOT listed — this defect preserves arm depth and corrupts which NAME occupies a slot, and that invariant only sees depth. The previous patch disabled `if (mergedLocals.length >= 2)` inside branchOutputRejectionReason — a function that only runs when an if arm emits an output, which the branch-merged-locals fixtures never do — so it applied cleanly, gated nothing, and SURVIVED while baseline.json recorded it as caught. The current patch truncates collectBranchMergedLocals' canonical merge list to its first entry, so only ONE local ever gets the explicit two-pass copy-then-rebind block both arms need and every other genuinely-reassigned local falls through to undeclared-result machinery — the pre-23ef2d2b behaviour, in the place that now decides it."
     },
     {
       "id": "stacklower-merge-locals-property-only",
       "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
-      "find": "return tn !== null && tn === elseCtx.stackMap.peekAtDepth(i);",
-      "replace": "return tn !== null &&\n          tn === elseCtx.stackMap.peekAtDepth(i) &&\n          this._properties.some(p => p.name === tn);",
+      "find": "      for (const name of results) {\n        this.stackMap.push(name);\n      }",
+      "replace": "      for (const name of results) {\n        this.stackMap.push(this._properties.some((p) => p.name === name) ? name : bindingName);\n      }",
       "class": "branch-merge regression",
       "stage": "stack-lower",
       "expectCaughtBy": [
-        "branch-merged-locals-vm"
+        "branch-merged-locals-vm",
+        "branch-result-depth-invariant",
+        "real-crypto-branch-merged-locals"
       ],
-      "finding": "PALMER-1 inversion: restores the pre-23ef2d2b `_properties` membership guard on lowerIf's N>=2 reconcile, so branch-merged LOCALS (not contract properties) fall back to the single-slot push(bindingName) path and register one stackMap name for N physical results — every later operand resolves one slot off. Caught by branch-merged-locals-vm.test.ts."
+      "finding": "PALMER-1 inversion (stack-lower face), RE-DERIVED 2026-08-06 against 4b0f688f. The previous patch added the `_properties` guard to `elseMatchesThenNResultLayout`, which after 4b0f688f is only reachable when nDeclared === 0 — every branch-merged-locals shape now takes the declared-results path instead, so the patch applied to dead code and SURVIVED while baseline.json recorded it as caught. The current patch puts the same pre-23ef2d2b `_properties` membership guard on the decision that replaced it: the by-name adoption of the declared results in lowerIf. A merged LOCAL is then registered under the if-binding's name instead of its own, so the parent's stackMap names a different slot than the one the arms actually left — one stackMap name for N physical results, which is exactly the pre-fix failure. MEASURED per-gate firing (2026-08-06, each gate run separately, twice, against two different working-tree states): branch-merged-locals-vm 8/9 shapes fail (all but S2, the if-without-else shape, which never reaches the declared-results adoption); branch-result-depth-invariant 12/18 fail — unlike its anf-lower peer this face also moves the stale-slot roll-out, so Layer C (7b888035) sees it; real-crypto-branch-merged-locals 3/3 spends fail. All three listed because all three were observed to fire in both runs."
     },
     {
       "id": "sdkstate-encode-minimaldata-opn",

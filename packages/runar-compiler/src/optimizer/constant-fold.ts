@@ -340,14 +340,15 @@ function foldValue(value: ANFValue, env: ConstEnv): ANFValue {
       //
       //   * An arm is not a free-floating list of bindings — it carries a
       //     STACK-SHAPE CONTRACT that 04-anf-lower establishes and
-      //     05-stack-lower depends on. For two or more branch-merged locals the
-      //     arms end with the identical `__merge$<i>` result block
-      //     (`appendMergedLocalResults`), which is how `lowerIf` learns K and
-      //     adopts the K results by name. Blanking one arm makes
-      //     `countMergedLocalResults` see 0, the N>=2 name-matched reconcile
-      //     cannot fire, and `lowerIf` registers ONE stackMap slot for K
-      //     physical results — every post-branch operand then resolves one or
-      //     more slots off. At K=2 that miscompiled SILENTLY: the deployed
+      //     05-stack-lower depends on. An `if` that declares `results` ends
+      //     BOTH arms with the identical `__merge$<i>` block
+      //     (`appendBranchResults`), which is what makes the declaration true:
+      //     `lowerIf` trims each arm to `results.length` and adopts the slots
+      //     by the declared ORDER. Blanking one arm leaves the node still
+      //     declaring K results that the arm no longer holds, so the reconcile
+      //     adopts slots that are not the results — every post-branch operand
+      //     then resolves one or more slots off. At K=2 that miscompiled
+      //     SILENTLY: the deployed
       //     script accepted spends the source rejects and rejected spends the
       //     source accepts. At K=1 it surfaced as `value 'tN' not found on
       //     stack`, i.e. a compile-time rejection of source that compiles fine

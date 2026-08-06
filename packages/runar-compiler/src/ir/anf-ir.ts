@@ -268,15 +268,19 @@ export type ANFValue =
  * Name prefix for the temporaries 04-anf-lower appends to BOTH arms of an
  * if-statement that merges two or more locals (`appendMergedLocalResults`).
  *
- * An `if` carries one value, so post-branch references to a merged local can
- * only be rewired by aliasing when there is exactly ONE of them. For two or
- * more, both arms instead end with an identical K-binding block — K copies
- * into `__merge$0..K-1`, then K rebinds of the locals from those temps — which
- * leaves the merged values on top in the same canonical order whichever branch
- * runs. Stack lowering recognises that trailing block by this prefix
- * (`countMergedLocalResults` in 05-stack-lower.ts), trims each arm down to the
- * K results, and adopts them by name, so a later reference resolves to the
- * merged value rather than the dead pre-branch binding.
+ * Emitted by `appendBranchResults` (04-anf-lower) for — and ONLY for — an `if`
+ * that declares `results`. Both arms end with an identical 2K-binding block:
+ * K copies into `__merge$0..K-1`, then K rebinds of the declared results from
+ * those temps. That makes each arm hold exactly `results`, in `results` order,
+ * whichever arm ran and whichever of them that arm actually assigned.
+ *
+ * The block is a MATERIALISATION MECHANISM, not a signal. Stack lowering reads
+ * the node's `results` list — it does not count or recognise this block, and
+ * has not since the multi-result branch node landed (the `countMergedLocalResults`
+ * inference it used to do is deleted in all seven tiers). The prefix survives
+ * in two roles only: naming the temps, and letting the lowerer REFUSE an ANF
+ * that carries the block without `results`, which is a pre-multi-result wire
+ * format no current compiler can produce.
  *
  * The prefix is part of the ANF wire format: all seven compilers emit and
  * recognise the same block.

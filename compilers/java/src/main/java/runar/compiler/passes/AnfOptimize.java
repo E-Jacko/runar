@@ -458,12 +458,20 @@ public final class AnfOptimize {
                     // Whole branch evaporated; binding is dead. Skip.
                     continue;
                 }
-                if (thenEmpty ^ elsEmpty) {
-                    // Exactly one branch survived — splice it in place of the If.
-                    List<AnfBinding> surviving = thenEmpty ? elsOpt : thenOpt;
-                    out.addAll(surviving);
-                    continue;
-                }
+                // NOTE: an earlier version spliced the surviving arm in place of
+                // the `If` whenever exactly one arm was empty. That is unsound
+                // for any condition that is not a compile-time constant, and
+                // this pass has no constant information: EVERY `if` without an
+                // else has an empty else arm, so the rule would hoist the
+                // then-arm's bindings — property writes included — out of the
+                // conditional and run them unconditionally. It is unreachable
+                // today (`runFullOptimizer` is unused; `Cli.optimizeAnf` calls
+                // `AnfOptimize.run`), which is exactly why it had to go before
+                // someone re-enables the optimiser.
+                //
+                // Keep the `If` with optimised children instead — including
+                // when one arm is empty, which is a legitimate shape the
+                // lowerer handles (`lowerIf`'s preserve-the-old-value path).
                 // Both branches non-empty: keep the If, but with optimized children.
                 out.add(new AnfBinding(b.name(),
                     new If(ifv.cond(), thenOpt, elsOpt, ifv.results()), b.sourceLoc()));

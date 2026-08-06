@@ -13,9 +13,21 @@
 // no longer matched what the compiler emitted.
 //
 // The rule. A wire-format change that moves no pinned bytes is UNTESTED BY
-// DEFINITION. So:
+// DEFINITION, and a tier-local codec test is not "pinned bytes" — it is the
+// encoder graded against its own inverse. So:
 //
-//     changed ∩ WIRE_FORMAT_GLOBS ≠ ∅   ∧   changed ∩ PIN_GLOBS = ∅   ⇒  FAIL
+//     changed ∩ WIRE_FORMAT_GLOBS ≠ ∅   ∧   changed ∩ STRONG_PIN_GLOBS = ∅  ⇒  FAIL
+//
+// The STRONG qualifier is load-bearing, and was added on 2026-08-06 after the
+// gate was replayed against the literal changed set of `bd7ec284` — the very
+// commit it was built to catch — and exited 0. That commit CO-ADDED
+// `packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts`, whose
+// name matches the `*minimaldata*` tier-local pin glob; the gate counted it as a
+// pin, warned that it was weak, and passed. A round-trip-class test added in the
+// same PR as the encoder it exercises is not independent evidence of anything.
+// The weak-pin allowance was granted because `conformance/sdk-vertical/**` did
+// not exist yet. It does now — 39 cases × 7 tiers of absolute compiler↔SDK pins —
+// so every wire-format change has a strong pin available to it.
 //
 // "Wire format" = anything whose bytes cross a component boundary: the SDK state
 // serializers + the shared field-width table, push-data / MINIMALDATA encoding,
@@ -310,9 +322,10 @@ export const WIRE_FORMAT_GLOBS: readonly string[] = WIRE_FORMAT_RULES.flatMap((r
 //     the BIP-143 fixture, and the real-crypto witnesses.
 //   * weak pins — evidence ABOUT bytes rather than the bytes themselves: the
 //     named tier-local MINIMALDATA / state-framing / codesep / constructor-slot
-//     tests, and the construct ledger. They satisfy the rule, but when they are
-//     the ONLY pin the report says so: a tier-local codec test is usually the
-//     encoder graded against its own inverse (plan P3, reviewer #4).
+//     tests, and the construct ledger. They are reported as moved evidence but
+//     they do NOT satisfy the rule on their own: a tier-local codec test is
+//     usually the encoder graded against its own inverse (plan P3, reviewer #4),
+//     and `bd7ec284` shipped a seven-SDK framing change on exactly one of them.
 
 /** Pins whose bytes ARE the wire format. Every glob is liveness-checked. */
 export const BYTE_ARTIFACT_PIN_GLOBS: readonly string[] = [
@@ -782,7 +795,12 @@ export function auditChangedPaths(changed: readonly string[], opts: AuditOptions
 
   const weakPinOnly = pinHits.length > 0 && !pinHits.some(isStrongPin);
 
-  const ok = problems.length === 0 && (wireHits.length === 0 || pinHits.length > 0);
+  // Only a STRONG pin satisfies the rule. A weak pin is still recorded and
+  // reported (it IS evidence — just not evidence that any cross-component byte
+  // was compared), but it cannot close a wire-format change on its own: that is
+  // precisely how `bd7ec284` passed this gate when the drill replayed it.
+  const ok =
+    problems.length === 0 && (wireHits.length === 0 || pinHits.some(isStrongPin));
 
   return {
     ok,
@@ -859,33 +877,50 @@ function renderMessage(res: Omit<AuditResult, 'message'>): string {
     return lines.join('\n');
   }
 
-  if (res.pinHits.length > 0) {
+  if (res.pinHits.length > 0 && !res.weakPinOnly) {
     lines.push(
       `✓ Must-move-a-golden gate: ${res.wireHits.length} wire-format path(s) changed, ` +
         `${res.pinHits.length} pinned byte artifact(s) moved with them.`,
     );
-    for (const p of res.pinHits) lines.push(`    pin: ${p}`);
-    if (res.weakPinOnly) {
-      lines.push('');
-      lines.push(
-        '⚠ Every pin in this PR is a tier-local test file. A tier-local codec test is ' +
-          'often the encoder graded against its own inverse (round-trip class, plan P3 / ' +
-          'reviewer #4) — it holds for ANY self-consistent framing, including a wrong one. ' +
-          'Prefer moving a cross-component byte pin as well: ' +
-          'conformance/sdk-output/tests/*/expected-*.hex, ' +
-          'conformance/sdk-vertical/cases/*/expected-*, conformance/tests/**/expected-script.hex, ' +
-          'or a conformance/witnesses/real-crypto/*.json witness.',
-      );
+    for (const p of res.pinHits) {
+      lines.push(`    pin${isStrongPin(p) ? '' : ' (weak)'}: ${p}`);
     }
     return lines.join('\n');
   }
 
   lines.push('✗ MUST-MOVE-A-GOLDEN GATE FAILED');
   lines.push('');
-  lines.push(
-    `${res.wireHits.length} wire-format implementation path(s) changed and NOT ONE pinned byte ` +
-      'artifact moved with them:',
-  );
+  if (res.weakPinOnly) {
+    lines.push(
+      `${res.wireHits.length} wire-format implementation path(s) changed, and every pin that ` +
+        'moved with them is WEAK — evidence ABOUT bytes, never the bytes themselves:',
+    );
+    lines.push('');
+    for (const p of res.pinHits) lines.push(`      ~ ${p}  (WEAK pin)`);
+    lines.push('');
+    lines.push('A tier-local codec test written in the same PR as the encoder it exercises is');
+    lines.push('the encoder graded against its own inverse (round-trip class, plan §2 P3) — it');
+    lines.push('holds for ANY self-consistent framing, including a wrong one. This is not a');
+    lines.push('hypothetical: bd7ec284 changed state-section framing in seven SDKs, co-added');
+    lines.push('exactly one such test, reported "SDK-output conformance 46/46", and shipped a');
+    lines.push('state section the compiler no longer agreed with. Replaying that commit through');
+    lines.push('this gate used to exit 0 on the strength of that one file.');
+    lines.push('');
+    lines.push('Move ONE cross-component byte pin as well (all three families exist today):');
+    lines.push('        conformance/sdk-vertical/cases/*/expected-*      (compiler↔SDK vertical pin)');
+    lines.push('        conformance/sdk-output/tests/*/expected-*.hex    (cross-SDK locking hex)');
+    lines.push('        conformance/tests/**/expected-*                  (compiler golden)');
+    lines.push('        conformance/anf-interpreter/expected*/*.json     (cross-tier post-state + outputs)');
+    lines.push('        conformance/sdk-bip143/fixtures.json             (cross-tier sighash preimage)');
+    lines.push('        conformance/witnesses/real-crypto/*.json         (spends + expectedState)');
+    lines.push('');
+    lines.push('The wire-format path(s) that need it:');
+  } else {
+    lines.push(
+      `${res.wireHits.length} wire-format implementation path(s) changed and NOT ONE pinned byte ` +
+        'artifact moved with them:',
+    );
+  }
   lines.push('');
   const byFamily = new Map<string, string[]>();
   for (const p of res.wireHits) {
@@ -912,7 +947,9 @@ function renderMessage(res: Omit<AuditResult, 'message'>): string {
   lines.push('        conformance/anf-interpreter/expected*/*.json         (cross-tier post-state + outputs)');
   lines.push('        conformance/sdk-bip143/fixtures.json                 (cross-tier sighash preimage)');
   lines.push('        conformance/witnesses/real-crypto/*.json             (spends + expectedState)');
-  lines.push('      An `input.json`, a runner, a generator or a note is NOT a pin.');
+  lines.push('      An `input.json`, a runner, a generator or a note is NOT a pin, and a');
+  lines.push('      tier-local unit test is only a WEAK pin — it never satisfies this gate');
+  lines.push('      on its own (see bd7ec284).');
   lines.push('      If no existing fixture exercises the value class you changed, ADD ONE.');
   lines.push('      "No fixture covers it" is the hole, not the excuse.');
   lines.push('');

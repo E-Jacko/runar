@@ -2236,6 +2236,52 @@ public final class StackLower {
                      List<String> results,
                      int idx, Map<String, Integer> lastUses,
                      boolean terminalAssert) {
+            // The ANF wire format has no version field, and --ir / --ir-parity
+            // are documented surfaces that feed a checked-in ANF JSON straight
+            // into this pass. An ANF produced BEFORE the multi-result node
+            // carries the trailing `__merge$` block WITHOUT results — back then
+            // the block was a naming CONVENTION this pass recognised, and no
+            // tier recognises it any more. It deserialises cleanly, the declared
+            // count is 0, and the result count falls back to
+            // thenDepth - parentDepth, which counts the arm's untrimmed block
+            // residue as results. Refuse it: the block can only be emitted by
+            // appendBranchResults, which only runs for an `if` that declares
+            // results. Emits no opcodes.
+            if (results == null || results.isEmpty()) {
+                List<AnfBinding> arms = new ArrayList<>();
+                if (thenB != null) arms.addAll(thenB);
+                if (elseB != null) arms.addAll(elseB);
+                for (AnfBinding b : arms) {
+                    if (b.name().startsWith(AnfValue.MERGED_LOCAL_TEMP_PREFIX)) {
+                        throw new IllegalStateException(
+                            "ANF produced by a pre-multi-result compiler: the "
+                            + "conditional's arm carries a '"
+                            + AnfValue.MERGED_LOCAL_TEMP_PREFIX + "' block but the node "
+                            + "declares no results (binding '" + b.name() + "'). That "
+                            + "block used to be a naming convention this pass inferred "
+                            + "results from; it is now a declared contract, and no tier "
+                            + "reads the convention any more. Recompile the source with "
+                            + "the current compiler instead of reusing the stored ANF. "
+                            + "binding='" + bindingName + "'.");
+                    }
+                }
+            }
+
+            // Result slots are identified BY NAME — two identically-named
+            // results are indistinguishable, so the layout assertion would be
+            // satisfied by coincidence while one value silently replaced the
+            // other. ANF lowering refuses the source shape; this guards the
+            // --ir path, where the list arrives as data.
+            if (results != null && results.size() > 1
+                && new LinkedHashSet<>(results).size() != results.size()) {
+                throw new IllegalStateException(
+                    "Internal codegen error: the conditional declares duplicate result "
+                    + "names [" + String.join(", ", results) + "]. Result slots are "
+                    + "matched by name, so duplicates cannot be told apart and one "
+                    + "value would silently replace the other. binding='"
+                    + bindingName + "'.");
+            }
+
             bringToTop(cond, isLastUse(cond, idx, lastUses));
             sm.pop();
 

@@ -15,7 +15,7 @@
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue};
+use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue, MERGED_LOCAL_TEMP_PREFIX};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1961,6 +1961,54 @@ impl LoweringContext {
         last_uses: &HashMap<String, usize>,
         terminal_assert: bool,
     ) {
+        // The ANF wire format has no version field, and `--ir` / `--ir-parity`
+        // are documented surfaces that feed a checked-in ANF JSON straight into
+        // this pass. An ANF produced BEFORE the multi-result node carries the
+        // trailing `__merge$` block WITHOUT `results` — back then the block was
+        // a naming CONVENTION this pass recognised, and no tier recognises it
+        // any more. It deserialises cleanly, the declared count is 0, and the
+        // result count falls back to `then_depth - parent_depth`, which counts
+        // the arm's untrimmed block residue as results. Refuse it: the block can
+        // only be emitted by `append_branch_results`, which only runs for an
+        // `if` that declares `results`. Emits no opcodes.
+        if results.is_empty() {
+            if let Some(stale) = then_bindings
+                .iter()
+                .chain(else_bindings.iter())
+                .find(|b| b.name.starts_with(MERGED_LOCAL_TEMP_PREFIX))
+            {
+                panic!(
+                    "ANF produced by a pre-multi-result compiler: the conditional's \
+                     arm carries a '{}' block but the node declares no results \
+                     (binding '{}'). That block used to be a naming convention this \
+                     pass inferred results from; it is now a declared contract, and \
+                     no tier reads the convention any more. Recompile the source \
+                     with the current compiler instead of reusing the stored ANF. \
+                     binding='{}'.",
+                    MERGED_LOCAL_TEMP_PREFIX, stale.name, binding_name
+                );
+            }
+        }
+
+        // Result slots are identified BY NAME — two identically-named results
+        // are indistinguishable, so the layout assertion would be satisfied by
+        // coincidence while one value silently replaced the other. ANF lowering
+        // refuses the source shape; this guards the `--ir` path, where the list
+        // arrives as data.
+        if results.len() > 1 {
+            let unique: HashSet<&String> = results.iter().collect();
+            if unique.len() != results.len() {
+                panic!(
+                    "Internal codegen error: the conditional declares duplicate \
+                     result names [{}]. Result slots are matched by name, so \
+                     duplicates cannot be told apart and one value would silently \
+                     replace the other. binding='{}'.",
+                    results.join(", "),
+                    binding_name
+                );
+            }
+        }
+
         let is_last = self.is_last_use(cond, binding_index, last_uses);
         self.bring_to_top(cond, is_last);
         self.sm.pop(); // OP_IF consumes condition

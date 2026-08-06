@@ -600,6 +600,10 @@ module RunarCompiler
         @method_scope = MethodScope.new
         # Issue #123: non-default @sighash flag for this method (nil = default).
         @sighash_flag = nil
+        # True in every context produced by +sub_context+ -- inside an if arm, a
+        # loop body, or an inlined helper's block -- and false only in the
+        # context a method's own body is lowered into.
+        @nested = false
       end
 
       # @return [MethodScope] shared per-method bookkeeping for intent intrinsics
@@ -609,6 +613,11 @@ module RunarCompiler
       # lowered, so a MANUAL +checkPreimage(pre)+ call binds under the same mode
       # as the method's declared sighash. nil = default ALL|FORKID.
       attr_accessor :sighash_flag
+
+      # True in every context produced by +sub_context+. +_lift_branch_update_props+
+      # walks method.body and does NOT recurse, so an +if+ its recogniser accepts
+      # is only actually REWRITTEN at method top level.
+      attr_accessor :nested
 
       # Push an alias for a parameter name, used while inlining the body of
       # a private method into this context: identifier references to that
@@ -843,6 +852,11 @@ module RunarCompiler
         # Propagate the method's declared @sighash flag (issue #123) so a manual
         # checkPreimage inside an if/else branch binds under the same mode.
         sub.sighash_flag = @sighash_flag
+        # _lift_branch_update_props walks method.body and does NOT recurse, so
+        # an +if+ its recogniser accepts is only actually REWRITTEN at method
+        # top level. lower_if_statement needs the same distinction before it
+        # defers to that pass.
+        sub.nested = true
         sub
       end
 
@@ -1129,6 +1143,22 @@ module RunarCompiler
           result_names << p.name if arm_props.include?(p.name)
         end
 
+        # The result list is keyed by NAME everywhere downstream, so a local
+        # that shares a contract property's name appears TWICE and both entries
+        # take the PROPERTY path -- the local's value is silently replaced by
+        # the property's, and the layout assertion cannot see it because both
+        # slots are legitimately named the same. Refuse the exact collision
+        # only; shadowing a property is otherwise fine.
+        shadowed = merged_locals.find { |n| arm_props.include?(n) }
+        if shadowed
+          raise ArgumentError,
+                "Local variable '#{shadowed}' shadows contract property " \
+                "'this.#{shadowed}', and the conditional assigns both. The " \
+                "branch's result slots are identified by name, so the two cannot " \
+                "be told apart and the local's value would be silently replaced " \
+                "by the property's. Rename the local."
+        end
+
         # When to materialise the contract instead of leaving the arms to the
         # stack-lowerer's inference:
         #
@@ -1161,10 +1191,23 @@ module RunarCompiler
         # side-effect free, and the block adds a second +update_prop+ behind it.
         # TicTacToe's position dispatch is exactly that shape, and losing the
         # lift there produced an unspendable +move+ script.
-        declares_results = !branch_has_outputs &&
-                           Frontend.send(:_collect_update_branches,
-                                         cond_ref, then_ctx.bindings,
-                                         else_ctx.bindings).nil? &&
+        #
+        # The exclusion must be exactly "the lift WILL rewrite this +if+", which
+        # is narrower than "the lift's recogniser accepts it" in TWO ways -- both
+        # were live defects producing an unspendable UTXO: the lift only rewrites
+        # chains of TWO OR MORE branches (_collect_update_branches returns a
+        # ONE-element list for the assert-false-else guard), and it only walks
+        # method.body, passing loop bodies and surviving arms through untouched,
+        # while declares_results is evaluated at EVERY nesting depth.
+        #
+        # A chain's DEEPEST +if+ is never at top level, so it now declares
+        # results and carries a normalisation block -- which is why
+        # _collect_update_branches strips a declared block before matching
+        # (_strip_declared_results).
+        lifted = Frontend.send(:_collect_update_branches,
+                               cond_ref, then_ctx.bindings, else_ctx.bindings)
+        will_be_lifted = !nested && !lifted.nil? && lifted.length >= 2
+        declares_results = !branch_has_outputs && !will_be_lifted &&
                            (merged_locals.length >= 2 ||
                             (!result_names.empty? && else_ctx.bindings.any?))
 
@@ -2518,6 +2561,25 @@ module RunarCompiler
     end
     private_class_method :_assert_false_else?
 
+    # An arm with its declared-results block removed.
+    #
+    # +_append_branch_results+ adds exactly <tt>2 * results.length</tt> trailing
+    # bindings to each arm of an +if+ that declares results. They are a
+    # materialisation mechanism, not program logic, and they hide the arm's real
+    # shape from this pass. A dispatch chain's deepest +if+ is nested by
+    # definition, so it declares results; without this the enclosing chain stops
+    # being recognised and TicTacToe's position dispatch loses the C20 lift (an
+    # unspendable +move+ script).
+    def self._strip_declared_results(bindings, results)
+      n = results.nil? ? 0 : results.length
+      return bindings if n.zero?
+
+      cut = bindings.length - (2 * n)
+      cut = 0 if cut.negative?
+      bindings[0...cut]
+    end
+    private_class_method :_strip_declared_results
+
     # Recursively collect update branches from a nested if-else chain.
     def self._collect_update_branches(if_cond, then_bindings, else_bindings)
       then_update = _extract_branch_update(then_bindings)
@@ -2539,7 +2601,9 @@ module RunarCompiler
         return nil unless _all_side_effect_free?(cond_setup)
 
         inner_branches = _collect_update_branches(
-          inner_if.cond, inner_if.then || [], inner_if.else_ || []
+          inner_if.cond,
+          _strip_declared_results(inner_if.then || [], inner_if.results),
+          _strip_declared_results(inner_if.else_ || [], inner_if.results)
         )
         return nil unless inner_branches
 
@@ -2710,7 +2774,9 @@ module RunarCompiler
 
         if_val = binding.value
         branches = _collect_update_branches(
-          if_val.cond, if_val.then || [], if_val.else_ || []
+          if_val.cond,
+          _strip_declared_results(if_val.then || [], if_val.results),
+          _strip_declared_results(if_val.else_ || [], if_val.results)
         )
 
         unless branches && branches.length >= 2

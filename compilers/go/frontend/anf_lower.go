@@ -609,6 +609,13 @@ type lowerCtx struct {
 	// ALL|FORKID, keeping the pinned binding blob unchanged. Propagated into
 	// sub-contexts so a manual call inside an if/for body picks it up.
 	sighashFlag *int
+	// nested is true in every context produced by subContext() — inside an if
+	// arm, a loop body, or an inlined helper's block — and false only in the
+	// context a method's own body is lowered into. liftBranchUpdateProps walks
+	// method.Body and does NOT recurse, so an `if` its recogniser accepts is
+	// only actually REWRITTEN at method top level; lowerIfStatement needs the
+	// same distinction before it defers to that pass.
+	nested bool
 }
 
 // methodScopeT holds per-method bookkeeping shared by parent and
@@ -869,6 +876,7 @@ func (ctx *lowerCtx) subContext() *lowerCtx {
 		localByteVars:    make(map[string]bool),
 		methodScope:      ctx.methodScope, // shared pointer — auto-injection registers propagate up
 		sighashFlag:      ctx.sighashFlag, // #123: nested manual checkPreimage inherits the method's mode
+		nested:           true,
 	}
 	// Share local name set
 	for k := range ctx.localNames {
@@ -1227,6 +1235,25 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt, readsAfter map[string]bool) {
 		}
 	}
 
+	// The result list is keyed by NAME everywhere downstream: appendBranchResults
+	// picks the local path or the property path per entry with armPropSeen[name],
+	// and stack lowering's layout assertion compares the arm's top-N slot names
+	// against this list. A local sharing a contract property's name therefore
+	// appears TWICE — once as a merged local, once as an arm-written property —
+	// and both entries take the PROPERTY path, so the local's value is silently
+	// replaced by the property's. The layout assertion cannot see it: both slots
+	// are legitimately named `count`. Refuse the exact collision only; shadowing
+	// a property is otherwise fine.
+	for _, name := range mergedLocals {
+		if armPropSeen[name] {
+			panic(fmt.Sprintf(
+				"Local variable '%s' shadows contract property 'this.%s', and the "+
+					"conditional assigns both. The branch's result slots are identified by "+
+					"name, so the two cannot be told apart and the local's value would be "+
+					"silently replaced by the property's. Rename the local.", name, name))
+		}
+	}
+
 	// When to materialise the contract instead of leaving the arms to the
 	// stack-lowerer's inference:
 	//
@@ -1257,8 +1284,29 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt, readsAfter map[string]bool) {
 	// adds a second update_prop behind it. TicTacToe's position dispatch is
 	// exactly that shape, and losing the lift there produced an unspendable
 	// `move` script.
+	//
+	// The exclusion must be exactly "the lift WILL rewrite this `if`", which is
+	// narrower than "the lift's recogniser accepts it" in TWO ways — both were
+	// live defects that produced an unspendable UTXO:
+	//
+	//   1. liftBranchUpdateProps only rewrites chains of TWO OR MORE branches,
+	//      but collectUpdateBranches returns a ONE-element list for the
+	//      isAssertFalseElse path. `if (n > 0n) { this.count = ... } else
+	//      { assert(false) }` — the idiomatic guard — was recognised, excluded,
+	//      and then never rewritten.
+	//   2. liftBranchUpdateProps only walks method.Body, passing loop bodies
+	//      and surviving if arms through untouched, while declaresResults is
+	//      evaluated at EVERY nesting depth.
+	//
+	// A chain's DEEPEST `if` is never at top level, so it now declares results
+	// and carries a normalisation block — which is why collectUpdateBranches
+	// strips a declared block before matching (stripDeclaredResults). The
+	// enclosing chain is still recognised, still lifted, and the lift discards
+	// the inner node, so the chain's bytes do not move.
+	lifted := collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings)
+	willBeLifted := !ctx.nested && lifted != nil && len(lifted) >= 2
 	declaresResults := !branchHasOutputs &&
-		collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings) == nil &&
+		!willBeLifted &&
 		(len(mergedLocals) >= 2 || (len(resultNames) >= 1 && len(elseCtx.bindings) > 0))
 
 	if declaresResults {
@@ -2514,6 +2562,29 @@ func isAssertFalseElse(bindings []ir.ANFBinding) bool {
 	return false
 }
 
+// stripDeclaredResults returns an arm with its declared-results block removed.
+//
+// appendBranchResults adds exactly 2*len(results) trailing bindings to each arm
+// of an `if` that declares results: K copies to `__merge$i` temps, then K
+// rebinds off those temps. They are a materialisation mechanism, not program
+// logic, and they hide the arm's real shape from this pass — the second
+// update_prop becomes the arm's last binding and the original lands in the
+// "everything before must be side-effect free" prefix. A dispatch chain's
+// deepest `if` is nested by definition, so it declares results; without this,
+// the enclosing chain stops being recognised and TicTacToe's position dispatch
+// loses the C20 lift (an unspendable `move` script).
+func stripDeclaredResults(bindings []ir.ANFBinding, results []string) []ir.ANFBinding {
+	n := len(results)
+	if n == 0 {
+		return bindings
+	}
+	cut := len(bindings) - 2*n
+	if cut < 0 {
+		cut = 0
+	}
+	return bindings[:cut]
+}
+
 // collectUpdateBranches recursively collects update branches from a nested if-else chain.
 func collectUpdateBranches(ifCond string, thenBindings, elseBindings []ir.ANFBinding) []updateBranch {
 	propName, valBindings, valRef, ok := extractBranchUpdate(thenBindings)
@@ -2541,7 +2612,11 @@ func collectUpdateBranches(ifCond string, thenBindings, elseBindings []ir.ANFBin
 			return nil
 		}
 
-		innerBranches := collectUpdateBranches(lastElse.Value.Cond, lastElse.Value.Then, lastElse.Value.Else)
+		innerBranches := collectUpdateBranches(
+			lastElse.Value.Cond,
+			stripDeclaredResults(lastElse.Value.Then, lastElse.Value.Results),
+			stripDeclaredResults(lastElse.Value.Else, lastElse.Value.Results),
+		)
 		if innerBranches == nil {
 			return nil
 		}
@@ -2686,7 +2761,11 @@ func liftBranchUpdateProps(bindings []ir.ANFBinding) []ir.ANFBinding {
 			continue
 		}
 
-		branches := collectUpdateBranches(binding.Value.Cond, binding.Value.Then, binding.Value.Else)
+		branches := collectUpdateBranches(
+			binding.Value.Cond,
+			stripDeclaredResults(binding.Value.Then, binding.Value.Results),
+			stripDeclaredResults(binding.Value.Else, binding.Value.Results),
+		)
 
 		if branches == nil || len(branches) < 2 {
 			result = append(result, binding)

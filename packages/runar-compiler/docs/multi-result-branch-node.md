@@ -363,3 +363,83 @@ are untouched. And an `if` whose arm emits outputs still refuses every
 combination that would need a second result (`branchOutputRejectionReason`) —
 lifting that is a separate change, because the output-bytes slot would have to
 join the result list and `drainBranchPrivateResidue` interacts with it.
+
+---
+
+## 11. Adversarial review of §10 — 2026-08-06
+
+An independent review of the landed node found two P0s and three P1s, all in
+the BOUNDARY the change drew around itself rather than in its mechanism. What
+the remediation measured:
+
+**The exclusion was wider than the rewrite it deferred to — twice.** §10 says
+liftable `if`s are excluded "because they are rewritten into flat single-valued
+`if`s anyway". That was true of the ones the lift REWRITES and false of the ones
+its collector merely RECOGNISES, and the gap had two halves:
+
+- `collectUpdateBranches` returns a **ONE-element** list on the
+  `isAssertFalseElse` path, but `liftBranchUpdateProps` only rewrites at **>= 2**.
+  So `if (n > 0n) { this.count = ... } else { assert(false) }` — the idiomatic
+  guard — was recognised, excluded, and then not rewritten. It declared no
+  results, the arm's `update_prop` kept the property's stale slot, and
+  `lowerGetStateScript`'s `findDepth` resolved the property to the TOPMOST slot,
+  so the continuation committed the PRE-call value: a permanently unspendable
+  UTXO. Deleting the `else` made it correct.
+- `liftBranchUpdateProps` walks `method.body` and does not recurse, while
+  `declaresResults` is evaluated at every nesting depth. The same chain one
+  `for` deeper, or inside another arm, was recognised everywhere and rewritten
+  nowhere.
+
+Both are fixed by making the exclusion mean what it says: `!ctx.nested && lifted
+!== null && lifted.length >= 2`. That needs one more piece, because a chain's
+DEEPEST `if` is nested by definition and therefore now declares results and
+carries a `__merge$` block — which the lift's recogniser reads as a second
+`update_prop` and rejects, silently disabling the C20 lift for the whole chain.
+Measured, not assumed: the naive `length < 2` fix alone moved TicTacToe by +464
+bytes (the unspendable-`move` regression §10 warned about) and `selector` by
+-10. `collectUpdateBranches` therefore strips a declared block before matching
+(`stripDeclaredResults`), after which the chain is recognised and lifted exactly
+as before and the lift discards the inner node, block and all.
+
+**Cost: ONE golden, and it is temp numbering only.** A 338-entry sweep (every
+conformance fixture and every `.runar.ts` in the repo, both fold modes) shows
+ZERO script-hex movement. `conformance/tests/selector/expected-ir.json` shifts
+every `tN` by one, because the chain tail's block emits its `update_prop` under
+a fresh temp and `liftBranchUpdateProps` starts its own naming one higher. All
+seven tiers produce the identical new ANF.
+
+**§9's layout invariant is still NOT landable, and its prediction was wrong.**
+§9 recorded 37 failures across 18 files and attributed all of them to the K=1
+alias rebind, which §10 deleted **for declaring `if`s only**. Re-run at HEAD:
+the "parent model == arms' model minus the result slots" invariant fails **41
+test files** (37 `branch layout mismatch` occurrences in the run log). The alias
+path at `04-anf-lower.ts`'s `if (!declaresResults)` is still live for every
+non-declaring `if` — which is every `if` without an else, and every lifted
+chain — so it still moves slots by design. An arms-vs-arms variant narrows the
+fixture corpus to three contracts, but one of them is TicTacToe, which is proven
+spendable on a regtest node, so that form is over-strict too.
+
+**The shape §9 called "P1-1" is real, and it is OPEN.** Reduced to
+`if (c1) { if (c2) { a = 5n } else { a = 6n } } ` with a live sibling local: the
+inner `if` declares its one result and its adopt loop physically ROLL+DROPs the
+stale slot out of the region the arm INHERITED from the enclosing arm. The
+enclosing `lowerIf` reconciles by name set and by depth, and neither sees a
+middle slot removed and a same-named slot appearing on top. The two arms of the
+OUTER `if` then leave the same DEPTH with different LAYOUTS, and the else-path
+compiles to an unspendable script. Confirmed pre-existing at `4b0f688f`
+(identical failure with the fix reverted), and confirmed unchanged by this
+remediation. Fixing it means teaching `lowerIf`'s reconcile about an arm that
+rearranged inherited slots — a change that moves bytes in all seven tiers, and
+which is deliberately NOT bundled here.
+
+**Two containment gaps closed, both byte-neutral.** The ANF wire format has no
+version field, so a pre-`4b0f688f` ANF (a legitimate `--ir` / `--ir-parity`
+input) loaded cleanly with `results` absent and the result count silently fell
+back to counting the arm's untrimmed block residue; all seven tiers now refuse a
+`__merge$` block without `results`. And `results` could contain the SAME NAME
+TWICE — a `let count` beside `this.count` yields `['count','count']`, both
+emitted as `load_prop`/`update_prop`, so the local's value was silently replaced
+by the property's while the layout assertion passed on coincidentally-equal
+names. Verified accepted end-to-end before fixing. All seven tiers now refuse
+the source shape, and the stack lowerer additionally refuses a duplicated
+declared list arriving as `--ir` data.

@@ -2020,6 +2020,46 @@ module RunarCompiler::Codegen
                   binding_index, last_uses, terminal_assert = false)
       then_bindings ||= []
       else_bindings ||= []
+      results ||= []
+
+      # The ANF wire format has no version field, and --ir / --ir-parity are
+      # documented surfaces that feed a checked-in ANF JSON straight into this
+      # pass. An ANF produced BEFORE the multi-result node carries the trailing
+      # +__merge$+ block WITHOUT results -- back then the block was a naming
+      # CONVENTION this pass recognised, and no tier recognises it any more. It
+      # deserialises cleanly, the declared count is 0, and the result count
+      # falls back to then_depth - parent_depth, which counts the arm's
+      # untrimmed block residue as results. Refuse it: the block can only be
+      # emitted by _append_branch_results, which only runs for an +if+ that
+      # declares results. Emits no opcodes.
+      if results.empty?
+        stale = (then_bindings + else_bindings).find do |b|
+          b.name.start_with?(::RunarCompiler::IR::MERGED_LOCAL_TEMP_PREFIX)
+        end
+        if stale
+          raise ArgumentError,
+                "ANF produced by a pre-multi-result compiler: the conditional's " \
+                "arm carries a " \
+                "'#{::RunarCompiler::IR::MERGED_LOCAL_TEMP_PREFIX}' block but the " \
+                "node declares no results (binding '#{stale.name}'). That block " \
+                "used to be a naming convention this pass inferred results from; " \
+                "it is now a declared contract, and no tier reads the convention " \
+                "any more. Recompile the source with the current compiler instead " \
+                "of reusing the stored ANF. binding='#{binding_name}'."
+        end
+      end
+
+      # Result slots are identified BY NAME -- two identically-named results are
+      # indistinguishable, so the layout assertion would be satisfied by
+      # coincidence while one value silently replaced the other. ANF lowering
+      # refuses the source shape; this guards the --ir path.
+      if results.length > 1 && results.uniq.length != results.length
+        raise ArgumentError,
+              "Internal codegen error: the conditional declares duplicate result " \
+              "names [#{results.join(', ')}]. Result slots are matched by name, " \
+              "so duplicates cannot be told apart and one value would silently " \
+              "replace the other. binding='#{binding_name}'."
+      end
 
       is_last = _is_last_use(cond, binding_index, last_uses)
       bring_to_top(cond, is_last)

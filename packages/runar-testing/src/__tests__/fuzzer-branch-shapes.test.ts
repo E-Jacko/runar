@@ -540,8 +540,10 @@ describe('IR generator branch shapes: the widened space compiles', () => {
 //       `if` binding instead. Reading the local inside the arms makes each arm
 //       ROLL the parent slot and leave its result in place, so the arms' net
 //       stack effect is zero, no depth-growth case in `lowerIf` fires, and the
-//       `if` binding was never registered. 05-stack-lower now adopts the
-//       rebound slot by name (`branchInPlaceRebindDepth`).
+//       `if` binding was never registered. The `if` now DECLARES its results
+//       and 05-stack-lower adopts them by the declared order (`If.results`);
+//       the `branchInPlaceRebindDepth` inference that first contained this is
+//       deleted in all seven tiers.
 //   B — the same k=1 merge under a COMPILE-TIME-CONSTANT condition, fold-ON
 //       only. The folder blanked the statically-dead arm while leaving the
 //       `if` in place, destroying the arm-shape contract. It no longer does.
@@ -672,9 +674,11 @@ describe('FIXED (2026-08-06) — k=1 branch merge, found by the widened space', 
 //
 // Root cause: the constant folder blanked the statically-dead arm (`then: []`)
 // while leaving the `if` node in place. That erased the `__merge$<i>` result
-// block 04-anf-lower appends to BOTH arms, so `countMergedLocalResults` saw 0,
-// `lowerIf`'s K>=2 name-matched reconcile could not fire, and ONE stackMap slot
-// was registered for TWO physical results. The folder no longer blanks arms.
+// block 04-anf-lower appends to BOTH arms, so the arms stopped holding the
+// results the node declares, `lowerIf`'s reconcile could not adopt them, and
+// ONE stackMap slot was registered for TWO physical results. The folder no
+// longer blanks arms, and the arm-shape contract is now checked rather than
+// inferred (the `countMergedLocalResults` count is deleted in all 7 tiers).
 
 const DEAD_ARM_K2 = `import { SmartContract, assert } from 'runar-lang';
 

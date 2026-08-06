@@ -1903,6 +1903,52 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, results []string, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
 	ta := len(terminalAssert) > 0 && terminalAssert[0]
 
+	// The ANF wire format has no version field, and --ir / --ir-parity are
+	// documented surfaces that feed a checked-in ANF JSON straight into this
+	// pass. An ANF produced BEFORE the multi-result node carries the trailing
+	// `__merge$` block WITHOUT Results — back then the block was a naming
+	// CONVENTION this pass recognised, and no tier recognises it any more. It
+	// deserialises cleanly, the declared count is 0, and the result count falls
+	// back to thenDepth - parentDepth, which counts the arm's untrimmed block
+	// residue as results. Refuse it: the block can only be emitted by
+	// appendBranchResults, which only runs for an `if` that declares Results,
+	// so block-without-results is by construction an ANF no current compiler
+	// could have produced. Emits no opcodes.
+	if len(results) == 0 {
+		for _, b := range append(append([]ir.ANFBinding{}, thenBindings...), elseBindings...) {
+			if strings.HasPrefix(b.Name, ir.MergedLocalTempPrefix) {
+				panic(fmt.Sprintf(
+					"ANF produced by a pre-multi-result compiler: the conditional's arm "+
+						"carries a '%s' block but the node declares no results (binding '%s'). "+
+						"That block used to be a naming convention this pass inferred results "+
+						"from; it is now a declared contract, and no tier reads the convention "+
+						"any more. Recompile the source with the current compiler instead of "+
+						"reusing the stored ANF. binding='%s'.",
+					ir.MergedLocalTempPrefix, b.Name, bindingName))
+			}
+		}
+	}
+
+	// Result slots are identified BY NAME — the layout assertion below compares
+	// the arm's top-N slot names against this list, so two identically-named
+	// results are indistinguishable and the assertion would be satisfied by
+	// coincidence while one value silently replaced the other. ANF lowering
+	// refuses the source shape that produces it; this guards the --ir path,
+	// where the list arrives as data.
+	if len(results) > 1 {
+		seen := make(map[string]bool, len(results))
+		for _, r := range results {
+			if seen[r] {
+				panic(fmt.Sprintf(
+					"Internal codegen error: the conditional declares duplicate result "+
+						"names [%s]. Result slots are matched by name, so duplicates cannot "+
+						"be told apart and one value would silently replace the other. "+
+						"binding='%s'.", strings.Join(results, ", "), bindingName))
+			}
+			seen[r] = true
+		}
+	}
+
 	isLast := ctx.isLastUse(cond, bindingIndex, lastUses)
 	ctx.bringToTop(cond, isLast)
 	ctx.sm.pop() // OP_IF consumes the condition

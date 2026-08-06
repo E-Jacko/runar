@@ -509,6 +509,15 @@ public final class AnfLower {
         // being lowered, so a MANUAL checkPreimage(pre) call binds under the
         // same mode as the method's declared sighash. null = default ALL|FORKID.
         Integer sighashFlag = null;
+        /**
+         * True in every context produced by {@link #subContext()} — inside an
+         * if arm, a loop body, or an inlined helper's block — and false only in
+         * the context a method's own body is lowered into. {@code
+         * liftBranchUpdateProps} walks {@code method.body()} and does NOT
+         * recurse, so an {@code if} its recogniser accepts is only actually
+         * REWRITTEN at method top level.
+         */
+        boolean nested = false;
 
         LowerCtx(ContractNode contract) {
             this.contract = contract;
@@ -689,6 +698,7 @@ public final class AnfLower {
             // bindings emitted inside an if/else / loop branch are still
             // mapped back to the originating AST statement.
             sub.currentSourceLoc = this.currentSourceLoc;
+            sub.nested = true;
             return sub;
         }
 
@@ -979,6 +989,26 @@ public final class AnfLower {
                 }
             }
 
+            // The result list is keyed by NAME everywhere downstream:
+            // appendBranchResults picks the local path or the property path per
+            // entry with armProps.contains(name), and stack lowering's layout
+            // assertion compares the arm's top-N slot names against this list.
+            // A local sharing a contract property's name therefore appears
+            // TWICE and both entries take the PROPERTY path, so the local's
+            // value is silently replaced by the property's — and the layout
+            // assertion cannot see it, because both slots are legitimately
+            // named the same. Refuse the exact collision only.
+            for (String local : mergedLocals) {
+                if (armProps.contains(local)) {
+                    throw new IllegalStateException(
+                        "Local variable '" + local + "' shadows contract property 'this."
+                        + local + "', and the conditional assigns both. The branch's "
+                        + "result slots are identified by name, so the two cannot be "
+                        + "told apart and the local's value would be silently replaced "
+                        + "by the property's. Rename the local.");
+                }
+            }
+
             // When to materialise the contract instead of leaving the arms to
             // the stack-lowerer's inference:
             //
@@ -1013,8 +1043,25 @@ public final class AnfLower {
             // side-effect free, and the block adds a second update_prop behind
             // it. TicTacToe's position dispatch is exactly that shape, and
             // losing the lift there produced an unspendable `move` script.
+            //
+            // The exclusion must be exactly "the lift WILL rewrite this `if`",
+            // which is narrower than "the lift's recogniser accepts it" in TWO
+            // ways — both were live defects producing an unspendable UTXO: the
+            // lift only rewrites chains of TWO OR MORE branches
+            // (collectUpdateBranches returns a ONE-element list for the
+            // assert-false-else guard), and it only walks method.body(),
+            // passing loop bodies and surviving arms through untouched, while
+            // declaresResults is evaluated at EVERY nesting depth.
+            //
+            // A chain's DEEPEST `if` is never at top level, so it now declares
+            // results and carries a normalisation block — which is why
+            // collectUpdateBranches strips a declared block before matching
+            // (stripDeclaredResults).
+            List<UpdateBranch> lifted =
+                collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings);
+            boolean willBeLifted = !nested && lifted != null && lifted.size() >= 2;
             boolean declaresResults = !branchHasOutputs
-                && collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings) == null
+                && !willBeLifted
                 && (mergedLocals.size() >= 2
                     || (!resultNames.isEmpty() && !elseCtx.bindings.isEmpty()));
 
@@ -2296,6 +2343,25 @@ public final class AnfLower {
         return false;
     }
 
+    /**
+     * An arm with its declared-results block removed.
+     *
+     * <p>{@code appendBranchResults} adds exactly {@code 2 * results.size()}
+     * trailing bindings to each arm of an {@code if} that declares results.
+     * They are a materialisation mechanism, not program logic, and they hide
+     * the arm's real shape from this pass. A dispatch chain's deepest {@code
+     * if} is nested by definition, so it declares results; without this the
+     * enclosing chain stops being recognised and TicTacToe's position dispatch
+     * loses the C20 lift (an unspendable {@code move} script).
+     */
+    private static List<AnfBinding> stripDeclaredResults(
+        List<AnfBinding> bindings, List<String> results) {
+        int n = results == null ? 0 : results.size();
+        if (n == 0) return bindings;
+        int cut = Math.max(0, bindings.size() - 2 * n);
+        return bindings.subList(0, cut);
+    }
+
     private static List<UpdateBranch> collectUpdateBranches(
         String ifCond, List<AnfBinding> thenBindings, List<AnfBinding> elseBindings) {
         BranchUpdate thenUpdate = extractBranchUpdate(thenBindings);
@@ -2315,7 +2381,9 @@ public final class AnfLower {
             if (!allBindingsSideEffectFree(condSetup)) return null;
 
             List<UpdateBranch> inner = collectUpdateBranches(
-                innerIf.cond(), innerIf.thenBranch(), innerIf.elseBranch()
+                innerIf.cond(),
+                stripDeclaredResults(innerIf.thenBranch(), innerIf.results()),
+                stripDeclaredResults(innerIf.elseBranch(), innerIf.results())
             );
             if (inner == null) return null;
 
@@ -2439,7 +2507,9 @@ public final class AnfLower {
             }
 
             List<UpdateBranch> branches = collectUpdateBranches(
-                ifv.cond(), ifv.thenBranch(), ifv.elseBranch()
+                ifv.cond(),
+                stripDeclaredResults(ifv.thenBranch(), ifv.results()),
+                stripDeclaredResults(ifv.elseBranch(), ifv.results())
             );
 
             if (branches == null || branches.size() < 2) {

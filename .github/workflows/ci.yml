@@ -845,6 +845,24 @@ jobs:
         # deleting one line while its row stays put).
         # See conformance/README.md ⇒ "Construct ledger".
         run: cd conformance && npx vitest run construct-ledger.test.ts
+      - name: Mutation corpus staleness guard
+        # A mutant is a patch against a specific line of a specific compiler
+        # source file. When that code is refactored the patch either stops
+        # applying (silent no-op) or starts hitting DEAD code (silent survival),
+        # and a survivor is indistinguishable from a genuine hole in the net.
+        # That is not hypothetical: 4b0f688f moved the branch-merge decision,
+        # both PALMER-1 mutants kept applying to lines that no longer gate
+        # anything, and conformance/mutation/baseline.json went on recording
+        # them as CAUGHT. The only check that would have noticed is the
+        # baseline-regression step in fuzzer-nightly.yml, which is nightly-only
+        # and had not run since.
+        #
+        # This step runs no gates and mutates nothing — it just asserts every
+        # mutant's find string still occurs EXACTLY ONCE in the file it patches
+        # (milliseconds), so "the corpus no longer describes the code" fails
+        # loudly on the PR that moves the code, not weeks later as a mystery
+        # survivor. See conformance/mutation/__tests__/mutant-staleness.test.ts.
+        run: npx vitest run conformance/mutation
 
   conformance-anf-parity:
     # Cross-interpreter parity for the ANF lenient interpreter shipped by

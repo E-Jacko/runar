@@ -80,6 +80,34 @@ const HISTORICAL_110_WIRE_PATHS = [
 ];
 
 /**
+ * The LITERAL changed set of `bd7ec284` ("fix(sdk): port #110 MINIMALDATA
+ * encode_push_data to the other 6 SDKs"), verbatim from
+ * `git show --name-only bd7ec284` — implementation files AND the test files the
+ * same commit co-added. This is the incident the whole gate exists for: it
+ * changed state-section framing in seven SDKs, moved zero pinned bytes, and its
+ * own commit message reports "SDK-output conformance 46/46".
+ *
+ * Feeding it back through the gate MUST exit 1. It did not until 2026-08-06:
+ * the co-added `encode-push-data-minimaldata.test.ts` matched the `*minimaldata*`
+ * tier-local WEAK-pin glob, and a weak pin used to satisfy the rule with only a
+ * `⚠` warning. See the `bd7ec284` describe block below.
+ */
+const BD7EC284_CHANGED_SET = [
+  'packages/runar-go/sdk_state.go',
+  'packages/runar-go/sdk_test.go',
+  'packages/runar-java/src/main/java/runar/lang/sdk/ScriptUtils.java',
+  'packages/runar-java/src/test/java/runar/lang/sdk/ScriptUtilsTest.java',
+  'packages/runar-py/runar/sdk/state.py',
+  'packages/runar-py/tests/test_sdk_state.py',
+  'packages/runar-rb/lib/runar/sdk/state.rb',
+  'packages/runar-rb/spec/sdk/state_spec.rb',
+  'packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts',
+  'packages/runar-sdk/src/contract.ts',
+  'packages/runar-sdk/src/state.ts',
+  'packages/runar-zig/src/sdk_state.zig',
+];
+
+/**
  * P0-1 (2026-08 gate audit). The P2PKH / OP_RETURN output-framing constants
  * (`1976a914`, `88ac`, `6a`) are emitted one pass UPSTREAM of stack-lower, in
  * anf-lower, in all seven tiers — plus the Zig stateful templates that hold the
@@ -321,20 +349,31 @@ describe('wire-format-pr-audit — auditChangedPaths', () => {
     expect(res.message).toContain('sdk-state-serialization');
   });
 
-  it('flags a tier-local unit test as a WEAK pin (round-trip class) without failing', () => {
-    // Historical note: the real #110 commit also touched
-    // `packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts`,
-    // which IS in the pin list — so that exact commit satisfies the rule via a
-    // unit pin. Per plan P3 a tier-local unit test is the encoder graded against
-    // itself, so the gate says so out loud. If the pin list is ever tightened to
-    // require a cross-component byte pin, this test goes red on purpose.
+  it('a tier-local unit test is a WEAK pin and is NOT sufficient on its own ⇒ FAIL', () => {
+    // FLIPPED 2026-08-06. This test used to assert the opposite — "flags a
+    // tier-local unit test as a WEAK pin (round-trip class) WITHOUT failing" —
+    // and its own comment said "if the pin list is ever tightened to require a
+    // cross-component byte pin, this test goes red on purpose". It has been
+    // tightened, for one measured reason: replaying the LITERAL changed set of
+    // bd7ec284 (the incident this gate exists for) through the gate exited 0,
+    // because that commit co-added exactly this file and a weak pin satisfied
+    // the rule. The warn-only allowance was granted when
+    // `conformance/sdk-vertical/**` did not exist; it does now (39 cases × 7
+    // tiers of absolute pins), so a strong pin is available to any wire change
+    // and there is nothing left to soften for. See the `bd7ec284` block below.
     const res = auditChangedPaths([
       ...HISTORICAL_110_WIRE_PATHS,
       'packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts',
     ]);
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
     expect(res.weakPinOnly).toBe(true);
-    expect(res.message).toMatch(/round-trip|weak/i);
+    // Still counted and still named as a pin — it is evidence, just not
+    // sufficient evidence — and the report must say which pins were weak.
+    expect(res.pinHits).toContain(
+      'packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts',
+    );
+    expect(res.message).toMatch(/WEAK/);
+    expect(res.message).toContain('encode-push-data-minimaldata.test.ts');
   });
 
   it('a cross-component byte pin is not flagged weak', () => {
@@ -349,6 +388,68 @@ describe('wire-format-pr-audit — auditChangedPaths', () => {
   it('ignores blank entries and normalises leading ./ in the changed set', () => {
     const res = auditChangedPaths(['', '   ', './packages/runar-sdk/src/state.ts']);
     expect(res.wireHits).toEqual(['packages/runar-sdk/src/state.ts']);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// THE HEADLINE REGRESSION. Named after the commit on purpose: this gate exists
+// because of `bd7ec284`, and until 2026-08-06 replaying that commit's literal
+// changed set through it exited 0. If you are here because one of these tests
+// went red, you are undoing the fix for the exact incident the gate was built
+// for — say so out loud in the PR description before you weaken it.
+// -----------------------------------------------------------------------------
+describe('wire-format-pr-audit — bd7ec284 (the incident this gate exists for)', () => {
+  it('bd7ec284: the literal changed set FAILS (a co-added weak pin is not evidence)', () => {
+    const res = auditChangedPaths(BD7EC284_CHANGED_SET);
+
+    expect(res.ok).toBe(false);
+    // The only pin that commit moved was its own tier-local codec test.
+    expect(res.pinHits).toEqual([
+      'packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts',
+    ]);
+    expect(res.weakPinOnly).toBe(true);
+    // Seven implementation paths across three wire families tripped it.
+    expect(res.wireHits).toContain('packages/runar-sdk/src/state.ts');
+    expect(res.wireHits).toContain('packages/runar-go/sdk_state.go');
+    expect(res.wireHits).toContain('packages/runar-py/runar/sdk/state.py');
+    expect(res.wireHits).toContain('packages/runar-rb/lib/runar/sdk/state.rb');
+    expect(res.wireHits).toContain('packages/runar-zig/src/sdk_state.zig');
+    expect(res.wireHits).toContain(
+      'packages/runar-java/src/main/java/runar/lang/sdk/ScriptUtils.java',
+    );
+    expect(res.wireHits).toContain('packages/runar-sdk/src/contract.ts');
+    // The co-added tier tests that are NOT pins must not be reported as pins.
+    expect(res.pinHits).not.toContain('packages/runar-go/sdk_test.go');
+    expect(res.pinHits).not.toContain('packages/runar-py/tests/test_sdk_state.py');
+  });
+
+  it('bd7ec284: the failure names the weak pin AND the strong-pin families', () => {
+    const { message } = auditChangedPaths(BD7EC284_CHANGED_SET);
+    expect(message).toMatch(/MUST-MOVE-A-GOLDEN GATE FAILED/);
+    expect(message).toContain(
+      'packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts',
+    );
+    // The three strong-pin families that were unavailable in 2026-07 and are
+    // available now — an author who trips this must be told where to go.
+    expect(message).toContain('conformance/sdk-vertical/cases/*/expected-*');
+    expect(message).toContain('conformance/sdk-output/tests/*/expected-*.hex');
+    expect(message).toContain('conformance/tests/**/expected-*');
+  });
+
+  it('bd7ec284: adding ONE strong pin turns the same changed set green (the gate stays passable)', () => {
+    // The control run from the 2026-08-06 drill. Tightening weak pins must not
+    // make the gate unpassable: the identical wire change with a real
+    // cross-component byte pin is exactly what the author is being asked for.
+    const res = auditChangedPaths([
+      ...BD7EC284_CHANGED_SET,
+      'conformance/sdk-output/tests/stateful-bytestring-op-n-state/expected-locking.hex',
+    ]);
+    expect(res.ok).toBe(true);
+    expect(res.weakPinOnly).toBe(false);
+    // The weak pin still counts as (insufficient) evidence and is still listed.
+    expect(res.pinHits).toContain(
+      'packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts',
+    );
   });
 });
 
@@ -455,7 +556,12 @@ describe('wire-format-pr-audit — audit regressions: pin inflation (P0-3)', () 
     expect(res.pinHits).toEqual([]);
   });
 
-  it('P0-3a: a REAL tier-local framing test is still a pin (weak), in every tier', () => {
+  it('P0-3a: a REAL tier-local framing test is a pin (weak) in every tier — counted, not sufficient', () => {
+    // FLIPPED 2026-08-06 alongside the `bd7ec284` block: a tier-local test is
+    // still recognised as a pin in all seven tiers (that half of P0-3a is
+    // unchanged — a doc named `*codesep*` must NOT be), but weak-only no longer
+    // satisfies the gate. The distinction being asserted here is pin
+    // CLASSIFICATION, which is what P0-3a was about; sufficiency moved.
     const realTierLocalPins = [
       'packages/runar-sdk/src/__tests__/codesep-offsets.test.ts',
       'packages/runar-go/sdk_state_push_framing_test.go',
@@ -467,9 +573,17 @@ describe('wire-format-pr-audit — audit regressions: pin inflation (P0-3)', () 
     ];
     for (const pin of realTierLocalPins) {
       const res = auditChangedPaths([...HISTORICAL_110_WIRE_PATHS, pin]);
-      expect(res.ok, `${pin} should still satisfy the gate`).toBe(true);
       expect(res.pinHits, `${pin} should be a pin`).toContain(pin);
       expect(res.weakPinOnly, `${pin} is tier-local ⇒ weak`).toBe(true);
+      expect(res.ok, `${pin} is weak ⇒ must not satisfy the gate alone`).toBe(false);
+      // ... but it does satisfy it next to one cross-component byte pin.
+      const withStrong = auditChangedPaths([
+        ...HISTORICAL_110_WIRE_PATHS,
+        pin,
+        'conformance/sdk-vertical/cases/bigint-0/expected-locking.hex',
+      ]);
+      expect(withStrong.ok, `${pin} + a strong pin should pass`).toBe(true);
+      expect(withStrong.weakPinOnly).toBe(false);
     }
   });
 
@@ -514,10 +628,11 @@ describe('wire-format-pr-audit — audit regressions: pin inflation (P0-3)', () 
   });
 
   it('P0-3d: a strong pin means "is a byte artifact", not "lives under conformance/"', () => {
-    // The construct ledger is prose evidence, not bytes. It may satisfy the
-    // gate, but it must never be reported as cross-component byte evidence.
+    // The construct ledger is prose evidence, not bytes. FLIPPED 2026-08-06:
+    // it no longer satisfies the gate on its own either (same reason as the
+    // `bd7ec284` block — a weak pin is a claim about bytes, not bytes).
     const res = auditChangedPaths([...HISTORICAL_110_WIRE_PATHS, 'conformance/construct-ledger.json']);
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
     expect(res.weakPinOnly).toBe(true);
 
     const bytes = auditChangedPaths([
@@ -834,6 +949,16 @@ describe('wire-format-pr-audit — CLI', () => {
     const { code, out } = cli(['--changed-file', file, '--root', REPO_ROOT]);
     expect(code).toBe(1);
     expect(out).toContain('MUST-MOVE-A-GOLDEN GATE FAILED');
+  });
+
+  it('--changed-file with the literal bd7ec284 changed set exits 1', () => {
+    // The drill's exact invocation, end to end through the CLI. Before
+    // 2026-08-06 this printed a ✓ plus a ⚠ and returned 0.
+    const file = changedFile(BD7EC284_CHANGED_SET);
+    const { code, out } = cli(['--changed-file', file, '--root', REPO_ROOT]);
+    expect(code).toBe(1);
+    expect(out).toContain('MUST-MOVE-A-GOLDEN GATE FAILED');
+    expect(out).toContain('encode-push-data-minimaldata.test.ts');
   });
 
   it('--warn-only reports the same failure but exits 0', () => {

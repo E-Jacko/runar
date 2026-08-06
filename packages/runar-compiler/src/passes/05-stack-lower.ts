@@ -19,7 +19,7 @@ import type {
   StackMethod,
   StackOp,
 } from '../ir/index.js';
-import { UnknownANFKindError } from 'runar-ir-schema';
+import { UnknownANFKindError, MERGED_LOCAL_TEMP_PREFIX } from 'runar-ir-schema';
 import { emitVerifySLHDSA } from './slh-dsa-codegen.js';
 import { emitVerifyWOTS } from './wots-codegen.js';
 import { emitVerifyRabinSig } from './rabin-codegen.js';
@@ -2105,6 +2105,48 @@ class LoweringContext {
     lastUses: Map<string, number>,
     terminalAssert = false,
   ): void {
+    // The ANF wire format has no version field, and `--ir` / `--ir-parity` are
+    // documented surfaces that feed a checked-in ANF JSON straight into this
+    // pass. An ANF produced BEFORE the multi-result node carries the trailing
+    // `__merge$` block WITHOUT `results` — back then the block was a naming
+    // CONVENTION this pass recognised, and no tier recognises it any more. It
+    // deserialises cleanly, `nDeclared` is 0, and the result count falls back
+    // to `thenDepth - parentDepth`, which counts the arm's untrimmed block
+    // residue as results. Refuse it: the block can only be emitted by
+    // `appendBranchResults`, which only runs for an `if` that declares
+    // `results`, so block-without-results is by construction an ANF no current
+    // compiler could have produced. Emits no opcodes.
+    if (results.length === 0) {
+      const stale = [...thenBindings, ...elseBindings]
+        .find((b) => b.name.startsWith(MERGED_LOCAL_TEMP_PREFIX));
+      if (stale) {
+        throw new Error(
+          `ANF produced by a pre-multi-result compiler: the conditional's arm ` +
+          `carries a '${MERGED_LOCAL_TEMP_PREFIX}' block but the node declares ` +
+          `no results (binding '${stale.name}'). That block used to be a naming ` +
+          `convention this pass inferred results from; it is now a declared ` +
+          `contract, and no tier reads the convention any more. Recompile the ` +
+          `source with the current compiler instead of reusing the stored ANF. ` +
+          `binding='${bindingName}'.`,
+        );
+      }
+    }
+
+    // Result slots are identified BY NAME — the layout assertion below compares
+    // the arm's top-N slot names against this list, so two identically-named
+    // results are indistinguishable and the assertion would be satisfied by
+    // coincidence while one value silently replaced the other. 04-anf-lower
+    // refuses the source shape that produces it (a local shadowing a written
+    // property); this guards the `--ir` path, where the list arrives as data.
+    if (results.length > 1 && new Set(results).size !== results.length) {
+      throw new Error(
+        `Internal codegen error: the conditional declares duplicate result ` +
+        `names [${results.join(', ')}]. Result slots are matched by name, so ` +
+        `duplicates cannot be told apart and one value would silently replace ` +
+        `the other. binding='${bindingName}'.`,
+      );
+    }
+
     // Get condition to top of stack
     const isLast = this.isLastUse(cond, bindingIndex, lastUses);
     this.bringToTop(cond, isLast);

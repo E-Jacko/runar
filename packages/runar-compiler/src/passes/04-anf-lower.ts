@@ -556,6 +556,20 @@ class LoweringContext {
   private readonly sideEffects: SideEffectSummary | null;
   /** Debug: source location to attach to emitted ANF bindings. */
   currentSourceLoc: { file: string; line: number; column: number } | undefined;
+  /**
+   * True in every context created by `subContext()` — i.e. inside an if arm,
+   * a loop body, or an inlined helper's block — and false only in the context
+   * a method's own body is lowered into.
+   *
+   * `liftBranchUpdateProps` walks `method.body` and does NOT recurse: a `loop`
+   * body or a surviving `if` arm is passed through untouched. So an `if` that
+   * the lift's recogniser accepts is only actually REWRITTEN when it sits at
+   * method top level. `lowerIfStatement` needs the same distinction before it
+   * defers to that pass, otherwise a dispatch chain one `for` deeper is
+   * recognised-but-not-rewritten AND excluded from declaring its results —
+   * which leaves it with no correct lowering at all.
+   */
+  nested = false;
 
   constructor(contract: ContractNode, sideEffects: SideEffectSummary | null = null) {
     this.contract = contract;
@@ -762,6 +776,7 @@ class LoweringContext {
     // Share the method scope so auto-injection from intrinsics called
     // inside the nested block bubbles up to the parent's ABI list.
     sub.methodScope = this.methodScope;
+    sub.nested = true;
     return sub;
   }
 
@@ -1105,6 +1120,30 @@ function lowerIfStatement(
     ...ctx.propertyNames().filter((name) => armProps.has(name)),
   ];
 
+  // The result list is keyed by NAME everywhere downstream: `appendBranchResults`
+  // picks the local path or the property path per entry with `props.has(name)`,
+  // and 05-stack-lower's layout assertion compares the arm's top-N slot names
+  // against this list. A local that shares a contract property's name therefore
+  // appears TWICE — once as a merged local, once as an arm-written property —
+  // and both entries take the PROPERTY path, so the local's value is silently
+  // replaced by the property's. The layout assertion cannot catch it: both
+  // slots are legitimately named `count`, so comparing names is satisfied by
+  // coincidence.
+  //
+  // Refuse instead. Only the exact collision is refused — a local shadowing a
+  // property is otherwise fine, and stays fine, as long as the two are not both
+  // results of the same `if`.
+  const shadowed = mergedLocals.filter((name) => armProps.has(name));
+  if (shadowed.length > 0) {
+    throw new Error(
+      `Local variable '${shadowed[0]}' shadows contract property ` +
+      `'this.${shadowed[0]}', and the conditional assigns both. The branch's ` +
+      `result slots are identified by name, so the two cannot be told apart ` +
+      `and the local's value would be silently replaced by the property's. ` +
+      `Rename the local.`,
+    );
+  }
+
   // When to materialise the contract instead of leaving the arms to the
   // stack-lowerer's inference:
   //
@@ -1135,9 +1174,41 @@ function lowerIfStatement(
   // free, and the block adds a second `update_prop` behind it. TicTacToe's
   // position dispatch is exactly that shape, and losing the lift there
   // produced an unspendable `move` script.
+  //
+  // The exclusion must be exactly "the lift WILL rewrite this `if`", and that
+  // is narrower than "the lift's recogniser accepts this `if`" in TWO ways.
+  // Both gaps were live defects: the shape fell through the exclusion AND
+  // through the rewrite, so it declared no results and got no flattening, and
+  // stack lowering fell back to inference that puts the property's STALE slot
+  // on top. `lowerGetStateScript` resolves properties by name through
+  // `findDepth`, which returns the TOPMOST slot, so the continuation committed
+  // the pre-call value and the UTXO was permanently unspendable.
+  //
+  //   1. `liftBranchUpdateProps` only rewrites chains of TWO OR MORE branches.
+  //      `collectUpdateBranches` returns a ONE-element list for the
+  //      `isAssertFalseElse` path, so `if (n > 0n) { this.count = ... } else
+  //      { assert(false) }` — the idiomatic guard — was recognised, excluded,
+  //      and then left alone.
+  //   2. `liftBranchUpdateProps` only walks `method.body`, and passes `loop`
+  //      bodies and surviving `if` arms through untouched. The same chain one
+  //      `for` deeper, or nested in another arm, is recognised at every depth
+  //      by `lowerIfStatement` but rewritten at none.
+  //
+  // Gating on `!ctx.nested` closes (2) byte-neutrally: every `if` the lift
+  // actually rewrites today is a top-level binding of `method.body`, so no
+  // currently-lifted chain changes behaviour, and the nested ones that were
+  // silently broken now take the declared-results path like any other `if`.
+  //
+  // A chain's DEEPEST `if` is never at top level, so it now declares results
+  // and carries a normalisation block — which is why `collectUpdateBranches`
+  // strips a declared block before matching (see `stripDeclaredResults`). The
+  // enclosing chain is still recognised and still lifted, and the lift
+  // discards the inner node (block and all), so the chain's bytes do not move.
+  const lifted = collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings);
+  const willBeLifted = !ctx.nested && lifted !== null && lifted.length >= 2;
   const declaresResults =
     !branchHasOutputs &&
-    collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings) === null &&
+    !willBeLifted &&
     (mergedLocals.length >= 2 || (resultNames.length >= 1 && elseCtx.bindings.length > 0));
 
   if (declaresResults) {
@@ -2373,6 +2444,33 @@ interface UpdateBranch {
 }
 
 /**
+ * An arm with its declared-results block removed.
+ *
+ * `appendBranchResults` adds exactly `2 * results.length` trailing bindings to
+ * each arm of an `if` that declares results: K copies to `__merge$i` temps,
+ * then K rebinds off those temps. Those bindings are a materialisation
+ * mechanism, not program logic, and they hide the arm's real shape from this
+ * pass — the second `update_prop` becomes the arm's last binding and the
+ * original one lands in the "everything before must be side-effect free"
+ * prefix, so the recogniser rejects the arm.
+ *
+ * That matters because a dispatch chain's DEEPEST `if` is nested by
+ * definition, so it declares results, so its arms carry a block — and without
+ * this the enclosing chain stops being recognised and TicTacToe's position
+ * dispatch loses the C20 lift (an unspendable `move` script). Stripping by the
+ * declared count is exact: the block's length is `results.length * 2` and it is
+ * always the arm's tail.
+ */
+function stripDeclaredResults(
+  bindings: ANFBinding[],
+  results: string[] | undefined,
+): ANFBinding[] {
+  const n = results?.length ?? 0;
+  if (n === 0) return bindings;
+  return bindings.slice(0, Math.max(0, bindings.length - 2 * n));
+}
+
+/**
  * Recursively collect branches from a nested if-else chain where every
  * branch ends with exactly one update_prop.
  */
@@ -2400,7 +2498,9 @@ function collectUpdateBranches(
     if (!allBindingsSideEffectFree(condSetup)) return null;
 
     const innerBranches = collectUpdateBranches(
-      innerIf.cond, innerIf.then, innerIf.else,
+      innerIf.cond,
+      stripDeclaredResults(innerIf.then, innerIf.results),
+      stripDeclaredResults(innerIf.else, innerIf.results),
     );
     if (!innerBranches) return null;
 
@@ -2570,7 +2670,11 @@ function liftBranchUpdateProps(bindings: ANFBinding[]): ANFBinding[] {
     }
 
     const ifVal = binding.value;
-    const branches = collectUpdateBranches(ifVal.cond, ifVal.then, ifVal.else);
+    const branches = collectUpdateBranches(
+      ifVal.cond,
+      stripDeclaredResults(ifVal.then, ifVal.results),
+      stripDeclaredResults(ifVal.else, ifVal.results),
+    );
 
     if (!branches || branches.length < 2) {
       result.push(binding);

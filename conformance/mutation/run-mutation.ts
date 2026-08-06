@@ -9,10 +9,19 @@
  * The gates resolve `runar-compiler` / `runar-testing` through the root
  * vitest SRC alias, so a mutated src file is observed WITHOUT a rebuild.
  *
+ * A mutant whose patch no longer APPLIES (find string absent, or no longer
+ * unique) is reported as STALE and fails the run. It is never counted as a
+ * survivor: "the code this mutant patches has changed" and "the safety net has
+ * a hole" need opposite fixes, and conflating them is how the two PALMER-1
+ * mutants rotted unnoticed after `4b0f688f` restructured branch merging.
+ * `__tests__/mutant-staleness.test.ts` re-checks applicability at PR speed,
+ * without running a single gate.
+ *
  * Usage:
  *   cd conformance && npx tsx mutation/run-mutation.ts          # scorecard
  *   cd conformance && npx tsx mutation/run-mutation.ts --json   # + machine JSON
  *   cd conformance && npx tsx mutation/run-mutation.ts --write-baseline
+ *   cd conformance && npx tsx mutation/run-mutation.ts --filter merge-locals
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -56,6 +65,10 @@ export interface MutantResult {
   unexpectedSurvivor: boolean;
   /** Expected gates that did not fire even though the mutant was caught. */
   missedExpectedGates: string[];
+  /** True when the patch could not be applied — the code it targets moved. */
+  stale: boolean;
+  /** Why the patch did not apply. Present only when `stale`. */
+  staleReason?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +107,21 @@ export const GATES: Record<string, GateSpec> = {
   'branch-merged-locals-vm': {
     cwd: '.',
     argv: ['npx', 'vitest', 'run', 'packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts'],
+  },
+  // Layer C of the branch lowering (7b888035): `lowerIf` asserts that the
+  // parent stackMap describes the physical stack after OP_ENDIF. Registered as
+  // a gate so the branch-merge mutants can MEASURE whether it fires rather than
+  // assume it does — for a depth-preserving, name-corrupting defect it does not
+  // (2026-08-06 drill), and the corpus says so instead of claiming credit.
+  'branch-result-depth-invariant': {
+    cwd: '.',
+    argv: ['npx', 'vitest', 'run', 'packages/runar-compiler/src/__tests__/branch-result-depth-invariant.test.ts'],
+  },
+  // Real-crypto witness replay for the branch-merged-locals fixture: accept /
+  // reject verdicts through the actual @bsv/sdk Spend, not the interpreter.
+  'real-crypto-branch-merged-locals': {
+    cwd: 'conformance',
+    argv: ['npx', 'vitest', 'run', 'witnesses/real-crypto-execution.test.ts', '-t', 'branch-merged-locals'],
   },
   'state-push-framing-vm': {
     cwd: '.',
@@ -166,6 +194,37 @@ export function revertMutant(mutant: Mutant, targetPath?: string): void {
   writeFileSync(file, content.replace(mutant.replace, mutant.find));
 }
 
+/**
+ * Undo a mutation without destroying anything that was saved into the file
+ * while the gates were running.
+ *
+ * This repo is worked in several checkouts at once and a gate run holds a
+ * mutated compiler source for seconds at a time; a blind
+ * `writeFileSync(file, snapshot)` at the end of that window silently discards a
+ * concurrent save. So the revert un-applies the PATCH (replace → find) against
+ * whatever the file holds now, which is a no-op difference in the normal case
+ * and preserves the other edit in the racy one. The snapshot is only forced
+ * when the mutated text is no longer there to un-apply, and the caller is told
+ * which of the three happened.
+ */
+export function restoreAfterMutation(
+  mutant: Mutant,
+  file: string,
+  snapshot: string,
+): 'clean' | 'reverted-over-concurrent-write' | 'snapshot-forced' {
+  const current = readFileSync(file, 'utf-8');
+  if (current === snapshot.replace(mutant.find, mutant.replace)) {
+    writeFileSync(file, snapshot);
+    return 'clean';
+  }
+  if (countOccurrences(current, mutant.replace) === 1) {
+    writeFileSync(file, current.replace(mutant.replace, mutant.find));
+    return 'reverted-over-concurrent-write';
+  }
+  writeFileSync(file, snapshot);
+  return 'snapshot-forced';
+}
+
 // ---------------------------------------------------------------------------
 // Gate execution
 // ---------------------------------------------------------------------------
@@ -196,15 +255,49 @@ export function scoreMutant(mutant: Mutant): MutantResult {
   const gatesToRun =
     mutant.expectCaughtBy.length > 0 ? mutant.expectCaughtBy : (mutant.checkGates ?? []);
 
-  const caughtBy: string[] = [];
+  const base = {
+    id: mutant.id,
+    class: mutant.class,
+    stage: mutant.stage,
+    expectCaughtBy: mutant.expectCaughtBy,
+    documentedSurvivor,
+  };
+
+  // STALENESS FIRST. If the patch cannot be applied, the mutant scores NOTHING:
+  // not caught, not survived. Reporting it as a survivor would be a lie in the
+  // most expensive direction — an unexpected survivor reads as "the safety net
+  // has a hole", when the truth is "this mutant no longer describes the code".
+  // No gate is run: there is nothing to detect.
   try {
     applyMutant(mutant, file);
+  } catch (e) {
+    return {
+      ...base,
+      caught: false,
+      survived: false,
+      caughtBy: [],
+      unexpectedSurvivor: false,
+      missedExpectedGates: [...mutant.expectCaughtBy],
+      stale: true,
+      staleReason: (e as Error).message,
+    };
+  }
+
+  const caughtBy: string[] = [];
+  try {
     for (const gate of gatesToRun) {
       if (runGate(gate)) caughtBy.push(gate);
     }
   } finally {
-    // Guaranteed revert: restore the exact pre-mutation bytes, even on error.
-    writeFileSync(file, snapshot);
+    // Guaranteed revert, even on error — and never over a concurrent save.
+    const how = restoreAfterMutation(mutant, file, snapshot);
+    if (how !== 'clean') {
+      // eslint-disable-next-line no-console
+      console.error(
+        `  ! ${mutant.id}: ${mutant.file} changed while the gates ran (${how}). ` +
+          'Another checkout is editing this file; re-run when it is idle.',
+      );
+    }
   }
 
   const caught = caughtBy.length > 0;
@@ -212,16 +305,13 @@ export function scoreMutant(mutant: Mutant): MutantResult {
   const missedExpectedGates = mutant.expectCaughtBy.filter((g) => !caughtBy.includes(g));
 
   return {
-    id: mutant.id,
-    class: mutant.class,
-    stage: mutant.stage,
+    ...base,
     caught,
     survived,
     caughtBy,
-    expectCaughtBy: mutant.expectCaughtBy,
-    documentedSurvivor,
     unexpectedSurvivor: mutant.expectCaughtBy.length > 0 && survived,
     missedExpectedGates,
+    stale: false,
   };
 }
 
@@ -244,18 +334,24 @@ export interface Scorecard {
   caughtExpected: number;
   unexpectedSurvivors: MutantResult[];
   documentedSurvivors: MutantResult[];
+  /** Mutants whose patch no longer applies — scored as neither caught nor survived. */
+  stale: MutantResult[];
   results: MutantResult[];
 }
 
 export function score(mutants: Mutant[]): Scorecard {
   const results = mutants.map(scoreMutant);
-  const expectedResults = results.filter((r) => r.expectCaughtBy.length > 0);
+  // Stale mutants are excluded from the denominator too: a corpus that cannot
+  // be applied has not measured anything, and counting it as "expected to be
+  // caught" would quietly deflate the score instead of naming the problem.
+  const expectedResults = results.filter((r) => r.expectCaughtBy.length > 0 && !r.stale);
   return {
     total: results.length,
     expected: expectedResults.length,
     caughtExpected: expectedResults.filter((r) => r.caught).length,
     unexpectedSurvivors: results.filter((r) => r.unexpectedSurvivor),
-    documentedSurvivors: results.filter((r) => r.documentedSurvivor),
+    documentedSurvivors: results.filter((r) => r.documentedSurvivor && !r.stale),
+    stale: results.filter((r) => r.stale),
     results,
   };
 }
@@ -271,7 +367,9 @@ function printScorecard(card: Scorecard, mutants: Mutant[]): void {
   console.log(`  (${card.total} total mutants; ${card.documentedSurvivors.length} documented survivor(s))`);
   console.log('');
   for (const r of card.results) {
-    const tag = r.documentedSurvivor
+    const tag = r.stale
+      ? 'STALE'
+      : r.documentedSurvivor
       ? r.caught
         ? 'SURVIVOR→CAUGHT'
         : 'survivor (doc)'
@@ -292,6 +390,16 @@ function printScorecard(card: Scorecard, mutants: Mutant[]): void {
       console.log(`   • ${r.id} (${r.class} / ${r.stage})${r.caught ? ' — NOW CAUGHT, update corpus' : ''}`);
       if (finding) console.log(`     ${finding}`);
     }
+    console.log('');
+  }
+  if (card.stale.length) {
+    console.log('  ✗ STALE MUTANTS — the code they patch has changed; they measured NOTHING:');
+    for (const r of card.stale) {
+      console.log(`   • ${r.id} (${r.class} / ${r.stage})`);
+      console.log(`     ${r.staleReason ?? 'patch did not apply'}`);
+    }
+    console.log('     Re-derive each against the current source and re-measure which gates');
+    console.log('     fire. A stale mutant is NOT a survivor and NOT a coverage hole.');
     console.log('');
   }
   if (card.unexpectedSurvivors.length) {
@@ -317,6 +425,7 @@ function serializeBaseline(card: Scorecard): string {
       caughtBy: r.caughtBy,
       expectCaughtBy: r.expectCaughtBy,
       documentedSurvivor: r.documentedSurvivor,
+      stale: r.stale,
     })),
   };
   return JSON.stringify(baseline, null, 2) + '\n';
@@ -324,7 +433,27 @@ function serializeBaseline(card: Scorecard): string {
 
 function main(): void {
   const args = process.argv.slice(2);
-  const mutants = loadMutants();
+  // `--filter <substr>` scores only the matching mutant ids. Written for the
+  // re-derivation loop: each run applies a patch to a REAL compiler source file
+  // in the working tree, so scoring one mutant instead of 22 keeps that window
+  // as short as possible when the checkout is shared. A filtered run never
+  // writes the baseline (it would drop every mutant it skipped).
+  const filterIdx = args.indexOf('--filter');
+  const filter = filterIdx !== -1 ? args[filterIdx + 1] : undefined;
+  const allMutants = loadMutants();
+  const mutants = filter ? allMutants.filter((m) => m.id.includes(filter)) : allMutants;
+  if (filter && mutants.length === 0) {
+    // eslint-disable-next-line no-console
+    console.error(`--filter '${filter}' matched no mutant id`);
+    process.exitCode = 2;
+    return;
+  }
+  if (filter && args.includes('--write-baseline')) {
+    // eslint-disable-next-line no-console
+    console.error('--filter and --write-baseline are mutually exclusive (a partial baseline is a lie)');
+    process.exitCode = 2;
+    return;
+  }
   const card = score(mutants);
   printScorecard(card, mutants);
 
@@ -350,8 +479,9 @@ function main(): void {
     console.log(serializeBaseline(card));
   }
 
-  // Fail the run if any mutant that MUST be caught survived (net weakened).
-  if (card.unexpectedSurvivors.length > 0) {
+  // Fail the run if any mutant that MUST be caught survived (net weakened), or
+  // if any mutant is stale (the corpus no longer describes the code it grades).
+  if (card.unexpectedSurvivors.length > 0 || card.stale.length > 0) {
     process.exitCode = 1;
   }
 }

@@ -762,6 +762,10 @@ struct LoweringContext<'a> {
     /// method's declared sighash. `None` = default ALL|FORKID, keeping the
     /// pinned binding blob unchanged.
     sighash_flag: Option<i64>,
+    /// True in every context produced by `sub_context()` — inside an if arm, a
+    /// loop body, or an inlined helper's block — and false only in the context a
+    /// method's own body is lowered into.
+    nested: bool,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -786,6 +790,7 @@ impl<'a> LoweringContext<'a> {
             side_effects,
             method_scope: Rc::new(RefCell::new(MethodScope::default())),
             sighash_flag: None,
+            nested: false,
         }
     }
 
@@ -950,6 +955,11 @@ impl<'a> LoweringContext<'a> {
         // Issue #123: a manual checkPreimage inside a nested block must bind
         // under the method's declared @sighash mode.
         sub.sighash_flag = self.sighash_flag;
+        // `lift_branch_update_props` walks method.body and does NOT recurse, so
+        // an `if` its recogniser accepts is only actually REWRITTEN at method
+        // top level. `lower_if_statement` needs the same distinction before it
+        // defers to that pass.
+        sub.nested = true;
         // Note: add_output_refs is NOT propagated to sub-contexts
         // because addOutput calls in sub-blocks should flow up to
         // the parent context via explicit tracking.
@@ -1364,6 +1374,20 @@ fn lower_if_statement(
         }
     }
 
+    // The result list is keyed by NAME everywhere downstream, so a local that
+    // shares a contract property's name appears TWICE and both entries take the
+    // PROPERTY path — the local's value is silently replaced by the property's,
+    // and the layout assertion cannot see it because both slots are legitimately
+    // named the same. Refuse the exact collision only.
+    if let Some(name) = merged_locals.iter().find(|n| arm_props.contains(n)) {
+        panic!(
+            "Local variable '{name}' shadows contract property 'this.{name}', and \
+             the conditional assigns both. The branch's result slots are identified \
+             by name, so the two cannot be told apart and the local's value would \
+             be silently replaced by the property's. Rename the local."
+        );
+    }
+
     // When to materialise the contract instead of leaving the arms to the
     // stack-lowerer's inference:
     //
@@ -1395,8 +1419,22 @@ fn lower_if_statement(
     // free, and the block adds a second `update_prop` behind it. TicTacToe's
     // position dispatch is exactly that shape, and losing the lift there
     // produced an unspendable `move` script.
+    //
+    // The exclusion must be exactly "the lift WILL rewrite this `if`", which is
+    // narrower than "the lift's recogniser accepts it" in TWO ways — both were
+    // live defects producing an unspendable UTXO: the lift only rewrites chains
+    // of TWO OR MORE branches (`collect_update_branches` returns a ONE-element
+    // list for the assert-false-else guard), and it only walks `method.body`,
+    // passing loop bodies and surviving arms through untouched, while
+    // `declares_results` is evaluated at EVERY nesting depth.
+    //
+    // A chain's DEEPEST `if` is never at top level, so it now declares results
+    // and carries a normalisation block — which is why `collect_update_branches`
+    // strips a declared block before matching (`strip_declared_results`).
+    let lifted = collect_update_branches(&cond_ref, &then_ctx.bindings, &else_ctx.bindings);
+    let will_be_lifted = !ctx.nested && lifted.as_ref().is_some_and(|b| b.len() >= 2);
     let declares_results = !branch_has_outputs
-        && collect_update_branches(&cond_ref, &then_ctx.bindings, &else_ctx.bindings).is_none()
+        && !will_be_lifted
         && (merged_locals.len() >= 2
             || (!result_names.is_empty() && !else_ctx.bindings.is_empty()));
 
@@ -2982,6 +3020,26 @@ fn is_assert_false_else(bindings: &[ANFBinding]) -> bool {
     false
 }
 
+/// An arm with its declared-results block removed.
+///
+/// `append_branch_results` adds exactly `2 * results.len()` trailing bindings to
+/// each arm of an `if` that declares results. They are a materialisation
+/// mechanism, not program logic, and they hide the arm's real shape from this
+/// pass. A dispatch chain's deepest `if` is nested by definition, so it declares
+/// results; without this the enclosing chain stops being recognised and
+/// TicTacToe's position dispatch loses the C20 lift (an unspendable script).
+fn strip_declared_results<'b>(
+    bindings: &'b [ANFBinding],
+    results: &[String],
+) -> &'b [ANFBinding] {
+    let n = results.len();
+    if n == 0 {
+        return bindings;
+    }
+    let cut = bindings.len().saturating_sub(2 * n);
+    &bindings[..cut]
+}
+
 /// Recursively collect update branches from a nested if-else chain.
 fn collect_update_branches(
     if_cond: &str,
@@ -3004,13 +3062,18 @@ fn collect_update_branches(
 
     // Check if else is another if (else-if chain)
     let last_else = &else_bindings[else_bindings.len() - 1];
-    if let ANFValue::If { cond, then, else_branch, .. } = &last_else.value {
+    if let ANFValue::If { cond, then, else_branch, results } = &last_else.value {
         let cond_setup = &else_bindings[..else_bindings.len() - 1];
         if !all_bindings_side_effect_free(cond_setup) {
             return None;
         }
 
-        let mut inner_branches = collect_update_branches(cond, then, else_branch)?;
+        let inner_results = results.clone();
+        let mut inner_branches = collect_update_branches(
+            cond,
+            strip_declared_results(then, &inner_results),
+            strip_declared_results(else_branch, &inner_results),
+        )?;
 
         // Prepend condition setup to first inner branch
         let mut new_setup = cond_setup.to_vec();
@@ -3142,7 +3205,9 @@ fn lift_branch_update_props(bindings: Vec<ANFBinding>) -> Vec<ANFBinding> {
 
     for binding in &bindings {
         let if_val = match &binding.value {
-            ANFValue::If { cond, then, else_branch, .. } => Some((cond, then, else_branch)),
+            ANFValue::If { cond, then, else_branch, results } => {
+                Some((cond, then, else_branch, results))
+            }
             _ => None,
         };
 
@@ -3151,9 +3216,14 @@ fn lift_branch_update_props(bindings: Vec<ANFBinding>) -> Vec<ANFBinding> {
             continue;
         }
 
-        let (cond, then_bindings, else_bindings) = if_val.unwrap();
+        let (cond, then_bindings, else_bindings, own_results) = if_val.unwrap();
 
-        let branches = collect_update_branches(cond, then_bindings, else_bindings);
+        let own_results = own_results.clone();
+        let branches = collect_update_branches(
+            cond,
+            strip_declared_results(then_bindings, &own_results),
+            strip_declared_results(else_bindings, &own_results),
+        );
 
         if branches.is_none() || branches.as_ref().map_or(true, |b| b.len() < 2) {
             result.push(binding.clone());

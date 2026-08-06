@@ -19,6 +19,7 @@ from runar_compiler.ir.types import (
     ANFProgram,
     ANFProperty,
     ANFValue,
+    MERGED_LOCAL_TEMP_PREFIX,
     SourceLocation,
 )
 
@@ -1695,6 +1696,43 @@ class _LoweringContext:
         most one result, and then every path below behaves exactly as it did
         before the multi-result contract existed.
         """
+        # The ANF wire format has no version field, and ``--ir`` / ``--ir-parity``
+        # are documented surfaces that feed a checked-in ANF JSON straight into
+        # this pass. An ANF produced BEFORE the multi-result node carries the
+        # trailing ``__merge$`` block WITHOUT ``results`` -- back then the block
+        # was a naming CONVENTION this pass recognised, and no tier recognises
+        # it any more. It deserialises cleanly, the declared count is 0, and the
+        # result count falls back to ``then_depth - parent_depth``, which counts
+        # the arm's untrimmed block residue as results. Refuse it: the block can
+        # only be emitted by ``_append_branch_results``, which only runs for an
+        # ``if`` that declares ``results``. Emits no opcodes.
+        if not results:
+            for _b in list(then_bindings) + list(else_bindings):
+                if _b.name.startswith(MERGED_LOCAL_TEMP_PREFIX):
+                    raise ValueError(
+                        f"ANF produced by a pre-multi-result compiler: the "
+                        f"conditional's arm carries a '{MERGED_LOCAL_TEMP_PREFIX}' "
+                        f"block but the node declares no results (binding "
+                        f"'{_b.name}'). That block used to be a naming convention "
+                        f"this pass inferred results from; it is now a declared "
+                        f"contract, and no tier reads the convention any more. "
+                        f"Recompile the source with the current compiler instead "
+                        f"of reusing the stored ANF. binding='{binding_name}'."
+                    )
+
+        # Result slots are identified BY NAME -- two identically-named results
+        # are indistinguishable, so the layout assertion would be satisfied by
+        # coincidence while one value silently replaced the other. ANF lowering
+        # refuses the source shape; this guards the ``--ir`` path, where the
+        # list arrives as data.
+        if len(results) > 1 and len(set(results)) != len(results):
+            raise ValueError(
+                f"Internal codegen error: the conditional declares duplicate "
+                f"result names [{', '.join(results)}]. Result slots are matched "
+                f"by name, so duplicates cannot be told apart and one value "
+                f"would silently replace the other. binding='{binding_name}'."
+            )
+
         is_last = self._is_last_use(cond, binding_index, last_uses)
         self.bring_to_top(cond, is_last)
         self.sm.pop()  # OP_IF consumes the condition

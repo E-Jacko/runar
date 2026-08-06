@@ -636,6 +636,10 @@ class _LowerCtx:
         # binds under the same mode as the method's declared sighash. ``None`` =
         # default ALL|FORKID, keeping the pinned binding blob unchanged.
         self.sighash_flag: int | None = None
+        # True in every context produced by ``sub_context()`` -- inside an if
+        # arm, a loop body, or an inlined helper's block -- and False only in
+        # the context a method's own body is lowered into.
+        self.nested: bool = False
         # Method-scoped parameter type table. Populated once per
         # method/constructor (and for auto-injected continuation params)
         # before its body is lowered. Mirrors the TS reference's
@@ -816,6 +820,11 @@ class _LowerCtx:
         sub._param_types = self._param_types
         sub._local_aliases = dict(self._local_aliases)
         sub._local_byte_vars = set(self._local_byte_vars)
+        # ``_lift_branch_update_props`` walks ``method.body`` and does NOT
+        # recurse, so an ``if`` its recogniser accepts is only actually
+        # REWRITTEN at method top level. ``lower_if_statement`` needs the same
+        # distinction before it defers to that pass.
+        sub.nested = True
         return sub
 
     def sync_counter(self, sub: _LowerCtx) -> None:
@@ -992,6 +1001,22 @@ class _LowerCtx:
             p.name for p in self._contract.properties if p.name in arm_props
         ]
 
+        # The result list is keyed by NAME everywhere downstream, so a local
+        # that shares a contract property's name appears TWICE and both entries
+        # take the PROPERTY path -- the local's value is silently replaced by
+        # the property's, and the layout assertion cannot see it because both
+        # slots are legitimately named the same. Refuse the exact collision
+        # only; shadowing a property is otherwise fine.
+        for _name in merged_locals:
+            if _name in arm_props:
+                raise ValueError(
+                    f"Local variable '{_name}' shadows contract property "
+                    f"'this.{_name}', and the conditional assigns both. The "
+                    f"branch's result slots are identified by name, so the two "
+                    f"cannot be told apart and the local's value would be "
+                    f"silently replaced by the property's. Rename the local."
+                )
+
         # When to materialise the contract instead of leaving the arms to the
         # stack-lowerer's inference:
         #
@@ -1025,9 +1050,27 @@ class _LowerCtx:
         # block adds a second ``update_prop`` behind it. TicTacToe's position
         # dispatch is exactly that shape, and losing the lift there produced an
         # unspendable ``move`` script.
-        declares_results = not branch_has_outputs and _collect_update_branches(
+        #
+        # The exclusion must be exactly "the lift WILL rewrite this ``if``",
+        # which is narrower than "the lift's recogniser accepts it" in TWO ways
+        # -- both were live defects producing an unspendable UTXO: the lift only
+        # rewrites chains of TWO OR MORE branches (``_collect_update_branches``
+        # returns a ONE-element list for the assert-false-else guard), and it
+        # only walks ``method.body``, passing loop bodies and surviving arms
+        # through untouched, while ``declares_results`` is evaluated at EVERY
+        # nesting depth.
+        #
+        # A chain's DEEPEST ``if`` is never at top level, so it now declares
+        # results and carries a normalisation block -- which is why
+        # ``_collect_update_branches`` strips a declared block before matching
+        # (``_strip_declared_results``).
+        lifted = _collect_update_branches(
             cond_ref, then_ctx.bindings, else_ctx.bindings
-        ) is None and (
+        )
+        will_be_lifted = (
+            not self.nested and lifted is not None and len(lifted) >= 2
+        )
+        declares_results = not branch_has_outputs and not will_be_lifted and (
             len(merged_locals) >= 2
             or (len(result_names) >= 1 and bool(else_ctx.bindings))
         )
@@ -2378,6 +2421,25 @@ def _is_assert_false_else(bindings: list[ANFBinding]) -> bool:
     return False
 
 
+def _strip_declared_results(
+    bindings: list[ANFBinding], results: list[str] | None
+) -> list[ANFBinding]:
+    """An arm with its declared-results block removed.
+
+    ``_append_branch_results`` adds exactly ``2 * len(results)`` trailing
+    bindings to each arm of an ``if`` that declares results. They are a
+    materialisation mechanism, not program logic, and they hide the arm's real
+    shape from this pass. A dispatch chain's deepest ``if`` is nested by
+    definition, so it declares results; without this the enclosing chain stops
+    being recognised and TicTacToe's position dispatch loses the C20 lift (an
+    unspendable ``move`` script).
+    """
+    n = len(results) if results else 0
+    if n == 0:
+        return bindings
+    return bindings[: max(0, len(bindings) - 2 * n)]
+
+
 def _collect_update_branches(
     if_cond: str,
     then_bindings: list[ANFBinding],
@@ -2412,8 +2474,8 @@ def _collect_update_branches(
 
         inner_branches = _collect_update_branches(
             last_else.value.cond or "",
-            last_else.value.then or [],
-            last_else.value.else_ or [],
+            _strip_declared_results(last_else.value.then or [], last_else.value.results),
+            _strip_declared_results(last_else.value.else_ or [], last_else.value.results),
         )
         if inner_branches is None:
             return None
@@ -2531,8 +2593,8 @@ def _lift_branch_update_props(bindings: list[ANFBinding]) -> list[ANFBinding]:
         if_val = binding.value
         branches = _collect_update_branches(
             if_val.cond or "",
-            if_val.then or [],
-            if_val.else_ or [],
+            _strip_declared_results(if_val.then or [], if_val.results),
+            _strip_declared_results(if_val.else_ or [], if_val.results),
         )
 
         if branches is None or len(branches) < 2:
