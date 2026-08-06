@@ -964,12 +964,12 @@ def _c_decompress_pub_key(
     whose order is composite, so the degenerate steps the interval argument
     rules out become reachable. The pubkey is a caller-supplied unlock argument.
 
-    So this emits a third output, ``_dk_valid`` = (x < p) AND
-    (y_cand^2 == y^2), which the caller ANDs into the verifier's boolean result.
-    A flag, not an OP_VERIFY: ``verifyECDSA_*`` is a total boolean-valued
-    builtin and turning attacker-chosen bytes into a script abort would be a
-    liveness regression -- the same argument _c_emit_scalar_reduce makes for
-    reducing rather than rejecting.
+    So this emits a third output, ``_dk_valid`` = (x < p) AND (y_cand^2 == y^2)
+    AND (prefix in {0x02, 0x03}), which the caller ANDs into the verifier's
+    boolean result. A flag, not an OP_VERIFY: ``verifyECDSA_*`` is a total
+    boolean-valued builtin and turning attacker-chosen bytes into a script abort
+    would be a liveness regression -- the same argument _c_emit_scalar_reduce
+    makes for reducing rather than rejecting.
     """
     t.to_top(pk_name)
 
@@ -980,6 +980,25 @@ def _c_decompress_pub_key(
     t.raw_block([pk_name], "", _split_prefix)
     t.nm.append("_dk_prefix")
     t.nm.append("_dk_xbytes")
+
+    # SEC1 sec 2.3.4 requires the prefix to be exactly 0x02 or 0x03. The parity
+    # reduction below is ``BIN2NUM, 2 MOD``, which accepts far more than that:
+    # 0x00 / 0x04 / 0x82 all alias to "even", and 0x83 is worse than an alias --
+    # BIN2NUM(0x83) = -3 (sign-magnitude), -3 mod 2 = -1, which encodes as 0x81
+    # and can never equal ``_dk_y_par`` in {<>, 0x01}, so the select silently
+    # returns the OTHER square root. Test the byte itself.
+    t.copy_to_top("_dk_prefix", "_dk_pfx_in")
+
+    def _prefix_is_valid(e: Callable) -> None:
+        e(_make_stack_op(op="dup"))
+        e(_make_stack_op(op="push", value=_make_push_value(kind="bytes", bytes_=b"\x02")))
+        e(_make_stack_op(op="opcode", code="OP_EQUAL"))
+        e(_make_stack_op(op="swap"))
+        e(_make_stack_op(op="push", value=_make_push_value(kind="bytes", bytes_=b"\x03")))
+        e(_make_stack_op(op="opcode", code="OP_EQUAL"))
+        e(_make_stack_op(op="opcode", code="OP_BOOLOR"))
+
+    t.raw_block(["_dk_pfx_in"], "_dk_pfx_ok", _prefix_is_valid)
 
     t.to_top("_dk_prefix")
 
@@ -1068,11 +1087,13 @@ def _c_decompress_pub_key(
             t.nm[i] = qx_name
             break
 
-    # valid = (qy^2 == y^2) AND (qx < p).
+    # valid = (qy^2 == y^2) AND (qx < p) AND (prefix in {0x02, 0x03}).
     # The selected qy is y_cand or p - y_cand, so squaring it tests the same
     # residue property either way. The first conjunct rejects an x whose RHS is
     # a quadratic non-residue -- the recovered point is then off the curve; the
-    # second rejects a non-canonical encoding of an otherwise fine x.
+    # second rejects a non-canonical encoding of an otherwise fine x; the third
+    # rejects a prefix byte the parity reduction would otherwise alias or, for
+    # 0x83, silently invert.
     t.copy_to_top(qy_name, "_dk_y_sq_in")
     _c_field_sqr(t, "_dk_y_sq_in", "_dk_y_sq", field_p)
     t.to_top("_dk_y_sq")
@@ -1085,13 +1106,114 @@ def _c_decompress_pub_key(
                 lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
     t.to_top("_dk_res_ok")
     t.to_top("_dk_x_ok")
-    t.raw_block(["_dk_res_ok", "_dk_x_ok"], "_dk_valid",
+    t.raw_block(["_dk_res_ok", "_dk_x_ok"], "_dk_curve_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+    t.to_top("_dk_pfx_ok")
+    t.raw_block(["_dk_curve_ok", "_dk_pfx_ok"], "_dk_valid",
                 lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
 
 # ===========================================================================
 # ECDSA verification (generic)
 # ===========================================================================
+
+def _c_emit_length_gate(t: ECTracker, name: str, want: int, flag_name: str) -> None:
+    """Length gate for an untrusted byte argument: leaves ``[flag, clamped]``.
+
+    ``flag`` is ``OP_SIZE(v) == want``; ``clamped`` is *v* forced to exactly
+    *want* bytes by ``v || 00*want``, split at *want*, tail dropped -- truncating
+    a long value and zero-extending a short one.
+
+    The clamp exists so the gate can stay a FLAG. Everything downstream peels a
+    fixed number of bytes (``OP_SPLIT coord_bytes``, then the 32/48 single-byte
+    splits inside _emit_reverse32/_emit_reverse48); handed 32 <= len(sig) < 64
+    the reversal runs out of bytes mid-loop and the SCRIPT ABORTS, which would
+    make ``verifyECDSA_P256(...) || fallback`` unwritable and contradict this
+    module's own totality rule (see _c_decompress_pub_key). Clamping first makes
+    every path total; the caller ANDs *flag* into the result so a wrong-length
+    argument can never verify whatever the clamped bytes computed.
+
+    Branch-free on purpose: the tracker's static stack model, and the emitted op
+    sequence, are the same for every input length -- the argument _c_affine_add
+    makes for selecting operands instead of branching.
+    """
+    t.to_top(name)
+
+    def _gate(e: Callable) -> None:
+        e(_make_stack_op(op="opcode", code="OP_SIZE"))
+        e(_make_stack_op(op="push", value=_big_int_push(want)))
+        e(_make_stack_op(op="opcode", code="OP_NUMEQUAL"))
+        e(_make_stack_op(op="swap"))
+        e(_make_stack_op(op="push", value=_make_push_value(kind="bytes", bytes_=bytes(want))))
+        e(_make_stack_op(op="opcode", code="OP_CAT"))
+        e(_make_stack_op(op="push", value=_big_int_push(want)))
+        e(_make_stack_op(op="opcode", code="OP_SPLIT"))
+        e(_make_stack_op(op="drop"))
+
+    t.raw_block([name], "", _gate)
+    t.nm.append(flag_name)
+    t.nm.append(name)
+
+
+def _c_emit_sig_range_gate(t: ECTracker, curve_n: int) -> None:
+    """SEC1 sec 4.1.4 step 1 / FIPS 186-5 sec 6.4.2: verify 1 <= r <= n-1 and
+    1 <= s <= n-1. Consumes nothing, leaves ``_range_ok`` above ``_r`` and
+    ``_s``.
+
+    ==> THIS IS A UNIVERSAL FORGERY GUARD, NOT A HYGIENE CHECK. <==
+
+    Nothing checked r or s at all, and _c_group_inv is Fermat (a^(n-2) mod n),
+    so inv(0) = 0 instead of an error. With ``sig = 0x00...`` and the contract's
+    own genuine, PUBLIC key:
+
+      r = s = 0            (BIN2NUM of coord_bytes zero bytes -> empty vector)
+      w = s^(n-2) = 0      Fermat, no failure channel
+      u1 = u2 = 0          every _c_group_mul in the ladder is 0*0 mod n
+      R1 = R2 = O          _c_emit_mul reduces 0, k' = 3n = 0 mod n, so Z3 = 0
+                           and _c_jacobian_to_affine's Fermat inverse turns it
+                           all-zero
+      R1 + R2              _c_affine_add sees xeq = yeq = 1, takes the tangent
+                           with den = 2*0 = 0, so s = 0 and rx = ry = 0
+      (R.x mod n) == r     OP_EQUAL(<>, <>) = 1
+
+    ...and ``_dk_valid`` is 1 because the pubkey is genuine. TRUE. No secret, no
+    off-curve point, not bound to the message: an all-zero signature verified
+    for ANY message under ANY public key. ``examples/ts/p256-wallet`` made
+    exactly that call its second authentication factor.
+
+    BOTH conjuncts are load-bearing and neither is redundant:
+      - s = 0 (or s = n, which Fermat also inverts to 0) is what collapses both
+        ladders to O;
+      - r = 0 is what makes the final OP_EQUAL compare the resulting 0 against
+        something that is also 0.
+    ``r = 0, s = n`` is a second spelling of the same forgery that an ``s != 0``
+    check alone would miss, which is why the bound is ``< n`` and not ``!= 0``.
+
+    A flag rather than an OP_VERIFY, for the reason _c_decompress_pub_key gives.
+    """
+    t.copy_to_top("_r", "_r_nz_in")
+    t.raw_block(["_r_nz_in"], "_r_nz",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_0NOTEQUAL")))
+    t.copy_to_top("_r", "_r_lt_in")
+    _c_push_group_n(t, "_n_for_r", curve_n)
+    t.raw_block(["_r_lt_in", "_n_for_r"], "_r_lt",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.raw_block(["_r_nz", "_r_lt"], "_r_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
+    t.copy_to_top("_s", "_s_nz_in")
+    t.raw_block(["_s_nz_in"], "_s_nz",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_0NOTEQUAL")))
+    t.copy_to_top("_s", "_s_lt_in")
+    _c_push_group_n(t, "_n_for_s", curve_n)
+    t.raw_block(["_s_lt_in", "_n_for_s"], "_s_lt",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.raw_block(["_s_nz", "_s_lt"], "_s_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
+    t.raw_block(["_r_ok", "_s_ok"], "_range_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
 
 def _c_emit_verify_ecdsa(
     emit: Callable,
@@ -1107,6 +1229,20 @@ def _c_emit_verify_ecdsa(
     gy: int,
 ) -> None:
     t = ECTracker(["_msg", "_sig", "_pk"], emit)
+
+    # Step 0: length gate. ``_sig`` and ``_pk`` are bare ByteString in the
+    # builtin table and the type checker imposes no width, so both arrive
+    # attacker-sized. Clamp them and remember whether they were the right size
+    # -- see _c_emit_length_gate for why a clamp and not an abort. Without it
+    # ``sig || junk`` verified identically to ``sig`` (fatal for any contract
+    # using signature bytes as a nullifier), and a short ``sig`` aborted the
+    # script outright.
+    _c_emit_length_gate(t, "_pk", coord_bytes + 1, "_pk_len_ok")
+    _c_emit_length_gate(t, "_sig", coord_bytes * 2, "_sig_len_ok")
+    t.to_top("_pk_len_ok")
+    t.to_top("_sig_len_ok")
+    t.raw_block(["_pk_len_ok", "_sig_len_ok"], "_len_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
     # Step 1: e = SHA-256(msg) as integer
     t.to_top("_msg")
@@ -1151,6 +1287,10 @@ def _c_emit_verify_ecdsa(
 
     t.raw_block(["_s_bytes"], "_s", _s_to_num)
 
+    # Step 2b: 1 <= r, s <= n-1. Without this an all-zero signature verifies for
+    # any message under any pubkey -- see _c_emit_sig_range_gate.
+    _c_emit_sig_range_gate(t, curve_n)
+
     # Step 3: Decompress pubkey. Also yields ``_dk_valid``: 0 when the pubkey
     # bytes do not decompress to a canonical on-curve point, which is ANDed into
     # the result below so such a key can never verify.
@@ -1159,6 +1299,16 @@ def _c_emit_verify_ecdsa(
         coord_bytes, reverse_bytes_fn,
         field_p, p_minus_2, curve_b, sqrt_exp,
     )
+
+    # Collapse the three argument verdicts into one flag. Everything below then
+    # carries a single item, as it did when ``_dk_valid`` was the only one.
+    t.to_top("_len_ok")
+    t.to_top("_range_ok")
+    t.raw_block(["_len_ok", "_range_ok"], "_arg_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+    t.to_top("_dk_valid")
+    t.raw_block(["_arg_ok", "_dk_valid"], "_input_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
     # Step 4: w = s^{-1} mod n
     _c_group_inv(t, "_s", "_w", curve_n, n_minus_2)
@@ -1178,8 +1328,8 @@ def _c_emit_verify_ecdsa(
     t.to_top("_u1")
 
     # Stash items on altstack.
-    # _dk_valid goes DEEPEST -- the altstack is LIFO and it is popped last.
-    t.to_top("_dk_valid")
+    # _input_ok goes DEEPEST -- the altstack is LIFO and it is popped last.
+    t.to_top("_input_ok")
     t.to_alt()
     t.to_top("_r_save")
     t.to_alt()
@@ -1248,9 +1398,9 @@ def _c_emit_verify_ecdsa(
 
     _c_group_mod(t, "rx", "_rx_mod_n", curve_n)
 
-    # Restore r, then the decompression verdict beneath it
+    # Restore r, then the argument verdict beneath it
     t.from_alt("_r_save")
-    t.from_alt("_dk_valid")
+    t.from_alt("_input_ok")
 
     t.to_top("_rx_mod_n")
     t.to_top("_r_save")
@@ -1260,12 +1410,13 @@ def _c_emit_verify_ecdsa(
         lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")),
     )
 
-    # A pubkey that did not decompress to a canonical on-curve point can never
-    # verify, whatever the ladder made of it.
-    t.to_top("_dk_valid")
+    # Arguments that were the wrong length, out of range, or did not decompress
+    # to a canonical on-curve point can never verify, whatever the ladder made
+    # of them.
+    t.to_top("_input_ok")
     t.to_top("_sig_ok")
     t.raw_block(
-        ["_dk_valid", "_sig_ok"],
+        ["_input_ok", "_sig_ok"],
         "_result",
         lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")),
     )

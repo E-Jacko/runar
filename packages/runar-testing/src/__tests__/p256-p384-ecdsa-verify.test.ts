@@ -14,23 +14,21 @@ import { ScriptVM } from '../index.js';
  * The oracle is OpenSSL: Node's `crypto` generates the key and produces the
  * signature; the script only ever sees (msg, r‖s, 02/03‖x).
  *
- * The rejection cases pin `decompressPubKey`'s precondition. It computes
- * y = (x³ − 3x + b)^((p+1)/4) and, before this change, never checked that
+ * The decompression cases pin `decompressPubKey`'s precondition. It computes
+ * y = (x³ − 3x + b)^((p+1)/4) and, before that change, never checked that
  * y² == x³ − 3x + b, nor that x < p. For an x whose RHS is a quadratic
  * non-residue the recovered point is NOT on the curve, and it went straight
  * into `cEmitMul`'s ladder — whose own soundness argument (the `c_i mod ord(P)`
  * interval in `buildJacobianAddOrDoubleInline`) is stated only for points ON
  * the curve, because cofactor 1 is what pins ord(P) = n.
  *
- * Honesty note on TDD: the rejection cases below are regression pins, NOT a
- * red-then-green proof. A pre-fix `true` cannot be constructed — every input
- * that trips the guard also fails the final `(R.x mod n) == r` comparison, and
- * making that comparison succeed with an attacker-chosen off-curve Q is
- * equivalent to forging ECDSA. So the practical exposure is an invalid-curve
- * computation on caller-supplied bytes, not a signature forgery; the guard
- * restores the precondition the ladder documents rather than closing a
- * demonstrated bypass. The genuinely new coverage is the ACCEPT case: this is
- * the first execution of either verifier by anything.
+ * The `(r, s)` range cases are a different and much sharper story: they ARE a
+ * red-then-green proof. Nothing validated r or s at all, and `cGroupInv` is
+ * Fermat, so inv(0) = 0 rather than an error. `sig = 0x00…` therefore drove
+ * w = u1 = u2 = 0, both ladders to the all-zero point, `cAffineAdd` down its
+ * tangent branch with den = 0, and the final comparison to `OP_EQUAL(<>, <>)`
+ * = 1 — a UNIVERSAL FORGERY against any message under any genuine pubkey.
+ * See `docs/audit/2026-08-ec-degenerate-cases.md`.
  */
 
 const CURVES = {
@@ -40,6 +38,7 @@ const CURVES = {
     hash: 'sha256',
     p: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn,
     b: 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn,
+    n: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n,
     emit: emitVerifyECDSA_P256,
   },
   p384: {
@@ -48,6 +47,7 @@ const CURVES = {
     hash: 'sha256',
     p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffffn,
     b: 0xb3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aefn,
+    n: 0xffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973n,
     emit: emitVerifyECDSA_P384,
   },
 } as const;
@@ -96,13 +96,17 @@ function derToRaw(c: Curve, der: Buffer): string {
   return r.toString(16).padStart(w, '0') + s.toString(16).padStart(w, '0');
 }
 
-function exec(ops: StackOp[]): string {
-  const { scriptHex } = emitMethod({ name: 't', ops } as never) as { scriptHex: string };
-  const r = new ScriptVM().executeHex(scriptHex) as never as { stack: Uint8Array[] };
-  return r.stack.length ? Buffer.from(r.stack[r.stack.length - 1]!).toString('hex') : '(empty)';
-}
-
-/** Run the curve's verifier over (msg, sig, compressed pubkey). */
+/**
+ * Run the curve's verifier over (msg, sig, compressed pubkey).
+ *
+ * Also enforces TOTALITY on every call: `verifyECDSA_*` is a boolean-valued
+ * builtin that `05-stack-lower.ts#lowerVerifyECDSA` lowers as "consume 3, push
+ * 1", so for ANY argument bytes it must terminate without an evaluation error
+ * and leave exactly one item. That is not decoration — before the length gate,
+ * a `sig` of 32..63 bytes ran `emitReverse32`'s `OP_SPLIT 1` off the end of the
+ * value and aborted the script, which would make `verifyECDSA_P256(x) || alt`
+ * unwritable.
+ */
 function verify(c: Curve, msgHex: string, sigHex: string, pkHex: string): boolean {
   const ops: StackOp[] = [
     { op: 'push', value: blob(msgHex) } as StackOp,
@@ -110,8 +114,15 @@ function verify(c: Curve, msgHex: string, sigHex: string, pkHex: string): boolea
     { op: 'push', value: blob(pkHex) } as StackOp,
   ];
   c.emit((o: StackOp) => ops.push(o));
-  const top = exec(ops);
-  return top !== '(empty)' && top !== '' && top !== '00';
+  const { scriptHex } = emitMethod({ name: 't', ops } as never) as { scriptHex: string };
+  const r = new ScriptVM().executeHex(scriptHex) as never as {
+    stack: Uint8Array[];
+    error?: unknown;
+  };
+  expect(r.error ?? null, 'verifier aborted instead of returning a boolean').toBe(null);
+  expect(r.stack.length, 'verifier is specified as 3 args in, 1 boolean out').toBe(1);
+  const top = Buffer.from(r.stack[0]!).toString('hex');
+  return top !== '' && top !== '00';
 }
 
 for (const [name, c] of Object.entries(CURVES) as Array<[string, Curve]>) {
@@ -175,5 +186,106 @@ for (const [name, c] of Object.entries(CURVES) as Array<[string, Curve]>) {
       expect(mod(x + c.p, c.p)).toBe(x);
       expect(verify(c, msgHex, sigHex, '02' + hx(x + c.p))).toBe(false);
     });
+
+    // ---- (r, s) range: SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2 -------------
+    //
+    // These are the universal-forgery cases. Nothing checked 1 <= r,s <= n-1,
+    // and `cGroupInv` is Fermat (a^(n-2) mod n), so inv(0) = 0 instead of an
+    // error. Every all-zero-driven path therefore collapses to the all-zero
+    // point and the final `(R.x mod n) == r` becomes `OP_EQUAL(<>, <>)` = 1.
+    const rGenuine = sigHex.slice(0, w);
+    const sGenuine = sigHex.slice(w);
+    const zero = '0'.repeat(w);
+
+    it('rejects an all-zero signature — THE universal forgery', () => {
+      // No secret material, no off-curve pubkey: 64 (P-256) / 96 (P-384) zero
+      // bytes plus the contract's own genuine, public key. If this returns
+      // true, `verifyECDSA_*` is not a signature check at all.
+      expect(verify(c, msgHex, zero + zero, compressed)).toBe(false);
+    });
+
+    it('rejects an all-zero signature under an unrelated message', () => {
+      // Universal: the forged signature is not bound to the message either.
+      expect(verify(c, '00', zero + zero, compressed)).toBe(false);
+    });
+
+    it('rejects r = 0 with a genuine s', () => {
+      expect(verify(c, msgHex, zero + sGenuine, compressed)).toBe(false);
+    });
+
+    it('rejects s = 0 with a genuine r', () => {
+      expect(verify(c, msgHex, rGenuine + zero, compressed)).toBe(false);
+    });
+
+    it('rejects r = 0, s = n — the same forgery with s out of range', () => {
+      // s = n makes inv(s) = n^(n-2) mod n = 0 just as s = 0 does, so this is
+      // a second spelling of the forgery that an `s != 0` check alone misses.
+      expect(verify(c, msgHex, zero + hx(c.n), compressed)).toBe(false);
+    });
+
+    it('rejects r = n', () => {
+      expect(verify(c, msgHex, hx(c.n) + sGenuine, compressed)).toBe(false);
+    });
+
+    it('rejects s = n', () => {
+      expect(verify(c, msgHex, rGenuine + hx(c.n), compressed)).toBe(false);
+    });
+
+    it('rejects r = n + 1', () => {
+      expect(verify(c, msgHex, hx(c.n + 1n) + sGenuine, compressed)).toBe(false);
+    });
+
+    it('rejects s = n + 1', () => {
+      expect(verify(c, msgHex, rGenuine + hx(c.n + 1n), compressed)).toBe(false);
+    });
+
+    // ---- argument length ---------------------------------------------------
+    //
+    // `sig` and `pubkey` are bare `ByteString` in `runar-lang/src/builtins.ts`
+    // and `03-typecheck.ts` imposes no width. The verifier split `sig` at
+    // coordBytes and took EVERYTHING after as s, and peeled exactly coordBytes
+    // off `pubkey` — so trailing bytes were ignored (malleability) and short
+    // ones aborted (`verify` asserts non-abort on every call above).
+    it('rejects a signature with trailing bytes (malleability)', () => {
+      expect(verify(c, msgHex, sigHex + 'ff', compressed)).toBe(false);
+    });
+
+    it('rejects a signature with many trailing bytes', () => {
+      expect(verify(c, msgHex, sigHex + 'de'.repeat(64), compressed)).toBe(false);
+    });
+
+    it('rejects a truncated signature without aborting', () => {
+      // coordBytes <= len < 2*coordBytes: the length where the byte reversal
+      // used to run out of input mid-loop and kill the script.
+      expect(verify(c, msgHex, sigHex.slice(0, (c.bytes + 4) * 2), compressed)).toBe(false);
+    });
+
+    it('rejects an empty signature without aborting', () => {
+      expect(verify(c, msgHex, '', compressed)).toBe(false);
+    });
+
+    it('rejects a pubkey with trailing bytes', () => {
+      expect(verify(c, msgHex, sigHex, compressed + 'ff')).toBe(false);
+    });
+
+    it('rejects a truncated pubkey without aborting', () => {
+      expect(verify(c, msgHex, sigHex, compressed.slice(0, -8))).toBe(false);
+    });
+
+    it('rejects an empty pubkey without aborting', () => {
+      expect(verify(c, msgHex, sigHex, '')).toBe(false);
+    });
+
+    // ---- compressed prefix (SEC1 §2.3.4) -----------------------------------
+    //
+    // The parity reduction is `BIN2NUM, 2 OP_MOD`, which accepts anything.
+    // 0x00/0x04/0x82 alias to "even"; 0x83 is worse — BIN2NUM(0x83) = -3 and
+    // -3 mod 2 = -1 encodes as 0x81, which never matches `_dk_y_par`, so the
+    // select silently returns the OTHER root.
+    for (const bad of ['00', '01', '04', '82', '83', 'ff']) {
+      it(`rejects pubkey prefix 0x${bad}`, () => {
+        expect(verify(c, msgHex, sigHex, bad + compressed.slice(2))).toBe(false);
+      });
+    }
   });
 }

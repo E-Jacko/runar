@@ -152,6 +152,14 @@ class TestP256P384Codegen < Minitest::Test
   # reference at the same commit. Final hex is byte-identical across all
   # 7 tiers (enforced by the conformance harness); these goldens are an
   # in-process localized-regression gate.
+  #
+  # `verifyECDSA_P256` moved 297273 -> 297331 (+58) when the verifier grew its
+  # input-validation gates: the two length clamps on `_pk` / `_sig`, the
+  # 1 <= r,s <= n-1 range gate, the SEC1 prefix test inside pubkey
+  # decompression, and the BOOLAND chain that folds all three verdicts into
+  # `_input_ok`. `verifyECDSA_P384` gains the same +58 but carries no golden
+  # here. Both are input validation, not a formula change, so the ladder
+  # emitters (`p256Mul` / `p384Mul`) are untouched.
   # ---------------------------------------------------------------------------
 
   P256_GOLDENS = {
@@ -161,7 +169,7 @@ class TestP256P384Codegen < Minitest::Test
     "p256Negate"           =>    945,
     "p256OnCurve"          =>    559,
     "p256EncodeCompressed" =>     16,
-    "verifyECDSA_P256"     => 297273,
+    "verifyECDSA_P256"     => 297331,
   }.freeze
 
   P256_EMITTERS = {

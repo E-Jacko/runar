@@ -53,7 +53,13 @@ func TestCryptoEmitOpCountGoldens(t *testing.T) {
 		{"EcOnCurve", EmitEcOnCurve, 533},
 		{"P256Add", EmitP256Add, 6663},
 		{"P256Mul", EmitP256Mul, 140036},
-		{"VerifyECDSA_P256", EmitVerifyECDSA_P256, 297273},
+		// +58 ops: SEC1 §4.1.4 / FIPS 186-5 input-validation gates on the
+		// verifier's untrusted arguments — sig/pubkey length gate
+		// (cEmitLengthGate), signature range gate 1<=r,s<=n-1
+		// (cEmitSigRangeGate), and the pubkey prefix-byte check folded into
+		// cDecompressPubKey's _dk_valid. P-384 carries the identical fix but
+		// has no golden entry in this table.
+		{"VerifyECDSA_P256", EmitVerifyECDSA_P256, 297331},
 		{"P384Add", EmitP384Add, 11469},
 		{"P384Mul", EmitP384Mul, 211178},
 		{"VerifyWOTS", EmitVerifyWOTS, 15488},

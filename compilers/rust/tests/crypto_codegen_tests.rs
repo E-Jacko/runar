@@ -398,7 +398,28 @@ fn test_verify_ecdsa_p256_op_count_golden() {
     //     check adds (one in c_field_sqr's reduce, one for the OP_LESSTHAN):
     //     33 extra bytes each on P-256, 49 each on P-384.
     // 52 + 33 = 85 ops; 85 + 66 = 151 bytes. Both match the TS reference.
-    assert_eq!(count_op_tree(&ops), 297265, "verify_ecdsa_p256 op count drift");
+    //
+    // 297265 -> 297323 (+58 ops / +225 script bytes) for the argument-validity
+    // gates — the length clamp on `_sig` / `_pk`, the 1 <= r,s <= n-1 range gate
+    // (a universal-forgery fix: an all-zero signature used to verify under any
+    // key), and the SEC1 prefix test in c_decompress_pub_key. Decomposes as:
+    //   * 23 ops / 124 bytes — the two length gates: 9 emitted ops each, plus
+    //     the rot/roll bringing the two flags together and the OP_BOOLAND that
+    //     joins them. Byte-heavy because each gate pushes `want` zero bytes
+    //     (33 and 64 here) for the OP_CAT clamp.
+    //   * 15 ops / 81 bytes — the range gate: OP_0NOTEQUAL, OP_LESSTHAN and
+    //     OP_BOOLAND per scalar over a picked copy, plus the closing OP_BOOLAND.
+    //     Two full-width pushes of n (34 bytes each on P-256) dominate.
+    //   * 8 ops / 8 bytes — the prefix test; OP_2 / OP_3 are single-byte pushes.
+    //   * 12 ops / 12 bytes — the two new AND chains (`_dk_curve_ok` ->
+    //     `_dk_valid`, `_len_ok` -> `_arg_ok` -> `_input_ok`) and the rolls
+    //     feeding them, including the extra OP_SWAP `_dk_pfx_ok` costs by
+    //     sitting under `_dk_xbytes`. All 1-byte ops.
+    // Every one of the 58 ops is curve-independent, so P-384 pays the same 58;
+    // it pays 306 bytes rather than 225 purely on wider constants — +49 in the
+    // length gates (49/96-byte pads) and +32 in the range gate (two 50-byte
+    // pushes of n). Both totals match the TS reference.
+    assert_eq!(count_op_tree(&ops), 297323, "verify_ecdsa_p256 op count drift");
 }
 
 // -- P-384 -----------------------------------------------------------------

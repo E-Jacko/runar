@@ -112,13 +112,38 @@ class P256P384Test {
      * </ul>
      *
      * 52 + 33 = 85 ops, 85 + 66 = 151 bytes. Both match the TypeScript reference.
+     *
+     * <p>A further <b>+58 ops / +225 bytes</b> for the argument-validation gates —
+     * the two length clamps on {@code _sig} / {@code _pk}, the
+     * {@code 1 <= r, s <= n-1} range gate, the SEC1 prefix check inside
+     * {@code cDecompressPubKey}, and the OP_BOOLANDs folding all of them into
+     * {@code _input_ok}. Unlike the {@code _dk_valid} delta above, the OP count is
+     * curve-INDEPENDENT (P-384 pays the same 58) because nothing here loops over the
+     * exponent; only the widths of the pushed constants differ. The 58 breaks down as
+     * 18 for the two length-gate blocks + 1 roll to reach {@code _sig}, 15 for the
+     * range gate, 8 for the prefix check, and 16 for the folds, rolls and picks that
+     * wire them together (7 of the 58 are OP_BOOLAND).
+     *
+     * <p>The +167 bytes beyond the op count are entirely wide pushes:
+     * <ul>
+     *   <li><b>3 x 34</b> — the 33-byte zero pad the {@code _pk} clamp concatenates,
+     *       and the two pushes of n the range gate compares against (n needs a
+     *       leading sign byte, so it is a 33-byte script number too). 102 bytes
+     *       against 3 the op count sees: +99.</li>
+     *   <li><b>1 x 65</b> — the 64-byte zero pad for the {@code _sig} clamp; 64 &lt;=
+     *       75, so it is a direct push, 1 length byte + 64: +64.</li>
+     *   <li><b>4 x 2</b> — the four small pushes of the target width (33, 33, 64, 64),
+     *       all above OP_16 so none collapses to an OP_N: +4.</li>
+     * </ul>
+     *
+     * 99 + 64 + 4 = 167, and 58 + 167 = 225.
      */
     @Test
     void verifyEcdsaP256Parity() {
         assertParity("verifyECDSA_P256",
             P256P384::emitVerifyECDSA_P256,
-            297273, 973799,
-            "e7601f63c10703b41a5f05d8e691f8593444200590c49b99038bc52bd3a69094");
+            297331, 974024,
+            "1b8077057d1f724348e603a79b7ebab7ef6b0c36cdf669323e2d4483ab9c4f77");
     }
 
     // --------------------------------------------------------------
@@ -179,13 +204,22 @@ class P256P384Test {
      * {@link #verifyEcdsaP256Parity()}: 52 + 287 = 339 ops, 339 + 2*49 = 437 bytes.
      * The 254-op gap to P-256 is exactly the gap in set-bit counts of {@code (p+1)/4}
      * (287 vs 33) — see there for the full decomposition.
+     *
+     * <p>Plus the same argument-validation gates as
+     * {@link #verifyEcdsaP256Parity()}: <b>+58 ops</b> — identical, the gates do not
+     * loop — and <b>+306 bytes</b>, the extra 81 over P-256 being nothing but wider
+     * constants: 3 x 50 for the 49-byte {@code _pk} pad and the two 49-byte pushes of
+     * n (+147), 1 x 98 for the 96-byte {@code _sig} pad (+97 — 96 &gt; 75, so this one
+     * needs an OP_PUSHDATA1 length prefix where P-256's 64-byte pad did not, which is
+     * the odd byte in 306 - 225 = 81), and 4 x 2 for the width pushes (+4).
+     * 147 + 97 + 4 = 248, and 58 + 248 = 306.
      */
     @Test
     void verifyEcdsaP384Parity() {
         assertParity("verifyECDSA_P384",
             P256P384::emitVerifyECDSA_P384,
-            453249, 1987088,
-            "d3398be003e870e7ab41012dc945cc07003099b0f0bc04f25b1a9268bbec1f02");
+            453307, 1987394,
+            "665371eff2690394d04ecbc2195d556d79103849c40b2bafe75ef2fdb5d3d1f9");
     }
 
     // --------------------------------------------------------------

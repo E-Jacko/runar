@@ -47,7 +47,11 @@ def _count_op_tree(ops: list[StackOp]) -> int:
     ("p256Negate",           emit_p256_negate,             945),
     ("p256OnCurve",          emit_p256_on_curve,           559),
     ("p256EncodeCompressed", emit_p256_encode_compressed,   16),
-    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    297273),
+    # 297273 -> 297331 (+58): the ECDSA verifier gained its argument-validation
+    # gates -- two length gates on `_sig` / `_pk`, the 1 <= r,s <= n-1 range
+    # gate, the SEC1 prefix-byte check inside decompression, and the ANDs that
+    # fold all of it into one `_input_ok` flag.
+    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    297331),
 ])
 def test_p256_op_count(name, fn, expected):
     ops: list[StackOp] = []

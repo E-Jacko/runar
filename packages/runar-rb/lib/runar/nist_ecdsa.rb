@@ -12,8 +12,15 @@ require 'openssl'
 #     NOT DER. This matches the input shape that the compiled `verifyECDSA_P256`
 #     / `verifyECDSA_P384` Bitcoin Script verifier expects on the stack.
 #
-# The compiled verifier hashes the message with SHA-256 (P-256) / SHA-384
-# (P-384) before verifying, so this module hashes consistently.
+# The compiled verifier hashes the message with SHA-256 on BOTH curves, so
+# this module does too. P-384 conventionally pairs with SHA-384, and this
+# module used to follow that convention -- which made every P-384 signature it
+# produced UNSPENDABLE, because `p384_verify` hashed the same wrong way and so
+# the Ruby example suite agreed with itself while only the chain disagreed.
+# SHA-384 is not available on-chain at all: it is SHA-512-based, and 64-bit
+# word arithmetic is not expressible in Bitcoin Script (issue #137).
+# Pinned by spec/runar/nist_ecdsa_spec.rb against a digest-explicit OpenSSL
+# verification, not against this module's own verify path.
 module Runar
   module NistECDSA
     module_function
@@ -49,18 +56,19 @@ module Runar
       keygen('secp384r1', 48)
     end
 
-    # Sign `msg` with a P-384 private key. Verifier hashes with SHA-384.
+    # Sign `msg` with a P-384 private key. The on-chain verifier hashes with
+    # SHA-256 (not SHA-384 -- see the module comment), so we sign SHA-256(msg).
     # Returns 96-byte raw r||s as a hex string.
     def p384_sign(msg, sk_hex)
-      sign('secp384r1', sk_hex, msg, OpenSSL::Digest::SHA384, 48)
+      sign('secp384r1', sk_hex, msg, OpenSSL::Digest::SHA256, 48)
     end
 
     # Verify a P-384 signature.
-    # @param msg [String]      hex-encoded message bytes (verifier hashes SHA-384)
+    # @param msg [String]      hex-encoded message bytes (verifier hashes SHA-256)
     # @param sig_hex [String]  hex-encoded 96-byte raw r||s signature
     # @param pk_hex [String]   hex-encoded 49-byte compressed public key
     def p384_verify(msg, sig_hex, pk_hex)
-      verify_raw('secp384r1', msg, sig_hex, pk_hex, OpenSSL::Digest::SHA384, 48)
+      verify_raw('secp384r1', msg, sig_hex, pk_hex, OpenSSL::Digest::SHA256, 48)
     end
 
     # -------------------------------------------------------------------------

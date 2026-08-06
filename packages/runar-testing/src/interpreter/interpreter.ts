@@ -1539,6 +1539,12 @@ function verifyECDSA_P256_impl(
   compressedPub: Uint8Array,
 ): boolean {
   try {
+    // Exact widths, matching the emitted script's OP_SIZE gate. Without this
+    // the subarrays below silently IGNORE trailing bytes, so `sig ‖ junk`
+    // verified here while the script rejects it — a differential-oracle
+    // divergence on the malleability case the size gate exists to close.
+    if (rawSig.length !== 64 || compressedPub.length !== 33) return false;
+
     // Convert raw r||s (64 bytes) to DER for Node.js verify()
     const r = rawSig.subarray(0, 32);
     const s = rawSig.subarray(32, 64);
@@ -1610,6 +1616,10 @@ function verifyECDSA_P384_impl(
   compressedPub: Uint8Array,
 ): boolean {
   try {
+    // Exact widths, matching the emitted script's OP_SIZE gate — see the
+    // P-256 helper above for why ignoring trailing bytes is not harmless.
+    if (rawSig.length !== 96 || compressedPub.length !== 49) return false;
+
     // Convert raw r||s (96 bytes) to DER for Node.js verify()
     const r = rawSig.subarray(0, 48);
     const s = rawSig.subarray(48, 96);

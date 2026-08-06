@@ -1129,12 +1129,12 @@ fn c_field_pow(t: &mut ECTracker, base_name: &str, exp: &BigInt, result_name: &s
 /// whose order is composite, so the degenerate steps the interval argument
 /// rules out become reachable. The pubkey is a caller-supplied unlock argument.
 ///
-/// So this emits a third output, `_dk_valid` = (x < p) AND (y_cand^2 == y^2),
-/// which the caller ANDs into the verifier's boolean result. A flag, not an
-/// OP_VERIFY: `verifyECDSA_*` is a total boolean-valued builtin and turning
-/// attacker-chosen bytes into a script abort would be a liveness regression —
-/// the same argument c_emit_scalar_reduce makes for reducing rather than
-/// rejecting.
+/// So this emits a third output, `_dk_valid` = (x < p) AND (y_cand^2 == y^2)
+/// AND (prefix ∈ {0x02, 0x03}), which the caller ANDs into the verifier's
+/// boolean result. A flag, not an OP_VERIFY: `verifyECDSA_*` is a total
+/// boolean-valued builtin and turning attacker-chosen bytes into a script abort
+/// would be a liveness regression — the same argument c_emit_scalar_reduce
+/// makes for reducing rather than rejecting.
 fn c_decompress_pub_key(
     t: &mut ECTracker,
     pk_name: &str,
@@ -1153,6 +1153,23 @@ fn c_decompress_pub_key(
     });
     t.nm.push("_dk_prefix".to_string());
     t.nm.push("_dk_xbytes".to_string());
+
+    // SEC1 §2.3.4 requires the prefix to be exactly 0x02 or 0x03. The parity
+    // reduction below is `BIN2NUM, 2 MOD`, which accepts far more than that:
+    // 0x00 / 0x04 / 0x82 all alias to "even", and 0x83 is worse than an alias —
+    // BIN2NUM(0x83) = -3 (sign-magnitude), -3 mod 2 = -1, which encodes as 0x81
+    // and can never equal `_dk_y_par` ∈ {<>, 0x01}, so the select silently
+    // returns the OTHER square root. Test the byte itself.
+    t.copy_to_top("_dk_prefix", "_dk_pfx_in");
+    t.raw_block(&["_dk_pfx_in"], Some("_dk_pfx_ok"), |e| {
+        e(StackOp::Dup);
+        e(StackOp::Push(PushValue::Bytes(vec![0x02])));
+        e(StackOp::Opcode("OP_EQUAL".into()));
+        e(StackOp::Swap);
+        e(StackOp::Push(PushValue::Bytes(vec![0x03])));
+        e(StackOp::Opcode("OP_EQUAL".into()));
+        e(StackOp::Opcode("OP_BOOLOR".into()));
+    });
 
     // Convert prefix to parity: 0x02 -> 0, 0x03 -> 1
     t.to_top("_dk_prefix");
@@ -1240,11 +1257,13 @@ fn c_decompress_pub_key(
         t.nm[xs_idx] = qx_name.to_string();
     }
 
-    // valid = (qy^2 == y^2) AND (qx < p).
+    // valid = (qy^2 == y^2) AND (qx < p) AND (prefix ∈ {0x02, 0x03}).
     // The selected qy is y_cand or p - y_cand, so squaring it tests the same
     // residue property either way. The first conjunct rejects an x whose RHS is
     // a quadratic non-residue — the recovered point is then off the curve; the
-    // second rejects a non-canonical encoding of an otherwise fine x.
+    // second rejects a non-canonical encoding of an otherwise fine x; the third
+    // rejects a prefix byte the parity reduction would otherwise alias or, for
+    // 0x83, silently invert.
     t.copy_to_top(qy_name, "_dk_y_sq_in");
     c_field_sqr(t, "_dk_y_sq_in", "_dk_y_sq", c);
     t.to_top("_dk_y_sq");
@@ -1259,7 +1278,11 @@ fn c_decompress_pub_key(
     });
     t.to_top("_dk_res_ok");
     t.to_top("_dk_x_ok");
-    t.raw_block(&["_dk_res_ok", "_dk_x_ok"], Some("_dk_valid"), |e| {
+    t.raw_block(&["_dk_res_ok", "_dk_x_ok"], Some("_dk_curve_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+    t.to_top("_dk_pfx_ok");
+    t.raw_block(&["_dk_curve_ok", "_dk_pfx_ok"], Some("_dk_valid"), |e| {
         e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
@@ -1267,6 +1290,105 @@ fn c_decompress_pub_key(
 // ===========================================================================
 // ECDSA verification
 // ===========================================================================
+
+/// Length gate for an untrusted byte argument: leaves `[flag, clamped]`.
+///
+/// `flag` is `OP_SIZE(v) == want`; `clamped` is `v` forced to exactly `want`
+/// bytes by `v ‖ 00*want`, split at `want`, tail dropped — truncating a long
+/// value and zero-extending a short one.
+///
+/// The clamp exists so the gate can stay a FLAG. Everything downstream peels a
+/// fixed number of bytes (`OP_SPLIT coord_bytes`, then 32/48 single-byte splits
+/// inside emit_reverse_32/48); handed 32 <= len(sig) < 64 the reversal runs out
+/// of bytes mid-loop and the SCRIPT ABORTS, which would make
+/// `verifyECDSA_P256(...) || fallback` unwritable and contradict this module's
+/// own totality rule (see c_decompress_pub_key). Clamping first makes every path
+/// total; the caller ANDs `flag` into the result so a wrong-length argument can
+/// never verify whatever the clamped bytes computed.
+///
+/// Branch-free on purpose: the tracker's static stack model, and the emitted op
+/// sequence, are the same for every input length — the argument c_affine_add
+/// makes for selecting operands instead of branching.
+fn c_emit_length_gate(t: &mut ECTracker, name: &str, want: usize, flag_name: &str) {
+    t.to_top(name);
+    t.raw_block(&[name], None, |e| {
+        e(StackOp::Opcode("OP_SIZE".into()));
+        e(StackOp::Push(PushValue::Int(BigInt::from(want as i128))));
+        e(StackOp::Opcode("OP_NUMEQUAL".into()));
+        e(StackOp::Swap);
+        e(StackOp::Push(PushValue::Bytes(vec![0u8; want])));
+        e(StackOp::Opcode("OP_CAT".into()));
+        e(StackOp::Push(PushValue::Int(BigInt::from(want as i128))));
+        e(StackOp::Opcode("OP_SPLIT".into()));
+        e(StackOp::Drop);
+    });
+    t.nm.push(flag_name.to_string());
+    t.nm.push(name.to_string());
+}
+
+/// SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2: verify 1 <= r <= n-1 and
+/// 1 <= s <= n-1. Consumes nothing, leaves `_range_ok` above `_r` and `_s`.
+///
+/// ==> THIS IS A UNIVERSAL FORGERY GUARD, NOT A HYGIENE CHECK. <==
+///
+/// Nothing checked r or s at all, and `c_group_inv` is Fermat (a^(n-2) mod n),
+/// so inv(0) = 0 instead of an error. With `sig = 0x00…` and the contract's own
+/// genuine, PUBLIC key:
+///
+///   r = s = 0            (BIN2NUM of coord_bytes zero bytes -> empty vector)
+///   w = s^(n-2) = 0      Fermat, no failure channel
+///   u1 = u2 = 0          every c_group_mul in the ladder is 0*0 mod n
+///   R1 = R2 = O          c_emit_mul reduces 0, k' = 3n = 0 mod n, so Z3 = 0 and
+///                        c_jacobian_to_affine's Fermat inverse turns it all-zero
+///   R1 + R2              c_affine_add sees xeq = yeq = 1, takes the tangent
+///                        with den = 2*0 = 0, so s = 0 and rx = ry = 0
+///   (R.x mod n) == r     OP_EQUAL(<>, <>) = 1
+///
+/// ...and `_dk_valid` is 1 because the pubkey is genuine. TRUE. No secret, no
+/// off-curve point, not bound to the message: an all-zero signature verified for
+/// ANY message under ANY public key. `examples/ts/p256-wallet` made exactly that
+/// call its second authentication factor.
+///
+/// BOTH conjuncts are load-bearing and neither is redundant:
+///   - s = 0 (or s = n, which Fermat also inverts to 0) is what collapses both
+///     ladders to O;
+///   - r = 0 is what makes the final OP_EQUAL compare the resulting 0 against
+///     something that is also 0.
+/// `r = 0, s = n` is a second spelling of the same forgery that an `s != 0`
+/// check alone would miss, which is why the bound is `< n` and not `!= 0`.
+///
+/// A flag rather than an OP_VERIFY, for the reason c_decompress_pub_key gives.
+fn c_emit_sig_range_gate(t: &mut ECTracker, g: &NistGroupParams) {
+    t.copy_to_top("_r", "_r_nz_in");
+    t.raw_block(&["_r_nz_in"], Some("_r_nz"), |e| {
+        e(StackOp::Opcode("OP_0NOTEQUAL".into()));
+    });
+    t.copy_to_top("_r", "_r_lt_in");
+    c_push_group_n(t, "_n_for_r", g);
+    t.raw_block(&["_r_lt_in", "_n_for_r"], Some("_r_lt"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.raw_block(&["_r_nz", "_r_lt"], Some("_r_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
+    t.copy_to_top("_s", "_s_nz_in");
+    t.raw_block(&["_s_nz_in"], Some("_s_nz"), |e| {
+        e(StackOp::Opcode("OP_0NOTEQUAL".into()));
+    });
+    t.copy_to_top("_s", "_s_lt_in");
+    c_push_group_n(t, "_n_for_s", g);
+    t.raw_block(&["_s_lt_in", "_n_for_s"], Some("_s_lt"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.raw_block(&["_s_nz", "_s_lt"], Some("_s_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
+    t.raw_block(&["_r_ok", "_s_ok"], Some("_range_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+}
 
 fn c_emit_verify_ecdsa(
     emit: &mut dyn FnMut(StackOp),
@@ -1278,6 +1400,20 @@ fn c_emit_verify_ecdsa(
     gy: &BigInt,
 ) {
     let mut t = ECTracker::new(&["_msg", "_sig", "_pk"], emit);
+
+    // Step 0: length gate. `_sig` and `_pk` are bare ByteString in the builtin
+    // table and the type checker imposes no width, so both arrive attacker-sized.
+    // Clamp them and remember whether they were the right size — see
+    // c_emit_length_gate for why a clamp and not an abort. Without it `sig ‖ junk`
+    // verified identically to `sig` (fatal for any contract using signature bytes
+    // as a nullifier), and a short `sig` aborted the script outright.
+    c_emit_length_gate(&mut t, "_pk", c.coord_bytes + 1, "_pk_len_ok");
+    c_emit_length_gate(&mut t, "_sig", c.coord_bytes * 2, "_sig_len_ok");
+    t.to_top("_pk_len_ok");
+    t.to_top("_sig_len_ok");
+    t.raw_block(&["_pk_len_ok", "_sig_len_ok"], Some("_len_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
 
     // Step 1: e = SHA-256(msg) as integer
     t.to_top("_msg");
@@ -1318,10 +1454,26 @@ fn c_emit_verify_ecdsa(
         e(StackOp::Opcode("OP_BIN2NUM".into()));
     });
 
+    // Step 2b: 1 <= r, s <= n-1. Without this an all-zero signature verifies for
+    // any message under any pubkey — see c_emit_sig_range_gate.
+    c_emit_sig_range_gate(&mut t, g);
+
     // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
     // bytes do not decompress to a canonical on-curve point, which is ANDed into
     // the result below so such a key can never verify.
     c_decompress_pub_key(&mut t, "_pk", "_qx", "_qy", c, curve_b, sqrt_exp);
+
+    // Collapse the three argument verdicts into one flag. Everything below then
+    // carries a single item, as it did when `_dk_valid` was the only one.
+    t.to_top("_len_ok");
+    t.to_top("_range_ok");
+    t.raw_block(&["_len_ok", "_range_ok"], Some("_arg_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+    t.to_top("_dk_valid");
+    t.raw_block(&["_arg_ok", "_dk_valid"], Some("_input_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
 
     // Step 4: w = s^{-1} mod n
     c_group_inv(&mut t, "_s", "_w", g);
@@ -1346,8 +1498,8 @@ fn c_emit_verify_ecdsa(
     t.to_top("_u1");
 
     // Stash items on altstack.
-    // _dk_valid goes DEEPEST — the altstack is LIFO and it is popped last.
-    t.to_top("_dk_valid");
+    // _input_ok goes DEEPEST — the altstack is LIFO and it is popped last.
+    t.to_top("_input_ok");
     t.to_alt();
     t.to_top("_r_save");
     t.to_alt();
@@ -1411,9 +1563,9 @@ fn c_emit_verify_ecdsa(
 
     c_group_mod(&mut t, "rx", "_rx_mod_n", g);
 
-    // Restore r, then the decompression verdict beneath it
+    // Restore r, then the argument verdict beneath it
     t.from_alt("_r_save");
-    t.from_alt("_dk_valid");
+    t.from_alt("_input_ok");
 
     // Compare
     t.to_top("_rx_mod_n");
@@ -1422,11 +1574,12 @@ fn c_emit_verify_ecdsa(
         e(StackOp::Opcode("OP_EQUAL".into()));
     });
 
-    // A pubkey that did not decompress to a canonical on-curve point can never
-    // verify, whatever the ladder made of it.
-    t.to_top("_dk_valid");
+    // Arguments that were the wrong length, out of range, or did not decompress
+    // to a canonical on-curve point can never verify, whatever the ladder made
+    // of them.
+    t.to_top("_input_ok");
     t.to_top("_sig_ok");
-    t.raw_block(&["_dk_valid", "_sig_ok"], Some("_result"), |e| {
+    t.raw_block(&["_input_ok", "_sig_ok"], Some("_result"), |e| {
         e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }

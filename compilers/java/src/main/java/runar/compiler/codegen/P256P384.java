@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.function.Consumer;
 import runar.compiler.codegen.Ec.ECTracker;
 import runar.compiler.ir.stack.DropOp;
+import runar.compiler.ir.stack.DupOp;
 import runar.compiler.ir.stack.IfOp;
 import runar.compiler.ir.stack.NipOp;
 import runar.compiler.ir.stack.OpcodeOp;
@@ -956,11 +957,11 @@ public final class P256P384 {
      * reachable. The pubkey is a caller-supplied unlock argument.
      *
      * <p>So this emits a third output, {@code _dk_valid} = (x &lt; p) AND
-     * (y_cand^2 == y^2), which the caller ANDs into the verifier's boolean result. A
-     * flag, not an OP_VERIFY: {@code verifyECDSA_*} is a total boolean-valued builtin
-     * and turning attacker-chosen bytes into a script abort would be a liveness
-     * regression — the same argument {@code cEmitScalarReduce} makes for reducing
-     * rather than rejecting.
+     * (y_cand^2 == y^2) AND (prefix in {0x02, 0x03}), which the caller ANDs into the
+     * verifier's boolean result. A flag, not an OP_VERIFY: {@code verifyECDSA_*} is a
+     * total boolean-valued builtin and turning attacker-chosen bytes into a script
+     * abort would be a liveness regression — the same argument
+     * {@code cEmitScalarReduce} makes for reducing rather than rejecting.
      */
     private static void cDecompressPubKey(ECTracker t, String pkName, String qxName,
                                            String qyName, int coordBytes,
@@ -976,6 +977,23 @@ public final class P256P384 {
         });
         t.nm.add("_dk_prefix");
         t.nm.add("_dk_xbytes");
+
+        // SEC1 §2.3.4 requires the prefix to be exactly 0x02 or 0x03. The parity
+        // reduction below is `BIN2NUM, 2 MOD`, which accepts far more than that:
+        // 0x00 / 0x04 / 0x82 all alias to "even", and 0x83 is worse than an alias —
+        // BIN2NUM(0x83) = -3 (sign-magnitude), -3 mod 2 = -1, which encodes as 0x81
+        // and can never equal `_dk_y_par` in {<>, 0x01}, so the select silently
+        // returns the OTHER square root. Test the byte itself.
+        t.copyToTop("_dk_prefix", "_dk_pfx_in");
+        t.rawBlock(List.of("_dk_pfx_in"), "_dk_pfx_ok", e -> {
+            e.accept(new DupOp());
+            e.accept(new PushOp(PushValue.ofHex("02")));
+            e.accept(new OpcodeOp("OP_EQUAL"));
+            e.accept(new SwapOp());
+            e.accept(new PushOp(PushValue.ofHex("03")));
+            e.accept(new OpcodeOp("OP_EQUAL"));
+            e.accept(new OpcodeOp("OP_BOOLOR"));
+        });
 
         // Convert prefix to parity: 0x02 → 0, 0x03 → 1
         t.toTop("_dk_prefix");
@@ -1071,11 +1089,13 @@ public final class P256P384 {
             }
         }
 
-        // valid = (qy^2 == y^2) AND (qx < p).
+        // valid = (qy^2 == y^2) AND (qx < p) AND (prefix in {0x02, 0x03}).
         // The selected qy is y_cand or p - y_cand, so squaring it tests the same
         // residue property either way. The first conjunct rejects an x whose RHS is
         // a quadratic non-residue — the recovered point is then off the curve; the
-        // second rejects a non-canonical encoding of an otherwise fine x.
+        // second rejects a non-canonical encoding of an otherwise fine x; the third
+        // rejects a prefix byte the parity reduction would otherwise alias or, for
+        // 0x83, silently invert.
         t.copyToTop(qyName, "_dk_y_sq_in");
         cFieldSqr(t, "_dk_y_sq_in", "_dk_y_sq", fieldP);
         t.toTop("_dk_y_sq");
@@ -1088,7 +1108,10 @@ public final class P256P384 {
             e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
         t.toTop("_dk_res_ok");
         t.toTop("_dk_x_ok");
-        t.rawBlock(List.of("_dk_res_ok", "_dk_x_ok"), "_dk_valid",
+        t.rawBlock(List.of("_dk_res_ok", "_dk_x_ok"), "_dk_curve_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        t.toTop("_dk_pfx_ok");
+        t.rawBlock(List.of("_dk_curve_ok", "_dk_pfx_ok"), "_dk_valid",
             e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
@@ -1096,12 +1119,129 @@ public final class P256P384 {
     // ECDSA verification (generic)
     // ===================================================================
 
+    /**
+     * Length gate for an untrusted byte argument: leaves {@code [flag, clamped]}.
+     *
+     * <p>{@code flag} is {@code OP_SIZE(v) == want}; {@code clamped} is {@code v}
+     * forced to exactly {@code want} bytes by {@code v || 00*want}, split at
+     * {@code want}, tail dropped — truncating a long value and zero-extending a
+     * short one.
+     *
+     * <p>The clamp exists so the gate can stay a FLAG. Everything downstream peels a
+     * fixed number of bytes ({@code OP_SPLIT coordBytes}, then 32/48 single-byte
+     * splits inside emitReverse32/48); handed 32 &lt;= len(sig) &lt; 64 the reversal
+     * runs out of bytes mid-loop and the SCRIPT ABORTS, which would make
+     * {@code verifyECDSA_P256(...) || fallback} unwritable and contradict this
+     * module's own totality rule (see {@code cDecompressPubKey}). Clamping first
+     * makes every path total; the caller ANDs {@code flag} into the result so a
+     * wrong-length argument can never verify whatever the clamped bytes computed.
+     *
+     * <p>Branch-free on purpose: the tracker's static stack model, and the emitted op
+     * sequence, are the same for every input length — the argument {@code cAffineAdd}
+     * makes for selecting operands instead of branching.
+     */
+    private static void cEmitLengthGate(ECTracker t, String name, int want, String flagName) {
+        t.toTop(name);
+        t.rawBlock(List.of(name), "", e -> {
+            e.accept(new OpcodeOp("OP_SIZE"));
+            e.accept(new PushOp(PushValue.of(want)));
+            e.accept(new OpcodeOp("OP_NUMEQUAL"));
+            e.accept(new SwapOp());
+            e.accept(new PushOp(PushValue.ofHex(Ec.hexOf(new byte[want]))));
+            e.accept(new OpcodeOp("OP_CAT"));
+            e.accept(new PushOp(PushValue.of(want)));
+            e.accept(new OpcodeOp("OP_SPLIT"));
+            e.accept(new DropOp());
+        });
+        t.nm.add(flagName);
+        t.nm.add(name);
+    }
+
+    /**
+     * SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2: verify 1 &lt;= r &lt;= n-1 and
+     * 1 &lt;= s &lt;= n-1. Consumes nothing, leaves {@code _range_ok} above
+     * {@code _r} and {@code _s}.
+     *
+     * <p>==&gt; THIS IS A UNIVERSAL FORGERY GUARD, NOT A HYGIENE CHECK. &lt;==
+     *
+     * <p>Nothing checked r or s at all, and {@code cGroupInv} is Fermat
+     * (a^(n-2) mod n), so inv(0) = 0 instead of an error. With {@code sig = 0x00…}
+     * and the contract's own genuine, PUBLIC key:
+     *
+     * <pre>
+     *   r = s = 0            (BIN2NUM of coordBytes zero bytes -&gt; empty vector)
+     *   w = s^(n-2) = 0      Fermat, no failure channel
+     *   u1 = u2 = 0          every cGroupMul in the ladder is 0*0 mod n
+     *   R1 = R2 = O          cEmitMul reduces 0, k' = 3n = 0 mod n, so Z3 = 0 and
+     *                        cJacobianToAffine's Fermat inverse turns it all-zero
+     *   R1 + R2              cAffineAdd sees xeq = yeq = 1, takes the tangent with
+     *                        den = 2*0 = 0, so s = 0 and rx = ry = 0
+     *   (R.x mod n) == r     OP_EQUAL(&lt;&gt;, &lt;&gt;) = 1
+     * </pre>
+     *
+     * <p>...and {@code _dk_valid} is 1 because the pubkey is genuine. TRUE. No
+     * secret, no off-curve point, not bound to the message: an all-zero signature
+     * verified for ANY message under ANY public key. {@code examples/ts/p256-wallet}
+     * made exactly that call its second authentication factor.
+     *
+     * <p>BOTH conjuncts are load-bearing and neither is redundant:
+     * <ul>
+     *   <li>s = 0 (or s = n, which Fermat also inverts to 0) is what collapses both
+     *       ladders to O;</li>
+     *   <li>r = 0 is what makes the final OP_EQUAL compare the resulting 0 against
+     *       something that is also 0.</li>
+     * </ul>
+     * {@code r = 0, s = n} is a second spelling of the same forgery that an
+     * {@code s != 0} check alone would miss, which is why the bound is {@code < n}
+     * and not {@code != 0}.
+     *
+     * <p>A flag rather than an OP_VERIFY, for the reason
+     * {@code cDecompressPubKey} gives.
+     */
+    private static void cEmitSigRangeGate(ECTracker t, BigInteger curveN) {
+        t.copyToTop("_r", "_r_nz_in");
+        t.rawBlock(List.of("_r_nz_in"), "_r_nz",
+            e -> e.accept(new OpcodeOp("OP_0NOTEQUAL")));
+        t.copyToTop("_r", "_r_lt_in");
+        cPushGroupN(t, "_n_for_r", curveN);
+        t.rawBlock(List.of("_r_lt_in", "_n_for_r"), "_r_lt",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.rawBlock(List.of("_r_nz", "_r_lt"), "_r_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+
+        t.copyToTop("_s", "_s_nz_in");
+        t.rawBlock(List.of("_s_nz_in"), "_s_nz",
+            e -> e.accept(new OpcodeOp("OP_0NOTEQUAL")));
+        t.copyToTop("_s", "_s_lt_in");
+        cPushGroupN(t, "_n_for_s", curveN);
+        t.rawBlock(List.of("_s_lt_in", "_n_for_s"), "_s_lt",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.rawBlock(List.of("_s_nz", "_s_lt"), "_s_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+
+        t.rawBlock(List.of("_r_ok", "_s_ok"), "_range_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+    }
+
     private static void cEmitVerifyECDSA(Consumer<StackOp> emit, int coordBytes,
                                          ReverseBytesFn revFn, BigInteger fieldP,
                                          BigInteger pMinus2, BigInteger curveN,
                                          BigInteger nMinus2, BigInteger curveB,
                                          BigInteger sqrtExp, BigInteger gx, BigInteger gy) {
         ECTracker t = new ECTracker(List.of("_msg", "_sig", "_pk"), emit);
+
+        // Step 0: length gate. `_sig` and `_pk` are bare ByteString in the builtin
+        // table and the type checker imposes no width, so both arrive attacker-sized.
+        // Clamp them and remember whether they were the right size — see
+        // cEmitLengthGate for why a clamp and not an abort. Without it `sig || junk`
+        // verified identically to `sig` (fatal for any contract using signature bytes
+        // as a nullifier), and a short `sig` aborted the script outright.
+        cEmitLengthGate(t, "_pk", coordBytes + 1, "_pk_len_ok");
+        cEmitLengthGate(t, "_sig", coordBytes * 2, "_sig_len_ok");
+        t.toTop("_pk_len_ok");
+        t.toTop("_sig_len_ok");
+        t.rawBlock(List.of("_pk_len_ok", "_sig_len_ok"), "_len_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
 
         // Step 1: e = SHA-256(msg) as integer
         t.toTop("_msg");
@@ -1140,11 +1280,25 @@ public final class P256P384 {
             e.accept(new OpcodeOp("OP_BIN2NUM"));
         });
 
+        // Step 2b: 1 <= r, s <= n-1. Without this an all-zero signature verifies for
+        // any message under any pubkey — see cEmitSigRangeGate.
+        cEmitSigRangeGate(t, curveN);
+
         // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
         // bytes do not decompress to a canonical on-curve point, which is ANDed into
         // the result below so such a key can never verify.
         cDecompressPubKey(t, "_pk", "_qx", "_qy",
             coordBytes, revFn, fieldP, pMinus2, curveB, sqrtExp);
+
+        // Collapse the three argument verdicts into one flag. Everything below then
+        // carries a single item, as it did when `_dk_valid` was the only one.
+        t.toTop("_len_ok");
+        t.toTop("_range_ok");
+        t.rawBlock(List.of("_len_ok", "_range_ok"), "_arg_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        t.toTop("_dk_valid");
+        t.rawBlock(List.of("_arg_ok", "_dk_valid"), "_input_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
 
         // Step 4: w = s^{-1} mod n
         cGroupInv(t, "_s", "_w", curveN, nMinus2);
@@ -1165,9 +1319,9 @@ public final class P256P384 {
         t.pushBytes("_G", gPointData);
         t.toTop("_u1");
 
-        // Stash items on altstack. _dk_valid goes DEEPEST — the altstack is LIFO
+        // Stash items on altstack. _input_ok goes DEEPEST — the altstack is LIFO
         // and it is popped last.
-        t.toTop("_dk_valid"); t.toAlt();
+        t.toTop("_input_ok"); t.toAlt();
         t.toTop("_r_save"); t.toAlt();
         t.toTop("_u2");     t.toAlt();
         t.toTop("_qy");     t.toAlt();
@@ -1232,9 +1386,9 @@ public final class P256P384 {
 
         cGroupMod(t, "rx", "_rx_mod_n", curveN);
 
-        // Restore r, then the decompression verdict beneath it
+        // Restore r, then the argument verdict beneath it
         t.fromAlt("_r_save");
-        t.fromAlt("_dk_valid");
+        t.fromAlt("_input_ok");
 
         // Compare
         t.toTop("_rx_mod_n");
@@ -1242,11 +1396,12 @@ public final class P256P384 {
         t.rawBlock(List.of("_rx_mod_n", "_r_save"), "_sig_ok",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
 
-        // A pubkey that did not decompress to a canonical on-curve point can never
-        // verify, whatever the ladder made of it.
-        t.toTop("_dk_valid");
+        // Arguments that were the wrong length, out of range, or did not decompress
+        // to a canonical on-curve point can never verify, whatever the ladder made
+        // of them.
+        t.toTop("_input_ok");
         t.toTop("_sig_ok");
-        t.rawBlock(List.of("_dk_valid", "_sig_ok"), "_result",
+        t.rawBlock(List.of("_input_ok", "_sig_ok"), "_result",
             e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 

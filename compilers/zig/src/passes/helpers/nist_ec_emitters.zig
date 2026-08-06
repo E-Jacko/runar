@@ -1354,12 +1354,12 @@ fn fieldPow(t: *NistTracker, base_name: []const u8, exp_be: []const u8, p_be: []
 /// whose order is composite, so the degenerate steps the interval argument
 /// rules out become reachable. The pubkey is a caller-supplied unlock argument.
 ///
-/// So this emits a third output, `_dk_valid` = (x < p) AND (y_cand^2 == y^2),
-/// which the caller ANDs into the verifier's boolean result. A flag, not an
-/// OP_VERIFY: `verifyECDSA_*` is a total boolean-valued builtin and turning
-/// attacker-chosen bytes into a script abort would be a liveness regression —
-/// the same argument the scalar reduce makes for reducing rather than
-/// rejecting.
+/// So this emits a third output, `_dk_valid` = (x < p) AND (y_cand^2 == y^2)
+/// AND (prefix in {0x02, 0x03}), which the caller ANDs into the verifier's
+/// boolean result. A flag, not an OP_VERIFY: `verifyECDSA_*` is a total
+/// boolean-valued builtin and turning attacker-chosen bytes into a script abort
+/// would be a liveness regression — the same argument the scalar reduce makes
+/// for reducing rather than rejecting.
 fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, qy_name: []const u8) !void {
     const c = t.params;
     const p_be = c.field_p_be;
@@ -1371,6 +1371,23 @@ fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, q
     try t.emitOpcode("OP_SPLIT");
     try t.names.append(t.allocator, "_dk_prefix");
     try t.names.append(t.allocator, "_dk_xbytes");
+
+    // SEC1 §2.3.4 requires the prefix to be exactly 0x02 or 0x03. The parity
+    // reduction below is `BIN2NUM, 2 MOD`, which accepts far more than that:
+    // 0x00 / 0x04 / 0x82 all alias to "even", and 0x83 is worse than an alias —
+    // BIN2NUM(0x83) = -3 (sign-magnitude), -3 mod 2 = -1, which encodes as 0x81
+    // and can never equal `_dk_y_par` in {<>, 0x01}, so the select silently
+    // returns the OTHER square root. Test the byte itself.
+    try t.copyToTop("_dk_prefix", "_dk_pfx_in");
+    t.popNames(1);
+    try t.emitRaw(.{ .dup = {} });
+    try t.emitRaw(.{ .push = .{ .bytes = &.{0x02} } });
+    try t.emitOpcode("OP_EQUAL");
+    try t.emitRaw(.{ .swap = {} });
+    try t.emitRaw(.{ .push = .{ .bytes = &.{0x03} } });
+    try t.emitOpcode("OP_EQUAL");
+    try t.emitOpcode("OP_BOOLOR");
+    try t.names.append(t.allocator, "_dk_pfx_ok");
 
     // Convert prefix to parity: 0x02 -> 0, 0x03 -> 1
     try t.toTop("_dk_prefix");
@@ -1493,11 +1510,13 @@ fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, q
         }
     }
 
-    // valid = (qy^2 == y^2) AND (qx < p).
+    // valid = (qy^2 == y^2) AND (qx < p) AND (prefix in {0x02, 0x03}).
     // The selected qy is y_cand or p - y_cand, so squaring it tests the same
     // residue property either way. The first conjunct rejects an x whose RHS is
     // a quadratic non-residue — the recovered point is then off the curve; the
-    // second rejects a non-canonical encoding of an otherwise fine x.
+    // second rejects a non-canonical encoding of an otherwise fine x; the third
+    // rejects a prefix byte the parity reduction would otherwise alias or, for
+    // 0x83, silently invert.
     try t.copyToTop(qy_name, "_dk_y_sq_in");
     try fieldSqr(t, "_dk_y_sq_in", p_be, "_dk_y_sq");
     try t.toTop("_dk_y_sq");
@@ -1516,6 +1535,11 @@ fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, q
     try t.toTop("_dk_x_ok");
     t.popNames(2);
     try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_dk_curve_ok");
+
+    try t.toTop("_dk_pfx_ok");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
     try t.names.append(t.allocator, "_dk_valid");
 }
 
@@ -1523,12 +1547,131 @@ fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, q
 // ECDSA verification
 // ===========================================================================
 
+/// Length gate for an untrusted byte argument: leaves `[flag, clamped]`.
+///
+/// `flag` is `OP_SIZE(v) == want`; `clamped` is `v` forced to exactly `want`
+/// bytes by `v || 00*want`, split at `want`, tail dropped — truncating a long
+/// value and zero-extending a short one.
+///
+/// The clamp exists so the gate can stay a FLAG. Everything downstream peels a
+/// fixed number of bytes (`OP_SPLIT coord_bytes`, then 32/48 single-byte splits
+/// inside emitReverseN); handed 32 <= len(sig) < 64 the reversal runs out of
+/// bytes mid-loop and the SCRIPT ABORTS, which would make
+/// `verifyECDSA_P256(...) || fallback` unwritable and contradict this module's
+/// own totality rule (see decompressPubKey). Clamping first makes every path
+/// total; the caller ANDs `flag` into the result so a wrong-length argument can
+/// never verify whatever the clamped bytes computed.
+///
+/// Branch-free on purpose: the tracker's static stack model, and the emitted op
+/// sequence, are the same for every input length — the argument affineAdd makes
+/// for selecting operands instead of branching.
+fn emitLengthGate(t: *NistTracker, name: []const u8, want: usize, flag_name: []const u8) !void {
+    try t.toTop(name);
+    t.popNames(1);
+    try t.emitOpcode("OP_SIZE");
+    try t.emitPushInt(@intCast(want));
+    try t.emitOpcode("OP_NUMEQUAL");
+    try t.emitRaw(.{ .swap = {} });
+    const pad = try t.allocator.alloc(u8, want);
+    @memset(pad, 0);
+    try t.owned_bytes.append(t.allocator, pad);
+    try t.emitRaw(.{ .push = .{ .bytes = pad } });
+    try t.emitOpcode("OP_CAT");
+    try t.emitPushInt(@intCast(want));
+    try t.emitOpcode("OP_SPLIT");
+    try t.emitRaw(.{ .drop = {} });
+    try t.names.append(t.allocator, flag_name);
+    try t.names.append(t.allocator, name);
+}
+
+/// SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2: verify 1 <= r <= n-1 and
+/// 1 <= s <= n-1. Consumes nothing, leaves `_range_ok` above `_r` and `_s`.
+///
+/// ==> THIS IS A UNIVERSAL FORGERY GUARD, NOT A HYGIENE CHECK. <==
+///
+/// Nothing checked r or s at all, and `groupInv` is Fermat (a^(n-2) mod n), so
+/// inv(0) = 0 instead of an error. With `sig = 0x00...` and the contract's own
+/// genuine, PUBLIC key:
+///
+///   r = s = 0            (BIN2NUM of coord_bytes zero bytes -> empty vector)
+///   w = s^(n-2) = 0      Fermat, no failure channel
+///   u1 = u2 = 0          every groupMul in the ladder is 0*0 mod n
+///   R1 = R2 = O          the ladder reduces 0, k' = 3n = 0 mod n, so Z3 = 0 and
+///                        jacobianToAffine's Fermat inverse turns it all-zero
+///   R1 + R2              affineAdd sees xeq = yeq = 1, takes the tangent with
+///                        den = 2*0 = 0, so s = 0 and rx = ry = 0
+///   (R.x mod n) == r     OP_EQUAL(<>, <>) = 1
+///
+/// ...and `_dk_valid` is 1 because the pubkey is genuine. TRUE. No secret, no
+/// off-curve point, not bound to the message: an all-zero signature verified for
+/// ANY message under ANY public key. `examples/ts/p256-wallet` made exactly that
+/// call its second authentication factor.
+///
+/// BOTH conjuncts are load-bearing and neither is redundant:
+///   - s = 0 (or s = n, which Fermat also inverts to 0) is what collapses both
+///     ladders to O;
+///   - r = 0 is what makes the final OP_EQUAL compare the resulting 0 against
+///     something that is also 0.
+/// `r = 0, s = n` is a second spelling of the same forgery that an `s != 0`
+/// check alone would miss, which is why the bound is `< n` and not `!= 0`.
+///
+/// A flag rather than an OP_VERIFY, for the reason decompressPubKey gives.
+fn emitSigRangeGate(t: *NistTracker, n_be: []const u8) !void {
+    try t.copyToTop("_r", "_r_nz_in");
+    t.popNames(1);
+    try t.emitOpcode("OP_0NOTEQUAL");
+    try t.names.append(t.allocator, "_r_nz");
+
+    try t.copyToTop("_r", "_r_lt_in");
+    try t.pushBigIntBE("_n_for_r", n_be);
+    t.popNames(2);
+    try t.emitOpcode("OP_LESSTHAN");
+    try t.names.append(t.allocator, "_r_lt");
+
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_r_ok");
+
+    try t.copyToTop("_s", "_s_nz_in");
+    t.popNames(1);
+    try t.emitOpcode("OP_0NOTEQUAL");
+    try t.names.append(t.allocator, "_s_nz");
+
+    try t.copyToTop("_s", "_s_lt_in");
+    try t.pushBigIntBE("_n_for_s", n_be);
+    t.popNames(2);
+    try t.emitOpcode("OP_LESSTHAN");
+    try t.names.append(t.allocator, "_s_lt");
+
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_s_ok");
+
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_range_ok");
+}
+
 fn emitVerifyECDSA(t: *NistTracker) !void {
     const c = t.params;
     const p_be = c.field_p_be;
     const n_be = c.group_n_be;
     const n_minus_2_be = c.group_n_minus_2_be;
     const cb = c.coord_bytes;
+
+    // Step 0: length gate. `_sig` and `_pk` are bare ByteString in the builtin
+    // table and the type checker imposes no width, so both arrive attacker-sized.
+    // Clamp them and remember whether they were the right size — see
+    // emitLengthGate for why a clamp and not an abort. Without it `sig || junk`
+    // verified identically to `sig` (fatal for any contract using signature bytes
+    // as a nullifier), and a short `sig` aborted the script outright.
+    try emitLengthGate(t, "_pk", cb + 1, "_pk_len_ok");
+    try emitLengthGate(t, "_sig", cb * 2, "_sig_len_ok");
+    try t.toTop("_pk_len_ok");
+    try t.toTop("_sig_len_ok");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_len_ok");
 
     // Step 1: e = SHA-256(msg) as integer
     try t.toTop("_msg");
@@ -1561,10 +1704,26 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
     try emitBytesToUnsignedNum(t, cb);
     try t.names.append(t.allocator, "_s");
 
+    // Step 2b: 1 <= r, s <= n-1. Without this an all-zero signature verifies for
+    // any message under any pubkey — see emitSigRangeGate.
+    try emitSigRangeGate(t, n_be);
+
     // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
     // bytes do not decompress to a canonical on-curve point, which is ANDed into
     // the result below so such a key can never verify.
     try decompressPubKey(t, "_pk", "_qx", "_qy");
+
+    // Collapse the three argument verdicts into one flag. Everything below then
+    // carries a single item, as it did when `_dk_valid` was the only one.
+    try t.toTop("_len_ok");
+    try t.toTop("_range_ok");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_arg_ok");
+    try t.toTop("_dk_valid");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_input_ok");
 
     // Step 4: w = s^{-1} mod n
     try groupInv(t, "_s", n_minus_2_be, n_be, "_w");
@@ -1587,8 +1746,8 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
     try t.toTop("_u1");
 
     // Stash items on altstack (pushed in reverse retrieval order).
-    // _dk_valid goes DEEPEST — the altstack is LIFO and it is popped last.
-    try t.toTop("_dk_valid");
+    // _input_ok goes DEEPEST — the altstack is LIFO and it is popped last.
+    try t.toTop("_input_ok");
     try t.toAlt();
     try t.toTop("_r_save");
     try t.toAlt();
@@ -1645,9 +1804,9 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
 
     try groupMod(t, "rx", n_be, "_rx_mod_n");
 
-    // Restore r, then the decompression verdict beneath it
+    // Restore r, then the argument verdict beneath it
     try t.fromAlt("_r_save");
-    try t.fromAlt("_dk_valid");
+    try t.fromAlt("_input_ok");
 
     // Compare
     try t.toTop("_rx_mod_n");
@@ -1656,9 +1815,10 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
     try t.emitOpcode("OP_EQUAL");
     try t.names.append(t.allocator, "_sig_ok");
 
-    // A pubkey that did not decompress to a canonical on-curve point can never
-    // verify, whatever the ladder made of it.
-    try t.toTop("_dk_valid");
+    // Arguments that were the wrong length, out of range, or did not decompress
+    // to a canonical on-curve point can never verify, whatever the ladder made
+    // of them.
+    try t.toTop("_input_ok");
     try t.toTop("_sig_ok");
     t.popNames(2);
     try t.emitOpcode("OP_BOOLAND");
@@ -1950,8 +2110,10 @@ test "nist_ec helper op-count goldens" {
     // as +21 OPS: they count a deep pick/roll as two ops, this tracker as one.
     //
     // verifyECDSA_P256 / _P384 also moved (decompressPubKey's `_dk_valid`
-    // residue + canonicity guard, +148 / +434 bytes) but carry no op-count
-    // golden here — the conformance hex is their gate.
+    // residue + canonicity guard, +148 / +434 bytes; then the argument
+    // validation gates — length clamp, r/s range, prefix byte — for a further
+    // +225 / +306 bytes) but carry no op-count golden here — the conformance
+    // hex is their gate.
     const cases = .{
         .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6639) },
         .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 129192) },

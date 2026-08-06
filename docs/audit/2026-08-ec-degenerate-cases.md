@@ -87,12 +87,179 @@ whose order is composite — and went straight into `cEmitMul`.
 It now emits `valid = (x < p) AND (y² == x³ − 3x + b)`, ANDed into the verifier's
 boolean result. A flag rather than an `OP_VERIFY`, for reason 3 above.
 
-**Severity, honestly stated:** this is defence in depth, not a demonstrated
-bypass. Every input that trips the guard also fails the final
-`(R.x mod n) == r` comparison, and making that comparison succeed with an
-attacker-chosen off-curve `Q` is equivalent to forging ECDSA. No pre-fix `true`
-is constructible, which is why the regression test for it is a pin rather than a
+**Severity of the decompression guard specifically:** defence in depth. Making
+`(R.x mod n) == r` succeed with an attacker-chosen off-curve `Q` is equivalent
+to forging ECDSA, so that guard's regression test is a pin rather than a
 red-then-green proof.
+
+> ### ⚠ CORRECTION (2026-08-06): the claim that used to stand here was FALSE
+>
+> This section previously said, of the whole verifier: *"Every input that trips
+> the guard also fails the final `(R.x mod n) == r` comparison … No pre-fix
+> `true` is constructible."* The first clause is true of the **decompression**
+> guard. Generalising it to the verifier was wrong, and it hid the most severe
+> defect in this audit series. A `true` **was** constructible, it needed no
+> off-curve `Q`, and it was not equivalent to forging ECDSA. See the next
+> section.
+
+## The universal forgery: `r` and `s` were never range-checked
+
+`verifyECDSA_P256` / `verifyECDSA_P384` split the signature into `r` and `s` and
+never checked `r != 0`, `s != 0`, `r < n` or `s < n` (SEC1 §4.1.4 step 1 /
+FIPS 186-5 §6.4.2). `cGroupInv` is Fermat — `a^(n-2) mod n` — so `inv(0) = 0`
+rather than an error, and every degenerate value flows through instead of
+failing.
+
+Take `sig` = 64 zero bytes (96 for P-384) and the contract's own **genuine,
+public** key:
+
+| step | value | why |
+|---|---|---|
+| `_r`, `_s` | `0` | `BIN2NUM` of 32 zero bytes is the empty vector |
+| `_w = s^(n-2)` | `0` | Fermat inverse of 0, no failure channel |
+| `_u1`, `_u2` | `0` | every `cGroupMul` in the ladder is `0*0 mod n` |
+| `R1 = u1*G` | all-zero point | scalar reduce gives 0, `k' = 3n ≡ 0 (mod n)`, so `Z3 = 0` and the Fermat inverse in `cJacobianToAffine` zeroes it |
+| `R2 = u2*Q` | all-zero point | same |
+| `R1 + R2` | `(0, 0)` | `cAffineAdd` sees `xeq = yeq = 1`, takes the TANGENT branch, `den = 2*0 = 0`, so `s = 0` and `rx = ry = 0` |
+| `_rx_mod_n` | empty vector | `0 mod n` |
+| `OP_EQUAL(_rx_mod_n, _r_save)` | **1** | `OP_EQUAL(<>, <>)` |
+| `_dk_valid` | `1` | the pubkey is genuine |
+| `OP_BOOLAND` | **TRUE** | |
+
+No secret material, no off-curve point, and not bound to the message: an
+all-zero signature verified for **any** message under **any** public key. That
+is a universal forgery, not a hygiene issue.
+
+`r = 0, s = n` is a second spelling of it — `n^(n-2) mod n` is also `0` — which
+is why the fix bounds both values by `< n` rather than only testing `!= 0`.
+
+**Live exposure in-tree.** `examples/ts/p256-wallet/P256Wallet.runar.ts:62` makes
+`assert(verifyECDSA_P256(sig, p256Sig, p256PubKey))` the entire second factor of
+a contract whose stated model is "an HSM or WebAuthn key gates Bitcoin
+spending". An attacker holding only the secp256k1 key supplied 64 zero bytes as
+`p256Sig` together with the genuine, public `p256PubKey`; `hash160(p256PubKey)`
+matched the committed hash and the P-256 factor was bypassed entirely.
+
+### Why nothing caught it
+
+Two independent gaps, and each on its own was enough:
+
+1. **The differential oracle disagreed and the disagreement was invisible.**
+   `packages/runar-testing/src/interpreter/interpreter.ts` implements
+   `verifyECDSA_*` with Node/OpenSSL, which rejects `(0, 0)`. So for the same
+   source the interpreter answered `false` and the script answered `true` — the
+   exact divergence a source-vs-script oracle exists to find. It was never run
+   on this builtin.
+2. **The only real-`Spend` test never varied the signature.**
+   `packages/runar-testing/src/__tests__/p256-p384-ecdsa-verify.test.ts` had five
+   cases, all varying the *pubkey encoding* or the message. The signature bytes
+   came from OpenSSL every time and were never malformed.
+
+### The fix
+
+`cEmitSigRangeGate` emits, per value, `OP_0NOTEQUAL` and `OP_LESSTHAN n`, joined
+with `OP_BOOLAND`, and the result is `OP_BOOLAND`ed into the verifier's boolean
+alongside the decompression verdict. A flag, not an `OP_VERIFY`, for the same
+reason the decompression guard is one.
+
+Two more argument defects were fixed in the same pass, both also returning
+`false` rather than aborting:
+
+- **No length validation.** `sig` and `pubkey` are bare `ByteString` in
+  `packages/runar-lang/src/builtins.ts` and `03-typecheck.ts` imposes no width.
+  The verifier took *everything after* `coordBytes` as `s`, so `sig ‖ junk`
+  verified identically to `sig` — fatal for any contract using signature bytes
+  as a nullifier. And for `coordBytes <= len(sig) < 2*coordBytes` the byte
+  reversal's `OP_SPLIT 1` ran off the end and **aborted the script**, which
+  would make `verifyECDSA_P256(...) || fallback` unwritable. `cEmitLengthGate`
+  now clamps each argument to its exact width (branch-free: `v ‖ 00*want`, split,
+  drop) and `OP_BOOLAND`s the size verdict into the result.
+- **Compressed prefix not validated.** The parity reduction was
+  `OP_BIN2NUM, 2 OP_MOD`, so `0x00` / `0x04` / `0x82` all aliased to "even" —
+  and `0x83` was worse than an alias: `BIN2NUM(0x83) = -3`, `-3 mod 2 = -1`,
+  which encodes as `0x81` and never equals `_dk_y_par ∈ {<>, 0x01}`, so the
+  select silently returned the *other* square root. Whether that verified
+  depended on the key's parity — for one of the two OpenSSL fixtures in the test
+  it did. The prefix byte is now tested against `0x02` / `0x03` directly.
+
+**Not fixed, deliberately: low-S.** `(r, s)` and `(r, n - s)` both verify.
+Enforcing low-S would reject conforming FIPS 186-5 signatures from OpenSSL and
+from WebAuthn authenticators, turning an interop detail into an unspendable
+output — the same liveness argument that makes every guard here a flag rather
+than an abort. It is documented in `docs/language-reference.md` instead, with
+the instruction to derive any uniqueness key from the message or from `r`, not
+from the signature blob.
+
+Measured cost: **+225 bytes** on `verifyECDSA_P256` (0.023%) and **+306 bytes**
+on `verifyECDSA_P384` (0.015%); +58 emitted ops on both, the count being
+curve-independent because none of the gates loops.
+
+Red-then-green, through the real `@bsv/sdk` `Spend`, in
+`packages/runar-testing/src/__tests__/p256-p384-ecdsa-verify.test.ts`: the
+all-zero signature returned `true` on both curves before the change and `false`
+after, and the OpenSSL accept case still passes. That file's `verify()` helper
+now also asserts on **every** call that the script neither aborted nor left more
+than one item, which is what pins totality.
+
+## BN254 G1: the same defect class, re-derived rather than assumed
+
+`bn254G1ScalarMul` and the Groth16 `emitG1ScalarMulNamed` are the same
+`k + 3r`, MSB-first, Jacobian mixed-add ladder. The interval argument was redone
+for BN254 rather than carried over, and **the secp256k1 numbers do not apply**:
+
+| | secp256k1 | BN254 |
+|---|---|---|
+| order bit length | 256 | **254** |
+| offset | `3n`, 258 bits | `3r`, **256 bits** |
+| accumulator seeded at bit | 257 | **255** |
+| iterations | 257 | **255** |
+
+`3r >= 2^255` and `4r - 1 < 2^256`, so for `k ∈ [0, r-1]` bit 255 is always set
+and nothing above it ever is. The existing offset and iteration count were
+therefore already right — but the precondition they rest on was not enforced:
+
+- **No `k mod r` reduce.** `k >= 2^256 - 3r` (≈ `2.2902 r`) sets bit 256, which
+  the loop never reads; `k <= -r` drops `k'` below `2^255`, making the seeded
+  accumulator bit a lie. Either way the ladder returns a **different multiple of
+  P** rather than failing. In Groth16 the scalars are the caller-supplied public
+  inputs of `vk_x = IC[0] + Σ IC[i]·pub_i`.
+- **The exceptional-case test was `H == 0` alone.** Sweeping `c_i = k' >> i`
+  over `k ∈ [0, r-1]` puts the mixed-add's degenerate cases at `i = 0` only, at
+  `k = 2` (accumulator `= +P`) and `k = 0` (accumulator `= -P`). `k = 2` was
+  already handled. `k = 0` was not: `H == 0` with `R != 0` also took the
+  doubling branch and returned `-2P` where the answer is the point at infinity.
+  A Groth16 public input of `0` is entirely ordinary. The test is now
+  `H == 0 AND R == 0`, paid only at `i = 0` because the sweep proves the branch
+  cannot fire anywhere else.
+
+A previous comment in `bn254BuildJacobianAddAffineInline` asserted the
+`acc = -base` case was "cryptographically unreachable for valid Groth16 public
+inputs". It is reachable at `k = 0`; the comment has been corrected.
+
+Measured cost on `bn254G1ScalarMul`: **134,181 → 134,245 bytes (+64, +0.048%)**,
+decomposing as +41 for the reduce and +23 for the strict test at `i = 0`.
+Applying the strict test at all 255 steps instead would have cost +5,865 bytes,
+which is what the `i = 0` localisation buys. `bn254G1Add` is unchanged. No
+conformance fixture exercises BN254, so no golden moved; the gate is
+`compilers/go/codegen/bn254_scalar_domain_test.go`, which runs eight scalars
+through the go-sdk interpreter and failed six of them before the fix.
+
+### What was NOT changed in BN254, and why
+
+`bn254G1AffineAdd` uses the unified slope `s = (px² + px·qx + qx²) / (py + qy)`,
+which is already correct for doubling — it never had the `ecAdd` bug. Its
+`py + qy == 0` case produces an off-curve blob via `inv(0) = 0`, and it was
+tempting to mask that to the all-zero point for consistency with the secp256k1 /
+NIST convention. **That would have been a regression.** BN254 has j-invariant 0
+and `p ≡ 1 (mod 3)`, so `F_p` contains a primitive cube root of unity `ω`; for
+any curve point `(x, y)` the point `(ωx, y)` is also on the curve, so
+`Q = (ωx, -y)` gives `py + qy == 0` while `Q != -P` — and the true sum `P + Q` is
+an **ordinary point**, not `O`. Masking would answer "point at infinity" for
+those inputs: on-curve, plausible, and wrong, which is precisely the failure
+mode `03f50d48` introduced on the NIST curves and `f16790a9` had to undo. The
+zero-denominator case keeps its fail-**closed** behaviour and the
+`assert(bn254G1OnCurve(r))` idiom rejects it. Pinned by
+`TestBN254G1AffineAdd_NegatedOperandStaysOffCurve`.
 
 ## Found on the way in: five off-chain mocks disagreed with the script
 

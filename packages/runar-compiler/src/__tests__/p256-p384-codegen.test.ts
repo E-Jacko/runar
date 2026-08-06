@@ -89,6 +89,23 @@ describe('NIST P-256 / P-384 codegen — op-count goldens (T-006)', () => {
   //
   // See the Zig-divergence note in ec.test.ts: these are pre-peephole OP
   // counts, not bytes, and the Zig peer's goldens legitimately differ.
+  //
+  // Second move, the argument-validation fix (universal forgery — see
+  // cEmitSigRangeGate and docs/audit/2026-08-ec-degenerate-cases.md):
+  //
+  //   verifyECDSA_P256  +58 ops
+  //   verifyECDSA_P384  +58 ops
+  //
+  //   +58 is curve-INDEPENDENT because every added op is a fixed-shape gate,
+  //   not a per-bit loop: 2 x 10 for the `_sig` / `_pk` length clamps, 1 for
+  //   their OP_BOOLAND, 26 for the (r, s) range gate (2 x {OP_0NOTEQUAL, a
+  //   copy, an n push, OP_LESSTHAN, OP_BOOLAND} plus roll/pick bookkeeping and
+  //   the joining OP_BOOLAND), 8 for the SEC1 prefix test and its fold-in, and
+  //   4 for collapsing the three verdicts into `_input_ok`. The two curves
+  //   differ only in the SIZE of the constants pushed, which op counts cannot
+  //   see. In bytes it is +225 (P-256) / +306 (P-384) standalone, the gap being
+  //   the wider n pushes (2 x 48 vs 2 x 32 bytes) and the wider clamp pads
+  //   (96 + 49 vs 64 + 33) — 0.023% / 0.015% of the whole script.
   const goldens: Array<[name: string, fn: (emit: (op: StackOp) => void) => void, expected: number]> = [
     ['p256Add',               emitP256Add,                6663],
     ['p256Mul',               emitP256Mul,              140036],
@@ -96,14 +113,14 @@ describe('NIST P-256 / P-384 codegen — op-count goldens (T-006)', () => {
     ['p256Negate',            emitP256Negate,              945],
     ['p256OnCurve',           emitP256OnCurve,             559],
     ['p256EncodeCompressed',  emitP256EncodeCompressed,     16],
-    ['verifyECDSA_P256',      emitVerifyECDSA_P256,     297273],
+    ['verifyECDSA_P256',      emitVerifyECDSA_P256,     297331],
     ['p384Add',               emitP384Add,               11469],
     ['p384Mul',               emitP384Mul,              211178],
     ['p384MulGen',            emitP384MulGen,           211180],
     ['p384Negate',            emitP384Negate,             1393],
     ['p384OnCurve',           emitP384OnCurve,             783],
     ['p384EncodeCompressed',  emitP384EncodeCompressed,     16],
-    ['verifyECDSA_P384',      emitVerifyECDSA_P384,     453249],
+    ['verifyECDSA_P384',      emitVerifyECDSA_P384,     453307],
   ];
 
   for (const [name, fn, expected] of goldens) {
