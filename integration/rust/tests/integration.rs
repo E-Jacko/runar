@@ -38,4 +38,5 @@ mod p384_wallet;
 mod data_outputs;
 mod nullfail_multimethod;
 mod message_board;
+mod phase_a_residuals;
 mod ordinals;

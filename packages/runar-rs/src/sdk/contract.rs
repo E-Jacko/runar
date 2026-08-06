@@ -86,6 +86,18 @@ pub const AUTO_PREVOUTS_PARAM_NAME: &str = "allPrevouts";
 ///
 /// Mirrors the Zig SDK's name gate (`sdk_contract.zig`): `Auto` for any other
 /// ByteString param is a caller error, not a stub request.
+/// True for OR-CHECKSIG; false when script looks like OP_CHECKMULTISIG (0xae/af).
+fn is_likely_or_checksig(artifact: &RunarArtifact) -> bool {
+    let script = artifact.script.to_ascii_lowercase();
+    // OP_CHECKMULTISIG = 0xae, OP_CHECKMULTISIGVERIFY = 0xaf
+    if script.contains("ae") || script.contains("af") {
+        return false;
+    }
+    // OP_BOOLOR = 0x9b (not 0x9a which is OP_BOOLAND). Coarse hex probe only —
+    // may false-positive inside push data; prefer ASM when available.
+    script.contains("9b")
+}
+
 fn is_auto_prevouts_param(param: &AbiParam) -> bool {
     param.name == AUTO_PREVOUTS_PARAM_NAME
 }
@@ -679,14 +691,9 @@ impl RunarContract {
             // emits OP_0 for it.
         }
 
-        // Soft heuristic (issue #106): more than one Auto Sig slot after
-        // resolution usually means an OR-CHECKSIG method whose non-matching
-        // branch should use `SdkValue::EmptySig` instead — otherwise every
-        // branch gets the same real signature and the failing CHECKSIG trips
-        // BIP146 NULLFAIL on broadcast. Legitimate AND-CHECKSIG multi-signer
-        // flows also use multiple Autos, so this is informational only (the ABI
-        // does not encode the script's OR-vs-AND topology).
-        if sig_indices.len() >= 2 {
+        // Soft heuristic (issue #106): warn only for likely OR-CHECKSIG
+        // (OP_BOOLOR + OP_CHECKSIG), not genuine multi-sig (OP_CHECKMULTISIG).
+        if sig_indices.len() >= 2 && is_likely_or_checksig(&self.artifact) {
             eprintln!(
                 "runar-sdk: warning: {}.call('{}') has {} auto-signed Sig slots. \
                  If this is an OR-CHECKSIG method, pass SdkValue::EmptySig for the \

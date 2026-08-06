@@ -116,6 +116,35 @@ export function isEmptySig(value: unknown): value is typeof EMPTY_SIG {
 }
 
 /**
+ * True when the locking script looks like OR-CHECKSIG (OP_BOOLOR + OP_CHECKSIG)
+ * rather than multi-sig (OP_CHECKMULTISIG). Used to scope the multi-null-Sig
+ * soft warning so genuine checkMultiSig unlocks are not spammed.
+ *
+ * Exported for unit tests.
+ */
+export function isLikelyOrCheckSigMethod(artifact: {
+  asm?: string;
+  script?: string;
+  scriptHex?: string;
+}): boolean {
+  const asm = (artifact.asm ?? '').toUpperCase();
+  if (asm.includes('OP_CHECKMULTISIG')) {
+    return false;
+  }
+  if (asm.includes('OP_BOOLOR') && asm.includes('OP_CHECKSIG')) {
+    return true;
+  }
+  // Fall back to hex when ASM is missing: OP_CHECKMULTISIG=0xae, OP_BOOLOR=0x9a
+  const hex = (artifact.script ?? artifact.scriptHex ?? '').toLowerCase();
+  if (hex.includes('ae') || hex.includes('af')) {
+    // May false-positive inside push data; prefer ASM. If ASM empty and we see
+    // ae, treat as multi-sig (safe: suppresses warning for MultiSig contracts).
+    if (!asm) return false;
+  }
+  return false;
+}
+
+/**
  * Invalidate the @bsv/sdk Transaction's serialization caches after
  * directly modifying inputs/outputs. The SDK caches toHex()/toBinary()
  * results and only invalidates them through addInput/addOutput.
@@ -863,13 +892,15 @@ export class RunarContract {
       // in `resolvedArgs` and `encodeArg` emits OP_0 (empty sig) for it.
     }
 
-    // Soft heuristic (issue #106): more than one auto-signed Sig slot usually
-    // means an OR-CHECKSIG method whose non-matching branch should use
-    // EMPTY_SIG instead — otherwise every branch gets the same real signature
-    // and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
-    // AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
-    // informational only (the ABI does not encode OR-vs-AND topology).
-    if (sigIndices.length >= 2) {
+    // Soft heuristic (issue #106): more than one auto-signed Sig slot on an
+    // OR-CHECKSIG method (`checkSig || checkSig` → OP_BOOLOR) usually means
+    // the non-matching branch should use EMPTY_SIG — otherwise every branch
+    // gets the same real signature and the failing CHECKSIG trips BIP146
+    // NULLFAIL on broadcast.
+    //
+    // Do NOT warn for genuine multi-sig (OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY):
+    // those require multiple real signatures (AND-style), not EMPTY_SIG.
+    if (sigIndices.length >= 2 && isLikelyOrCheckSigMethod(this.artifact)) {
       console.warn(
         `runar-sdk: ${this.artifact.contractName}.call('${methodName}') has ` +
           `${sigIndices.length} auto-signed Sig slots. If this is an OR-CHECKSIG ` +

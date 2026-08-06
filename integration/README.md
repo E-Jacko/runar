@@ -83,7 +83,28 @@ pnpm integration:all
 pnpm integration:all:run
 ```
 
-## Contracts Tested
+## Test-only contracts (`integration/contracts/`)
+
+Non-tutorial fixtures for feature / construct coverage live under
+`integration/contracts/` — **not** under `examples/`. See
+`integration/contracts/README.md` and `coverage-matrix.json`.
+
+Phase A (TS + Go regtest):
+
+| Feature | Contract | Require |
+|---------|----------|---------|
+| Branch-merged locals (Palmer-1) | `constructs/BranchMergedLocals.runar.ts` | deploy+spend+state |
+| Cond multi-field write (#99) | `constructs/CondWriteMultiField.runar.ts` | deploy+spend+state |
+| Conditional `addDataOutput` | `constructs/ConditionalDataOutput.runar.ts` | deploy+spend+state |
+| 1-byte ByteString state (OP_N) | `constructs/StateByteString1B.runar.ts` | deploy+spend+state |
+| `addRawOutput` | `outputs/RawOutput.runar.ts` | deploy+spend+output shape |
+| `checkMultiSig` 2-of-3 | `crypto/MultiSig2of3.runar.ts` | deploy+spend |
+
+```bash
+node integration/contracts/check-matrix.mjs
+```
+
+## Contracts Tested (examples)
 
 | Contract | Type | Go | TS | Rust | Python | Ruby | Zig | Java | Key Feature |
 |----------|------|----|----|------|--------|------|-----|------|-------------|
