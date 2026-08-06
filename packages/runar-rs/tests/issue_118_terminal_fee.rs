@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use runar_lang::sdk::script_utils::build_p2pkh_script;
 use runar_lang::sdk::{
     CallOptions, DeployOptions, LocalSigner, MockProvider, RunarContract, SdkValue, Signer, Utxo,
 };
@@ -97,7 +98,7 @@ fn deploy() -> (RunarContract, MockProvider, LocalSigner) {
         txid: "cc".repeat(32),
         output_index: 0,
         satoshis: 200_000,
-        script: format!("76a914{}88ac", "00".repeat(20)),
+        script: build_p2pkh_script(&address),
     });
     let mut contract = RunarContract::new(trivial_artifact(), Vec::<SdkValue>::new());
     contract

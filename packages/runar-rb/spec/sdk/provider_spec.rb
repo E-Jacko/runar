@@ -152,29 +152,71 @@ RSpec.describe 'Runar::SDK::Provider' do
       end
     end
 
+    # Testing-gap remediation Phase A5: MockProvider#broadcast is fail-closed by
+    # default, so these bookkeeping specs must hand it REAL transactions whose
+    # spent outpoints the provider knows. They previously broadcast the literal
+    # strings 'rawhexdata' / 'tx1raw' / 'deadbeef01020304' — payloads a real node
+    # would reject outright — and asserted success. Using genuine transactions
+    # proves the same bookkeeping properties (recording, ordering, deterministic
+    # txid, raw storage, copy-safety) while keeping the gate armed.
+    def valid_tx(prev_txid, out_sats)
+      tx = +''
+      tx << '01000000'                                                   # version
+      tx << '01'                                                         # 1 input
+      tx << [prev_txid].pack('H*').bytes.reverse.pack('C*').unpack1('H*')
+      tx << '00000000'                                                   # vout 0
+      tx << '00'                                                         # empty scriptSig
+      tx << 'ffffffff'                                                   # sequence
+      tx << '01'                                                         # 1 output
+      tx << [out_sats & 0xFFFFFFFF, out_sats >> 32].pack('VV').unpack1('H*')
+      tx << '0151'                                                       # OP_TRUE
+      tx << '00000000'                                                   # locktime
+      tx
+    end
+
+    def seeded_provider(*prev_txids)
+      p = Runar::SDK::MockProvider.new
+      prev_txids.each do |t|
+        p.add_utxo('addr', Runar::SDK::Utxo.new(txid: t, output_index: 0, satoshis: 100_000, script: '51'))
+      end
+      p
+    end
+
     describe '#broadcast' do
       it 'stores the raw transaction and returns a deterministic txid' do
-        txid = provider.broadcast('rawhexdata')
-        expect(provider.get_broadcasted_txs).to eq(['rawhexdata'])
+        p = seeded_provider('aa' * 32)
+        raw = valid_tx('aa' * 32, 90_000)
+        txid = p.broadcast(raw)
+        expect(p.get_broadcasted_txs).to eq([raw])
         expect(txid).to match(/\A[0-9a-f]{64}\z/)
       end
 
       it 'tracks multiple broadcasts in order' do
-        provider.broadcast('tx1raw')
-        provider.broadcast('tx2raw')
-        expect(provider.get_broadcasted_txs).to eq(%w[tx1raw tx2raw])
+        p = seeded_provider('aa' * 32, 'bb' * 32)
+        raw1 = valid_tx('aa' * 32, 90_000)
+        raw2 = valid_tx('bb' * 32, 80_000)
+        p.broadcast(raw1)
+        p.broadcast(raw2)
+        expect(p.get_broadcasted_txs).to eq([raw1, raw2])
       end
 
       it 'returns different txids for different inputs' do
-        txid1 = provider.broadcast('aaaaaa')
-        txid2 = provider.broadcast('bbbbbb')
+        p = seeded_provider('aa' * 32, 'bb' * 32)
+        txid1 = p.broadcast(valid_tx('aa' * 32, 90_000))
+        txid2 = p.broadcast(valid_tx('bb' * 32, 80_000))
         expect(txid1).not_to eq(txid2)
       end
 
       it 'returns a copy of broadcasted txs so external mutation is safe' do
-        provider.broadcast('tx1raw')
-        provider.get_broadcasted_txs << 'injected'
-        expect(provider.get_broadcasted_txs.length).to eq(1)
+        p = seeded_provider('aa' * 32)
+        p.broadcast(valid_tx('aa' * 32, 90_000))
+        p.get_broadcasted_txs << 'injected'
+        expect(p.get_broadcasted_txs.length).to eq(1)
+      end
+
+      it 'REFUSES a payload that is not a parseable transaction' do
+        expect { seeded_provider.broadcast('rawhexdata') }
+          .to raise_error(Runar::SDK::BroadcastRejected)
       end
     end
 
@@ -191,23 +233,26 @@ RSpec.describe 'Runar::SDK::Provider' do
 
     describe '#get_raw_transaction after #broadcast' do
       it 'returns the raw hex of a transaction that was broadcast' do
-        raw = 'deadbeef01020304'
-        txid = provider.broadcast(raw)
-        expect(provider.get_raw_transaction(txid)).to eq(raw)
+        p = seeded_provider('aa' * 32)
+        raw = valid_tx('aa' * 32, 90_000)
+        txid = p.broadcast(raw)
+        expect(p.get_raw_transaction(txid)).to eq(raw)
       end
 
       it 'returns raw hex keyed by the txid returned from broadcast' do
-        raw1 = 'aabbccdd'
-        raw2 = '11223344'
-        txid1 = provider.broadcast(raw1)
-        txid2 = provider.broadcast(raw2)
-        expect(provider.get_raw_transaction(txid1)).to eq(raw1)
-        expect(provider.get_raw_transaction(txid2)).to eq(raw2)
+        p = seeded_provider('aa' * 32, 'bb' * 32)
+        raw1 = valid_tx('aa' * 32, 90_000)
+        raw2 = valid_tx('bb' * 32, 80_000)
+        txid1 = p.broadcast(raw1)
+        txid2 = p.broadcast(raw2)
+        expect(p.get_raw_transaction(txid1)).to eq(raw1)
+        expect(p.get_raw_transaction(txid2)).to eq(raw2)
       end
 
       it 'prioritizes broadcast-stored hex over add_transaction raw field' do
         # If both exist for the same txid, broadcast storage wins.
-        raw_broadcast = 'broadcasthex'
+        provider = seeded_provider('aa' * 32)
+        raw_broadcast = valid_tx('aa' * 32, 90_000)
         txid = provider.broadcast(raw_broadcast)
 
         tx = Runar::SDK::Transaction.new(txid: txid, raw: 'stored_raw')

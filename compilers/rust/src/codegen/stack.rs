@@ -367,6 +367,118 @@ fn collect_deep_binding_names(bindings: &[ANFBinding]) -> HashSet<String> {
     names
 }
 
+/// Locals a loop body REBINDS and then READS AGAIN in the same iteration.
+///
+/// `compute_last_uses` maps a name to the MAXIMUM index that references it, so
+/// for a body like
+///
+/// ```text
+/// t3   = acc + step     (index 1 — reads the value carried in)
+/// acc  = @ref:t3        (index 2 — rebinds: renames t3's slot to `acc`)
+/// t4   = wacc + acc     (index 3 — reads the value just rebound)
+/// ```
+///
+/// `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies (PICK)
+/// instead of consuming, leaving the incoming slot on the stack under the same
+/// name as the rebound one; index 3 then IS the last use, and `find_depth`
+/// resolves to the topmost match — so it consumes the UPDATED value and leaves
+/// the dead incoming one. The next iteration reads that dead slot, and every
+/// iteration recomputes from the pre-loop value:
+/// `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc + acc; }`
+/// produced `wacc = step*N` where the source says `step*N*(N+1)/2` — silently
+/// in a stateless contract, and as a permanently unspendable UTXO in a stateful
+/// one (the covenant commits to a continuation the SDK never builds).
+/// `outer_refs` does not cover it: `acc` is excluded there precisely because the
+/// body binds it.
+///
+/// The value these names hold at the end of an iteration is live at the start of
+/// the next one, so `lower_loop` protects them from consumption exactly like an
+/// outer ref. The incoming slot each rebinding shadows is left behind and
+/// drained with the rest of the frame at method exit — a name always resolves to
+/// its newest slot, so the reads stay correct.
+///
+/// Both halves of the predicate are load-bearing:
+///   - read BEFORE the first rebinding: the name is carried IN from the
+///     enclosing scope, rather than being a body-private temp that merely
+///     happens to be read after it is bound;
+///   - read AFTER the last rebinding: without it the rebound value is dead at
+///     the end of the iteration and consuming it is correct. This is what keeps
+///     every shipped accumulator (`sum = sum + i`, `off = off + len`)
+///     byte-for-byte unchanged.
+///
+/// NESTED loops: the scan runs over `flatten_nested_loop_bodies(body)`, not
+/// over `body` itself. A name rebound only inside an INNER loop is bound at no
+/// top-level index of the outer body, so the raw scan classified it as neither
+/// an outer ref (`collect_deep_binding_names` excludes it — the body does bind
+/// it, deeply) nor a carried rebind, and the outer loop never marked it live.
+/// The inner loop's final iteration then consumed it, because `used_after_loop`
+/// asks the enclosing scope and the enclosing scope had not been told either,
+/// so every outer iteration restarted from the slot the previous one left
+/// behind: `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }`
+/// with step = 3 produced `wacc = 24` where the source says 30. Splicing the
+/// inner body in at the loop's position preserves the read/rebind/read ordering
+/// the inner level already sees, so the outer level draws the same conclusion.
+fn collect_loop_carried_rebinds(body: &[ANFBinding]) -> HashSet<String> {
+    let flat = flatten_nested_loop_bodies(body);
+
+    let mut first_bind: HashMap<&str, usize> = HashMap::new();
+    let mut last_bind: HashMap<&str, usize> = HashMap::new();
+    for (i, b) in flat.iter().enumerate() {
+        first_bind.entry(b.name.as_str()).or_insert(i);
+        last_bind.insert(b.name.as_str(), i);
+    }
+
+    let mut read_before_bind: HashSet<String> = HashSet::new();
+    let mut read_after_bind: HashSet<String> = HashSet::new();
+    for (i, b) in flat.iter().enumerate() {
+        for r in collect_refs(&b.value) {
+            if first_bind.get(r.as_str()).is_some_and(|&first| i < first) {
+                read_before_bind.insert(r.clone());
+            }
+            if last_bind.get(r.as_str()).is_some_and(|&last| i > last) {
+                read_after_bind.insert(r);
+            }
+        }
+    }
+
+    read_before_bind
+        .into_iter()
+        .filter(|r| read_after_bind.contains(r))
+        .collect()
+}
+
+/// The binding sequence with every nested `loop` binding replaced, in place, by
+/// its own (recursively flattened) body.
+///
+/// Only `collect_loop_carried_rebinds` uses this, and only to order reads
+/// against rebindings. The loop binding itself contributes no stack slot (loops
+/// are statements), so dropping it loses nothing; splicing the body in at its
+/// position is what lets an outer loop see a rebinding that happens one level
+/// down. `if` branches are deliberately NOT flattened — their two arms are
+/// alternatives, not a sequence, and reassignments inside them are reconciled
+/// by `lower_if`, not by protection here.
+///
+/// A body with no nested loop is returned entry-for-entry unchanged, which is
+/// what makes this byte-neutral for every non-nesting loop.
+fn flatten_nested_loop_bodies(body: &[ANFBinding]) -> Vec<&ANFBinding> {
+    if !body
+        .iter()
+        .any(|b| matches!(b.value, ANFValue::Loop { .. }))
+    {
+        return body.iter().collect();
+    }
+    let mut flat: Vec<&ANFBinding> = Vec::with_capacity(body.len());
+    for b in body {
+        match &b.value {
+            ANFValue::Loop { body: inner, .. } => {
+                flat.extend(flatten_nested_loop_bodies(inner));
+            }
+            _ => flat.push(b),
+        }
+    }
+    flat
+}
+
 /// How many branch-merged locals an if-statement's two arms carry as results.
 ///
 /// ANF lowering's `append_merged_local_results` ends both arms with the same
@@ -1846,6 +1958,65 @@ impl LoweringContext {
         }
     }
 
+    /// Arm-side half of the "both arms rebound one local IN PLACE" check:
+    /// `(local name, its depth in both arms, the arms' depth)`, or `None` when
+    /// the `if` does not have that shape.
+    ///
+    /// The shape: ANF lowering merged a SINGLE local across the arms, so
+    /// instead of appending a `__merge$<i>` result block it aliased the local
+    /// to the if-expression itself. Both arms then read that local and rebound
+    /// it, which makes the arm ROLL the parent's slot away and leave its own
+    /// result in the same position — the arms' net stack effect is zero, so
+    /// none of the depth-growth cases in `lower_if` fire and the if's value
+    /// would go unregistered.
+    ///
+    /// Split in two because the arms' op vectors are moved into the emitted
+    /// `if` before the parent stackMap is reconciled: this half reads the arms,
+    /// the caller then checks the reconciled parent holds the same name at the
+    /// same depth and that `binding_name` is read after the `if`.
+    ///
+    /// Every condition is required:
+    ///   - no normalised K-merge block (that is the K>=2 path, which grows
+    ///     depth by K and is adopted by name),
+    ///   - both arms end on a binding of the SAME name, and that name is a
+    ///     local, not a contract property (properties have their own
+    ///     reconcile),
+    ///   - both arms hold that name at the same depth — i.e. the slot really
+    ///     was rebound where it stood,
+    ///   - the arms sit at the parent's depth, so the slot is the only effect,
+    ///   - `binding_name` is read after the `if` (caller-side). Without a
+    ///     reader there is nothing to repair and renaming would only lose a
+    ///     name; with one, the pre-fix compiler failed with "value not found on
+    ///     stack". That is what makes adopting the slot byte-neutral for every
+    ///     program that compiled before.
+    fn branch_in_place_rebind_candidate(
+        then_bindings: &[ANFBinding],
+        else_bindings: &[ANFBinding],
+        then_ctx: &LoweringContext,
+        else_ctx: &LoweringContext,
+        merged_result_count: usize,
+        properties: &[ANFProperty],
+    ) -> Option<(String, usize, usize)> {
+        if merged_result_count != 0 {
+            return None;
+        }
+        if then_ctx.sm.depth() != else_ctx.sm.depth() {
+            return None;
+        }
+        let name = then_bindings.last()?.name.clone();
+        if name.is_empty() || name != else_bindings.last()?.name {
+            return None;
+        }
+        if properties.iter().any(|p| p.name == name) {
+            return None;
+        }
+        let depth = then_ctx.sm.find_depth(&name)?;
+        if else_ctx.sm.find_depth(&name) != Some(depth) {
+            return None;
+        }
+        Some((name, depth, then_ctx.sm.depth()))
+    }
+
     fn lower_if(
         &mut self,
         binding_name: &str,
@@ -2061,6 +2232,19 @@ impl LoweringContext {
             );
         }
 
+        // Arm-side half of the in-place-rebind check, taken BEFORE the arms'
+        // op vectors are moved into the emitted `if`. The parent-side half runs
+        // after the parent stackMap reconcile below. See
+        // `branch_in_place_rebind_candidate`.
+        let in_place_candidate = Self::branch_in_place_rebind_candidate(
+            then_bindings,
+            else_bindings,
+            &then_ctx,
+            &else_ctx,
+            merged_result_count,
+            &self.properties,
+        );
+
         let then_ops = then_ctx.ops;
         let else_ops = else_ctx.ops;
 
@@ -2206,6 +2390,41 @@ impl LoweringContext {
             }
         } else if else_ctx.sm.depth() > self.sm.depth() {
             self.sm.push(binding_name);
+        } else if let Some(depth) = in_place_candidate
+            .as_ref()
+            .filter(|_| last_uses.contains_key(binding_name))
+            .and_then(|(name, depth, arm_depth)| {
+                if *arm_depth == self.sm.depth() && self.sm.find_depth(name) == Some(*depth) {
+                    Some(*depth)
+                } else {
+                    None
+                }
+            })
+        {
+            // Single branch-merged local rebound IN PLACE by both arms.
+            //
+            // At K=1 ANF lowering does not append a `__merge$<i>` result block;
+            // it ALIASES the local to the if-expression's binding name instead,
+            // so every post-branch read of the local names the `if`. That works
+            // when the arms PUSH their new value — depth grows by one and the
+            // `then_ctx.depth > self.depth` arm above registers `binding_name`.
+            //
+            // But when both arms READ the local and rebind it (`m0 = m0 + 1`),
+            // the local is not live under its own name after the `if` (the
+            // alias moved every reader to the `if`), so it is not
+            // outer-protected and each arm ROLLS the parent slot away and
+            // leaves its result in the same position. Net depth change: zero.
+            // Control then fell into the "void if" case below, nothing was
+            // registered for `binding_name`, and the very next binding failed
+            // with "value not found on stack" — a compile-time rejection of
+            // source that compiles at K=2 and compiles without an `else`. The
+            // value IS on the stack; only its NAME was wrong.
+            //
+            // Adopt it: rename the slot the arms rebound to the if's binding
+            // name. No opcode is emitted — bookkeeping only, gated on
+            // `binding_name` actually being referenced later, which is
+            // precisely the case that used to fail.
+            self.sm.rename_at_depth(depth, binding_name);
         } else {
             // Void if — don't push phantom
         }
@@ -2258,6 +2477,17 @@ impl LoweringContext {
                 if r.as_str() != iter_var && !deep_body_binding_names.contains(&r) {
                     outer_refs.insert(r);
                 }
+            }
+        }
+
+        // A local the body REBINDS and then READS AGAIN in the same iteration
+        // is carried across iterations through the rebound slot, so it must
+        // survive the body exactly like an outer ref. `deep_body_binding_names`
+        // above excludes it precisely because the body binds it — which is what
+        // made the updated value consumable. See `collect_loop_carried_rebinds`.
+        for r in collect_loop_carried_rebinds(body) {
+            if r.as_str() != iter_var {
+                outer_refs.insert(r);
             }
         }
 
@@ -4861,21 +5091,12 @@ impl LoweringContext {
 /// Private methods are inlined at call sites rather than compiled separately.
 /// The constructor is skipped since it's not emitted to Bitcoin Script.
 pub fn lower_to_stack(program: &ANFProgram) -> Result<Vec<StackMethod>, String> {
-    // Wrap the inner implementation with catch_unwind to convert any panics
-    // (from stack underflow, unknown operators, type mismatches, etc.) into
-    // proper error returns instead of crashing the process.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lower_to_stack_inner(program)
-    }))
-    .unwrap_or_else(|e| {
-        if let Some(s) = e.downcast_ref::<String>() {
-            Err(format!("stack lowering: {}", s))
-        } else if let Some(s) = e.downcast_ref::<&str>() {
-            Err(format!("stack lowering: {}", s))
-        } else {
-            Err("stack lowering: internal error".to_string())
-        }
-    })
+    // Convert any panic (stack underflow, unknown operator, type mismatch, or a
+    // deliberate refusal) into an error return instead of crashing the process
+    // — and without the default panic hook printing a crash report first. See
+    // `crate::refusal`.
+    crate::refusal::catch_refusal("stack lowering", || lower_to_stack_inner(program))
+        .and_then(|inner| inner)
 }
 
 fn lower_to_stack_inner(program: &ANFProgram) -> Result<Vec<StackMethod>, String> {

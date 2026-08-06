@@ -1,17 +1,23 @@
 {
-  "_doc": "Curated compiler-bug corpus for measuring the safety-net's detection power (TS-GAP-006). Each mutant is a targeted, exact, UNIQUE find/replace patch to a real line in a TypeScript compiler source file under packages/runar-compiler/src/. run-mutation.ts applies each patch to the working tree, runs the mapped fast in-process gate(s), records caught-vs-survived, and ALWAYS reverts. Because the gates resolve `runar-compiler`/`runar-testing` through the root vitest SRC alias (see vitest.config.ts), a mutated src file is observed WITHOUT a rebuild. Scope: TS tier only; Go/other-tier mutants are a documented future extension.",
+  "_doc": "Curated compiler-bug corpus for measuring the safety-net's detection power (TS-GAP-006). Each mutant is a targeted, exact, UNIQUE find/replace patch to a real line in a TypeScript compiler source file under packages/runar-compiler/src/. run-mutation.ts applies each patch to the working tree, runs the mapped fast in-process gate(s), records caught-vs-survived, and ALWAYS reverts. Because the gates resolve `runar-compiler`/`runar-testing` through the root vitest SRC alias (see vitest.config.ts), a mutated src file is observed WITHOUT a rebuild. Scope: TS tier only; Go/other-tier mutants are a documented future extension. Six Palmer-class entries (TS-GAP-007 / remediation-plan Phase E1, 2026-08) target packages/runar-compiler/src/passes/{04-anf-lower,05-stack-lower}.ts (branch-merged-locals, inverting 23ef2d2b) and packages/runar-sdk/src/{state,contract}.ts (state-section MINIMALDATA framing, also inverting 23ef2d2b; constructor-slot splice length and codeSeparator off-by-one, new families gated on conformance/sdk-vertical). These four inversion mutants and the two sdk-vertical mutants are gated by packages/runar-testing and packages/runar-sdk VM/unit tests and by conformance/sdk-vertical rather than the compiler-only gates above.",
   "_gates": {
     "differential-witness": "cd conformance && npx vitest run witnesses/differential.test.ts",
     "fold-equivalence": "cd conformance && npx vitest run witnesses/fold-equivalence.test.ts",
-    "peephole-exhaustive": "cd packages/runar-compiler && npx vitest run src/__tests__/peephole-exhaustive.test.ts"
+    "peephole-exhaustive": "cd packages/runar-compiler && npx vitest run src/__tests__/peephole-exhaustive.test.ts",
+    "fold-execution": "cd conformance && npx vitest run witnesses/fold-execution.test.ts",
+    "branch-merged-locals-vm": "npx vitest run packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts",
+    "state-push-framing-vm": "npx vitest run packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+    "c28-state-strict": "npx vitest run packages/runar-sdk/src/__tests__/c28-state-strict.test.ts",
+    "sdk-vertical-constructor-slots": "cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter bigint-0",
+    "sdk-vertical-codeseparator": "cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter codesep-tag-zero"
   },
   "_schema": {
     "id": "stable unique id",
     "file": "repo-relative path to the compiler src file",
     "find": "exact substring that MUST occur exactly once in file",
     "replace": "replacement substring injecting the bug",
-    "class": "one of: off-by-one stack index | swapped operands | dropped OP_VERIFY | if-without-else regression",
-    "stage": "pipeline stage: stack-lower | emit | constant-fold | peephole",
+    "class": "one of: off-by-one stack index | swapped operands | dropped OP_VERIFY | if-without-else regression | branch-merge regression | state-framing regression | constructor-slot splice regression | codeSeparator off-by-one",
+    "stage": "compiler pipeline stage: anf-lower | stack-lower | emit | constant-fold | peephole; or SDK-layer stage: sdk-state | sdk-splice",
     "expectCaughtBy": "gate names that MUST fail (catch) this mutant; empty => documented survivor",
     "checkGates": "for documented survivors: gates run to CONFIRM the mutant survives them",
     "finding": "for documented survivors: the measured coverage hole this mutant records"
@@ -24,7 +30,9 @@
       "replace": "'+': ['OP_SUB'],",
       "class": "swapped operands",
       "stage": "stack-lower",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "stacklower-sub-to-add",
@@ -33,7 +41,9 @@
       "replace": "'-': ['OP_ADD'],",
       "class": "swapped operands",
       "stage": "stack-lower",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "stacklower-mul-to-add",
@@ -42,7 +52,9 @@
       "replace": "'*': ['OP_ADD'],",
       "class": "swapped operands",
       "stage": "stack-lower",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "stacklower-gt-to-lt",
@@ -51,7 +63,9 @@
       "replace": "'>': ['OP_LESSTHAN'],",
       "class": "swapped operands",
       "stage": "stack-lower",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "stacklower-numeq-to-numneq",
@@ -60,7 +74,9 @@
       "replace": "'===': ['OP_NUMNOTEQUAL'],",
       "class": "swapped operands",
       "stage": "stack-lower",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "emit-add-opcode-to-sub",
@@ -69,7 +85,10 @@
       "replace": "'OP_ADD': 0x94,",
       "class": "swapped operands",
       "stage": "emit",
-      "expectCaughtBy": ["differential-witness", "peephole-exhaustive"]
+      "expectCaughtBy": [
+        "differential-witness",
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "emit-numequal-to-numnotequal",
@@ -78,7 +97,9 @@
       "replace": "'OP_NUMEQUAL': 0x9e,",
       "class": "swapped operands",
       "stage": "emit",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "emit-lessthan-to-greaterthan",
@@ -87,7 +108,9 @@
       "replace": "'OP_LESSTHAN': 0xa0,",
       "class": "swapped operands",
       "stage": "emit",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "emit-if-without-else-threshold",
@@ -96,7 +119,9 @@
       "replace": "if (elseOps && elseOps.length > 1)",
       "class": "if-without-else regression",
       "stage": "emit",
-      "expectCaughtBy": ["differential-witness"]
+      "expectCaughtBy": [
+        "differential-witness"
+      ]
     },
     {
       "id": "peephole-equalverify-drop",
@@ -105,7 +130,9 @@
       "replace": "replacement: [opc('OP_EQUAL')],",
       "class": "dropped OP_VERIFY",
       "stage": "peephole",
-      "expectCaughtBy": ["peephole-exhaustive"]
+      "expectCaughtBy": [
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "peephole-numequalverify-drop",
@@ -114,7 +141,9 @@
       "replace": "replacement: [opc('OP_NUMEQUAL')],",
       "class": "dropped OP_VERIFY",
       "stage": "peephole",
-      "expectCaughtBy": ["peephole-exhaustive"]
+      "expectCaughtBy": [
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "peephole-1add-to-1sub",
@@ -123,7 +152,9 @@
       "replace": "replacement: [opc('OP_1SUB')],",
       "class": "swapped operands",
       "stage": "peephole",
-      "expectCaughtBy": ["peephole-exhaustive"]
+      "expectCaughtBy": [
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "peephole-numequal-to-not-corrupt",
@@ -132,7 +163,9 @@
       "replace": "replacement: [opc('OP_0NOTEQUAL')],",
       "class": "swapped operands",
       "stage": "peephole",
-      "expectCaughtBy": ["peephole-exhaustive"]
+      "expectCaughtBy": [
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "peephole-rot-to-swap",
@@ -141,7 +174,9 @@
       "replace": "replacement: [{ op: 'swap' }],",
       "class": "off-by-one stack index",
       "stage": "peephole",
-      "expectCaughtBy": ["peephole-exhaustive"]
+      "expectCaughtBy": [
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "peephole-pick1-over-to-dup",
@@ -150,7 +185,9 @@
       "replace": "replacement: [{ op: 'dup' }],",
       "class": "off-by-one stack index",
       "stage": "peephole",
-      "expectCaughtBy": ["peephole-exhaustive"]
+      "expectCaughtBy": [
+        "peephole-exhaustive"
+      ]
     },
     {
       "id": "constantfold-add-to-sub",
@@ -159,9 +196,89 @@
       "replace": "case '+': return left - right;",
       "class": "swapped operands",
       "stage": "constant-fold",
-      "expectCaughtBy": ["fold-execution"],
-      "checkGates": ["differential-witness", "fold-equivalence", "fold-execution"],
+      "expectCaughtBy": [
+        "fold-execution"
+      ],
+      "checkGates": [
+        "differential-witness",
+        "fold-equivalence",
+        "fold-execution"
+      ],
       "finding": "Previously a MEASURED HOLE (survivor): no witnessed fixture executed an all-constant subexpression through the fold pass, so a fold arithmetic bug in evalBinOp('+') was invisible to the execution gates. CLOSED by conformance/witnesses/fold-execution.test.ts, whose accept/reject verdict depends on a folded constant (2n + 3n) and is checked by both the source-vs-script differential oracle and the fold-OFF/fold-ON oracle; the mutation now diverges both and is caught."
+    },
+    {
+      "id": "anflower-merge-locals-single-only",
+      "file": "packages/runar-compiler/src/passes/04-anf-lower.ts",
+      "find": "if (mergedLocals.length >= 2) {",
+      "replace": "if (mergedLocals.length >= 1000) {",
+      "class": "branch-merge regression",
+      "stage": "anf-lower",
+      "expectCaughtBy": [
+        "branch-merged-locals-vm"
+      ],
+      "finding": "PALMER-1 inversion: disables the >=2 branch-merged-locals normalisation added in 23ef2d2b, reproducing the pre-fix behaviour where an `if` whose two arms rebind DIFFERENT locals (or >=2 of them) leaves every post-branch reference pointing at the dead pre-branch binding. Caught by branch-merged-locals-vm.test.ts (real @bsv/sdk Spend + expectedState pins, not just accept/reject)."
+    },
+    {
+      "id": "stacklower-merge-locals-property-only",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "return tn !== null && tn === elseCtx.stackMap.peekAtDepth(i);",
+      "replace": "return tn !== null &&\n          tn === elseCtx.stackMap.peekAtDepth(i) &&\n          this._properties.some(p => p.name === tn);",
+      "class": "branch-merge regression",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "branch-merged-locals-vm"
+      ],
+      "finding": "PALMER-1 inversion: restores the pre-23ef2d2b `_properties` membership guard on lowerIf's N>=2 reconcile, so branch-merged LOCALS (not contract properties) fall back to the single-slot push(bindingName) path and register one stackMap name for N physical results — every later operand resolves one slot off. Caught by branch-merged-locals-vm.test.ts."
+    },
+    {
+      "id": "sdkstate-encode-minimaldata-opn",
+      "file": "packages/runar-sdk/src/state.ts",
+      "find": "const len = dataHex.length / 2;\n  if (len <= 75) {",
+      "replace": "const len = dataHex.length / 2;\n  if (len === 1) {\n    const byte = parseInt(dataHex, 16);\n    if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0');\n    if (byte === 0x81) return '4f';\n  }\n  if (len <= 75) {",
+      "class": "state-framing regression",
+      "stage": "sdk-state",
+      "expectCaughtBy": [
+        "state-push-framing-vm",
+        "c28-state-strict"
+      ],
+      "finding": "PALMER-2 inversion: re-applies the #110 MINIMALDATA short-circuit (OP_1..OP_16 / OP_1NEGATE) to the STATE section, which the interpreter never executes and the compiler's on-chain reader parses strictly as <len><data>. Verified caught by both state-push-framing-vm.test.ts and c28-state-strict.test.ts."
+    },
+    {
+      "id": "sdkstate-decode-opn-as-length",
+      "file": "packages/runar-sdk/src/state.ts",
+      "find": "if (opcode <= 75) {\n    // Direct push: opcode is the byte length",
+      "replace": "if (opcode >= 0x51 && opcode <= 0x60) {\n    return { data: (opcode - 0x50).toString(16).padStart(2, '0'), bytesRead: 2 };\n  } else if (opcode === 0x4f) {\n    return { data: '81', bytesRead: 2 };\n  } else if (opcode <= 75) {\n    // Direct push: opcode is the byte length",
+      "class": "state-framing regression",
+      "stage": "sdk-state",
+      "expectCaughtBy": [
+        "state-push-framing-vm",
+        "c28-state-strict"
+      ],
+      "finding": "PALMER-2 inversion (READ face): re-teaches decodePushData to accept OP_1..OP_16 / OP_1NEGATE as state-section framing. MEASURED GAP: with the encoder left correct, state-push-framing-vm.test.ts's round-trips never construct an OP_N-framed blob, so this mutant SURVIVES that gate alone (verified by execution) -- only c28-state-strict.test.ts's direct `deserializeState(fields, '55')` negative pin catches it. expectCaughtBy lists both because the mutant IS caught overall (c28-state-strict fires); run-mutation.ts's missedExpectedGates reporting flags state-push-framing-vm as the gate that did NOT fire, which is the honest TG-007 finding: that VM test's decode coverage is round-trip-only for this shape (P3 violation) and should gain a direct malformed-input case."
+    },
+    {
+      "id": "sdksplice-constructor-slot-wrong-length",
+      "file": "packages/runar-sdk/src/contract.ts",
+      "find": "encoded: encodeArg(this.constructorArgs[slot.paramIndex]),",
+      "replace": "encoded: encodeArg(this.constructorArgs[slot.paramIndex]) + '00',",
+      "class": "constructor-slot splice regression",
+      "stage": "sdk-splice",
+      "expectCaughtBy": [
+        "sdk-vertical-constructor-slots"
+      ],
+      "finding": "Phase C3 (TG-016) mutant: appends a stray byte to every constructor-slot substitution in buildCodeScript(), so the deployed code part is one byte too long per slot and every subsequent byte offset shifts. Caught by the compiler<->SDK vertical pin (conformance/sdk-vertical), which compares the TS SDK's deployed script against an INDEPENDENTLY re-derived code part (reference/derive.ts, imports nothing from packages/**) -- horizontal 7-SDK agreement alone would not have caught a bug that only one tier's splice logic has."
+    },
+    {
+      "id": "sdksplice-codeseparator-off-by-one",
+      "file": "packages/runar-sdk/src/contract.ts",
+      "find": "adjustedValue: slot.codeSepIndex + shift });",
+      "replace": "adjustedValue: slot.codeSepIndex + shift + 1 });",
+      "class": "codeSeparator off-by-one",
+      "stage": "sdk-splice",
+      "expectCaughtBy": [
+        "sdk-vertical-codeseparator"
+      ],
+      "finding": "Phase C4 (TG-016) mutant: off-by-one on the deploy-time-adjusted codeSepIndex value baked into a codeSepIndexSlots placeholder. Caught by the compiler<->SDK vertical pin against the independently-derived expected-code-part.hex / expected-vertical.json for the CodeSepMatrix fixture."
     }
   ]
 }

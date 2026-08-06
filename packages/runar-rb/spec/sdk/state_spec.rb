@@ -119,14 +119,60 @@ RSpec.describe 'Runar::SDK::State' do
       expect(mod.encode_script_int(128)).to eq('028000')
     end
 
-    it 'encodes a negative value (-1)' do
-      # magnitude 0x01, set top bit → 0x81
-      expect(mod.encode_script_int(-1)).to eq('0181')
+    # REGRESSION (fund-safety): -1 encodes to the sign-magnitude byte 0x81,
+    # and a 1-byte 0x81 payload MUST use OP_1NEGATE (0x4f) under
+    # SCRIPT_VERIFY_MINIMALDATA — exactly as encode_push_data already does for
+    # ByteString pushes, and as the other six SDKs do. Ruby used to emit the
+    # non-minimal direct push '0181' (this very spec asserted it), which is
+    # one byte longer than every peer tier: on the DEPLOY path that shifts every
+    # subsequent locking-script byte (including OP_CODESEPARATOR positions), so a
+    # peer tier reconstructing the continuation computes a different hashOutputs
+    # and the output cannot be spent; on the CALL path minimal-push enforcement
+    # rejects '0181' outright and the spend never relays.
+    it 'encodes -1 as OP_1NEGATE (0x4f), not the non-minimal push 0181' do
+      expect(mod.encode_script_int(-1)).to eq('4f')
+    end
+
+    it 'encodes -127 as a 1-byte push with the sign bit folded in' do
+      # magnitude 0x7f, top bit clear → OR in the sign bit → 0xff
+      expect(mod.encode_script_int(-127)).to eq('01ff')
     end
 
     it 'encodes -128' do
       # magnitude 0x80 → top bit already set → append 0x80 sign byte
       expect(mod.encode_script_int(-128)).to eq('028080')
+    end
+
+    it 'encodes 255 with a 0x00 sign byte' do
+      # magnitude 0xff → top bit set → append 0x00
+      expect(mod.encode_script_int(255)).to eq('02ff00')
+    end
+
+    it 'encodes 256 as two LE bytes' do
+      # 0x0100 → LE 00 01, last byte 0x01 top bit clear
+      expect(mod.encode_script_int(256)).to eq('020001')
+    end
+
+    it 'encodes -256 by folding the sign bit into the last LE byte' do
+      # magnitude LE 00 01 → last byte 0x01, top bit clear → OR 0x80 → 0x81
+      expect(mod.encode_script_int(-256)).to eq('020081')
+    end
+
+    it 'encodes every OP_N short-circuit value (1..16)' do
+      (1..16).each do |n|
+        expect(mod.encode_script_int(n)).to eq(format('%02x', 0x50 + n))
+      end
+    end
+
+    # The decoder's OP_1NEGATE branch (script_utils.rb interpret_script_element)
+    # existed before this fix but the Ruby encoder never produced 0x4f, so the
+    # round trip was only ever exercised against PEER-tier scripts. Pin it.
+    it 'round-trips -1 through the constructor-arg decoder' do
+      encoded = mod.encode_script_int(-1)
+      expect(encoded).to eq('4f')
+      opcode = encoded[0, 2].to_i(16)
+      expect(Runar::SDK::ScriptUtils.interpret_script_element(opcode, '', 'bigint')).to eq(-1)
+      expect(Runar::SDK::ScriptUtils.interpret_script_element(opcode, '', 'int')).to eq(-1)
     end
 
     it 'encodes a large positive value (1000)' do

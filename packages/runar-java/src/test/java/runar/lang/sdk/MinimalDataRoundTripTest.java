@@ -38,6 +38,14 @@ class MinimalDataRoundTripTest {
     // ------------------------------------------------------------------
     // C9 — state path
     // ------------------------------------------------------------------
+    //
+    // round-trip only — absolute pin:
+    // packages/runar-java/src/test/java/runar/lang/sdk/StatePushFramingTest.java
+    // (this file also carries two REAL absolute pins of its own -- see
+    // encodePushDataMatchesCompilerEncodePushBytesHex and
+    // decodePushDataInvertsTheMinimalDataOpcodes below -- so label this file
+    // precisely rather than wholesale: only the two round-trip methods in
+    // this section are smoke, not evidence).
 
     @ParameterizedTest(name = "state ByteString payload [{0}]")
     @ValueSource(strings = {"00", "01", "05", "10", "81", "aabbccdd", ""})
@@ -54,6 +62,12 @@ class MinimalDataRoundTripTest {
     // ------------------------------------------------------------------
     // S1 — constructor-arg path
     // ------------------------------------------------------------------
+    //
+    // round-trip only — absolute pin: encodePushDataMatchesCompilerEncodePushBytesHex
+    // (below, this file). This method exercises ContractScript's ctor-arg
+    // splice/restore round trip; the literal expected bytes for the encoder
+    // it shares with the unlocking-script path are pinned by the method
+    // below, not here.
 
     @ParameterizedTest(name = "ctor ByteString payload [{0}]")
     @ValueSource(strings = {"00", "01", "05", "10", "81", "aabbccdd", ""})
@@ -80,6 +94,12 @@ class MinimalDataRoundTripTest {
     // ------------------------------------------------------------------
     // Codec-level assertions (parity with the compiler's encodePushBytesHex)
     // ------------------------------------------------------------------
+    //
+    // ABSOLUTE PIN (not round-trip) — literal expected bytes derived from the
+    // compiler's encodePushBytesHex first, then asserted. This is the Java
+    // tier's local KAT for the unlocking-script encoder (mirrors
+    // packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts,
+    // packages/runar-rs/tests/encode_push_data_minimaldata.rs).
 
     @Test
     void encodePushDataMatchesCompilerEncodePushBytesHex() {
@@ -92,6 +112,10 @@ class MinimalDataRoundTripTest {
         assertEquals("04aabbccdd", ScriptUtils.encodePushData("aabbccdd"));
     }
 
+    // ABSOLUTE PIN (not round-trip) — the input opcodes are computed
+    // (0x50 + n), not decoded from a prior encode call, and the expected
+    // output is the independently-known payload byte n; this pins the DECODE
+    // direction against the spec, not against ScriptUtils' own encoder.
     @Test
     void decodePushDataInvertsTheMinimalDataOpcodes() {
         for (int n = 1; n <= 16; n++) {

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	bsvscript "github.com/bsv-blockchain/go-sdk/script"
+	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 )
 
@@ -41,9 +43,20 @@ type Provider interface {
 // MockProvider — in-memory provider for testing
 // ---------------------------------------------------------------------------
 
+// knownOutpoint is the script + value of an outpoint this MockProvider has
+// been told about (or has itself produced via a prior Broadcast). Broadcast
+// validation can only execute inputs whose outpoint appears here.
+type knownOutpoint struct {
+	Script   string
+	Satoshis int64
+}
+
 // MockProvider is an in-memory provider for unit tests and local development.
 // It stores transactions and UTXOs that can be injected via helper methods,
 // and records all broadcasts for assertion in tests.
+//
+// Broadcast validation is DEFAULT-ON (testing-gap remediation Phase A5). See
+// ValidateBroadcast / README "How fund-path tests fail closed in the Go tier".
 type MockProvider struct {
 	transactions    map[string]*TransactionData
 	rawTransactions map[string]string
@@ -53,21 +66,80 @@ type MockProvider struct {
 	network         string
 	broadcastCount  int
 	feeRate         int64
+
+	// validateBroadcasts gates the fail-closed check in Broadcast. Default
+	// true; the opt-out is governed by always_ack_allowlist.json (see
+	// always_ack_allowlist_test.go).
+	validateBroadcasts bool
+	// knownOutpoints maps "txid:vout" -> script+value for every outpoint the
+	// provider knows about, whether injected (AddTransaction / AddUtxo /
+	// AddContractUtxo) or created by an earlier Broadcast.
+	knownOutpoints map[string]knownOutpoint
+	// lastValidatedInputs / lastTotalInputs record the non-vacuity witness of
+	// the most recent validating Broadcast.
+	lastValidatedInputs int
+	lastTotalInputs     int
 }
 
 // NewMockProvider creates a new MockProvider for the given network.
+// Broadcast validation is ON — see Broadcast.
 func NewMockProvider(network string) *MockProvider {
 	if network == "" {
 		network = "testnet"
 	}
 	return &MockProvider{
-		transactions:    make(map[string]*TransactionData),
-		rawTransactions: make(map[string]string),
-		utxos:           make(map[string][]UTXO),
-		contractUtxos:   make(map[string]*UTXO),
-		network:         network,
-		feeRate:         100,
+		transactions:       make(map[string]*TransactionData),
+		rawTransactions:    make(map[string]string),
+		utxos:              make(map[string][]UTXO),
+		contractUtxos:      make(map[string]*UTXO),
+		knownOutpoints:     make(map[string]knownOutpoint),
+		network:            network,
+		feeRate:            100,
+		validateBroadcasts: true,
 	}
+}
+
+// NewAlwaysAckMockProvider creates a MockProvider whose Broadcast never
+// validates the transaction it is handed — the pre-Phase-A5 behaviour.
+//
+// FOR ALLOWLISTED TESTS ONLY: every _test.go file that calls this (or the
+// other opt-outs) must carry a matching entry in always_ack_allowlist.json,
+// which always_ack_allowlist_test.go enforces. Fund-path deploy/call tests
+// must not use it.
+func NewAlwaysAckMockProvider(network string) *MockProvider {
+	m := NewMockProvider(network)
+	m.validateBroadcasts = false
+	return m
+}
+
+// EnableBroadcastValidation turns the fail-closed Broadcast check on or off.
+// Default is on; passing false is an allowlisted opt-out (see
+// NewAlwaysAckMockProvider).
+func (m *MockProvider) EnableBroadcastValidation(enabled bool) {
+	m.validateBroadcasts = enabled
+}
+
+// DisableBroadcastValidation restores the legacy always-ack Broadcast.
+// Allowlisted opt-out — see NewAlwaysAckMockProvider.
+func (m *MockProvider) DisableBroadcastValidation() {
+	m.validateBroadcasts = false
+}
+
+// LastValidatedInputCount reports how many inputs the most recent validating
+// Broadcast actually executed through the script interpreter. Exposed so a
+// test can assert its gate is NOT vacuous.
+func (m *MockProvider) LastValidatedInputCount() int { return m.lastValidatedInputs }
+
+// LastBroadcastInputCount reports how many inputs the most recent validating
+// Broadcast saw in total (validated + unknown-outpoint).
+func (m *MockProvider) LastBroadcastInputCount() int { return m.lastTotalInputs }
+
+// rememberOutpoint records an outpoint's script + value for broadcast validation.
+func (m *MockProvider) rememberOutpoint(txid string, vout int, scriptHex string, satoshis int64) {
+	if scriptHex == "" {
+		return
+	}
+	m.knownOutpoints[fmt.Sprintf("%s:%d", txid, vout)] = knownOutpoint{Script: scriptHex, Satoshis: satoshis}
 }
 
 // AddTransaction injects a transaction into the mock store.
@@ -76,16 +148,86 @@ func (m *MockProvider) AddTransaction(tx *TransactionData) {
 	if tx.Raw != "" {
 		m.rawTransactions[tx.Txid] = tx.Raw
 	}
+	for i, out := range tx.Outputs {
+		m.rememberOutpoint(tx.Txid, i, out.Script, out.Satoshis)
+	}
 }
 
 // AddUtxo injects a UTXO for the given address.
 func (m *MockProvider) AddUtxo(address string, utxo UTXO) {
 	m.utxos[address] = append(m.utxos[address], utxo)
+	m.rememberOutpoint(utxo.Txid, utxo.OutputIndex, utxo.Script, utxo.Satoshis)
 }
 
 // AddContractUtxo injects a contract UTXO for lookup by script hash.
 func (m *MockProvider) AddContractUtxo(scriptHash string, utxo *UTXO) {
 	m.contractUtxos[scriptHash] = utxo
+	if utxo != nil {
+		m.rememberOutpoint(utxo.Txid, utxo.OutputIndex, utxo.Script, utxo.Satoshis)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed broadcast validation (testing-gap remediation Phase A5)
+// ---------------------------------------------------------------------------
+
+// validateBroadcastTx replays every input whose outpoint the provider knows
+// through the go-sdk script interpreter with FULL transaction context (so
+// OP_CHECKSIG / OP_PUSH_TX bind to the real spending sighash), then checks
+// value conservation when every input is known.
+//
+// Returns the number of inputs actually executed. A caller MUST treat a zero
+// count as a failure: a gate that validates nothing passes vacuously, which
+// is exactly the fail-open hole this phase exists to close.
+func validateBroadcastTx(tx *transaction.Transaction, known map[string]knownOutpoint) (int, error) {
+	validated := 0
+	allInputsKnown := true
+	var totalKnownIn int64
+
+	for i, in := range tx.Inputs {
+		if in.SourceTXID == nil {
+			allInputsKnown = false
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", in.SourceTXID.String(), in.SourceTxOutIndex)
+		ko, ok := known[key]
+		if !ok {
+			allInputsKnown = false
+			continue
+		}
+		totalKnownIn += ko.Satoshis
+
+		lockingScript, err := bsvscript.NewFromHex(ko.Script)
+		if err != nil {
+			return validated, fmt.Errorf("input %d: known outpoint %s has invalid script hex: %w", i, key, err)
+		}
+		prevOut := &transaction.TransactionOutput{
+			Satoshis:      uint64(ko.Satoshis),
+			LockingScript: lockingScript,
+		}
+		if execErr := interpreter.NewEngine().Execute(
+			interpreter.WithTx(tx, i, prevOut),
+			interpreter.WithAfterGenesis(),
+			interpreter.WithAfterChronicle(),
+			interpreter.WithForkID(),
+		); execErr != nil {
+			return validated, fmt.Errorf("input %d: script REJECTED by the go-sdk interpreter: %w", i, execErr)
+		}
+		validated++
+	}
+
+	if allInputsKnown {
+		var totalOut int64
+		for _, out := range tx.Outputs {
+			totalOut += int64(out.Satoshis)
+		}
+		if totalOut > totalKnownIn {
+			return validated, fmt.Errorf(
+				"underfunded: outputs (%d sats) exceed known inputs (%d sats)", totalOut, totalKnownIn)
+		}
+	}
+
+	return validated, nil
 }
 
 // GetBroadcastedTxs returns all raw tx hexes that were broadcast.
@@ -102,8 +244,32 @@ func (m *MockProvider) GetTransaction(txid string) (*TransactionData, error) {
 	return tx, nil
 }
 
-// Broadcast records the transaction and returns a deterministic fake txid.
+// Broadcast validates the transaction (unless validation has been opted out
+// of) and then records it, returning a deterministic fake txid.
+//
+// Fail-closed by default (testing-gap remediation Phase A5): every input whose
+// outpoint the provider knows is executed by the go-sdk script interpreter with
+// full transaction context, outputs may not exceed known inputs, and a
+// transaction none of whose inputs could be executed is REJECTED rather than
+// waved through — a gate that validates nothing is worse than no gate.
 func (m *MockProvider) Broadcast(tx *transaction.Transaction) (string, error) {
+	if m.validateBroadcasts {
+		validated, err := validateBroadcastTx(tx, m.knownOutpoints)
+		m.lastValidatedInputs = validated
+		m.lastTotalInputs = len(tx.Inputs)
+		if err != nil {
+			return "", fmt.Errorf("MockProvider: refusing to broadcast invalid transaction: %w", err)
+		}
+		if validated == 0 {
+			return "", fmt.Errorf(
+				"MockProvider: refusing to broadcast — validated 0 of %d inputs (no input's "+
+					"outpoint is known to this provider, so validation would pass vacuously). "+
+					"Seed the spent outpoints via AddUtxo/AddContractUtxo/AddTransaction, or use "+
+					"NewAlwaysAckMockProvider (allowlisted) if this test genuinely needs always-ack",
+				len(tx.Inputs))
+		}
+	}
+
 	rawTx := tx.Hex()
 	m.broadcastedTxs = append(m.broadcastedTxs, rawTx)
 	m.broadcastCount++
@@ -116,6 +282,16 @@ func (m *MockProvider) Broadcast(tx *transaction.Transaction) (string, error) {
 	// Auto-store raw hex for subsequent getRawTransaction lookups
 	if _, ok := m.transactions[fakeTxid]; !ok {
 		m.rawTransactions[fakeTxid] = rawTx
+	}
+
+	// Register this tx's own outputs as known outpoints so a chained call
+	// (spending the continuation this broadcast just created) can be validated
+	// too.
+	for i, out := range tx.Outputs {
+		if out.LockingScript == nil {
+			continue
+		}
+		m.rememberOutpoint(fakeTxid, i, out.LockingScript.String(), int64(out.Satoshis))
 	}
 
 	return fakeTxid, nil

@@ -1757,3 +1757,87 @@ The `runar.sdk` API surface is considered stable; deprecations are signaled in t
 - BRC-100 wallet protocol: <https://brc.dev/100>
 - BSV-20 / BSV-21 token spec: <https://docs.1satordinals.com/>
 - BIP-143 (sighash): <https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki>
+
+---
+
+## How fund-path tests fail closed in the Python tier
+
+`MockProvider.broadcast` used to ack every transaction and return a fake txid.
+Testing-gap remediation Phase A5 flipped it to **fail-closed by default**, in
+two layers — because one of them depends on an optional package and that
+dependency must never turn into a silent coverage hole.
+
+### Layer 1 — structural, non-vacuity, value conservation (stdlib only, ALWAYS on)
+
+1. **Structural** — the payload must parse as a Bitcoin transaction
+   (`runar.sdk.oppushtx._parse_raw_tx`, pure stdlib).
+2. **Non-vacuity** — at least one spent outpoint must be known to the provider.
+   A transaction none of whose inputs it knows is REJECTED, not waved through.
+   The TypeScript reference (`packages/runar-sdk/src/providers/mock.ts`) accepts
+   that case; this port deliberately does not. A gate that validates nothing is
+   worse than no gate.
+3. **Value conservation** — when every input's outpoint is known, outputs may
+   not exceed inputs.
+
+### Layer 2 — script execution (needs the optional `bsv-sdk`)
+
+Every known input is replayed through `bsv.script.spend.Spend` with full
+transaction context — real secp256k1, real BIP-143 sighash.
+
+**State this plainly: outside CI, Python fund-path *script* validation is
+conditional on an optional dependency.** Layer 1 is unconditional; layer 2 is
+not. The dependency is handled explicitly, never silently:
+
+- `last_validation_report` carries **`script_vm_available`**, so a skipped
+  script check can never be mistaken for a passing one, and `validated` stays 0
+  rather than being inflated.
+- **In CI (`$CI` set) the absence of `bsv-sdk` is a hard
+  `BroadcastValidationUnavailable` error** — CI must never lose the script
+  layer. CI already installs it for this package
+  (`.github/workflows/ci.yml`: `pip install pytest slh-dsa bsv-sdk`), and
+  `pyproject.toml`'s `dev` extra now declares it.
+- Locally, the script-layer tests **skip with a loud reason** (matching the
+  precedent `tests/test_script_vm.py` already set) rather than failing a
+  developer's run on a PEP-668 environment where `pip install` is blocked.
+  `runar` itself stays zero-dependency at runtime; `bsv-sdk` is a test
+  dependency.
+
+Install it with `pip install bsv-sdk` (or `pip install 'runar[dev]'`).
+
+### One tier-specific carve-out
+
+runar-py's OP_PUSH_TX preimage does not match the BIP-143 sighash `bsv-sdk`
+recomputes, so a stateful contract's **covenant** input always aborts at the
+covenant's `OP_CHECKSIGVERIFY`. This is pre-existing and independent of the SDK
+change — already pinned by the xfail in
+`tests/test_g1_raw_outputs_spend.py::test_send_to_script_covenant_input0_validates_through_spend`,
+whose control shows a plain stateful `Counter` with no raw outputs failing
+identically. Such an input is counted as **`unvalidatable`**, never as
+validated, so it can never satisfy the non-vacuity requirement on its own; the
+call's funding input still executes for real.
+`tests/test_mock_broadcast_validation.py` asserts the carve-out fires exactly
+once for a real deploy+call, so it goes RED the moment the incompatibility is
+fixed and the carve-out can be deleted.
+
+### The opt-out, and how it is governed
+
+`MockProvider.always_ack()`, `disable_broadcast_validation()` and
+`enable_broadcast_validation(False)` restore the old behaviour. Every test file
+that uses one must have an entry in **`always_ack_allowlist.json`** with a file,
+a reason and a category; `tests/test_always_ack_allowlist.py` fails on unlisted
+usage **and** on stale entries, so the list can only shrink.
+
+Fund-path tests with a real `LocalSigner` and a real compiled contract are **not
+allowlisted**. The allowlist covers only synthetic OP_TRUE artifacts signed by
+`MockSigner`, whose placeholder signatures no OP_CHECKSIG can ever verify.
+
+### What this caught
+
+Three fund-path test files funded their transactions from a P2PKH coin locked to
+`"76a914" + "00" * 20 + "88ac"` — a hash nobody holds — so the funding input was
+unspendable and the always-ack provider reported success anyway. They now use
+`build_p2pkh_script(signer.get_public_key())` and pass under real script
+execution. Several `MockProvider` bookkeeping tests were also broadcasting byte
+strings that are not transactions at all (`'01000000000000000000'`) and
+asserting success; they now use genuine transactions, plus an explicit
+rejection test for the non-transaction case.

@@ -3,6 +3,12 @@
 require 'spec_helper'
 require 'runar/sdk'
 
+# round-trip only — absolute pin: packages/runar-rb/spec/sdk/state_push_framing_spec.rb (C9, state half).
+# The S1 (constructor-arg) half has no Ruby-local literal-byte KAT; its only
+# absolute evidence is indirect, via the deploy-time splice path
+# (conformance/sdk-vertical) -- see the "unlocking-encodeArg-minimaldata"
+# residual note in conformance/wire-primitives.json.
+#
 # C9 + S1 — single-byte MINIMALDATA push data must round-trip.
 #
 # C9 (state): +serialize_state+ routes a variable-length (ByteString) field

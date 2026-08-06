@@ -19,6 +19,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import type { RunarArtifact } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,66 @@ function compileSource(source: string, fileName: string): RunarArtifact {
   return result.artifact;
 }
 
+// --- opcode-boundary scanning ----------------------------------------------
+//
+// Locating an opcode by `scriptHex.indexOf('ab')` is not locating an opcode.
+// A hex substring search matches at ODD nibble offsets (the low nibble of one
+// byte plus the high nibble of the next), and it matches PUSH DATA — a 33-byte
+// PubKey constructor arg containing a 0xab byte is not an OP_CODESEPARATOR.
+// Both failure modes are proved below in "RED-PROOF: hex-substring scanning".
+//
+// This walk is a deliberate minimal re-implementation. The fuller version in
+// conformance/sdk-vertical/reference/script.ts is a REFERENCE implementation
+// that imports nothing from packages/** on purpose; importing it here would
+// invert that dependency.
+
+const OP_PUSHDATA1 = 0x4c;
+const OP_PUSHDATA2 = 0x4d;
+const OP_PUSHDATA4 = 0x4e;
+const OP_CODESEPARATOR = 0xab;
+const OP_CHECKSIGVERIFY = 0xad;
+
+/** Byte offset of every real opcode in `scriptHex`, in order. */
+function opcodeOffsets(scriptHex: string): { offset: number; opcode: number }[] {
+  if (scriptHex.length % 2 !== 0) {
+    throw new Error(`script hex has odd length ${scriptHex.length}`);
+  }
+  const total = scriptHex.length / 2;
+  const byteAt = (i: number): number => {
+    if (i < 0 || i >= total) throw new Error(`script read past end at byte ${i} of ${total}`);
+    return parseInt(scriptHex.slice(i * 2, i * 2 + 2), 16);
+  };
+
+  const ops: { offset: number; opcode: number }[] = [];
+  let i = 0;
+  while (i < total) {
+    const opcode = byteAt(i);
+    ops.push({ offset: i, opcode });
+    if (opcode >= 0x01 && opcode <= 0x4b) i += 1 + opcode;
+    else if (opcode === OP_PUSHDATA1) i += 2 + byteAt(i + 1);
+    else if (opcode === OP_PUSHDATA2) i += 3 + (byteAt(i + 1) | (byteAt(i + 2) << 8));
+    else if (opcode === OP_PUSHDATA4)
+      i +=
+        5 +
+        (byteAt(i + 1) |
+          (byteAt(i + 2) << 8) |
+          (byteAt(i + 3) << 16) |
+          byteAt(i + 4) * 0x1000000);
+    else i += 1;
+  }
+  // A push whose length runs off the end leaves `i > total`. That is a
+  // malformed script, not a script with no matches.
+  if (i !== total) throw new Error(`script does not decode cleanly: ended at ${i} of ${total}`);
+  return ops;
+}
+
+/** Byte offsets at which `opcode` appears as an OPCODE (never inside push data). */
+function findOpcode(scriptHex: string, opcode: number): number[] {
+  return opcodeOffsets(scriptHex)
+    .filter((o) => o.opcode === opcode)
+    .map((o) => o.offset);
+}
+
 const PRIV_KEY =
   '0000000000000000000000000000000000000000000000000000000000000001';
 
@@ -55,12 +116,12 @@ async function setupFundedProvider(
   const signer = new LocalSigner(PRIV_KEY);
   const address = await signer.getAddress();
   const pubKeyHex = await signer.getPublicKey();
-  const provider = new MockProvider();
+  const provider = new MockProvider('testnet');
   provider.addUtxo(address, {
     txid: 'aa'.repeat(32),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(pubKeyHex),
   });
   return { provider, signer, address, pubKeyHex };
 }
@@ -138,6 +199,64 @@ function countPushdataItems(scriptHex: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// RED-PROOF: hex-substring scanning is not opcode scanning
+// ---------------------------------------------------------------------------
+//
+// Two assertions in this file used to locate opcodes with a hex-STRING search:
+//
+//   expect(artifact.script).toContain('ab');   // "OP_CODESEPARATOR exists"
+//   const checksigPos = script.indexOf('ad');  // "OP_CHECKSIGVERIFY is here"
+//
+// Neither locates an opcode. The tests below feed both the scripts they cannot
+// tell apart: the old form PASSES on a script that contains no such opcode at
+// all, while the opcode walk correctly reports none. That is what makes the
+// replacement a real assertion rather than a reworded one.
+
+describe('RED-PROOF: hex-substring scanning is not opcode scanning', () => {
+  it('indexOf("ad") matches at an ODD NIBBLE offset, where no opcode begins', () => {
+    // OP_1 OP_DROP <0xba> <0xda> OP_1 — bytes: 51 75 ba da 51. There is no
+    // 0xad byte anywhere, yet 'ad' spans the low nibble of 0xba and the high
+    // nibble of 0xda.
+    const script = '5175bada51';
+
+    // The OLD assertion is satisfied — it "found" OP_CHECKSIGVERIFY.
+    expect(script.indexOf('ad')).toBeGreaterThanOrEqual(0);
+    expect(script.indexOf('ad') % 2).toBe(1); // ...at an odd nibble: not a byte
+
+    // The opcode walk knows better.
+    expect(findOpcode(script, OP_CHECKSIGVERIFY)).toEqual([]);
+  });
+
+  it('toContain("ab") matches a 0xab byte INSIDE a push, which is data not an opcode', () => {
+    // OP_PUSHDATA1 33 <33 bytes, one of them 0xab> — a PubKey constructor arg,
+    // exactly the shape this suite's fixtures splice in. No OP_CODESEPARATOR.
+    const pubkey = '02' + 'ab'.repeat(32); // 33 bytes: 0x02 then 32 x 0xab
+    const script = '4c21' + pubkey + '75'; // PUSHDATA1 33 <pubkey> OP_DROP
+    expect(pubkey.length / 2).toBe(33);
+
+    // The OLD assertion is satisfied — it "found" OP_CODESEPARATOR.
+    expect(script).toContain('ab');
+
+    // The opcode walk knows better: every 0xab is push payload.
+    expect(findOpcode(script, OP_CODESEPARATOR)).toEqual([]);
+  });
+
+  it('the walk still finds an opcode that IS at a byte boundary', () => {
+    // Same push, now genuinely followed by OP_CODESEPARATOR OP_CHECKSIGVERIFY.
+    const pubkey = '02' + 'ab'.repeat(32);
+    const script = '4c21' + pubkey + 'ab' + 'ad';
+    expect(findOpcode(script, OP_CODESEPARATOR)).toEqual([35]);
+    expect(findOpcode(script, OP_CHECKSIGVERIFY)).toEqual([36]);
+  });
+
+  it('rejects a script whose push runs off the end instead of reporting "no matches"', () => {
+    // PUSHDATA1 claiming 33 bytes with only 2 present. A silent decode would
+    // report an empty match list, which reads identically to "opcode absent".
+    expect(() => findOpcode('4c210102', OP_CODESEPARATOR)).toThrow(/does not decode cleanly|past end/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test: stateful terminal method without terminalOutputs
 // ---------------------------------------------------------------------------
 
@@ -196,11 +315,6 @@ describe('OP_CODESEPARATOR: stateful terminal method without terminalOutputs', (
 
     const { provider, signer, pubKeyHex } = await setupFundedProvider(100_000);
 
-    const bidderSigner = new LocalSigner(
-      '0000000000000000000000000000000000000000000000000000000000000002',
-    );
-    const bidderPubKey = await bidderSigner.getPublicKey();
-
     const contract = new RunarContract(artifact, [
       pubKeyHex,       // auctioneer
       pubKeyHex,       // highestBidder (self initially)
@@ -210,10 +324,17 @@ describe('OP_CODESEPARATOR: stateful terminal method without terminalOutputs', (
 
     await contract.deploy(provider, signer, { satoshis: 50_000 });
 
-    // bid(sig, bidder, bidAmount) — non-terminal, state-mutating
+    // bid(sig, bidder, bidAmount) — non-terminal, state-mutating. This test
+    // only exercises _codePart pushdata bookkeeping, so `bidder` is the
+    // connected signer's OWN key (self-bid) — the simple call() API only
+    // ever auto-signs Sig params with the one connected signer, so `bidder`
+    // must match it or checkSig(sig, bidder) genuinely fails on-chain.
+    // (Pre-A1 finding: this test previously passed `bidder` = an unrelated
+    // second key while auto-signing with the auctioneer's key, silently
+    // broadcasting a script-invalid bid tx through the always-ack provider.)
     const result = await contract.call(
       'bid',
-      [null, bidderPubKey, 200n],
+      [null, pubKeyHex, 200n],
       provider, signer,
     );
     expect(result.txid).toBeTruthy();
@@ -278,8 +399,13 @@ describe('OP_CODESEPARATOR: stateless contract user sig scriptCode', () => {
     );
 
     expect(artifact.codeSeparatorIndex).toBeDefined();
-    // Verify OP_CODESEPARATOR (0xab) exists in the base script
-    expect(artifact.script).toContain('ab');
+    // OP_CODESEPARATOR (0xab) must be present AS AN OPCODE, at exactly the
+    // offset the artifact advertises. `script.toContain('ab')` used to stand
+    // in for this and is near-vacuous on a 795-byte script — see the RED-PROOF
+    // block above.
+    expect(findOpcode(artifact.script, OP_CODESEPARATOR)).toEqual([
+      artifact.codeSeparatorIndex,
+    ]);
 
     const { provider, signer, pubKeyHex } = await setupFundedProvider(100_000);
 
@@ -323,6 +449,12 @@ describe('OP_CODESEPARATOR: stateless contract user sig scriptCode', () => {
   it('stateless checkSig is before OP_CODESEPARATOR in compiled script', () => {
     // Verify the script structure: checkSig (0xad = OP_CHECKSIGVERIFY)
     // appears before the OP_CODESEPARATOR (0xab).
+    //
+    // This used to be `script.indexOf('ad')` — a HEX-STRING search, which
+    // matches at odd nibble offsets and inside push data, so it did not locate
+    // the opcode at all. It also compared that hex index against
+    // `codeSepOffset * 2`, mixing two coordinate systems. Both are now byte
+    // offsets from a real opcode walk. See the RED-PROOF block above.
     const artifact = compileContract(
       'examples/ts/covenant-vault/CovenantVault.runar.ts',
     );
@@ -330,11 +462,15 @@ describe('OP_CODESEPARATOR: stateless contract user sig scriptCode', () => {
     const script = artifact.script;
     const codeSepOffset = artifact.codeSeparatorIndex!;
 
-    // The base script (before constructor substitution) has OP_CHECKSIGVERIFY
-    // at a position before the code separator.
-    const checksigPos = script.indexOf('ad'); // OP_CHECKSIGVERIFY
-    expect(checksigPos).toBeLessThan(codeSepOffset * 2);
-    expect(checksigPos).toBeGreaterThanOrEqual(0);
+    const checksigOffsets = findOpcode(script, OP_CHECKSIGVERIFY);
+    expect(checksigOffsets.length).toBeGreaterThan(0);
+    // The user's checkSig is the FIRST OP_CHECKSIGVERIFY, and it is emitted
+    // before the separator — which is why its sighash must use the FULL
+    // locking script, not the post-separator subscript.
+    expect(checksigOffsets[0]).toBeLessThan(codeSepOffset);
+    // ...and the separator is a real opcode at the advertised offset, not a
+    // stray 0xab byte inside a 33-byte PubKey push.
+    expect(findOpcode(script, OP_CODESEPARATOR)).toEqual([codeSepOffset]);
   });
 });
 

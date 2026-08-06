@@ -28,6 +28,30 @@ func getCounterArtifact(t *testing.T) *runar.RunarArtifact {
 	return counterArtifact
 }
 
+// assertOnChainCount decodes the `count` field out of the state section of
+// the contract's CURRENT on-chain UTXO (i.e. the real bytes the node just
+// accepted) and compares it to want. Deliberately does NOT use
+// contract.GetState() — see helpers.ReadOnChainState's doc comment for why
+// the SDK's in-memory next-state prediction is the wrong oracle here.
+func assertOnChainCount(t *testing.T, artifact *runar.RunarArtifact, contract *runar.RunarContract, want int64) {
+	t.Helper()
+	utxo := contract.GetCurrentUtxo()
+	if utxo == nil {
+		t.Fatalf("assertOnChainCount: no current UTXO tracked on the contract")
+	}
+	state, err := helpers.ReadOnChainState(artifact, utxo.Txid, utxo.OutputIndex)
+	if err != nil {
+		t.Fatalf("assertOnChainCount: %v", err)
+	}
+	got, ok := state["count"].(int64)
+	if !ok {
+		t.Fatalf("assertOnChainCount: on-chain state.count is %T (%#v), want int64", state["count"], state["count"])
+	}
+	if got != want {
+		t.Fatalf("on-chain state.count (tx %s output %d): got %d, want %d", utxo.Txid, utxo.OutputIndex, got, want)
+	}
+}
+
 func TestCounter_Increment(t *testing.T) {
 	artifact := getCounterArtifact(t)
 	t.Logf("Counter script: %d bytes", len(artifact.Script)/2)
@@ -59,6 +83,10 @@ func TestCounter_Increment(t *testing.T) {
 		t.Fatalf("call increment: %v", err)
 	}
 	t.Logf("increment TX confirmed: %s", callTxid)
+
+	// increment: count 0 -> 1. Read the value back out of the ACTUAL output
+	// script the node accepted, not the SDK's predicted next state.
+	assertOnChainCount(t, artifact, contract, 1)
 }
 
 func TestCounter_IncrementChain(t *testing.T) {
@@ -92,6 +120,7 @@ func TestCounter_IncrementChain(t *testing.T) {
 		t.Fatalf("call increment (0->1): %v", err)
 	}
 	t.Logf("count->1 TX: %s", txid1)
+	assertOnChainCount(t, artifact, contract, 1)
 
 	// Increment 1 -> 2
 	txid2, _, err := contract.Call("increment", []interface{}{}, provider, signer, nil)
@@ -99,6 +128,7 @@ func TestCounter_IncrementChain(t *testing.T) {
 		t.Fatalf("call increment (1->2): %v", err)
 	}
 	t.Logf("count->2 TX: %s", txid2)
+	assertOnChainCount(t, artifact, contract, 2)
 	t.Logf("chain: 0->1->2 succeeded")
 }
 
@@ -133,6 +163,7 @@ func TestCounter_IncrementThenDecrement(t *testing.T) {
 		t.Fatalf("call increment (0->1): %v", err)
 	}
 	t.Logf("count->1 TX: %s", txid1)
+	assertOnChainCount(t, artifact, contract, 1)
 
 	// Decrement 1 -> 0
 	txid2, _, err := contract.Call("decrement", []interface{}{}, provider, signer, nil)
@@ -140,6 +171,7 @@ func TestCounter_IncrementThenDecrement(t *testing.T) {
 		t.Fatalf("call decrement (1->0): %v", err)
 	}
 	t.Logf("count->0 TX: %s", txid2)
+	assertOnChainCount(t, artifact, contract, 0)
 	t.Logf("chain: 0->1->0 succeeded")
 }
 

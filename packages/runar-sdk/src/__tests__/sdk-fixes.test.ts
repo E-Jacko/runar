@@ -4,6 +4,7 @@ import { selectUtxos, estimateDeployFee } from '../deployment.js';
 import { buildCallTransaction } from '../calling.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { serializeState, deserializeState } from '../state.js';
 import type { RunarArtifact, StateField } from 'runar-ir-schema';
 import type { TransactionData, UTXO } from '../types.js';
@@ -25,12 +26,19 @@ function makeArtifact(
   };
 }
 
+const PRIV_KEY = '0000000000000000000000000000000000000000000000000000000000000001';
+const FAKE_TXID = 'aa'.repeat(32);
+
+// Every test in this file signs with PRIV_KEY — derive the funding UTXO
+// script once from the real signer's pubkey.
+const FUNDING_SCRIPT = buildP2PKHScript(await new LocalSigner(PRIV_KEY).getPublicKey());
+
 function makeUtxo(satoshis: number, index = 0): UTXO {
   return {
     txid: 'aabbccdd'.repeat(8),
     outputIndex: index,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: FUNDING_SCRIPT,
   };
 }
 
@@ -46,9 +54,6 @@ function makeTx(
     locktime: 0,
   };
 }
-
-const PRIV_KEY = '0000000000000000000000000000000000000000000000000000000000000001';
-const FAKE_TXID = 'aa'.repeat(32);
 
 /**
  * Parse raw tx hex to verify structure (minimal parser).
@@ -158,12 +163,12 @@ describe('insertUnlockingScript', () => {
   it('deploy() inserts the signing script into input 0', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo(address, {
       txid: 'aa'.repeat(32),
       outputIndex: 0,
       satoshis: 100_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: FUNDING_SCRIPT,
     });
 
     const artifact = makeArtifact({
@@ -185,20 +190,20 @@ describe('insertUnlockingScript', () => {
   it('deploy() with multiple UTXOs inserts scripts into all inputs', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
 
     // Add two UTXOs — both small enough that we need both
     provider.addUtxo(address, {
       txid: 'aa'.repeat(32),
       outputIndex: 0,
       satoshis: 30_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: FUNDING_SCRIPT,
     });
     provider.addUtxo(address, {
       txid: 'bb'.repeat(32),
       outputIndex: 0,
       satoshis: 30_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: FUNDING_SCRIPT,
     });
 
     const artifact = makeArtifact({
@@ -231,7 +236,12 @@ describe('state mutation during call()', () => {
 
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    // This artifact's on-chain script is a bare OP_TRUE that never consumes
+    // the auto-injected continuation witnesses (_changePKH/_changeAmount/
+    // _newAmount/txPreimage) the stateful call path still pushes, so real
+    // Spend trips the clean-stack rule — structure-only, not a fund-path
+    // spend (this test asserts SDK-side state mutation, not spendability).
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     provider.addUtxo(address, makeUtxo(100_000));
 
     const artifact = makeArtifact({
@@ -292,7 +302,8 @@ describe('state mutation during call()', () => {
 
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    // Structure-only — see comment on the first test in this block.
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     provider.addUtxo(address, makeUtxo(100_000));
 
     const artifact = makeArtifact({
@@ -347,7 +358,7 @@ describe('fromTxId code script preservation', () => {
     // The correct on-chain script after constructor arg splicing
     const onChainScript = '76a914' + pubKeyHash + '88ac';
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addTransaction(
       makeTx(FAKE_TXID, [{ satoshis: 10_000, script: onChainScript }]),
     );
@@ -369,7 +380,7 @@ describe('fromTxId code script preservation', () => {
     const stateHex = serializeState(stateFields, originalState);
     const fullScript = codeHex + '6a' + stateHex;
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addTransaction(
       makeTx(FAKE_TXID, [{ satoshis: 10_000, script: fullScript }]),
     );
@@ -419,7 +430,7 @@ describe('fromTxId code script preservation', () => {
     // On chain, threshold was set to 1000n -> encoded as 02e803
     const onChainScript = '02e8039c69';
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addTransaction(
       makeTx(FAKE_TXID, [{ satoshis: 5_000, script: onChainScript }]),
     );
@@ -543,7 +554,7 @@ describe('selectUtxos', () => {
   it('deploy() uses selected UTXOs, not all available', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
 
     // Add 5 UTXOs
     for (let i = 0; i < 5; i++) {
@@ -551,7 +562,7 @@ describe('selectUtxos', () => {
         txid: (i.toString(16).padStart(2, '0')).repeat(32),
         outputIndex: 0,
         satoshis: i === 2 ? 1_000_000 : 1_000, // One big UTXO, rest are small
-        script: '76a914' + '00'.repeat(20) + '88ac',
+        script: FUNDING_SCRIPT,
       });
     }
 
@@ -808,7 +819,11 @@ describe('auto-compute state from ANF IR', () => {
   it('prepareCall auto-computes newState when ANF IR present', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    // makeStatefulArtifact()'s on-chain script is a bare OP_TRUE that never
+    // consumes the continuation witness pushes, so real Spend trips the
+    // clean-stack rule — structure-only, this test asserts the ANF-IR-driven
+    // newState auto-compute, not spendability.
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     provider.addUtxo(address, makeUtxo(100_000));
 
     const artifact = makeStatefulArtifact();
@@ -829,7 +844,8 @@ describe('auto-compute state from ANF IR', () => {
   it('prepareCall uses explicit newState when provided (override)', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    // Structure-only — see comment on the first test in this block.
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     provider.addUtxo(address, makeUtxo(100_000));
 
     const artifact = makeStatefulArtifact();
@@ -909,7 +925,7 @@ describe('ANF data output extraction', () => {
   it('extracts data outputs from ANF when newState is omitted', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo(address, makeUtxo(100_000));
 
     const contract = new RunarContract(makeEmitterArtifact(), [0n]);
@@ -929,7 +945,7 @@ describe('ANF data output extraction', () => {
   it('extracts data outputs from ANF even when newState is supplied', async () => {
     const signer = new LocalSigner(PRIV_KEY);
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo(address, makeUtxo(100_000));
 
     const contract = new RunarContract(makeEmitterArtifact(), [0n]);

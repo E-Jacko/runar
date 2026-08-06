@@ -57,6 +57,18 @@ pub fn lower_to_anf(contract: &ContractNode) -> ANFProgram {
     }
 }
 
+/// Lower a type-checked Rúnar AST to ANF IR, converting a panic into a proper
+/// error return instead of unwinding out of the compiler.
+///
+/// Pass 4 panics deliberately: it is how the lowering pass refuses a construct
+/// it must not emit (e.g. a conditional that both declares outputs and merges
+/// two or more locals, which used to compile to an unspendable script). This
+/// is the same wrapper the backend uses for pass 5 — see
+/// `codegen::stack::lower_to_stack` around `lower_to_stack_inner`.
+pub fn try_lower_to_anf(contract: &ContractNode) -> Result<ANFProgram, String> {
+    crate::refusal::catch_refusal("anf lowering", || lower_to_anf(contract))
+}
+
 // ---------------------------------------------------------------------------
 // Properties
 // ---------------------------------------------------------------------------
@@ -65,23 +77,82 @@ fn lower_properties(contract: &ContractNode) -> Vec<ANFProperty> {
     contract
         .properties
         .iter()
-        .map(|prop| ANFProperty {
-            name: prop.name.clone(),
-            prop_type: type_node_to_string(&prop.prop_type),
-            readonly: prop.readonly,
-            initial_value: prop.initializer.as_ref().and_then(extract_literal_value),
-            synthetic_array_chain: prop.synthetic_array_chain.as_ref().map(|chain| {
-                chain
-                    .iter()
-                    .map(|level| ANFSyntheticArrayLevel {
-                        base: level.base.clone(),
-                        index: level.index,
-                        length: level.length,
-                    })
-                    .collect()
-            }),
+        .map(|prop| {
+            let prop_type = type_node_to_string(&prop.prop_type);
+            check_state_bigint_magnitude(prop, &prop_type);
+            ANFProperty {
+                name: prop.name.clone(),
+                prop_type,
+                readonly: prop.readonly,
+                initial_value: prop.initializer.as_ref().and_then(extract_literal_value),
+                synthetic_array_chain: prop.synthetic_array_chain.as_ref().map(|chain| {
+                    chain
+                        .iter()
+                        .map(|level| ANFSyntheticArrayLevel {
+                            base: level.base.clone(),
+                            index: level.index,
+                            length: level.length,
+                        })
+                        .collect()
+                }),
+            }
         })
         .collect()
+}
+
+/// Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+///
+/// `num2bin-le8` is a fixed 8-byte little-endian SIGN-MAGNITUDE word: bytes
+/// 0..6 plus the low 7 bits of byte 7 carry the magnitude, 0x80 of byte 7
+/// carries the sign. A magnitude of 2^63 or more does not fit, and nothing
+/// used to check: the compiler stamped `encoding: "num2bin-le8"` on the field
+/// and carried the initializer verbatim, the SDK wrote the low 8 bytes of it
+/// into the deployed state section, and the covenant then rebuilt the
+/// continuation with its own OP_NUM2BIN 8 — which produces different bytes —
+/// so hash256(outputs) never matched and the UTXO was permanently unspendable.
+/// It deployed cleanly, with no diagnostic at compile time or deploy time.
+///
+/// This catches the statically-known half. Values that only exist at call time
+/// are stopped by the SDK serializer (packages/runar-rs/src/sdk/state.rs).
+///
+/// READONLY properties are deliberately exempt: they are baked into the
+/// locking script as script-number pushes, never into the state section, and
+/// BSV script numbers are arbitrary-precision after Genesis.
+fn check_state_bigint_magnitude(prop: &PropertyNode, prop_type: &str) {
+    if prop.readonly || (prop_type != "bigint" && prop_type != "int") {
+        return;
+    }
+    let Some(value) = prop.initializer.as_ref().and_then(literal_bigint) else {
+        return;
+    };
+    let limit = num_bigint::BigInt::from(1u8) << 63u32;
+    let neg_limit = -limit.clone();
+    if value < limit && value > neg_limit {
+        return;
+    }
+    panic!(
+        "Cannot compile state property '{}' initialised to {}: it does not fit \
+         the fixed 8-byte sign-magnitude state word (magnitude must be < 2^63). \
+         Reduce the value, or make the property readonly if it is a constant \
+         rather than state.",
+        prop.name, value,
+    );
+}
+
+/// The signed value of a bigint literal (with an optional unary minus), or
+/// `None` for any other initializer form.
+fn literal_bigint(expr: &Expression) -> Option<num_bigint::BigInt> {
+    match expr {
+        Expression::BigIntLiteral { value } => Some(value.clone()),
+        Expression::UnaryExpr {
+            op: UnaryOp::Neg,
+            operand,
+        } => match operand.as_ref() {
+            Expression::BigIntLiteral { value } => Some(-value),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Convert an i128 to a serde_json::Value. Values within i64 range use
@@ -897,6 +968,17 @@ impl<'a> LoweringContext<'a> {
 // ---------------------------------------------------------------------------
 
 fn lower_statements(stmts: &[Statement], ctx: &mut LoweringContext) {
+    lower_statements_with_reads(stmts, ctx, &HashSet::new());
+}
+
+/// Lower a statement block, threading down the set of identifiers the enclosing
+/// blocks still read after this block ends. Only the block-forming statements
+/// (if / for) consume it; see `reads_after_statement`.
+fn lower_statements_with_reads(
+    stmts: &[Statement],
+    ctx: &mut LoweringContext,
+    reads_after_block: &HashSet<String>,
+) {
     for i in 0..stmts.len() {
         let stmt = &stmts[i];
         // When an if-statement has no else, the then-block ends with return,
@@ -917,11 +999,136 @@ fn lower_statements(stmts: &[Statement], ctx: &mut LoweringContext) {
                     else_branch: Some(remaining),
                     source_location: source_location.clone(),
                 };
-                lower_statement(&modified_if, ctx);
+                lower_statement_with_reads(&modified_if, ctx, reads_after_block);
                 return;
             }
         }
-        lower_statement(stmt, ctx);
+        // Only the block-forming statements need to know what the code after
+        // them still reads; computing it for every statement would be quadratic
+        // for no benefit.
+        match stmt {
+            Statement::IfStatement { .. } | Statement::ForStatement { .. } => {
+                let reads_after = reads_after_statement(stmts, i, reads_after_block);
+                lower_statement_with_reads(stmt, ctx, &reads_after);
+            }
+            _ => lower_statement(stmt, ctx),
+        }
+    }
+}
+
+/// The identifiers still readable once statement `index` of this block has run:
+/// everything the following statements in this block read, plus whatever the
+/// enclosing blocks read after this block.
+///
+/// Used by `lower_if_statement` to tell a branch-merged local that is dead after
+/// the `if` (safe) from one that is still live (not representable alongside a
+/// branch output — see `branch_output_rejection_reason`).
+fn reads_after_statement(
+    stmts: &[Statement],
+    index: usize,
+    reads_after_block: &HashSet<String>,
+) -> HashSet<String> {
+    let mut reads = reads_after_block.clone();
+    for stmt in &stmts[index + 1..] {
+        collect_statement_reads(stmt, &mut reads);
+    }
+    reads
+}
+
+/// Collect every identifier a statement READS. The `x` in `x = expr` is a write,
+/// not a read, so a plain identifier assignment target is skipped; every other
+/// target form can still read locals.
+fn collect_statement_reads(stmt: &Statement, out: &mut HashSet<String>) {
+    match stmt {
+        Statement::VariableDecl { init, .. } => collect_expression_reads(init, out),
+        Statement::Assignment { target, value, .. } => {
+            if !matches!(target, Expression::Identifier { .. }) {
+                collect_expression_reads(target, out);
+            }
+            collect_expression_reads(value, out);
+        }
+        Statement::IfStatement {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expression_reads(condition, out);
+            for s in then_branch {
+                collect_statement_reads(s, out);
+            }
+            if let Some(else_stmts) = else_branch {
+                for s in else_stmts {
+                    collect_statement_reads(s, out);
+                }
+            }
+        }
+        Statement::ForStatement {
+            init,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            collect_statement_reads(init, out);
+            collect_expression_reads(condition, out);
+            collect_statement_reads(update, out);
+            for s in body {
+                collect_statement_reads(s, out);
+            }
+        }
+        Statement::ReturnStatement { value, .. } => {
+            if let Some(v) = value {
+                collect_expression_reads(v, out);
+            }
+        }
+        Statement::ExpressionStatement { expression, .. } => {
+            collect_expression_reads(expression, out)
+        }
+    }
+}
+
+/// Collect every identifier an expression reads.
+fn collect_expression_reads(expr: &Expression, out: &mut HashSet<String>) {
+    match expr {
+        Expression::Identifier { name } => {
+            out.insert(name.clone());
+        }
+        Expression::BinaryExpr { left, right, .. } => {
+            collect_expression_reads(left, out);
+            collect_expression_reads(right, out);
+        }
+        Expression::UnaryExpr { operand, .. } => collect_expression_reads(operand, out),
+        Expression::CallExpr { callee, args, .. } => {
+            collect_expression_reads(callee, out);
+            for a in args {
+                collect_expression_reads(a, out);
+            }
+        }
+        Expression::MemberExpr { object, .. } => collect_expression_reads(object, out),
+        Expression::TernaryExpr {
+            condition,
+            consequent,
+            alternate,
+        } => {
+            collect_expression_reads(condition, out);
+            collect_expression_reads(consequent, out);
+            collect_expression_reads(alternate, out);
+        }
+        Expression::IndexAccess { object, index } => {
+            collect_expression_reads(object, out);
+            collect_expression_reads(index, out);
+        }
+        Expression::IncrementExpr { operand, .. } | Expression::DecrementExpr { operand, .. } => {
+            collect_expression_reads(operand, out)
+        }
+        Expression::ArrayLiteral { elements } => {
+            for e in elements {
+                collect_expression_reads(e, out);
+            }
+        }
+        // Literals and `this.x` property access read no locals.
+        _ => {}
     }
 }
 
@@ -956,6 +1163,14 @@ fn statement_source_location(stmt: &Statement) -> &super::ast::SourceLocation {
 }
 
 fn lower_statement(stmt: &Statement, ctx: &mut LoweringContext) {
+    lower_statement_with_reads(stmt, ctx, &HashSet::new());
+}
+
+fn lower_statement_with_reads(
+    stmt: &Statement,
+    ctx: &mut LoweringContext,
+    reads_after: &HashSet<String>,
+) {
     // Propagate source location to emitted ANF bindings
     let ast_loc = statement_source_location(stmt);
     ctx.current_source_loc = Some(SourceLocation {
@@ -979,7 +1194,7 @@ fn lower_statement(stmt: &Statement, ctx: &mut LoweringContext) {
             else_branch,
             ..
         } => {
-            lower_if_statement(condition, then_branch, else_branch.as_deref(), ctx);
+            lower_if_statement(condition, then_branch, else_branch.as_deref(), ctx, reads_after);
         }
         Statement::ForStatement {
             init,
@@ -988,7 +1203,7 @@ fn lower_statement(stmt: &Statement, ctx: &mut LoweringContext) {
             body,
             ..
         } => {
-            lower_for_statement(init, condition, update, body, ctx);
+            lower_for_statement(init, condition, update, body, ctx, reads_after);
         }
         Statement::ExpressionStatement { expression, .. } => {
             lower_expr_to_ref(expression, ctx);
@@ -1067,18 +1282,19 @@ fn lower_if_statement(
     then_branch: &[Statement],
     else_branch: Option<&[Statement]>,
     ctx: &mut LoweringContext,
+    reads_after: &HashSet<String>,
 ) {
     let cond_ref = lower_expr_to_ref(condition, ctx);
 
     // Lower then-block into sub-context
     let mut then_ctx = ctx.sub_context();
-    lower_statements(then_branch, &mut then_ctx);
+    lower_statements_with_reads(then_branch, &mut then_ctx, reads_after);
     ctx.sync_counter(&then_ctx);
 
     // Lower else-block into sub-context
     let mut else_ctx = ctx.sub_context();
     if let Some(else_stmts) = else_branch {
-        lower_statements(else_stmts, &mut else_ctx);
+        lower_statements_with_reads(else_stmts, &mut else_ctx, reads_after);
     }
     ctx.sync_counter(&else_ctx);
 
@@ -1095,9 +1311,11 @@ fn lower_if_statement(
         || !then_ctx.add_data_output_refs.is_empty()
         || !else_ctx.add_data_output_refs.is_empty();
 
+    let mut then_output_bytes = String::new();
+    let mut else_output_bytes = String::new();
     if branch_has_outputs {
-        append_branch_output_concat(&mut then_ctx);
-        append_branch_output_concat(&mut else_ctx);
+        then_output_bytes = append_branch_output_concat(&mut then_ctx);
+        else_output_bytes = append_branch_output_concat(&mut else_ctx);
     }
 
     // Branch-merged locals (2 or more). An `if` expression carries exactly ONE
@@ -1112,20 +1330,26 @@ fn lower_if_statement(
     // Fix: give both arms the SAME result set in the SAME order by appending
     // an explicit rebind of every merged local to each arm.
     let merged_locals = collect_branch_merged_locals(&then_ctx, &else_ctx, ctx);
-    if merged_locals.len() >= 2 {
-        if branch_has_outputs {
-            // The arms' single value is already spoken for: it is the output
-            // concat the continuation hash consumes. Refuse at compile time
-            // rather than emit the unspendable script this used to produce.
+
+    if branch_has_outputs {
+        if let Some(reason) = branch_output_rejection_reason(
+            &then_ctx,
+            &else_ctx,
+            &then_output_bytes,
+            &else_output_bytes,
+            &merged_locals,
+            reads_after,
+        ) {
             panic!(
-                "Cannot compile conditional that both declares outputs and merges {} \
-                 local variables ({}). Move the addOutput/addRawOutput/addDataOutput \
-                 call after the if-statement, or give each branch its own complete \
-                 addOutput.",
-                merged_locals.len(),
-                merged_locals.join(", ")
+                "Cannot compile conditional that both declares outputs and {}. \
+                 Move the addOutput/addRawOutput/addDataOutput call after the \
+                 if-statement.",
+                reason
             );
         }
+    }
+
+    if merged_locals.len() >= 2 {
         append_merged_local_results(&mut then_ctx, &merged_locals);
         ctx.sync_counter(&then_ctx);
         append_merged_local_results(&mut else_ctx, &merged_locals);
@@ -1281,12 +1505,129 @@ fn append_branch_output_concat(branch_ctx: &mut LoweringContext) -> String {
     accumulated
 }
 
+/// Why an `if` whose arms declare outputs cannot be represented — or `None`
+/// when it can. The result is the reason clause the diagnostic embeds.
+///
+/// An `if` expression carries exactly ONE value, and when an arm emits an output
+/// that value is already spoken for: it is the output bytes the continuation
+/// hash consumes (`append_branch_output_concat`). Anything ELSE the arm leaves
+/// behind breaks one of two invariants that nothing downstream enforces:
+///
+///   - INV-A: the parent registers the if-expression's value as the branch's
+///     contribution to the continuation hash, so "the branch's output bytes"
+///     really means "whatever the arm's LAST binding is". A binding that lands
+///     after the output — a rebound local, a property write — silently replaces
+///     the serialized output with an unrelated value, and the residue drain then
+///     physically drops the real output because it is no longer on top.
+///   - INV-B: an arm that emits an output AND leaves any other slot the parent
+///     can still name — a property write anywhere in the arm, or a rebound local
+///     that is still read after the `if` — leaves 2+ results against the ONE
+///     stackMap name the stack lowerer registers, desyncing the parent stack by
+///     a slot from there on. The residue drain cannot save it: it filters BY
+///     NAME and those names are all pre-`if` names.
+///
+/// Neither is visible off-chain, so both shipped as permanently unspendable
+/// locking scripts. Refuse at compile time rather than emit one. See
+/// packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+/// for the real-Script-VM proof of each shape.
+///
+/// The clauses are checked in a fixed order so all seven tiers report the same
+/// reason for a source that trips more than one.
+fn branch_output_rejection_reason(
+    then_ctx: &LoweringContext,
+    else_ctx: &LoweringContext,
+    then_output_bytes: &str,
+    else_output_bytes: &str,
+    merged_locals: &[String],
+    reads_after: &HashSet<String>,
+) -> Option<String> {
+    // 1. Two or more merged locals: normalising them would need a multi-result
+    //    `if` node, and the arms' single value is already the output concat.
+    if merged_locals.len() >= 2 {
+        return Some(format!(
+            "merges {} local variables ({})",
+            merged_locals.len(),
+            merged_locals.join(", ")
+        ));
+    }
+
+    // 2. INV-A: the arm's terminal binding must BE its output bytes.
+    let arms: [(&str, &LoweringContext, &str); 2] = [
+        ("then", then_ctx, then_output_bytes),
+        ("else", else_ctx, else_output_bytes),
+    ];
+    for (label, branch_ctx, output_bytes) in arms.iter() {
+        match branch_ctx.bindings.last() {
+            Some(last) if last.name == *output_bytes => {}
+            _ => {
+                return Some(format!(
+                    "continues past its output in the {}-branch",
+                    label
+                ))
+            }
+        }
+    }
+
+    // 3. INV-B: a property write leaves a slot the parent can still name,
+    //    wherever in the arm it sits.
+    let mut written_props: Vec<String> = Vec::new();
+    for (_, branch_ctx, _) in arms.iter() {
+        collect_updated_props(&branch_ctx.bindings, &mut written_props);
+    }
+    if !written_props.is_empty() {
+        return Some(format!(
+            "assigns contract properties ({}) inside the branch",
+            written_props.join(", ")
+        ));
+    }
+
+    // 4. INV-B: a rebound local that survives the `if` is protected from being
+    //    rolled away, so the arm ends one slot deeper than lowerIf accounts for.
+    let live_merged: Vec<String> = merged_locals
+        .iter()
+        .filter(|name| reads_after.contains(*name))
+        .cloned()
+        .collect();
+    if !live_merged.is_empty() {
+        return Some(format!(
+            "reassigns local variables read after it ({})",
+            live_merged.join(", ")
+        ));
+    }
+
+    None
+}
+
+/// Append every property name an ANF binding list assigns, including the ones
+/// nested inside an `if` arm or a `loop` body — a nested write is just as much a
+/// named slot the enclosing arm leaves behind.
+fn collect_updated_props(bindings: &[ANFBinding], out: &mut Vec<String>) {
+    for binding in bindings {
+        match &binding.value {
+            ANFValue::UpdateProp { name, .. } => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            ANFValue::If {
+                then, else_branch, ..
+            } => {
+                collect_updated_props(then, out);
+                collect_updated_props(else_branch, out);
+            }
+            ANFValue::Loop { body, .. } => collect_updated_props(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn lower_for_statement(
     init: &Statement,
     condition: &Expression,
     update: &Statement,
     body: &[Statement],
     ctx: &mut LoweringContext,
+    reads_after: &HashSet<String>,
 ) {
     // Resolve the loop's compile-time shape: start value, step direction, and
     // iteration count. Rúnar requires bounded loops, so all three must be
@@ -1300,9 +1641,15 @@ fn lower_for_statement(
         "_i".to_string()
     };
 
-    // Lower body into sub-context
+    // Lower body into sub-context. The body repeats, so every read anywhere in
+    // it is a read that happens after any given statement inside it.
+    let mut body_reads = reads_after.clone();
+    for s in body {
+        collect_statement_reads(s, &mut body_reads);
+    }
+
     let mut body_ctx = ctx.sub_context();
-    lower_statements(body, &mut body_ctx);
+    lower_statements_with_reads(body, &mut body_ctx, &body_reads);
     ctx.sync_counter(&body_ctx);
 
     ctx.emit(ANFValue::Loop {

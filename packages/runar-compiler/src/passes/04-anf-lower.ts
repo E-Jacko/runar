@@ -78,10 +78,52 @@ function lowerProperties(contract: ContractNode): ANFProperty[] {
     // Extract literal value from property initializer
     if (prop.initializer) {
       anfProp.initialValue = extractLiteralValue(prop.initializer);
+      checkStateBigintMagnitude(anfProp);
     }
 
     return anfProp;
   });
+}
+
+/**
+ * Magnitude bits a bigint state field gets: `num2bin-le8` is a fixed 8-byte
+ * little-endian SIGN-MAGNITUDE word, so bytes 0..6 plus the low 7 bits of byte
+ * 7 carry the magnitude and 0x80 of byte 7 carries the sign.
+ */
+const STATE_BIGINT_MAGNITUDE_LIMIT = 1n << 63n;
+
+/**
+ * Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+ *
+ * The state section writes every bigint field with OP_NUM2BIN 8, which cannot
+ * represent a magnitude of 2^63 or more. Nothing used to check: the compiler
+ * stamped `encoding: "num2bin-le8"` on the field and carried the initializer
+ * verbatim, the SDK wrote the low 8 bytes of it into the deployed state
+ * section, and the covenant then rebuilt the continuation with its own
+ * OP_NUM2BIN 8 — which produces different bytes — so hash256(outputs) never
+ * matched and the UTXO was permanently unspendable. It deployed cleanly, with
+ * no diagnostic at compile time or deploy time.
+ *
+ * This catches the statically-known half. Values that only exist at call time
+ * are stopped by the SDK serializer (`encodeNum2Bin`, runar-sdk/src/state.ts).
+ *
+ * READONLY properties are deliberately exempt: they are baked into the locking
+ * script as script-number pushes, never into the state section, and BSV script
+ * numbers are arbitrary-precision after Genesis.
+ */
+function checkStateBigintMagnitude(prop: ANFProperty): void {
+  if (prop.readonly) return;
+  if (prop.type !== 'bigint' && prop.type !== 'int') return;
+  const v = prop.initialValue;
+  if (typeof v !== 'bigint') return;
+  if (v < STATE_BIGINT_MAGNITUDE_LIMIT && v > -STATE_BIGINT_MAGNITUDE_LIMIT) return;
+
+  throw new Error(
+    `Cannot compile state property '${prop.name}' initialised to ${v}: it does ` +
+    `not fit the fixed 8-byte sign-magnitude state word (magnitude must be ` +
+    `< 2^63). Reduce the value, or make the property readonly if it is a ` +
+    `constant rather than state.`,
+  );
 }
 
 /** Extract a literal value from an Expression for ANFProperty.initialValue. */
@@ -728,7 +770,14 @@ class LoweringContext {
 // Statement lowering
 // ---------------------------------------------------------------------------
 
-function lowerStatements(stmts: Statement[], ctx: LoweringContext): void {
+/** Shared empty read-set, so the common call sites allocate nothing. */
+const NO_READS: ReadonlySet<string> = new Set<string>();
+
+function lowerStatements(
+  stmts: Statement[],
+  ctx: LoweringContext,
+  readsAfterBlock: ReadonlySet<string> = NO_READS,
+): void {
   for (let i = 0; i < stmts.length; i++) {
     const stmt = stmts[i]!;
 
@@ -749,11 +798,120 @@ function lowerStatements(stmts: Statement[], ctx: LoweringContext): void {
         ...stmt,
         else: remaining,
       };
-      lowerStatement(modifiedIf, ctx);
+      lowerStatement(modifiedIf, ctx, readsAfterBlock);
       return; // remaining stmts are now inside the else branch
     }
 
-    lowerStatement(stmt, ctx);
+    // Only the block-forming statements need to know what the code after them
+    // still reads; computing it for every statement would be quadratic for no
+    // benefit.
+    const readsAfter =
+      stmt.kind === 'if_statement' || stmt.kind === 'for_statement'
+        ? readsAfterStatement(stmts, i, readsAfterBlock)
+        : NO_READS;
+    lowerStatement(stmt, ctx, readsAfter);
+  }
+}
+
+/**
+ * The identifiers still readable once statement `index` of this block has run:
+ * everything the following statements in this block read, plus whatever the
+ * enclosing blocks read after this block.
+ *
+ * Used by `lowerIfStatement` to tell a branch-merged local that is dead after
+ * the `if` (safe) from one that is still live (not representable alongside a
+ * branch output — see `branchOutputRejectionReason`).
+ */
+function readsAfterStatement(
+  stmts: Statement[],
+  index: number,
+  readsAfterBlock: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const reads = new Set(readsAfterBlock);
+  for (let j = index + 1; j < stmts.length; j++) {
+    collectStatementReads(stmts[j]!, reads);
+  }
+  return reads;
+}
+
+/**
+ * Collect every identifier a statement READS. The `x` in `x = expr` is a write,
+ * not a read, so a plain identifier assignment target is skipped; every other
+ * target form (index access, member access) can still read locals.
+ */
+function collectStatementReads(stmt: Statement, out: Set<string>): void {
+  switch (stmt.kind) {
+    case 'variable_decl':
+      collectExpressionReads(stmt.init, out);
+      break;
+
+    case 'assignment':
+      if (stmt.target.kind !== 'identifier') collectExpressionReads(stmt.target, out);
+      collectExpressionReads(stmt.value, out);
+      break;
+
+    case 'if_statement':
+      collectExpressionReads(stmt.condition, out);
+      for (const s of stmt.then) collectStatementReads(s, out);
+      if (stmt.else) for (const s of stmt.else) collectStatementReads(s, out);
+      break;
+
+    case 'for_statement':
+      collectExpressionReads(stmt.init.init, out);
+      collectExpressionReads(stmt.condition, out);
+      collectStatementReads(stmt.update, out);
+      for (const s of stmt.body) collectStatementReads(s, out);
+      break;
+
+    case 'return_statement':
+      if (stmt.value) collectExpressionReads(stmt.value, out);
+      break;
+
+    case 'expression_statement':
+      collectExpressionReads(stmt.expression, out);
+      break;
+  }
+}
+
+/** Collect every identifier an expression reads. */
+function collectExpressionReads(expr: Expression, out: Set<string>): void {
+  switch (expr.kind) {
+    case 'identifier':
+      out.add(expr.name);
+      break;
+    case 'binary_expr':
+      collectExpressionReads(expr.left, out);
+      collectExpressionReads(expr.right, out);
+      break;
+    case 'unary_expr':
+      collectExpressionReads(expr.operand, out);
+      break;
+    case 'call_expr':
+      collectExpressionReads(expr.callee, out);
+      for (const a of expr.args) collectExpressionReads(a, out);
+      break;
+    case 'member_expr':
+      collectExpressionReads(expr.object, out);
+      break;
+    case 'ternary_expr':
+      collectExpressionReads(expr.condition, out);
+      collectExpressionReads(expr.consequent, out);
+      collectExpressionReads(expr.alternate, out);
+      break;
+    case 'index_access':
+      collectExpressionReads(expr.object, out);
+      collectExpressionReads(expr.index, out);
+      break;
+    case 'increment_expr':
+    case 'decrement_expr':
+      collectExpressionReads(expr.operand, out);
+      break;
+    case 'array_literal':
+      for (const e of expr.elements) collectExpressionReads(e, out);
+      break;
+    default:
+      // Literals and `this.x` property access read no locals.
+      break;
   }
 }
 
@@ -770,7 +928,11 @@ function branchEndsWithReturn(stmts: Statement[]): boolean {
   return false;
 }
 
-function lowerStatement(stmt: Statement, ctx: LoweringContext): void {
+function lowerStatement(
+  stmt: Statement,
+  ctx: LoweringContext,
+  readsAfter: ReadonlySet<string> = NO_READS,
+): void {
   // Propagate source location to emitted ANF bindings
   ctx.currentSourceLoc = stmt.sourceLocation;
 
@@ -784,11 +946,11 @@ function lowerStatement(stmt: Statement, ctx: LoweringContext): void {
       break;
 
     case 'if_statement':
-      lowerIfStatement(stmt, ctx);
+      lowerIfStatement(stmt, ctx, readsAfter);
       break;
 
     case 'for_statement':
-      lowerForStatement(stmt, ctx);
+      lowerForStatement(stmt, ctx, readsAfter);
       break;
 
     case 'expression_statement':
@@ -846,18 +1008,19 @@ function lowerAssignment(
 function lowerIfStatement(
   stmt: Extract<Statement, { kind: 'if_statement' }>,
   ctx: LoweringContext,
+  readsAfter: ReadonlySet<string> = NO_READS,
 ): void {
   const condRef = lowerExprToRef(stmt.condition, ctx);
 
   // Lower then-block into sub-context
   const thenCtx = ctx.subContext();
-  lowerStatements(stmt.then, thenCtx);
+  lowerStatements(stmt.then, thenCtx, readsAfter);
   ctx.syncCounter(thenCtx);
 
   // Lower else-block into sub-context
   const elseCtx = ctx.subContext();
   if (stmt.else) {
-    lowerStatements(stmt.else, elseCtx);
+    lowerStatements(stmt.else, elseCtx, readsAfter);
   }
   ctx.syncCounter(elseCtx);
 
@@ -884,9 +1047,11 @@ function lowerIfStatement(
     thenOutputRefs.length > 0 || elseOutputRefs.length > 0
     || thenDataRefs.length > 0 || elseDataRefs.length > 0;
 
+  let thenOutputBytes = '';
+  let elseOutputBytes = '';
   if (branchHasOutputs) {
-    appendBranchOutputConcat(thenCtx);
-    appendBranchOutputConcat(elseCtx);
+    thenOutputBytes = appendBranchOutputConcat(thenCtx);
+    elseOutputBytes = appendBranchOutputConcat(elseCtx);
   }
 
   // Branch-merged locals (2 or more). An `if` expression carries exactly ONE
@@ -909,19 +1074,21 @@ function lowerIfStatement(
   // results, which `lowerIf`'s N>=2 reconcile adopts by name — so a reference
   // after the `if` resolves to the merged value whichever branch ran.
   const mergedLocals = collectBranchMergedLocals(thenCtx, elseCtx, ctx);
-  if (mergedLocals.length >= 2) {
-    if (branchHasOutputs) {
-      // The arms' single value is already spoken for: it is the output concat
-      // the continuation hash consumes. Normalising merged locals on top of
-      // that would need a multi-result `if` node. Refuse at compile time
-      // rather than emit the unspendable script this used to produce.
+
+  if (branchHasOutputs) {
+    const reason = branchOutputRejectionReason(
+      thenCtx, elseCtx, thenOutputBytes, elseOutputBytes, mergedLocals, readsAfter,
+    );
+    if (reason !== null) {
       throw new Error(
-        `Cannot compile conditional that both declares outputs and merges ` +
-        `${mergedLocals.length} local variables (${mergedLocals.join(', ')}). ` +
+        `Cannot compile conditional that both declares outputs and ${reason}. ` +
         `Move the addOutput/addRawOutput/addDataOutput call after the ` +
-        `if-statement, or give each branch its own complete addOutput.`,
+        `if-statement.`,
       );
     }
+  }
+
+  if (mergedLocals.length >= 2) {
     appendMergedLocalResults(thenCtx, mergedLocals);
     ctx.syncCounter(thenCtx);
     appendMergedLocalResults(elseCtx, mergedLocals);
@@ -1048,6 +1215,110 @@ function collectBranchMergedLocals(
 }
 
 /**
+ * Why an `if` whose arms declare outputs cannot be represented — or `null` when
+ * it can. Returns the reason clause the diagnostic embeds.
+ *
+ * An `if` expression carries exactly ONE value, and when an arm emits an output
+ * that value is already spoken for: it is the output bytes the continuation
+ * hash consumes (`appendBranchOutputConcat`). Anything ELSE the arm leaves
+ * behind breaks one of two invariants that nothing downstream enforces:
+ *
+ *   INV-A  the parent registers the if-expression's value as the branch's
+ *          contribution to the continuation hash, so "the branch's output
+ *          bytes" really means "whatever the arm's LAST binding is". A binding
+ *          that lands after the output — a rebound local, a property write —
+ *          silently replaces the serialized output with an unrelated value,
+ *          and `drainBranchPrivateResidue` then physically drops the real
+ *          output because it is no longer on top.
+ *   INV-B  an arm that emits an output AND leaves any other slot the parent
+ *          can still name — a property write anywhere in the arm, or a rebound
+ *          local that is still read after the `if` — leaves 2+ results against
+ *          the ONE stackMap name `lowerIf` registers, desyncing the parent
+ *          stack by a slot from there on. `drainBranchPrivateResidue` cannot
+ *          save it: it filters BY NAME and those names are all pre-`if` names.
+ *
+ * Neither is visible off-chain — the ANF interpreter copies branch bindings
+ * back into the parent env and skips the auto-injected continuation assert
+ * outright — so both shipped as permanently unspendable locking scripts.
+ * Refuse at compile time rather than emit one. See
+ * packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+ * for the real-Script-VM proof of each shape.
+ *
+ * The clauses are checked in a fixed order so all seven tiers report the same
+ * reason for a source that trips more than one.
+ */
+function branchOutputRejectionReason(
+  thenCtx: LoweringContext,
+  elseCtx: LoweringContext,
+  thenOutputBytes: string,
+  elseOutputBytes: string,
+  mergedLocals: string[],
+  readsAfter: ReadonlySet<string>,
+): string | null {
+  // 1. Two or more merged locals: normalising them would need a multi-result
+  //    `if` node, and the arms' single value is already the output concat.
+  if (mergedLocals.length >= 2) {
+    return `merges ${mergedLocals.length} local variables (${mergedLocals.join(', ')})`;
+  }
+
+  // 2. INV-A: the arm's terminal binding must BE its output bytes.
+  const arms: Array<[string, LoweringContext, string]> = [
+    ['then', thenCtx, thenOutputBytes],
+    ['else', elseCtx, elseOutputBytes],
+  ];
+  for (const [label, branchCtx, outputBytes] of arms) {
+    const last = branchCtx.bindings[branchCtx.bindings.length - 1];
+    if (!last || last.name !== outputBytes) {
+      return `continues past its output in the ${label}-branch`;
+    }
+  }
+
+  // 3. INV-B: a property write leaves a slot the parent can still name,
+  //    wherever in the arm it sits.
+  const writtenProps = new Set<string>();
+  for (const [, branchCtx] of arms) {
+    collectUpdatedProps(branchCtx.bindings, writtenProps);
+  }
+  if (writtenProps.size > 0) {
+    return `assigns contract properties (${[...writtenProps].join(', ')}) inside the branch`;
+  }
+
+  // 4. INV-B: a rebound local that survives the `if` is protected from being
+  //    rolled away, so the arm ends one slot deeper than lowerIf accounts for.
+  const liveMerged = mergedLocals.filter((name) => readsAfter.has(name));
+  if (liveMerged.length > 0) {
+    return `reassigns local variables read after it (${liveMerged.join(', ')})`;
+  }
+
+  return null;
+}
+
+/**
+ * Every property name an ANF binding list assigns, including the ones nested
+ * inside an `if` arm or a `loop` body — a nested write is just as much a named
+ * slot the enclosing arm leaves behind.
+ */
+function collectUpdatedProps(bindings: ANFBinding[], out: Set<string>): void {
+  for (const binding of bindings) {
+    const value = binding.value;
+    switch (value.kind) {
+      case 'update_prop':
+        out.add(value.name);
+        break;
+      case 'if':
+        collectUpdatedProps(value.then, out);
+        collectUpdatedProps(value.else, out);
+        break;
+      case 'loop':
+        collectUpdatedProps(value.body, out);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+/**
  * Concatenate a branch's collected output refs (state then data, in
  * declaration order) into a single bytes-ref appended to the
  * branch's bindings. If the branch has no outputs, emits an empty
@@ -1078,15 +1349,20 @@ function appendBranchOutputConcat(branchCtx: LoweringContext): string {
 function lowerForStatement(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
   ctx: LoweringContext,
+  readsAfter: ReadonlySet<string> = NO_READS,
 ): void {
   // Resolve the loop's compile-time shape: start value, step direction, and
   // iteration count. Rúnar requires bounded loops, so all three must be
   // statically determinable (issue #121).
   const { start, step, count } = extractLoopShape(stmt);
 
-  // Lower body into sub-context
+  // Lower body into sub-context. The body repeats, so every read anywhere in
+  // it is a read that happens after any given statement inside it.
+  const bodyReads = new Set(readsAfter);
+  for (const s of stmt.body) collectStatementReads(s, bodyReads);
+
   const bodyCtx = ctx.subContext();
-  lowerStatements(stmt.body, bodyCtx);
+  lowerStatements(stmt.body, bodyCtx, bodyReads);
   ctx.syncCounter(bodyCtx);
 
   ctx.emit({

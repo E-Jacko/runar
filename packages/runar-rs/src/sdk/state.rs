@@ -41,12 +41,17 @@ pub fn serialize_state(
                 let leaf_type = innermost_element_type(&field.field_type, &fa.element_type);
                 let flat = flatten_nested(value, &dims);
                 // Each leaf is encoded with the innermost element type.
-                for leaf in &flat {
-                    hex.push_str(&encode_state_value(leaf, &leaf_type));
+                for (i, leaf) in flat.iter().enumerate() {
+                    let label = fa
+                        .synthetic_names
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or(&field.name);
+                    hex.push_str(&encode_state_value(leaf, &leaf_type, label));
                 }
                 continue;
             }
-            hex.push_str(&encode_state_value(value, &field.field_type));
+            hex.push_str(&encode_state_value(value, &field.field_type, &field.name));
         }
     }
     hex
@@ -381,25 +386,13 @@ pub fn find_last_op_return(script_hex: &str) -> Option<usize> {
 
 /// Encode a state field as raw bytes (no push opcode wrapper) matching the
 /// compiler's OP_NUM2BIN-based fixed-width serialization.
-fn encode_state_value(value: &SdkValue, field_type: &str) -> String {
+fn encode_state_value(value: &SdkValue, field_type: &str, label: &str) -> String {
     match field_type {
         "int" | "bigint" => {
             // Defensively handle SdkValue::Bytes containing a BigInt string
             // (e.g. "0n", "1000n") that may have slipped through from JSON
             // artifacts loaded without a BigInt reviver.
-            let n = match value {
-                SdkValue::Int(i) => *i,
-                SdkValue::BigInt(bi) => {
-                    // Convert BigInt to i64 for NUM2BIN encoding (state fields
-                    // are always 8 bytes, so values must fit in i64 range).
-                    bi.to_string().parse::<i64>().unwrap_or(0)
-                }
-                SdkValue::Bytes(s) => {
-                    let num_str = if s.ends_with('n') { &s[..s.len() - 1] } else { s.as_str() };
-                    num_str.parse::<i64>().unwrap_or(0)
-                }
-                _ => value.as_int(),
-            };
+            let n = state_field_i64(value, label, 8);
             encode_num2bin(n, 8)
         }
         "bool" => {
@@ -424,6 +417,80 @@ fn encode_state_value(value: &SdkValue, field_type: &str) -> String {
             }
         }
     }
+}
+
+/// Coerce a bigint state value to `i64` for OP_NUM2BIN encoding, PANICKING if
+/// its magnitude does not fit the fixed `width`-byte sign-magnitude state word.
+///
+/// The check has to run HERE, not inside `encode_num2bin`: the old
+/// `bi.to_string().parse::<i64>().unwrap_or(0)` narrowing destroyed an
+/// oversized value before any encoder could see it, writing a plausible ZERO
+/// with no signal at all.
+///
+/// `width` bytes of sign-magnitude hold `8*width - 1` magnitude bits — the top
+/// bit of the last byte is the sign. `encode_num2bin` writes the low `width`
+/// bytes, drops everything above, then ORs the sign bit in on top of whatever
+/// landed there, so an oversized value serialises to a plausible but WRONG
+/// word:
+///
+/// ```text
+/// 2^63      -> 0000000000000080   reads back as 0   (negative zero)
+/// 2^63 + 5  -> 0500000000000080   reads back as -5  (sign flip)
+/// 2^64      -> 0000000000000000   reads back as 0
+/// ```
+///
+/// The deploy then succeeded and the UTXO was unspendable: the covenant
+/// rebuilds the continuation with the compiler's own OP_NUM2BIN `width`, which
+/// cannot produce those bytes from that number, so `hash256(outputs)` never
+/// matches. `±(2^(8*width-1) - 1)` stays representable and is unaffected.
+///
+/// Panics rather than returning a `Result` so `serialize_state` keeps its
+/// signature; this is the same "the value cannot be represented, so every
+/// result would be wrong" contract as `SdkValue::as_int` and the `i64 overflow`
+/// panics in `prelude.rs`.
+fn state_field_i64(value: &SdkValue, label: &str, width: usize) -> i64 {
+    use num_bigint::BigInt;
+
+    // Resolve the value at ARBITRARY precision first — narrowing is what used
+    // to destroy it.
+    let wide: Option<BigInt> = match value {
+        SdkValue::Int(i) => Some(BigInt::from(*i)),
+        SdkValue::BigInt(bi) => Some(bi.clone()),
+        // Defensively handle SdkValue::Bytes containing a BigInt string
+        // (e.g. "0n", "1000n") that may have slipped through from JSON
+        // artifacts loaded without a BigInt reviver.
+        SdkValue::Bytes(s) => {
+            let num_str = if s.ends_with('n') { &s[..s.len() - 1] } else { s.as_str() };
+            num_str.parse::<BigInt>().ok()
+        }
+        _ => Some(BigInt::from(value.as_int())),
+    };
+
+    // A non-numeric byte string keeps the historical lenient behaviour (0).
+    let n = match wide {
+        Some(n) => n,
+        None => return 0,
+    };
+
+    let limit = BigInt::from(1) << (8 * width - 1);
+    let neg_limit = -limit.clone();
+    if n >= limit || n <= neg_limit {
+        panic!(
+            "serialize_state: bigint state field \"{}\" = {} does not fit the fixed {}-byte \
+             sign-magnitude state word (magnitude must be < 2^{}). Serializing it would write a \
+             different number into the state section than the contract's on-chain OP_NUM2BIN {} \
+             rebuilds, leaving the output unspendable",
+            label,
+            n,
+            width,
+            8 * width - 1,
+            width
+        );
+    }
+
+    n.to_string()
+        .parse::<i64>()
+        .expect("state_field_i64: range-checked value must fit i64")
 }
 
 /// Encode an integer as a fixed-width LE sign-magnitude byte string,
@@ -1233,5 +1300,185 @@ mod tests {
         let values_int = make_values(&[("count", SdkValue::Int(1000))]);
         let hex_int = serialize_state(&fields, &values_int);
         assert_eq!(hex_str, hex_int);
+    }
+}
+
+/// A bigint state value whose MAGNITUDE does not fit the fixed 8-byte
+/// little-endian sign-magnitude word must be REFUSED, not silently truncated.
+///
+/// `num2bin-le8` gives a bigint state field exactly 63 bits of magnitude
+/// (bytes 0..6 plus the low 7 bits of byte 7) and one sign bit (0x80 of byte
+/// 7). Measured in the TS reference before the guard:
+///
+/// ```text
+/// value       bytes written       reads back as
+/// 2^63        0000000000000080    0    (negative zero)
+/// 2^63 + 5    0500000000000080    -5   (SIGN FLIP)
+/// 2^64        0000000000000000    0
+/// ```
+///
+/// The Rust tier corrupted EARLIER and even more quietly: `encode_state_value`
+/// narrowed the value with `.parse::<i64>().unwrap_or(0)`, so an oversized
+/// `SdkValue::BigInt` wrote a plausible ZERO with no signal at all. The guard
+/// therefore lives where the wide value still exists, not in `encode_num2bin`.
+///
+/// Expected bytes below are derived BY HAND from the sign-magnitude rule,
+/// never read off the serializer.
+#[cfg(test)]
+mod state_range_guard_tests {
+    use super::*;
+    use num_bigint::BigInt;
+
+    fn count_field() -> Vec<StateField> {
+        vec![StateField {
+            name: "count".to_string(),
+            field_type: "bigint".to_string(),
+            index: 0,
+            initial_value: None,
+            fixed_array: None,
+        }]
+    }
+
+    fn one_value(v: SdkValue) -> HashMap<String, SdkValue> {
+        let mut m = HashMap::new();
+        m.insert("count".to_string(), v);
+        m
+    }
+
+    fn big(decimal: &str) -> SdkValue {
+        SdkValue::BigInt(decimal.parse::<BigInt>().unwrap())
+    }
+
+    fn encode(v: SdkValue) -> String {
+        serialize_state(&count_field(), &one_value(v))
+    }
+
+    // -----------------------------------------------------------------
+    // Rejecting
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_two_pow_63() {
+        encode(big("9223372036854775808"));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_negative_two_pow_63_bigint() {
+        encode(big("-9223372036854775808"));
+    }
+
+    /// -2^63 IS a valid i64, but its MAGNITUDE is 2^63 — one past the 63
+    /// magnitude bits — and it encoded as negative zero (0000000000000080).
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_i64_min() {
+        encode(SdkValue::Int(i64::MIN));
+    }
+
+    /// The sign-flip case: used to write 0500000000000080, which reads back
+    /// as -5 — a positive balance deserialising as a debt.
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_two_pow_63_plus_5() {
+        encode(big("9223372036854775813"));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_two_pow_64() {
+        encode(big("18446744073709551616"));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_two_pow_70() {
+        encode(big("1180591620717411303424"));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_negative_two_pow_70() {
+        encode(big("-1180591620717411303424"));
+    }
+
+    /// The unrevived-JSON path: `SdkValue::Bytes("...n")` used to
+    /// `.parse::<i64>().unwrap_or(0)` and write a silent zero.
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_out_of_range_bigint_string() {
+        encode(SdkValue::Bytes("9223372036854775808n".to_string()));
+    }
+
+    #[test]
+    fn names_the_field_and_the_value_it_refused() {
+        let err = std::panic::catch_unwind(|| encode(big("9223372036854775808"))).unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
+        assert!(msg.contains("count"), "message must name the field: {}", msg);
+        assert!(
+            msg.contains("9223372036854775808"),
+            "message must quote the value: {}",
+            msg
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn rejects_out_of_range_fixed_array_element() {
+        let fields = vec![StateField {
+            name: "slots".to_string(),
+            field_type: "FixedArray<bigint, 2>".to_string(),
+            index: 0,
+            initial_value: None,
+            fixed_array: Some(crate::sdk::types::FixedArrayInfo {
+                element_type: "bigint".to_string(),
+                length: 2,
+                synthetic_names: vec!["slots__0".to_string(), "slots__1".to_string()],
+            }),
+        }];
+        let mut values = HashMap::new();
+        values.insert(
+            "slots".to_string(),
+            SdkValue::Array(vec![SdkValue::Int(1), big("9223372036854775808")]),
+        );
+        serialize_state(&fields, &values);
+    }
+
+    // -----------------------------------------------------------------
+    // Accepting controls — byte-exact, and they must stay byte-exact
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn accepts_max_magnitude_byte_exact() {
+        // magnitude bytes 0..6 all 0xff, byte 7 = 0x7f (seven magnitude bits
+        // set, sign bit clear).
+        assert_eq!(encode(SdkValue::Int(i64::MAX)), "ffffffffffffff7f");
+        assert_eq!(encode(big("9223372036854775807")), "ffffffffffffff7f");
+        assert_eq!(
+            encode(SdkValue::Bytes("9223372036854775807n".to_string())),
+            "ffffffffffffff7f"
+        );
+        // same magnitude, sign bit set: 0x7f | 0x80 = 0xff.
+        assert_eq!(encode(SdkValue::Int(-i64::MAX)), "ffffffffffffffff");
+        assert_eq!(encode(big("-9223372036854775807")), "ffffffffffffffff");
+        assert_eq!(
+            encode(SdkValue::Bytes("-9223372036854775807n".to_string())),
+            "ffffffffffffffff"
+        );
+    }
+
+    #[test]
+    fn accepts_the_small_values_every_shipped_contract_uses() {
+        assert_eq!(encode(SdkValue::Int(0)), "0000000000000000");
+        assert_eq!(encode(SdkValue::Int(1)), "0100000000000000");
+        assert_eq!(encode(SdkValue::Int(-1)), "0100000000000080");
+        assert_eq!(encode(SdkValue::Int(127)), "7f00000000000000");
+        assert_eq!(encode(SdkValue::Int(-127)), "7f00000000000080");
+        assert_eq!(encode(SdkValue::Int(128)), "8000000000000000");
+        assert_eq!(encode(SdkValue::Int(-128)), "8000000000000080");
     }
 }

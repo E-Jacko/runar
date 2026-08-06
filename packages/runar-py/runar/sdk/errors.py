@@ -37,6 +37,31 @@ def assert_script_hex_under_limit(
         raise ScriptSizeExceededError(limit=limit, actual=actual_bytes, context=context)
 
 
+class BroadcastRejected(Exception):
+    """Raised when :class:`~runar.sdk.provider.MockProvider` refuses to
+    acknowledge a broadcast (testing-gap remediation Phase A5).
+
+    Distinct typed exception so a test can assert the fund-safety gate fired,
+    rather than matching on a generic ``RuntimeError``.
+    """
+
+
+class BroadcastValidationUnavailable(Exception):
+    """Raised when :class:`~runar.sdk.provider.MockProvider` is asked to
+    validate a broadcast but the optional ``bsv-sdk`` dependency that provides
+    the script interpreter is not installed.
+
+    This is deliberately an ERROR, not a silent skip. Quietly degrading to
+    "validated nothing, returned a fake txid" is exactly the fail-open bug
+    class Phase A5 exists to close: it would let a test suite report green
+    while every transaction it built was unspendable.
+
+    ``runar`` itself stays zero-dependency at RUNTIME; ``bsv-sdk`` is a TEST
+    dependency (``pip install 'runar[dev]'`` or ``pip install bsv-sdk``) and CI
+    installs it for the ``packages/runar-py`` job.
+    """
+
+
 class WitnessValueMissingError(Exception):
     """Raised when a method call requires a caller-supplied intent-intrinsic
     witness value (auto-injected ``_prevOutScript_<i>`` or

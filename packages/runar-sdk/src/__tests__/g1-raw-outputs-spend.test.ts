@@ -28,6 +28,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, UnlockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -55,7 +56,7 @@ async function fundedSigner(provider: MockProvider, privKey: string, satoshis: n
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   return signer;
 }
@@ -102,7 +103,7 @@ describe('G1 (P1) — addRawOutput spend builds a covenant-valid tx in source or
   it('deploy + call(sendToScript) validates through Spend, outputs are [raw][state][change]', async () => {
     const artifact = compileSource(SRC, 'RawOutputTest.runar.ts');
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const deployer = await fundedSigner(provider, DEPLOYER_KEY, 500_000);
     const caller = await fundedSigner(provider, CALLER_KEY, 500_000);
 

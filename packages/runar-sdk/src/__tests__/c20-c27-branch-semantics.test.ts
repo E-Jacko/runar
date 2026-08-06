@@ -26,6 +26,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -49,7 +50,7 @@ async function setupWallet(provider: MockProvider, privKey: string, satoshis: nu
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   return { signer };
 }
@@ -108,9 +109,16 @@ describe('C20 — terminal assert(false) else must abort an unmatched selector',
     }
   `;
 
-  async function deploySelector() {
+  /**
+   * @param alwaysAck - Only for the out-of-range test below, which
+   *   deliberately calls a selector the fixed compiler now aborts on-chain
+   *   (dropped `assert(false)` regression). A validating provider refuses
+   *   that broadcast before `spendRejects` can inspect and prove the
+   *   rejection itself, so that one test opts out explicitly.
+   */
+  async function deploySelector(alwaysAck = false) {
     const artifact = compileSource(SRC, 'Selector.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet', alwaysAck ? { validateBroadcasts: false } : undefined);
     const { signer } = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [5n, 7n]);
     await contract.deploy(provider, signer, {});
@@ -137,7 +145,7 @@ describe('C20 — terminal assert(false) else must abort an unmatched selector',
   });
 
   it('out-of-range selector set(2,99) is REJECTED (no spendable no-op)', async () => {
-    const { contract, provider, signer, deployTx } = await deploySelector();
+    const { contract, provider, signer, deployTx } = await deploySelector(true);
     // The SDK's post-state interpreter is permissive (skips asserts), so it
     // still builds a continuation tx (a silent no-op keeping {5,7}). The real
     // script must reject it: the dropped assert(false) has to abort on-chain.
@@ -160,7 +168,7 @@ describe('C27 — else-present multi-field write must produce a spendable contin
 
   async function deployTwoField() {
     const artifact = compileSource(SRC, 'TwoField.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const { signer } = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [1n, 2n]);
     await contract.deploy(provider, signer, {});
@@ -200,7 +208,7 @@ describe('C27 control — empty-else multi-field write (issue #99 Bug 1) must no
 
   it('taken branch upd(0,100,200) still spends and encodes {a:100,b:200}', async () => {
     const artifact = compileSource(SRC, 'TwoFieldNoElse.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const { signer } = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [1n, 2n]);
     await contract.deploy(provider, signer, {});

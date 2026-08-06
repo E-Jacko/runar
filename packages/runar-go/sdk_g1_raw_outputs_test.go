@@ -58,7 +58,7 @@ func TestG1_AddRawOutputSpendIsCovenantValidInSourceOrder(t *testing.T) {
 		Txid:        strings.Repeat("aa", 32),
 		OutputIndex: 0,
 		Satoshis:    500000,
-		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+		Script:      BuildP2PKHScript(addr),
 	})
 
 	// Deploy with count = 0.

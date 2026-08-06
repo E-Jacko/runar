@@ -445,48 +445,46 @@ def _fold_value(value: ANFValue, env: ConstEnv) -> ANFValue:
         return value
 
     if kind == "if":
-        cond_const = env.get(value.cond)
-        if cond_const is not None and cond_const[0] == "bool":
-            cond_val: bool = cond_const[1]
-            if cond_val:
-                then_env = dict(env)
-                folded_then = _fold_bindings(value.then or [], then_env)
-                # Merge constants from taken branch back into env
-                for b in folded_then:
-                    cv = _anf_value_to_const(b.value)
-                    if cv is not None:
-                        env[b.name] = cv
-                return ANFValue(
-                    kind="if",
-                    cond=value.cond,
-                    then=folded_then,
-                    else_=[],
-                )
-            else:
-                else_env = dict(env)
-                folded_else = _fold_bindings(value.else_ or [], else_env)
-                for b in folded_else:
-                    cv = _anf_value_to_const(b.value)
-                    if cv is not None:
-                        env[b.name] = cv
-                return ANFValue(
-                    kind="if",
-                    cond=value.cond,
-                    then=[],
-                    else_=folded_else,
-                )
-        else:
-            # Condition not known -- fold both branches independently
-            then_env = dict(env)
-            else_env = dict(env)
-            folded_then = _fold_bindings(value.then or [], then_env)
-            folded_else = _fold_bindings(value.else_ or [], else_env)
-            return ANFValue(
-                kind="if",
-                cond=value.cond,
-                then=folded_then,
-                else_=folded_else,
-            )
+        # Fold both arms independently, ALWAYS -- including when the condition
+        # is a compile-time constant.
+        #
+        # This pass used to "optimise" a statically-known condition by blanking
+        # the untaken arm (else_=[]) while LEAVING the `if` node itself in
+        # place, and by propagating the taken arm's constants into the
+        # enclosing env.  Both halves were unsound:
+        #
+        #   * An arm is not a free-floating binding list -- it carries a
+        #     STACK-SHAPE CONTRACT that ANF lowering establishes and stack
+        #     lowering depends on.  For two or more branch-merged locals both
+        #     arms end with the identical __merge$<i> result block, which is
+        #     how lower_if learns K and adopts the K results by name.  Blanking
+        #     one arm makes the merged-result count 0, the N>=2 name-matched
+        #     reconcile cannot fire, and ONE stack slot is registered for K
+        #     physical results -- every post-branch operand then resolves one
+        #     or more slots off.  At K=2 that miscompiled SILENTLY: the
+        #     deployed script accepted spends the source rejects and rejected
+        #     spends the source accepts.  At K=1 it surfaced as "value not
+        #     found on stack", a compile-time rejection of source that compiles
+        #     with folding disabled.
+        #   * Propagating the taken arm's constants outward is only sound if
+        #     the other arm is really gone.  The `if` node survives this pass,
+        #     so both arms are still emitted and either can run.
+        #
+        # Correct dead-arm elimination would have to delete the `if` and splice
+        # the live arm into the parent, re-establishing the parent's shape.
+        # That is a lowering-level rewrite, not a fold, so it does not live
+        # here.  The bytes given up are the statically-dead arm's ops, which
+        # never execute.
+        then_env = dict(env)
+        else_env = dict(env)
+        folded_then = _fold_bindings(value.then or [], then_env)
+        folded_else = _fold_bindings(value.else_ or [], else_env)
+        return ANFValue(
+            kind="if",
+            cond=value.cond,
+            then=folded_then,
+            else_=folded_else,
+        )
 
     if kind == "loop":
         body_env = dict(env)

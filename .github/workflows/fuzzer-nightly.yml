@@ -612,6 +612,121 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # Testing-gap remediation Phase E3 (reviewer point #6 / design principle P8)
+  # — the SPEND-ORACLE fuzzer.
+  #
+  # Every other fuzz job in this workflow is HORIZONTAL: its oracle is tier
+  # agreement. Seven tiers that share one bug agree with each other perfectly
+  # and every one of those jobs stays green — which is exactly how the two
+  # 2026-08 fund-safety bugs shipped. This job's oracle is ABSOLUTE: it drives a
+  # real deploy + call transaction through the SDK, replays both broadcasts
+  # through the production @bsv/sdk Spend engine, and compares the post-spend
+  # state decoded from the BROADCAST TRANSACTION'S BYTES against the
+  # generator's OWN model (never against the SDK's next-state computation,
+  # which runs through the same ANF the covenant does and is therefore poisoned
+  # by the very bug class this hunts). See conformance/fuzzer/README.md.
+  #
+  # Tier-independent (in-process TS compiler + @bsv/sdk), so it needs none of
+  # the native toolchains the `fuzz` job builds.
+  #
+  #   - pull_request : FIXED seed 424242, 32 cases, metamorphic variants on.
+  #                    Deterministic, flake-free, ~1 min including setup.
+  #                    32 == REQUIRED_CASE_COUNT in conformance/fuzzer/spend-shapes.ts.
+  #                    Families are drawn ROUND-ROBIN, so `--num` below that count
+  #                    silently skips the tail — at --num 25 the seven loop-carried
+  #                    families (indices 25-31) never ran on PRs at all. Keep this
+  #                    number >= REQUIRED_CASE_COUNT whenever a family is added.
+  #   - otherwise    : rotating run_id-derived seed, 400 cases, budgeted. An
+  #                    early-stopped run that did not finish its corpus FAILS
+  #                    (C5) rather than reporting a partial pass.
+  # ---------------------------------------------------------------------------
+  spend-oracle:
+    name: Spend-oracle fuzz (real Spend + independent post-state pin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The harness imports runar-compiler / runar-sdk / runar-testing
+      # in-process, so the TS workspace must be installed + built; conformance
+      # is not a pnpm workspace member and installs its own deps.
+      - name: Restore turbo build outputs
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-dist-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', 'tsconfig.base.json', 'package.json') }}-
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      # PR merge gate: every argv value is a literal constant — no untrusted PR
+      # input reaches the shell.
+      - name: Spend-oracle (PR gate — fixed seed, metamorphic)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --spend-oracle \
+            --metamorphic \
+            --num 32 \
+            --seed 424242 \
+            --output /tmp/spend-oracle-pr.json
+
+      # Rotating-seed sweep. The seed is derived in a separate step and reaches
+      # the fuzzer through `env:` (never interpolated into the shell), matching
+      # the injection-safety rule the `fuzz` job documents.
+      - name: Resolve spend-oracle seed
+        if: github.event_name != 'pull_request'
+        id: spendparams
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          seed="$INPUT_SEED"
+          if [ -z "$seed" ]; then
+            seed=$(( RUN_ID % 2147483647 ))
+          fi
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+
+      - name: Spend-oracle (rotating seed, budgeted)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.spendparams.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --spend-oracle \
+            --metamorphic \
+            --num 400 \
+            --seed "$SEED" \
+            --time-budget-ms 900000 \
+            --output /tmp/spend-oracle-nightly.json
+
+      - name: Upload spend-oracle findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spend-oracle-findings-${{ github.run_id }}
+          path: |
+            conformance/fuzz-findings-spend/
+            /tmp/spend-oracle-pr.json
+            /tmp/spend-oracle-nightly.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   # TS-GAP-006 — mutation scoring of the safety net.
   #
   # Applies a curated corpus of representative compiler bugs

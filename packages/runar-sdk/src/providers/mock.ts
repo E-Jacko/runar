@@ -19,21 +19,62 @@ import { assertScriptHexUnderLimit } from '../errors.js';
  * that would create a `providers/mock.ts` <-> `contract.ts` dependency in
  * the wrong direction (providers are a leaf module). Keep both thin
  * wrappers in sync if `Spend`'s constructor shape ever changes.
+ *
+ * `otherInputs` below is the raw filtered `tx.inputs` slice, unlike
+ * `dryRunContractInput`'s per-entry stubbing — see the P2 comment there for
+ * why both are equivalent (only `sourceTXID`/`sourceOutputIndex`/`sequence`
+ * are read off each entry by BIP-143 sighash construction).
  */
+/** The outpoint key `validateBroadcastTx` looks an input up by: prefer the
+ * explicit `sourceTXID` @bsv/sdk permits on an input, and fall back to
+ * hashing the attached `sourceTransaction` (the shape `WalletProvider`'s EF
+ * assembly and issue #107's broadcaster-injection tests use) — an input that
+ * carries neither can never match a known outpoint. */
+function inputOutpointKey(input: Transaction['inputs'][number]): string {
+  const txid = input.sourceTXID ?? input.sourceTransaction?.id('hex');
+  return `${txid}:${input.sourceOutputIndex}`;
+}
+
 function validateBroadcastTx(
   tx: Transaction,
   knownOutpoints: ReadonlyMap<string, { script: string; satoshis: number }>,
-): { valid: boolean; error?: string } {
+  feeRate: number,
+  enforceFeeFloor: boolean,
+): { valid: boolean; error?: string; validated: number; skipped: number } {
+  // P2: @bsv/sdk's `Spend.isRelaxed()` returns true whenever
+  // `transactionVersion > 1`, which silently disables push-only,
+  // clean-stack, low-S, and minimal-number enforcement for the WHOLE spend
+  // (locking-script rules are unaffected, but unlocking-script maleability
+  // checks are not). Every builder in this SDK uses version 1 today, so C8
+  // validation here is strict — but nothing else guards that invariant, and
+  // a future version bump (e.g. for BIP-68 relative locktime) would
+  // silently downgrade every check this gate performs with no signal.
+  if (tx.version > 1) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `MockProvider: broadcasting a version ${tx.version} transaction — @bsv/sdk's Spend treats ` +
+        'transactionVersion > 1 as "relaxed" and skips push-only/clean-stack/low-S/minimal-number ' +
+        'checks (C8/P2). Validation for this broadcast is weaker than the version-1 default.',
+    );
+  }
+
   let allInputsKnown = true;
   let totalKnownIn = 0;
+  let validated = 0;
+  let skipped = 0;
+  let firstUnknownOutpoint: string | undefined;
 
   for (let i = 0; i < tx.inputs.length; i++) {
     const input = tx.inputs[i]!;
-    const known = knownOutpoints.get(`${input.sourceTXID}:${input.sourceOutputIndex}`);
+    const outpoint = inputOutpointKey(input);
+    const known = knownOutpoints.get(outpoint);
     if (!known) {
       allInputsKnown = false;
+      skipped++;
+      if (firstUnknownOutpoint === undefined) firstUnknownOutpoint = outpoint;
       continue;
     }
+    validated++;
     totalKnownIn += known.satoshis;
 
     const otherInputs = tx.inputs.filter((_, j) => j !== i);
@@ -51,25 +92,91 @@ function validateBroadcastTx(
         inputSequence: input.sequence ?? 0xffffffff,
         lockTime: tx.lockTime,
       });
+      // P2: @bsv/sdk's `Spend.validate()` never actually returns `false` —
+      // every failure path throws `ScriptEvaluationError` instead (see
+      // `scriptEvaluationError()` in its source), so this branch is dead;
+      // every rejection observed in practice exits through the `catch`
+      // below. Kept as defensive belt-and-braces in case a future @bsv/sdk
+      // version reverts to returning a boolean.
       if (!spend.validate()) {
-        return { valid: false, error: `input ${i}: script evaluated to false` };
+        return { valid: false, error: `input ${i}: script evaluated to false`, validated, skipped };
       }
     } catch (e) {
-      return { valid: false, error: `input ${i}: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
-
-  if (allInputsKnown) {
-    const totalOut = tx.outputs.reduce((sum, o) => sum + (o.satoshis ?? 0), 0);
-    if (totalOut > totalKnownIn) {
       return {
         valid: false,
-        error: `underfunded: outputs (${totalOut} sats) exceed known inputs (${totalKnownIn} sats)`,
+        error: `input ${i}: ${e instanceof Error ? e.message : String(e)}`,
+        validated,
+        skipped,
       };
     }
   }
 
-  return { valid: true };
+  // P1-1: a tx with inputs that validated NONE of them is not "passing
+  // validation" — it never ran a single `Spend`. Previously this fell
+  // through to `{ valid: true }` because the fee check below is also gated
+  // on `allInputsKnown`, so an entirely-unregistered-input broadcast was
+  // acked exactly like a genuinely-validated one. Fail closed instead and
+  // name the offending outpoint + how to register it.
+  if (tx.inputs.length > 0 && validated === 0) {
+    return {
+      valid: false,
+      error:
+        `no inputs could be validated: ${tx.inputs.length} input(s), all unknown ` +
+        `(e.g. ${firstUnknownOutpoint}) — register the funding UTXO via addUtxo() / ` +
+        'addContractUtxo() / addTransaction() before broadcasting',
+      validated,
+      skipped,
+    };
+  }
+
+  if (allInputsKnown) {
+    // P1-2: an output with no satoshis value set is a bug, not a free pass
+    // to spend nothing on it — `o.satoshis ?? 0` previously hid that.
+    // (Realistically this is a `{ change: true }` output whose amount
+    // `Transaction.fee()` was never called to compute.)
+    let totalOut = 0;
+    for (let i = 0; i < tx.outputs.length; i++) {
+      const o = tx.outputs[i]!;
+      if (o.satoshis === undefined) {
+        return {
+          valid: false,
+          error: `output ${i}: satoshis is undefined (call tx.fee() to compute a "change" output before broadcasting)`,
+          validated,
+          skipped,
+        };
+      }
+      totalOut += o.satoshis;
+    }
+
+    if (enforceFeeFloor) {
+      // P1-2: conservation alone (outputs <= inputs) lets a zero-fee or
+      // dust-fee tx through. Require the same fee model the SDK's own
+      // builders use (`estimateDeployFee` / `estimateCallFee`):
+      // ceil(txSize * feeRate / 1000).
+      const txSizeBytes = tx.toHex().length / 2;
+      const requiredFee = Math.ceil((txSizeBytes * feeRate) / 1000);
+      const actualFee = totalKnownIn - totalOut;
+      if (actualFee < requiredFee) {
+        return {
+          valid: false,
+          error:
+            `fee too low: paid ${actualFee} sats, required >= ${requiredFee} sats ` +
+            `(tx size ${txSizeBytes}B @ ${feeRate} sat/KB)`,
+          validated,
+          skipped,
+        };
+      }
+    } else if (totalOut > totalKnownIn) {
+      return {
+        valid: false,
+        error: `underfunded: outputs (${totalOut} sats) exceed known inputs (${totalKnownIn} sats)`,
+        validated,
+        skipped,
+      };
+    }
+  }
+
+  return { valid: true, validated, skipped };
 }
 
 /**
@@ -88,17 +195,51 @@ export class MockProvider implements Provider {
   private readonly network: 'mainnet' | 'testnet';
   private broadcastCount = 0;
   private feeRate = 100;
-  /** Deep-review C8 (part 2): opt-in broadcast validation, off by default. */
-  private validateBroadcasts = false;
+  /**
+   * Deep-review C8 (part 2) / testing-gap remediation Phase A1: broadcast
+   * validation is default-ON. Tests that genuinely need an always-ack
+   * provider must opt out explicitly (constructor `{ validateBroadcasts:
+   * false }`, `disableBroadcastValidation()`, or the allowlisted
+   * `newAlwaysAckMockProvider()` factory below) and are tracked by the
+   * machine-checked allowlist in `always-ack-allowlist.json`.
+   */
+  private validateBroadcasts = true;
+  /**
+   * Testing-gap remediation P1-2: when `validateBroadcasts` is on and every
+   * input is known, require the tx to pay at least the fee the SDK's own
+   * `estimateDeployFee`/`estimateCallFee` model would (`ceil(txSize *
+   * feeRate / 1000)`), not merely `outputs <= inputs`. Default-ON, distinct
+   * from `validateBroadcasts`: turning this off still runs the real `Spend`
+   * interpreter and the conservation check, it only stops requiring a
+   * real-world fee. For tests that intentionally underpay — use
+   * `disableFeeFloor()` / `{ enforceFeeFloor: false }`, named separately
+   * from the always-ack escape hatches so it isn't mistaken for one.
+   */
+  private enforceFeeFloor = true;
   /** outpoint ("txid:vout") -> { script, satoshis } for every UTXO this
    * provider has been told about (via addUtxo/addContractUtxo/addTransaction)
    * or has itself produced via a prior broadcast(). Used by
    * `validateBroadcastTx` to check script validity / fee sanity for the
    * inputs it actually knows the value+script of. */
   private readonly knownOutpoints: Map<string, { script: string; satoshis: number }> = new Map();
+  /** Cumulative counts of inputs actually run through `Spend.validate()`
+   * (`validated`) vs. skipped because their outpoint was never registered
+   * (`skipped`), across every `broadcast()` call made while validation was
+   * enabled. See `getValidationStats()` (P1-1). */
+  private validatedInputCount = 0;
+  private skippedInputCount = 0;
 
-  constructor(network: 'mainnet' | 'testnet' = 'testnet') {
+  constructor(
+    network: 'mainnet' | 'testnet' = 'testnet',
+    opts?: { validateBroadcasts?: boolean; enforceFeeFloor?: boolean },
+  ) {
     this.network = network;
+    if (opts?.validateBroadcasts !== undefined) {
+      this.validateBroadcasts = opts.validateBroadcasts;
+    }
+    if (opts?.enforceFeeFloor !== undefined) {
+      this.enforceFeeFloor = opts.enforceFeeFloor;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -129,17 +270,49 @@ export class MockProvider implements Provider {
   }
 
   /**
-   * Opt in to validating `broadcast()`ed transactions (deep-review C8 part
+   * Toggle validation of `broadcast()`ed transactions (deep-review C8 part
    * 2): checks script validity (via @bsv/sdk's `Spend`) for every input
    * whose UTXO this provider knows about, and — when ALL inputs are known —
    * rejects a tx whose outputs exceed its inputs. `broadcast()` throws
    * instead of returning a fake txid when validation fails.
    *
-   * Default is OFF (unchanged legacy always-ack behaviour) so existing
-   * tests that don't care about validity keep passing.
+   * Default is ON (testing-gap remediation Phase A1) — kept here for
+   * back-compat with call sites that explicitly re-enable validation (e.g.
+   * after constructing with `{ validateBroadcasts: false }`). Prefer the
+   * constructor option or `disableBroadcastValidation()` for opting out.
    */
   enableBroadcastValidation(enabled = true): void {
     this.validateBroadcasts = enabled;
+  }
+
+  /**
+   * Opt out of broadcast validation (testing-gap remediation Phase A1 /
+   * A2): restores the legacy always-ack behaviour. Only for tests on the
+   * machine-checked `always-ack-allowlist.json` — fund-path deploy/call
+   * tests must not use this.
+   */
+  disableBroadcastValidation(): void {
+    this.validateBroadcasts = false;
+  }
+
+  /**
+   * Toggle the fee-floor check (testing-gap remediation P1-2) independently
+   * of `validateBroadcasts`: on by default, requires the broadcast tx to pay
+   * at least `ceil(txSize * feeRate / 1000)` sats when every input is known.
+   */
+  enableFeeFloor(enabled = true): void {
+    this.enforceFeeFloor = enabled;
+  }
+
+  /**
+   * Opt out of the fee-floor check only (testing-gap remediation P1-2): the
+   * real `Spend` interpreter and the outputs-<=-inputs conservation check
+   * still run. For tests that intentionally build a zero-fee or
+   * below-market-rate tx (e.g. issue #116's exact-cover case) — distinct
+   * from `disableBroadcastValidation()`, which also stops running `Spend`.
+   */
+  disableFeeFloor(): void {
+    this.enforceFeeFloor = false;
   }
 
   /** Get all raw tx hexes that were broadcast through this provider. */
@@ -150,6 +323,19 @@ export class MockProvider implements Provider {
   /** Get all Transaction objects that were broadcast through this provider. */
   getBroadcastedTxObjects(): readonly Transaction[] {
     return this.broadcastedTxObjects;
+  }
+
+  /**
+   * Cumulative count of inputs actually run through `Spend.validate()`
+   * (`validated`) vs. inputs skipped because their outpoint was never
+   * registered via `addUtxo`/`addContractUtxo`/`addTransaction` (`skipped`),
+   * across every `broadcast()` call made while validation was enabled
+   * (testing-gap remediation P1-1). Lets a test assert its broadcasts
+   * weren't "validated" vacuously — `validated === 0` after a broadcast
+   * means no script actually ran.
+   */
+  getValidationStats(): { validated: number; skipped: number } {
+    return { validated: this.validatedInputCount, skipped: this.skippedInputCount };
   }
 
   // -------------------------------------------------------------------------
@@ -166,7 +352,9 @@ export class MockProvider implements Provider {
 
   async broadcast(tx: Transaction): Promise<string> {
     if (this.validateBroadcasts) {
-      const result = validateBroadcastTx(tx, this.knownOutpoints);
+      const result = validateBroadcastTx(tx, this.knownOutpoints, this.feeRate, this.enforceFeeFloor);
+      this.validatedInputCount += result.validated;
+      this.skippedInputCount += result.skipped;
       if (!result.valid) {
         throw new Error(
           `MockProvider: refusing to broadcast invalid transaction (C8)${result.error ? `: ${result.error}` : ''}.`,
@@ -251,6 +439,19 @@ export class MockProvider implements Provider {
   setFeeRate(rate: number): void {
     this.feeRate = rate;
   }
+}
+
+/**
+ * Convenience factory for an always-ack `MockProvider` (testing-gap
+ * remediation Phase A1). `broadcast()` never validates the tx it's given.
+ *
+ * FOR ALLOWLISTED TESTS ONLY — every call site must have a corresponding
+ * entry in `always-ack-allowlist.json` (see `always-ack-allowlist.test.ts`),
+ * which fails CI for any unlisted use of this factory or the other
+ * always-ack opt-outs. Fund-path deploy/call tests must not use this.
+ */
+export function newAlwaysAckMockProvider(network: 'mainnet' | 'testnet' = 'testnet'): MockProvider {
+  return new MockProvider(network, { validateBroadcasts: false });
 }
 
 // ---------------------------------------------------------------------------

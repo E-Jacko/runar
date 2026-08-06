@@ -10,6 +10,7 @@
 # names (t0, t1, ...).
 
 require "json"
+require "set"
 require_relative "../ir/types"
 require_relative "ast_nodes"
 require_relative "sighash_directive"
@@ -127,6 +128,7 @@ module RunarCompiler
         )
         unless prop.initializer.nil?
           anf_prop.initial_value = _extract_literal_value(prop.initializer)
+          _check_state_bigint_magnitude(anf_prop)
         end
         # Propagate the FixedArray-expansion marker so the artifact assembler
         # can re-group the synthetic scalar run back into a logical FixedArray
@@ -138,6 +140,47 @@ module RunarCompiler
       end
     end
     private_class_method :_lower_properties
+
+    # Magnitude a bigint state field gets: +num2bin-le8+ is a fixed 8-byte
+    # little-endian SIGN-MAGNITUDE word, so bytes 0..6 plus the low 7 bits of
+    # byte 7 carry the magnitude and 0x80 of byte 7 carries the sign.
+    STATE_BIGINT_MAGNITUDE_LIMIT = 1 << 63
+
+    # Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+    #
+    # The state section writes every bigint field with OP_NUM2BIN 8, which
+    # cannot represent a magnitude of 2**63 or more. Nothing used to check: the
+    # compiler stamped +encoding: "num2bin-le8"+ on the field and carried the
+    # initializer verbatim, the SDK wrote the low 8 bytes of it into the
+    # deployed state section, and the covenant then rebuilt the continuation
+    # with its own OP_NUM2BIN 8 -- which produces different bytes -- so
+    # hash256(outputs) never matched and the UTXO was permanently unspendable.
+    # It deployed cleanly, with no diagnostic at compile time or deploy time.
+    #
+    # This catches the statically-known half. Values that only exist at call
+    # time are stopped by the SDK serializer (packages/runar-rb/lib/runar/sdk/state.rb).
+    #
+    # READONLY properties are deliberately exempt: they are baked into the
+    # locking script as script-number pushes, never into the state section, and
+    # BSV script numbers are arbitrary-precision after Genesis.
+    #
+    # @param prop [IR::ANFProperty]
+    # @return [void]
+    def self._check_state_bigint_magnitude(prop)
+      return if prop.readonly
+      return unless ["bigint", "int"].include?(prop.type)
+
+      value = prop.initial_value
+      return unless value.is_a?(Integer)
+      return if value.abs < STATE_BIGINT_MAGNITUDE_LIMIT
+
+      raise ArgumentError,
+            "Cannot compile state property '#{prop.name}' initialised to #{value}: " \
+            "it does not fit the fixed 8-byte sign-magnitude state word (magnitude " \
+            "must be < 2^63). Reduce the value, or make the property readonly if it " \
+            "is a constant rather than state."
+    end
+    private_class_method :_check_state_bigint_magnitude
 
     # @param expr [Expression]
     # @return [String, Integer, Boolean, nil]
@@ -814,7 +857,11 @@ module RunarCompiler
       # -----------------------------------------------------------------
 
       # @param stmts [Array<Statement>]
-      def lower_statements(stmts)
+      # Lower a statement block, threading down the set of identifiers the
+      # enclosing blocks still read after this block ends. Only the
+      # block-forming statements (if / for) consume it; see
+      # +Frontend._reads_after_statement+.
+      def lower_statements(stmts, reads_after_block = Set.new)
         stmts.each_with_index do |stmt, i|
           # Early-return nesting: when an if-statement's then-block ends with a
           # return and there is no else-branch, the remaining statements after the
@@ -829,15 +876,24 @@ module RunarCompiler
               then: stmt.then,
               else_: remaining
             )
-            lower_statement(modified_if)
+            lower_statement(modified_if, reads_after_block)
             return
           end
-          lower_statement(stmt)
+          # Only the block-forming statements need to know what the code after
+          # them still reads; computing it for every statement would be
+          # quadratic for no benefit.
+          reads_after =
+            if stmt.is_a?(IfStmt) || stmt.is_a?(ForStmt)
+              Frontend._reads_after_statement(stmts, i, reads_after_block)
+            else
+              Set.new
+            end
+          lower_statement(stmt, reads_after)
         end
       end
 
       # @param stmt [Statement]
-      def lower_statement(stmt)
+      def lower_statement(stmt, reads_after = Set.new)
         # Propagate source location to emitted ANF bindings
         stmt_loc = stmt.respond_to?(:source_location) ? stmt.source_location : nil
         if stmt_loc
@@ -854,9 +910,9 @@ module RunarCompiler
         when AssignmentStmt
           _lower_assignment(stmt)
         when IfStmt
-          _lower_if_statement(stmt)
+          _lower_if_statement(stmt, reads_after)
         when ForStmt
-          _lower_for_statement(stmt)
+          _lower_for_statement(stmt, reads_after)
         when ExpressionStmt
           lower_expr_to_ref(stmt.expr)
         when ReturnStmt
@@ -998,18 +1054,18 @@ module RunarCompiler
       end
 
       # @param stmt [IfStmt]
-      def _lower_if_statement(stmt)
+      def _lower_if_statement(stmt, reads_after = Set.new)
         cond_ref = lower_expr_to_ref(stmt.condition)
 
         # Lower then-block into sub-context
         then_ctx = sub_context
-        then_ctx.lower_statements(stmt.then)
+        then_ctx.lower_statements(stmt.then, reads_after)
         sync_counter(then_ctx)
 
         # Lower else-block into sub-context
         else_ctx = sub_context
         if stmt.else_ && stmt.else_.any?
-          else_ctx.lower_statements(stmt.else_)
+          else_ctx.lower_statements(stmt.else_, reads_after)
         end
         sync_counter(else_ctx)
 
@@ -1028,9 +1084,11 @@ module RunarCompiler
           then_ctx.get_add_data_output_refs.any? ||
           else_ctx.get_add_data_output_refs.any?
 
+        then_output_bytes = ""
+        else_output_bytes = ""
         if branch_has_outputs
-          Frontend._append_branch_output_concat(then_ctx)
-          Frontend._append_branch_output_concat(else_ctx)
+          then_output_bytes = Frontend._append_branch_output_concat(then_ctx)
+          else_output_bytes = Frontend._append_branch_output_concat(else_ctx)
         end
 
         # Branch-merged locals (2 or more). An +if+ expression carries exactly
@@ -1045,17 +1103,21 @@ module RunarCompiler
         # Fix: give both arms the SAME result set in the SAME order by appending
         # an explicit rebind of every merged local to each arm.
         merged_locals = collect_branch_merged_locals(then_ctx, else_ctx)
-        if merged_locals.length >= 2
-          if branch_has_outputs
-            # The arms' single value is already spoken for: it is the output
-            # concat the continuation hash consumes. Refuse at compile time
-            # rather than emit the unspendable script this used to produce.
+
+        if branch_has_outputs
+          reason = Frontend._branch_output_rejection_reason(
+            then_ctx, else_ctx, then_output_bytes, else_output_bytes,
+            merged_locals, reads_after
+          )
+          unless reason.nil?
             raise ArgumentError,
-                  "Cannot compile conditional that both declares outputs and merges " \
-                  "#{merged_locals.length} local variables (#{merged_locals.join(', ')}). " \
-                  "Move the addOutput/addRawOutput/addDataOutput call after the " \
-                  "if-statement, or give each branch its own complete addOutput."
+                  "Cannot compile conditional that both declares outputs and " \
+                  "#{reason}. Move the addOutput/addRawOutput/addDataOutput " \
+                  "call after the if-statement."
           end
+        end
+
+        if merged_locals.length >= 2
           Frontend._append_merged_local_results(then_ctx, merged_locals)
           sync_counter(then_ctx)
           Frontend._append_merged_local_results(else_ctx, merged_locals)
@@ -1128,15 +1190,19 @@ module RunarCompiler
       end
 
       # @param stmt [ForStmt]
-      def _lower_for_statement(stmt)
+      def _lower_for_statement(stmt, reads_after = Set.new)
         # Resolve the loop's compile-time shape: start value, step direction,
         # and iteration count. Non-zero starts and countdown loops are
         # supported (#121) — on iteration i the iterator holds start + i*step.
         shape = Frontend._extract_loop_shape(stmt)
 
-        # Lower body into sub-context
+        # Lower body into sub-context. The body repeats, so every read anywhere
+        # in it is a read that happens after any given statement inside it.
+        body_reads = reads_after.dup
+        stmt.body.each { |s| Frontend._collect_statement_reads(s, body_reads) }
+
         body_ctx = sub_context
-        body_ctx.lower_statements(stmt.body)
+        body_ctx.lower_statements(stmt.body, body_reads)
         sync_counter(body_ctx)
 
         emit(IR::ANFValue.new(kind: "loop").tap do |v|
@@ -1751,6 +1817,163 @@ module RunarCompiler
         accumulated = branch_ctx.emit(_make_call("cat", [accumulated, ref]))
       end
       accumulated
+    end
+
+    # The identifiers still readable once statement +index+ of this block has
+    # run: everything the following statements in this block read, plus whatever
+    # the enclosing blocks read after this block.
+    #
+    # Used by +_lower_if_statement+ to tell a branch-merged local that is dead
+    # after the +if+ (safe) from one that is still live (not representable
+    # alongside a branch output -- see +_branch_output_rejection_reason+).
+    def self._reads_after_statement(stmts, index, reads_after_block)
+      reads = reads_after_block.dup
+      stmts[(index + 1)..].each { |stmt| _collect_statement_reads(stmt, reads) }
+      reads
+    end
+
+    # Collect every identifier a statement READS. The +x+ in +x = expr+ is a
+    # write, not a read, so a plain identifier assignment target is skipped;
+    # every other target form can still read locals.
+    def self._collect_statement_reads(stmt, out)
+      case stmt
+      when VariableDeclStmt
+        _collect_expression_reads(stmt.init, out)
+      when AssignmentStmt
+        _collect_expression_reads(stmt.target, out) unless stmt.target.is_a?(Identifier)
+        _collect_expression_reads(stmt.value, out)
+      when IfStmt
+        _collect_expression_reads(stmt.condition, out)
+        (stmt.then || []).each { |inner| _collect_statement_reads(inner, out) }
+        (stmt.else_ || []).each { |inner| _collect_statement_reads(inner, out) }
+      when ForStmt
+        _collect_statement_reads(stmt.init, out) if stmt.init
+        _collect_expression_reads(stmt.condition, out)
+        _collect_statement_reads(stmt.update, out) if stmt.update
+        (stmt.body || []).each { |inner| _collect_statement_reads(inner, out) }
+      when ReturnStmt
+        _collect_expression_reads(stmt.value, out)
+      when ExpressionStmt
+        _collect_expression_reads(stmt.expr, out)
+      end
+    end
+
+    # Collect every identifier an expression reads.
+    def self._collect_expression_reads(expr, out)
+      return if expr.nil?
+
+      case expr
+      when Identifier
+        out.add(expr.name)
+      when BinaryExpr
+        _collect_expression_reads(expr.left, out)
+        _collect_expression_reads(expr.right, out)
+      when UnaryExpr
+        _collect_expression_reads(expr.operand, out)
+      when CallExpr
+        (expr.args || []).each { |a| _collect_expression_reads(a, out) }
+      when MethodCallExpr
+        (expr.args || []).each { |a| _collect_expression_reads(a, out) }
+      when MemberExpr
+        _collect_expression_reads(expr.object, out)
+      when TernaryExpr
+        _collect_expression_reads(expr.condition, out)
+        _collect_expression_reads(expr.consequent, out)
+        _collect_expression_reads(expr.alternate, out)
+      when IndexAccessExpr
+        _collect_expression_reads(expr.object, out)
+        _collect_expression_reads(expr.index, out)
+      when IncrementExpr, DecrementExpr
+        _collect_expression_reads(expr.operand, out)
+      when ArrayLiteralExpr
+        (expr.elements || []).each { |e| _collect_expression_reads(e, out) }
+      end
+      # Literals and `this.x` property access read no locals.
+    end
+
+    # Why an +if+ whose arms declare outputs cannot be represented -- or +nil+
+    # when it can. The result is the reason clause the diagnostic embeds.
+    #
+    # An +if+ expression carries exactly ONE value, and when an arm emits an
+    # output that value is already spoken for: it is the output bytes the
+    # continuation hash consumes (+_append_branch_output_concat+). Anything ELSE
+    # the arm leaves behind breaks one of two invariants nothing downstream
+    # enforces:
+    #
+    # INV-A:: the parent registers the if-expression's value as the branch's
+    #         contribution to the continuation hash, so "the branch's output
+    #         bytes" really means "whatever the arm's LAST binding is". A binding
+    #         that lands after the output -- a rebound local, a property write --
+    #         silently replaces the serialized output with an unrelated value,
+    #         and the residue drain then physically drops the real output.
+    # INV-B:: an arm that emits an output AND leaves any other slot the parent
+    #         can still name -- a property write anywhere in the arm, or a
+    #         rebound local that is still read after the +if+ -- leaves 2+
+    #         results against the ONE stack-map name the stack lowerer
+    #         registers, desyncing the parent stack by a slot from there on.
+    #
+    # Neither is visible off-chain, so both shipped as permanently unspendable
+    # locking scripts. Refuse at compile time rather than emit one. See
+    # packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+    # for the real-Script-VM proof of each shape.
+    #
+    # The clauses are checked in a fixed order so all seven tiers report the same
+    # reason for a source that trips more than one.
+    def self._branch_output_rejection_reason(
+      then_ctx, else_ctx, then_output_bytes, else_output_bytes, merged_locals, reads_after
+    )
+      # 1. Two or more merged locals: normalising them would need a
+      #    multi-result +if+ node, and the arms' single value is already the
+      #    output concat.
+      if merged_locals.length >= 2
+        return "merges #{merged_locals.length} local variables " \
+               "(#{merged_locals.join(', ')})"
+      end
+
+      arms = [["then", then_ctx, then_output_bytes], ["else", else_ctx, else_output_bytes]]
+
+      # 2. INV-A: the arm's terminal binding must BE its output bytes.
+      arms.each do |label, branch_ctx, output_bytes|
+        if branch_ctx.bindings.empty? || branch_ctx.bindings.last.name != output_bytes
+          return "continues past its output in the #{label}-branch"
+        end
+      end
+
+      # 3. INV-B: a property write leaves a slot the parent can still name,
+      #    wherever in the arm it sits.
+      written_props = []
+      arms.each { |_, branch_ctx, _| _collect_updated_props(branch_ctx.bindings, written_props) }
+      unless written_props.empty?
+        return "assigns contract properties (#{written_props.join(', ')}) inside the branch"
+      end
+
+      # 4. INV-B: a rebound local that survives the +if+ is protected from being
+      #    rolled away, so the arm ends one slot deeper than lowerIf accounts
+      #    for.
+      live_merged = merged_locals.select { |name| reads_after.include?(name) }
+      unless live_merged.empty?
+        return "reassigns local variables read after it (#{live_merged.join(', ')})"
+      end
+
+      nil
+    end
+
+    # Append every property name an ANF binding list assigns, including the ones
+    # nested inside an +if+ arm or a +loop+ body -- a nested write is just as
+    # much a named slot the enclosing arm leaves behind.
+    def self._collect_updated_props(bindings, out)
+      bindings.each do |binding|
+        value = binding.value
+        case value.kind
+        when "update_prop"
+          out << value.name unless out.include?(value.name)
+        when "if"
+          _collect_updated_props(value.then || [], out)
+          _collect_updated_props(value.else_ || [], out)
+        when "loop"
+          _collect_updated_props(value.body || [], out)
+        end
+      end
     end
 
     # @param value_ref [String]

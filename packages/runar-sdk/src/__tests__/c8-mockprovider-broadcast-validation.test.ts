@@ -1,20 +1,21 @@
 /**
  * Deep-review finding C8 (part 2): `MockProvider.broadcast()` unconditionally
- * acks — it never inspects the transaction, so a script-invalid or
- * underfunded tx is "successfully broadcast" (a deterministic fake txid is
+ * acked — it never inspected the transaction, so a script-invalid or
+ * underfunded tx was "successfully broadcast" (a deterministic fake txid was
  * returned) exactly like a valid one. Part 1 (the pre-broadcast local
  * dry-run in `finalizeCall`) already fails closed for the SDK's OWN call
- * path; this part adds an OPT-IN validating mode to `MockProvider` itself so
- * tests that talk to the provider directly (or a different code path
- * entirely) can also be held to a real bar.
+ * path.
  *
- * Default behaviour is UNCHANGED — validation is off unless
- * `enableBroadcastValidation()` is called — so the ~550 pre-existing SDK
- * tests that rely on MockProvider's permissive ack keep passing.
+ * Testing-gap remediation plan Phase A1 (reviewer #1, TG-001): broadcast
+ * validation is no longer opt-in. `MockProvider` validates by default —
+ * the switch that would have failed both Palmer bugs on the main SDK test
+ * path is now the one every test hits unless it explicitly opts out via
+ * `disableBroadcastValidation()` / `{ validateBroadcasts: false }`, which
+ * Phase A2's machine-checked allowlist gates.
  */
 import { describe, it, expect } from 'vitest';
 import { Transaction, UnlockingScript, LockingScript } from '@bsv/sdk';
-import { MockProvider } from '../providers/mock.js';
+import { MockProvider, newAlwaysAckMockProvider } from '../providers/mock.js';
 
 const OUTPOINT_TXID = 'aa'.repeat(32);
 
@@ -47,8 +48,8 @@ function makeUnderfundedTx(): Transaction {
   return tx;
 }
 
-describe('MockProvider — opt-in broadcast validation (C8 part 2)', () => {
-  it('RED: today, a script-invalid tx spending a KNOWN utxo is "successfully" broadcast', async () => {
+describe('MockProvider — broadcast validation is default-on (C8 part 2 / Phase A1)', () => {
+  it('GREEN: a default MockProvider() rejects a script-invalid tx spending a KNOWN utxo', async () => {
     const provider = new MockProvider();
     provider.addContractUtxo('scriptinvalid', {
       txid: OUTPOINT_TXID,
@@ -57,11 +58,10 @@ describe('MockProvider — opt-in broadcast validation (C8 part 2)', () => {
       script: '00', // OP_FALSE — unsatisfiable by an empty unlocking script
     });
 
-    const txid = await provider.broadcast(makeScriptInvalidTx());
-    expect(txid).toMatch(/^[0-9a-f]{64}$/);
+    await expect(provider.broadcast(makeScriptInvalidTx())).rejects.toThrow();
   });
 
-  it('RED: today, a tx spending more than its known inputs are worth is "successfully" broadcast', async () => {
+  it('GREEN: a default MockProvider() rejects an underfunded tx (outputs > known inputs)', async () => {
     const provider = new MockProvider();
     provider.addContractUtxo('underfunded', {
       txid: OUTPOINT_TXID,
@@ -70,39 +70,11 @@ describe('MockProvider — opt-in broadcast validation (C8 part 2)', () => {
       script: '51', // OP_TRUE — script-valid regardless of amounts
     });
 
-    const txid = await provider.broadcast(makeUnderfundedTx());
-    expect(txid).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  it('GREEN: enableBroadcastValidation() rejects the same script-invalid tx', async () => {
-    const provider = new MockProvider();
-    provider.enableBroadcastValidation();
-    provider.addContractUtxo('scriptinvalid', {
-      txid: OUTPOINT_TXID,
-      outputIndex: 0,
-      satoshis: 500,
-      script: '00',
-    });
-
-    await expect(provider.broadcast(makeScriptInvalidTx())).rejects.toThrow();
-  });
-
-  it('GREEN: enableBroadcastValidation() rejects the same underfunded tx', async () => {
-    const provider = new MockProvider();
-    provider.enableBroadcastValidation();
-    provider.addContractUtxo('underfunded', {
-      txid: OUTPOINT_TXID,
-      outputIndex: 1,
-      satoshis: 500,
-      script: '51',
-    });
-
     await expect(provider.broadcast(makeUnderfundedTx())).rejects.toThrow();
   });
 
-  it('GREEN: enableBroadcastValidation() still accepts a script-valid, well-funded tx', async () => {
+  it('GREEN: a default MockProvider() still accepts a script-valid, well-funded tx', async () => {
     const provider = new MockProvider();
-    provider.enableBroadcastValidation();
     provider.addContractUtxo('wellfunded', {
       txid: OUTPOINT_TXID,
       outputIndex: 2,
@@ -123,14 +95,66 @@ describe('MockProvider — opt-in broadcast validation (C8 part 2)', () => {
     expect(txid).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('validation is off by default (backward compatible with the ~550 pre-existing SDK tests)', async () => {
-    const provider = new MockProvider();
+  it('GREEN: new MockProvider("testnet", { validateBroadcasts: false }) still acks the invalid tx', async () => {
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     provider.addContractUtxo('scriptinvalid', {
       txid: OUTPOINT_TXID,
       outputIndex: 0,
       satoshis: 500,
       script: '00',
     });
+
     await expect(provider.broadcast(makeScriptInvalidTx())).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('GREEN: disableBroadcastValidation() still acks the same invalid tx (opt-out API)', async () => {
+    const provider = new MockProvider();
+    provider.disableBroadcastValidation();
+    provider.addContractUtxo('scriptinvalid', {
+      txid: OUTPOINT_TXID,
+      outputIndex: 0,
+      satoshis: 500,
+      script: '00',
+    });
+
+    await expect(provider.broadcast(makeScriptInvalidTx())).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('GREEN: enableBroadcastValidation(false) still acks the same invalid tx (back-compat)', async () => {
+    const provider = new MockProvider();
+    provider.enableBroadcastValidation(false);
+    provider.addContractUtxo('scriptinvalid', {
+      txid: OUTPOINT_TXID,
+      outputIndex: 0,
+      satoshis: 500,
+      script: '00',
+    });
+
+    await expect(provider.broadcast(makeScriptInvalidTx())).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('GREEN: newAlwaysAckMockProvider() acks the invalid tx (allowlisted-tests-only convenience factory)', async () => {
+    const provider = newAlwaysAckMockProvider();
+    provider.addContractUtxo('scriptinvalid', {
+      txid: OUTPOINT_TXID,
+      outputIndex: 0,
+      satoshis: 500,
+      script: '00',
+    });
+
+    await expect(provider.broadcast(makeScriptInvalidTx())).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('GREEN: enableBroadcastValidation() (no args) re-enables validation after an opt-out', async () => {
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
+    provider.enableBroadcastValidation();
+    provider.addContractUtxo('scriptinvalid', {
+      txid: OUTPOINT_TXID,
+      outputIndex: 0,
+      satoshis: 500,
+      script: '00',
+    });
+
+    await expect(provider.broadcast(makeScriptInvalidTx())).rejects.toThrow();
   });
 });

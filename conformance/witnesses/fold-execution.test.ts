@@ -19,7 +19,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { runDifferentialExecution, runFoldEquivalence } from 'runar-testing';
+import { runDifferentialExecution, runFoldEquivalence } from '../../packages/runar-testing/src/index.js';
 
 // `(2n + 3n)` is an all-constant subexpression the fold pass collapses to 5n.
 // `this.base` is a constructor arg (NOT constant), so `this.base + 5n` stays a

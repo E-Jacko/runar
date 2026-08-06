@@ -117,7 +117,11 @@
     {
       "fixture": "babybear-ext4",
       "cause": "go-only",
-      "reason": "BabyBear quartic-extension proof-system primitive is Go-only (compilers:[go]); no TypeScript codegen",
+      "reason": "BabyBear quartic-extension proof-system primitive is Go-only (compilers:[go]); single-tier by project policy, so it has no cross-tier agreement signal either — a bug here has neither an execution check nor a parity check behind it.",
+      "closePlan": {
+        "date": "2026-08-06",
+        "plan": "Go script-exec, and the machinery already exists. conformance/script_execution_test.go has ZERO babybear tests today (its only p256/p384/babybear matches are secp256k1 comments), but compileRúnar(fixture, argsJSON) + executeScript(locking, unlocking) is exactly the pattern its 16 TestECPrimitives_* functions use, and encodePushBigInt / buildUnlockingScript are already in the file. Add compileRúnar(\"babybear-ext4\", ...) coverage for CheckMul, CheckInv and CheckFriFold with expected values read from tests/vectors/babybear_ext4_mul.json and babybear_ext4_inv.json — Plonky3-generated, i.e. EXTERNAL to this codebase, which is what makes them able to catch an all-tiers-wrong bug. Nearest existing execution, and why it is not this: compilers/go/codegen/script_correctness_test.go TestBBExt4Inv_Script / _WrongResult really does run script through the go-sdk interpreter against those vectors, but it assembles gatherOps(EmitBBExt4Inv0..3) inline at the Stack-IR level — Inv only, not Mul, and not this fixture's composed bytes. integration/go/fri_colinearity_vectors_test.go TestFRI_Vectors_Accept spends real ext4-Mul on regtest, but of an inline FRIColinearityCheck contract, not this fixture. Neither is a byte-matched spend of babybear-ext4, so neither may be cited here."
+      },
       "coveredBy": {
         "kind": "go-only-nocodegen"
       }
@@ -177,6 +181,10 @@
       "fixture": "ec-unit",
       "cause": "crypto-witness-infeasible",
       "reason": "ROOT-CAUSED 2026-08-03, PARTIALLY FIXED. testOps() takes no arguments and needs no cryptographic witness, so it was spent on a live regtest node and REJECTED with 'Script failed an OP_VERIFY operation'. Two independent codegen defects, both the same shape — a degenerate EC case the codegen never handled: (1) FIXED — ecAdd could not DOUBLE a point; the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q and the tangent 3px^2/(2py) is required. affineAdd now selects numerator and denominator so one fieldInv still suffices; ecAdd(G,G)==2G and ecAdd(2G,2G)==4G are pinned by packages/runar-testing/src/__tests__/ec-add-doubling.test.ts. (2) STILL OPEN — ecMul and ecMulGen both return an all-zero point for scalar k=2 exactly (k=1,3,4 are correct). The Jacobian ladder's add-affine step hits the same degenerate case when the accumulator equals the point being added, and it cannot double either. testOps() calls ecMul(g, 2n), so this fixture still cannot spend. Fixing it means branching inside a 257-iteration loop, which is a materially larger change than the affine fix. Do NOT mark covered until ecMul k=2 is fixed and the spend passes.",
+      "closePlan": {
+        "date": "2026-08-06",
+        "plan": "BLOCKED ON A CONFIRMED CODEGEN BUG, not on harness capability — do not close by relabelling. testOps() takes no arguments and needs no cryptographic witness, so the cheapest close is a go-script-exec entry: compileRúnar(\"ec-unit\", \"{}\") + executeScript(locking, \"\") in conformance/script_execution_test.go, exactly as its 16 TestECPrimitives_* functions already do for the ec-primitives fixture. That test would go red today, correctly: defect (2) in the reason above is STILL OPEN, ecMul(g, 2n) returns an all-zero point, and testOps() calls it, so the fixture is known-unspendable. ORDER: (1) fix the Jacobian ladder's add-affine degenerate case (accumulator == point being added) in all seven tiers; (2) re-run the regtest spend that failed on 2026-08-03; (3) only then add the script_execution_test.go entry and repoint this row at it. Adding a golden or a stronger label before step 1 would freeze a known-unspendable script as correct."
+      },
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "ec"
@@ -225,6 +233,10 @@
       "fixture": "p256-primitives",
       "cause": "crypto-witness-infeasible",
       "reason": "NIST P-256 EC primitives — non-secp256k1 EC witness",
+      "closePlan": {
+        "date": "2026-08-06",
+        "plan": "BLOCKED ON TWO CONFIRMED CODEGEN BUGS, the same pair `ec-unit` is blocked on — do not close by adding a witness before they are fixed. Verified 2026-08-06 by executing the emitted script through @bsv/sdk's Spend: p256Add(G, G) returns 29d05c193da77b71… where 2G is 7cf27b188d034f7e… (cAffineAdd in packages/runar-compiler/src/passes/p256-p384-codegen.ts still implements ONLY the chord slope (qy-py)/(qx-px); the tangent-select fix that commit 8a6494b4 applied to secp256k1 affineAdd was NEVER ported to the NIST-P curves), and p256Mul(G, 2n) returns an all-zero point (the Jacobian ladder's add-affine step degenerates when the accumulator equals the point being added). p256Mul(G, 3n) is correct, pinning the blob format. verifyAdd(a, b) would exercise the first defect directly and verify(k, basePoint) the second, so a real witness written today would go RED for the codegen, not for the harness. ORDER: fix both in all seven tiers, then close. CAUSE NOT RECLASSIFIED, deliberately: the spend needs no signature, so `crypto-witness-infeasible` reads false on its own wording, and the plain differential oracle is in fact blocked by something else entirely — the ANF interpreter MOCKS p256Add / p256Mul / p256MulGen (returns 64 zero bytes) and p256OnCurve (returns true unconditionally), see packages/runar-testing/src/interpreter/interpreter.ts, which is `interpreter-unsupported` in all but name. The cause is left as-is because `crypto-witness-infeasible` also carries PROVENANCE (it marks exactly the entries that came from the former crypto-exempt.json) and flipping it would destroy that; and because the interpreter mock is removable, so `interpreter-unsupported` would go stale in turn. Neither cause is the real blocker. verify(k, basePoint), verifyAdd(a, b) and verifyMulGen(k) take plain scalars and points, not a signature, so conformance/script_execution_test.go can run them the same way its 16 TestECPrimitives_* functions already run the ec-primitives fixture: compileRúnar(\"p256-primitives\", ...) + executeScript, with the witness built by the encodePushBigInt (:2510) and encodePushPoint (:2545) helpers that are already in that file. THE HARD PART IS THE EXPECTED VALUES, not the harness: the repo has NO P-256 curve-arithmetic KAT — conformance/runtime-vectors/ecdsa-rfc6979.json carries P-256 SIGNATURE vectors only, and packages/runar-go/crypto_kat_test.go (TestOfficialKAT_ECDSA_RFC6979) feeds them to the NATIVE Go implementation, never to compiled script. Take the expected points from an external NIST/RFC source, NOT from this repo's own P-256 implementation — deriving them from the implementation under test reproduces the BUG-101 shape (seven tiers agreeing on a wrong answer) that this whole residual section exists to name."
+      },
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "p256"
@@ -234,6 +246,10 @@
       "fixture": "p256-wallet",
       "cause": "crypto-witness-infeasible",
       "reason": "NIST P-256 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
+      "closePlan": {
+        "date": "2026-08-06",
+        "plan": "Integration SPEND, and there is a working template two files away. integration/go/wots_test.go closes the identical problem for post-quantum-wallet: compile the fixture's own source, deploy, build a real spending tx, produce the real signature the script verifies, AssertTxAccepted, plus two AssertTxRejected legs. The P-256 analogue needs a real P-256 signature (Go stdlib crypto/ecdsa over elliptic.P256()) alongside the real secp256k1 checkSig. WHAT ALREADY EXISTS AND WHY IT DOES NOT COUNT: integration/go/p256_wallet_test.go and integration/ts/p256-wallet.test.ts DO spend on a live regtest node, but of INLINE contracts (P256Verify / P256OnCurve / P256MulGen — 2 params, no checkSig), not of examples/ts/p256-wallet/P256Wallet.runar.ts, which declares spend(sigP256, p256PubKey, sig, pubKey) and includes hash160 + checkSig. The python/ruby/rust/java peer suites are compile+deploy only and say so in their own headers — deploying does not execute a locking script. So the close is small: point a Go integration test at the FIXTURE's source and verify the compiled template is byte-identical to expected-script.hex before citing it, the same check that was run for post-quantum-wallet and sphincs-wallet on 2026-08-06."
+      },
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "p256"
@@ -243,6 +259,10 @@
       "fixture": "p384-primitives",
       "cause": "crypto-witness-infeasible",
       "reason": "NIST P-384 EC primitives — non-secp256k1 EC witness",
+      "closePlan": {
+        "date": "2026-08-06",
+        "plan": "BLOCKED ON TWO CONFIRMED CODEGEN BUGS, the same pair `ec-unit` is blocked on — do not close by adding a witness before they are fixed. Verified 2026-08-06 by executing the emitted script through @bsv/sdk's Spend: p384Add(G, G) returns aaf06bba82e9f590… where 2G is 08d999057ba3d2d9… (cAffineAdd in packages/runar-compiler/src/passes/p256-p384-codegen.ts still implements ONLY the chord slope (qy-py)/(qx-px); the tangent-select fix that commit 8a6494b4 applied to secp256k1 affineAdd was NEVER ported to the NIST-P curves), and p384Mul(G, 2n) returns an all-zero point (the Jacobian ladder's add-affine step degenerates when the accumulator equals the point being added). p384Mul(G, 3n) is correct, pinning the blob format. verifyAdd(a, b) would exercise the first defect directly and verify(k, basePoint) the second, so a real witness written today would go RED for the codegen, not for the harness. ORDER: fix both in all seven tiers, then close. CAUSE NOT RECLASSIFIED, deliberately: the spend needs no signature, so `crypto-witness-infeasible` reads false on its own wording, and the plain differential oracle is in fact blocked by something else entirely — the ANF interpreter MOCKS p384Add / p384Mul / p384MulGen (returns 64 zero bytes) and p384OnCurve (returns true unconditionally), see packages/runar-testing/src/interpreter/interpreter.ts, which is `interpreter-unsupported` in all but name. The cause is left as-is because `crypto-witness-infeasible` also carries PROVENANCE (it marks exactly the entries that came from the former crypto-exempt.json) and flipping it would destroy that; and because the interpreter mock is removable, so `interpreter-unsupported` would go stale in turn. Neither cause is the real blocker. verify(k, basePoint), verifyAdd(a, b) and verifyMulGen(k) take plain scalars and points, not a signature, so conformance/script_execution_test.go can run them the same way its 16 TestECPrimitives_* functions already run the ec-primitives fixture: compileRúnar(\"p384-primitives\", ...) + executeScript, with the witness built by the encodePushBigInt (:2510) and encodePushPoint (:2545) helpers that are already in that file. THE HARD PART IS THE EXPECTED VALUES, not the harness: the repo has NO P-384 curve-arithmetic KAT — conformance/runtime-vectors/ecdsa-rfc6979.json carries P-384 SIGNATURE vectors only, and packages/runar-go/crypto_kat_test.go (TestOfficialKAT_ECDSA_RFC6979) feeds them to the NATIVE Go implementation, never to compiled script. Take the expected points from an external NIST/RFC source, NOT from this repo's own P-384 implementation — deriving them from the implementation under test reproduces the BUG-101 shape (seven tiers agreeing on a wrong answer) that this whole residual section exists to name."
+      },
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "p384"
@@ -252,6 +272,10 @@
       "fixture": "p384-wallet",
       "cause": "crypto-witness-infeasible",
       "reason": "NIST P-384 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
+      "closePlan": {
+        "date": "2026-08-06",
+        "plan": "Integration SPEND, and there is a working template two files away. integration/go/wots_test.go closes the identical problem for post-quantum-wallet: compile the fixture's own source, deploy, build a real spending tx, produce the real signature the script verifies, AssertTxAccepted, plus two AssertTxRejected legs. The P-384 analogue needs a real P-384 signature (Go stdlib crypto/ecdsa over elliptic.P384()) alongside the real secp256k1 checkSig. WHAT ALREADY EXISTS AND WHY IT DOES NOT COUNT: integration/go/p384_wallet_test.go and integration/ts/p384-wallet.test.ts DO spend on a live regtest node, but of INLINE contracts (P384Verify / P384OnCurve / P384MulGen — 2 params, no checkSig), not of examples/ts/p384-wallet/P384Wallet.runar.ts, which declares spend(sigP384, p384PubKey, sig, pubKey) and includes hash160 + checkSig. The python/ruby/rust/java peer suites are compile+deploy only and say so in their own headers — deploying does not execute a locking script. So the close is small: point a Go integration test at the FIXTURE's source and verify the compiled template is byte-identical to expected-script.hex before citing it, the same check that was run for post-quantum-wallet and sphincs-wallet on 2026-08-06."
+      },
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "p384"
@@ -320,10 +344,11 @@
     {
       "fixture": "post-quantum-wallet",
       "cause": "crypto-witness-infeasible",
-      "reason": "WOTS+ verification + ECDSA checkSig — WOTS+ one-time witness; real signatures required",
+      "reason": "WOTS+ verification + ECDSA checkSig — WOTS+ one-time witness; the in-process differential oracle cannot synthesise one. UPGRADED from codegen-golden 2026-08-06 (plan Phase G2): the Go integration suite has been spending it on a live regtest node, and both this entry and the witnesses README carried the stale claim that the wallet fixtures 'only deploy'.",
       "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "wots"
+        "kind": "integration",
+        "path": "integration/go/wots_test.go",
+        "note": "real deploy + SPEND on a live regtest node: TestWOTS_ValidSpend (accept — a real ECDSA signature over the real spending input, then a real WOTS+ signature over those signature bytes, pushed as <wotsSig><wotsPK><ecdsaSig><ecdsaPubKey> and confirmed with AssertTxAccepted) plus TestWOTS_TamperedSig_Rejected and TestWOTS_WrongECDSASig_Rejected (AssertTxRejected). getWOTSArtifact compiles examples/ts/post-quantum-wallet/PostQuantumWallet.runar.ts — the exact .runar.ts source this fixture resolves to — and that compile was verified 2026-08-06 to be BYTE-IDENTICAL to this fixture's expected-script.hex (19,594 bytes, in BOTH fold modes), so the node executed this fixture's own bytes with only the two constructorSlots (ecdsaPubKeyHash, wotsPubKeyHash) substituted. SCOPE, stated honestly: the Go tier is the only one that spends — integration/go/post_quantum_wallet_test.go and the ts/python/rust/ruby/zig/java peers are deploy-only, and integration/README.md's 'Deploy + Spend' row over-claims for those six. The test is behind //go:build integration and t.Skip under -short; CI runs it at .github/workflows/ci.yml:1305 (`cd integration/go && go test -tags integration`)."
       }
     },
     {
@@ -371,10 +396,11 @@
     {
       "fixture": "sphincs-wallet",
       "cause": "crypto-witness-infeasible",
-      "reason": "SLH-DSA (SPHINCS+) verification + ECDSA checkSig — huge PQ witness; real signatures required",
+      "reason": "SLH-DSA (SPHINCS+) verification + ECDSA checkSig — huge PQ witness; the in-process differential oracle cannot synthesise one. UPGRADED from codegen-golden 2026-08-06 (plan Phase G2), same stale-claim correction as post-quantum-wallet.",
       "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "slh-dsa"
+        "kind": "integration",
+        "path": "integration/go/slhdsa_test.go",
+        "note": "real deploy + SPEND on a live regtest node: TestSLHDSA_ValidSpend (accept — real ECDSA signature over the spending input, then a real SLH-DSA-SHA2-128s signature over those bytes via runar.SLHSign, confirmed with AssertTxAccepted) plus TestSLHDSA_TamperedSig_Rejected and TestSLHDSA_WrongECDSASig_Rejected (AssertTxRejected). getSLHDSAArtifact compiles examples/ts/sphincs-wallet/SPHINCSWallet.runar.ts — the exact .runar.ts source this fixture resolves to — verified 2026-08-06 to be BYTE-IDENTICAL to this fixture's expected-script.hex (188,609 bytes, in BOTH fold modes), so the node executed this fixture's own bytes with only the two constructorSlots substituted. This is the strongest available answer to the C24 'parity-green-but-wrong' risk for the SLH-DSA family: an all-tiers-agree-and-all-are-wrong verifier would reject a signature produced by an independent signer, and it does not. SCOPE: Go tier only (integration/go/sphincs_wallet_test.go and the six peer-tier suites are deploy-only); //go:build integration, skipped under -short, run in CI at .github/workflows/ci.yml:1305."
       }
     },
     {

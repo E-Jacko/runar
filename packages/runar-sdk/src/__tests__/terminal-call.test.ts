@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import type { RunarArtifact } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
@@ -29,12 +30,12 @@ async function setupFundedProvider(
 ): Promise<{ provider: MockProvider; signer: LocalSigner; address: string }> {
   const signer = new LocalSigner(PRIV_KEY);
   const address = await signer.getAddress();
-  const provider = new MockProvider();
+  const provider = new MockProvider('testnet');
   provider.addUtxo(address, {
     txid: 'aa'.repeat(32),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   return { provider, signer, address };
 }

@@ -1,0 +1,10 @@
+{
+  "$comment": "Ruby tier. Spec files permitted to disable MockProvider broadcast validation (MockProvider.always_ack / disable_broadcast_validation / enable_broadcast_validation(false)). See docs/audit/2026-08-testing-gap-remediation-plan.md Phase A5 and packages/runar-rb/README.md 'How fund-path tests fail closed in the Ruby tier'. Fund-path deploy/call specs MUST NOT appear here.",
+  "entries": [
+    {
+      "file": "spec/sdk/mock_broadcast_validation_spec.rb",
+      "reason": "Directly tests the opt-out surface itself (MockProvider.always_ack, disable_broadcast_validation, enable_broadcast_validation(false)) so those escape hatches keep working. Every other example in the file uses the default validating provider.",
+      "category": "negative-api"
+    }
+  ]
+}

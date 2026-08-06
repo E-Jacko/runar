@@ -1,0 +1,534 @@
+{
+  "_doc": [
+    "WIRE-PRIMITIVE register — for every fund-critical primitive whose BYTES",
+    "cross a boundary, the ABSOLUTE pin that proves those bytes. Reviewer point",
+    "#4 / TG-004 / P3 / plan Phase C0",
+    "(docs/audit/2026-08-testing-gap-remediation-plan.md).",
+    "",
+    "WHY THIS FILE EXISTS. `deserialize(serialize(x)) === x` holds for ANY",
+    "self-consistent framing, including a wrong one. That is not a hypothetical:",
+    "#110 taught all seven SDKs the MINIMALDATA rule on the state section and",
+    "none of the seven compilers. Every round-trip test stayed green, every",
+    "cross-SDK comparison stayed green (all seven moved together), and ZERO",
+    "goldens moved — while any contract carrying a 1-byte 0x01..0x10 ByteString",
+    "state value became permanently unspendable. The missing artefact was a",
+    "single assertion against the OTHER implementation of the format.",
+    "",
+    "THE RULE (plan §2 P3). For any encoding shared across a boundary the gate",
+    "is `bytes_from_A(value) === bytes_from_B(value)` or `spend(A_bytes) accepts",
+    "and yields expectedState`. NEVER only `deserialize(serialize(x)) === x`.",
+    "Round-trip tests may remain as smoke tests — they live in",
+    "`roundTripSmokeTests` — but a row whose ONLY evidence is round-trip is a",
+    "hard CI failure in wire-primitives.test.ts.",
+    "",
+    "SCHEMA — one object per primitive under `primitives`:",
+    "  id           — stable slug. Unique. The hard-coded REQUIRED_PRIMITIVES set",
+    "                 in wire-primitives.test.ts names the ids that MUST have a",
+    "                 row, so a new fund-critical wire primitive cannot be",
+    "                 introduced without one.",
+    "  description  — free text, FOR HUMANS. Never machine-checked, never",
+    "                 evidence.",
+    "  producedBy   — repo-relative path(s) implementing the ENCODE side. Every",
+    "                 path must exist on disk.",
+    "  consumedBy   — repo-relative path(s) implementing the DECODE side, or the",
+    "                 independent other-side implementation the bytes are pinned",
+    "                 against (a peer tier, the compiler's own codec, the",
+    "                 @bsv/sdk Spend interpreter, the sdk-vertical reference).",
+    "  absolutePins — the MACHINE-CHECKED evidence, a non-empty array of",
+    "                 {kind, path, note?}. Every path must exist on disk and must",
+    "                 NOT be a known round-trip test (denylist in the test file).",
+    "  roundTripSmokeTests — repo-relative path(s) that only prove an",
+    "                 implementation is its own inverse. Allowed, informative,",
+    "                 and NEVER sufficient alone. A path may not appear both here",
+    "                 and in `absolutePins`.",
+    "  residual     — optional free text: what this row still does NOT prove.",
+    "                 Documented so a partial pin is not read as a complete one.",
+    "  status       — the string \"UNCOVERED\", and ONLY when `absolutePins` is",
+    "                 absent or empty.",
+    "  issue        — mandatory on an UNCOVERED row: a tracking ref or a dated",
+    "                 close plan. Required so an empty cell stays loud.",
+    "",
+    "A row carries a non-empty `absolutePins` XOR (`status` + `issue`). Never",
+    "both, never neither — enforced in code, not documented here.",
+    "",
+    "`absolutePins.kind` vocabulary (closed; enforced in wire-primitives.test.ts):",
+    "  vertical-pin       — crosses compiler<->SDK. It compares what an SDK DOES",
+    "      with an artifact against what the compiler that produced that artifact",
+    "      DECLARED, or against an independent re-derivation of the encoding",
+    "      spec. Two tiers can only pass by both being right. Reviewer point #5.",
+    "  cross-tier-golden  — frozen bytes in the repo that two or more INDEPENDENT",
+    "      implementations must reproduce (a conformance/sdk-output",
+    "      expected-locking.hex, a conformance/sdk-vertical case golden, or a",
+    "      fixture like conformance/sdk-bip143/fixtures.json that six non-TS",
+    "      tiers recompute from scratch). Cross-implementation, not a",
+    "      self-inverse.",
+    "  spend-execution    — the bytes are EXECUTED: @bsv/sdk's production `Spend`",
+    "      (which enforces clean-stack, push-only unlocking and minimal-push), or",
+    "      a real broadcast against a node. The strongest kind, because the",
+    "      grader is consensus rather than another copy of our own code.",
+    "  kat                — a known-answer test: expected bytes written down as",
+    "      literals, derived from the spec / consensus rule FIRST and only then",
+    "      compared with the implementation. Absolute, but tier-local: it pins",
+    "      one implementation against a constant, not against a peer.",
+    "",
+    "RELATIONSHIP TO conformance/construct-ledger.json. That ledger answers a",
+    "per-CONSTRUCT question ('which fund-critical language shape / wire value",
+    "class is exercised, by what?'). This file answers a per-PRIMITIVE question",
+    "('for this encoding, what proves the BYTES against the other side of the",
+    "boundary?'). They share the ROUND_TRIP_ONLY_PATHS denylist concept:",
+    "wire-primitives.test.ts asserts its denylist is a SUPERSET of the one",
+    "declared in construct-ledger.test.ts, so the two cannot drift into two",
+    "different opinions about what counts as evidence.",
+    "",
+    "MAINTENANCE. When a wire-format path in this file's `producedBy` /",
+    "`consumedBy` changes, the must-move-a-golden gate",
+    "(conformance/scripts/wire-format-pr-audit.ts) is the companion check: a",
+    "serializer change that moves ZERO pinned bytes should block, not reassure."
+  ],
+  "primitives": [
+    {
+      "id": "state-section-framing",
+      "description": "The state section of a deployed stateful locking script: the fields written after the OP_RETURN separator, each framed <len><data> (empty value -> `00`), in declaration order. Raw data, never executed, therefore never MINIMALDATA-checked — the compiler's on-chain writer and reader both use <len><data>, so a 1-byte 0x01..0x10 / 0x81 value must NOT collapse to OP_N. bigint fields are a fixed 8-byte little-endian SIGN-MAGNITUDE word (sign in bit 0x80 of byte 7), not two's complement.",
+      "producedBy": [
+        "packages/runar-sdk/src/state.ts",
+        "packages/runar-go/sdk_state.go",
+        "packages/runar-rs/src/sdk/state.rs",
+        "packages/runar-py/runar/sdk/state.py",
+        "packages/runar-zig/src/sdk_state.zig",
+        "packages/runar-rb/lib/runar/sdk/state.rb",
+        "packages/runar-java/src/main/java/runar/lang/sdk/StateSerializer.java"
+      ],
+      "consumedBy": [
+        "packages/runar-compiler/src/passes/05-stack-lower.ts",
+        "packages/runar-compiler/src/passes/push-encoding.ts",
+        "packages/runar-compiler/src/passes/06-emit.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "vertical-pin",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "The compiler<->SDK pin for this primitive. Compiles a real stateful contract with the real compiler, deploys and calls it through the real SDK on the real Script VM with broadcast validation, over the whole dangerous value table (empty, 0x00, 0x01..0x10, 0x81, multi-byte, 40-byte). Both faces: the WRITE face (continuation the script rebuilds vs outputs the SDK serialised) and the READ face (a contract DEPLOYED with such a value is spendable at all)."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-output/tests/stateful-bytestring-op-n-state/expected-locking.hex",
+          "note": "Absolute deployed-locking golden for a ByteString state value of exactly `05` — the PALMER-2 value class. All seven SDK tools must reproduce it byte for byte, so one tier regressing to OP_5 fails against an external constant, not against its own inverse."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-output/tests/stateful-bytestring/expected-locking.hex",
+          "note": "The multi-byte ByteString state class (5 bytes, 48656c6c6f), same seven-tool absolute golden."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-output/tests/state-bigint-edges/expected-locking.hex",
+          "note": "The bigint sign bit: lo = -1, hi = +1 in the deployed state section. Every pre-existing bigint state golden was non-negative, so nothing cross-implementation touched sign-magnitude byte 7 before this."
+        },
+        {
+          "kind": "spend-execution",
+          "path": "conformance/witnesses/real-crypto/stateful-bytestring.json",
+          "note": "Executed on @bsv/sdk `Spend` with real secp256k1 and a real BIP-143 continuation preimage. The burn() accept pins expectedState message === '0x00' after a spend that does not touch the field — the exact expectation that read '0x' while the C9 bug was recorded as correct behaviour."
+        },
+        {
+          "kind": "spend-execution",
+          "path": "conformance/witnesses/real-crypto/state-bigint-edges.json",
+          "note": "Deploys carrying NEGATIVE bigint state and then spends: the SDK serializer that wrote the deployed state section and the compiler's on-chain rebuild inside the covenant must agree byte for byte or hash256(outputs) never matches. Each accept also pins the post-state VALUE, so a stale-state regression fails even where the spend would still be accepted."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts",
+          "note": "Absolute byte literals for serializeState across the whole OP_N range: '05' -> '0105', '00' -> '0100', '81' -> '0181', '11' -> '0111', '0011' -> '020011'. Derived from the compiler's encodePushBytesHex rule first, then asserted."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-go/sdk_state_push_framing_test.go",
+          "note": "The same absolute literals in the Go tier."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-rs/tests/state_push_framing.rs",
+          "note": "The same absolute literals in the Rust tier."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-rb/spec/sdk/state_push_framing_spec.rb",
+          "note": "The same absolute literals in the Ruby tier."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-java/src/test/java/runar/lang/sdk/StatePushFramingTest.java",
+          "note": "The same absolute literals in the Java tier."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-py/tests/test_sdk_state.py",
+          "note": "The same absolute literals in the Python tier, in the TestStatePushFraming class (6 literal-byte tests). NOT a dedicated *_push_framing* file, which is why an earlier revision of this register wrongly recorded Python as having no tier-local pin."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-zig/src/sdk_state.zig",
+          "note": "The same absolute literals in the Zig tier, as inline `test \"state ByteString: ...\"` blocks alongside the serializer itself (~lines 1012-1050). Same caveat as Python: no dedicated *_push_framing* filename, so a filename-only search misses it."
+        }
+      ],
+      "roundTripSmokeTests": [
+        "packages/runar-sdk/src/__tests__/state.test.ts",
+        "packages/runar-go/sdk_c9_s1_minimaldata_roundtrip_test.go",
+        "packages/runar-rs/tests/c9_s1_minimaldata_roundtrip.rs",
+        "packages/runar-py/tests/test_c9_s1_minimaldata_roundtrip.py",
+        "packages/runar-zig/src/sdk_c9_s1_minimaldata_roundtrip_test.zig",
+        "packages/runar-rb/spec/sdk/c9_s1_minimaldata_roundtrip_spec.rb",
+        "packages/runar-java/src/test/java/runar/lang/sdk/MinimalDataRoundTripTest.java"
+      ],
+      "residual": "None outstanding for tier coverage: all seven tiers ship a tier-local absolute framing pin (Python's and Zig's live inside test_sdk_state.py / sdk_state.zig rather than in a dedicated *_push_framing* file — verified 2026-08-06 by reading them, after an earlier revision of this register wrongly recorded them as missing on the strength of a filename search alone). The TS vertical pin state-push-framing-vm.test.ts now also covers the bigint edges (including negatives), bool, the raw-fixed classes (PubKey/Addr/Ripemd160/Sha256/Point) and a mixed bigint+ByteString+bigint carrier — i.e. all three of the framing rules in state.ts, not only ByteString."
+    },
+    {
+      "id": "unlocking-encodeArg-minimaldata",
+      "description": "Push encoding for UNLOCKING-script arguments (`encodeArg` / `encodePushData`). These pushes ARE executed by the interpreter, so SCRIPT_VERIFY_MINIMALDATA applies and the opposite rule to the state section holds: a 1-byte payload in {0x01..0x10} must be OP_1..OP_16 and 0x81 must be OP_1NEGATE. 0x00 is deliberately excluded — OP_0 pushes the EMPTY array, so the minimal encoding of a 1-byte 0x00 is the direct push `01 00`.",
+      "producedBy": [
+        "packages/runar-sdk/src/contract.ts",
+        "packages/runar-go/sdk_contract.go",
+        "packages/runar-rs/src/sdk/contract.rs",
+        "packages/runar-py/runar/sdk/contract.py",
+        "packages/runar-zig/src/sdk_contract.zig",
+        "packages/runar-rb/lib/runar/sdk/contract.rb",
+        "packages/runar-java/src/main/java/runar/lang/sdk/ScriptUtils.java"
+      ],
+      "consumedBy": [
+        "packages/runar-testing/src/vm/script-vm.ts",
+        "packages/runar-compiler/src/passes/push-encoding.ts",
+        "conformance/sdk-vertical/reference/encode.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "spend-execution",
+          "path": "conformance/witnesses/real-crypto/state-bigint-edges.json",
+          "note": "A stateful witness: the unlocking script is built by the REAL SDK (finalizeCall -> encodeArg) with args 1n / 126n / 127n / 255n and then handed to @bsv/sdk `Spend.validate()`, which rejects a non-minimally-encoded push ('This data is not minimally-encoded', Spend.js:381). The grader is the consensus interpreter, not another copy of our encoder."
+        },
+        {
+          "kind": "spend-execution",
+          "path": "conformance/witnesses/real-crypto/multi-method.json",
+          "note": "Same mechanism with OP_N-range args 6n and 3n on a multi-method stateful contract."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-locking.hex",
+          "note": "The same encoder on the deploy-time splice path, driven through all seven SDK tools by conformance/sdk-vertical/runner/vertical-runner.ts. `05` must land as the single byte OP_5 at the pinned offset — so a non-TS tier that loses MINIMALDATA on 1-byte pushes fails against an external constant."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-vertical.json",
+          "note": "The SEMANTIC layer: the derived layout records pushedHex '05' with byteLength 1 and headerBytes 0, derived by conformance/sdk-vertical/reference/encode.ts, which imports nothing from packages/**. OP_0 and `01 00` are both legal pushes; this is what distinguishes them."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts",
+          "note": "Absolute byte literals for the executed path, pinned as the deliberate MIRROR IMAGE of serializeState in the same file: encodeArg('05') === '55', encodeArg('81') === '4f', encodeArg('00') === '0100', encodeArg('11') === '0111', encodeArg('deadbeef') === '04deadbeef'. Unifying the unlock and state encoders breaks one half or the other."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-rs/tests/encode_push_data_minimaldata.rs",
+          "note": "The same absolute literals in the Rust tier, including the C9/S1 regression assertion that a 1-byte 0x00 is NOT OP_0."
+        }
+      ],
+      "roundTripSmokeTests": [
+        "packages/runar-sdk/src/__tests__/ctor-bytestring-minimaldata-roundtrip.test.ts",
+        "packages/runar-go/sdk_c9_s1_minimaldata_roundtrip_test.go",
+        "packages/runar-rs/tests/c9_s1_minimaldata_roundtrip.rs",
+        "packages/runar-py/tests/test_c9_s1_minimaldata_roundtrip.py",
+        "packages/runar-zig/src/sdk_c9_s1_minimaldata_roundtrip_test.zig",
+        "packages/runar-rb/spec/sdk/c9_s1_minimaldata_roundtrip_spec.rb",
+        "packages/runar-java/src/test/java/runar/lang/sdk/MinimalDataRoundTripTest.java"
+      ],
+      "residual": "UNREGISTERED ABSOLUTE EVIDENCE (found 2026-08-06): packages/runar-java/src/test/java/runar/lang/sdk/MinimalDataRoundTripTest.java MIXES evidence kinds. Two of its methods are round-trips (why the file is listed under roundTripSmokeTests), but encodePushDataMatchesCompilerEncodePushBytesHex and decodePushDataInvertsTheMinimalDataOpcodes are genuine absolute pins — the first grades the Java SDK encoder against the COMPILER's encodePushBytesHex, i.e. the other implementation of the format, which is a real cross-component pin and not a self-inverse. It is NOT listed in absolutePins above because this register keys evidence by PATH, and a path may not appear on both sides (the gate would fail, correctly, since the file is also on the round-trip denylist). Close plan: split the two absolute methods into a dedicated packages/runar-java/src/test/java/runar/lang/sdk/EncodePushDataKatTest.java, then register that file here. Until then Java's absolute unlocking-encode evidence is real but unregistered — do not read its absence as a coverage hole. --- Separately: no cross-tier absolute golden of UNLOCKING-script bytes exists anywhere in the repo: conformance/sdk-output pins expected-locking.hex only (sdk-runner.ts compares deployed locking scripts), and there is no expected-unlocking.hex peer. For Go / Python / Zig / Ruby / Java, the absolute evidence for this primitive is therefore INDIRECT — it comes through the deploy-time splice path (sdk-vertical), which shares the encoder, plus the spend-execution pins which exercise the TS SDK only. Closing this means either a per-tier KAT alongside the existing round-trips, or an unlocking-script golden in the sdk-output shape."
+    },
+    {
+      "id": "constructor-slot-splicing",
+      "description": "Deploy-time splicing of constructor arguments into the locking-script template at artifact `constructorSlots[]` offsets. The compiler emits the template plus a SPECIFICATION of each splice (byteOffset, valueEncoding, fixedValueByteLength, fixedPushHeaderBytes); each SDK performs the splice. An off-by-one offset, a wrong encoding choice for a 1-byte ByteString, or a tier-local splice bug produces a green deploy and an unspendable or wrong-valued contract.",
+      "producedBy": [
+        "packages/runar-compiler/src/passes/06-emit.ts",
+        "packages/runar-compiler/src/ir/artifact.ts"
+      ],
+      "consumedBy": [
+        "packages/runar-sdk/src/contract.ts",
+        "packages/runar-go/sdk_contract.go",
+        "packages/runar-rs/src/sdk/contract.rs",
+        "packages/runar-py/runar/sdk/contract.py",
+        "packages/runar-zig/src/sdk_contract.zig",
+        "packages/runar-rb/lib/runar/sdk/contract.rb",
+        "packages/runar-java/src/main/java/runar/lang/sdk/ContractScript.java",
+        "conformance/sdk-vertical/reference/derive.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/vertical-pins.test.ts",
+          "note": "Plan Phase C3. Walks the COMPILED script with an independent opcode walker (conformance/sdk-vertical/reference/script.ts, which imports nothing from packages/**) and checks the compiler's own claims: that each declared byteOffset is a real opcode boundary holding a push of the declared shape, and that the spliced result pushes the declared VALUE. Ships four deliberate corruptions proving each pin fires."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-vertical.json",
+          "note": "Checked-in derived golden: per-slot templateByteOffset / byteOffset / headerBytes / valueByteLength / encoding / pushedHex, written from the independent derivation and never from an SDK."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/multi-slot-mixed-a/expected-vertical.json",
+          "note": "The multi-slot case: several slots of different encodings in one script, so a splice that shifts one slot's downstream offsets is caught rather than absorbed."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-locking.hex",
+          "note": "The full deployed script all seven SDK tools must reproduce (conformance/sdk-vertical/runner/vertical-runner.ts, run in the CI sdk-output job)."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-vertical/cases/bytes-zero/expected-locking.hex",
+          "note": "The 1-byte 0x00 class, where an OP_0 splice and a `01 00` splice are both legal pushes of DIFFERENT values — the case a byte-diff oracle derived from the SDK's own output cannot separate."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-sdk/src/__tests__/constructor-slots.test.ts",
+          "note": "Absolute expected locking scripts for the splicing mechanism itself: a 20-byte arg at its offset, multiple args at distinct offsets, a bigint arg, the no-constructorSlots append fallback, and the negative case that a legitimate OP_0 outside a placeholder position is not corrupted."
+        }
+      ],
+      "roundTripSmokeTests": [
+        "packages/runar-sdk/src/__tests__/ctor-bytestring-minimaldata-roundtrip.test.ts",
+        "packages/runar-java/src/test/java/runar/lang/sdk/MinimalDataRoundTripTest.java"
+      ]
+    },
+    {
+      "id": "codeseparator-index",
+      "description": "Artifact fields `codeSeparatorIndex` / `codeSeparatorIndices` (and the `codeSepIndexSlots[]` that bake the index into the script) must match the OP_CODESEPARATOR byte positions the compiler actually emitted. The SDKs read them to build the sighash subscript. Wrong offsets give a green compile and wrong signatures — unspendable, or signed over the wrong subscript.",
+      "producedBy": [
+        "packages/runar-compiler/src/passes/06-emit.ts",
+        "packages/runar-compiler/src/ir/artifact.ts"
+      ],
+      "consumedBy": [
+        "packages/runar-sdk/src/oppushtx.ts",
+        "packages/runar-sdk/src/contract.ts",
+        "conformance/sdk-vertical/reference/script.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/codesep-tag-op-n/expected-vertical.json",
+          "note": "Plan Phase C4, and the pin conformance/construct-ledger.json explicitly recorded as MISSING. templateCodeSeparators and deployedCodeSeparators are found by walking the compiled script opcode by opcode — so a 0xab byte inside push data is not mistaken for an OP_CODESEPARATOR — and codeSepSlotValues asserts the index BAKED into the script equals the separator position actually found."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/codesep-tag-pushdata1/expected-vertical.json",
+          "note": "The same walk where a constructor arg pushes via OP_PUSHDATA1, i.e. where the splice CHANGES downstream separator offsets — so a tier that reuses template offsets on the deployed script diverges."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/vertical-pins.test.ts",
+          "note": "Runs the walk and the checked-in goldens, plus the deliberate corruptions that prove the codesep pins fire rather than merely pass."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "packages/runar-sdk/src/__tests__/codeseparator-signing.test.ts",
+          "note": "Compiles real contracts (examples/ts/auction, token-nft, covenant-vault) with the real compiler and drives real SDK deploy->call against the emitted index: terminal methods must not push _codePart (CLEANSTACK), non-terminal ones must, and a stateless contract whose checkSig precedes the separator must sign over the FULL script."
+        },
+        {
+          "kind": "spend-execution",
+          "path": "packages/runar-sdk/src/__tests__/issue-132-restore-codesep.test.ts",
+          "note": "Issue #132: computeOpPushTxWithCodeSep must byte-walk the real _codeScript rather than re-derive the offset from in-memory constructorArgs (which are wrong on the restore path). Validated on a real @bsv/sdk Spend, so a wrong offset surfaces as a real signature failure, not a mismatched integer."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-vertical/cases/codesep-tag-op-n/expected-locking.hex",
+          "note": "The deployed script all seven SDK tools must reproduce for the codesep matrix contract."
+        }
+      ],
+      "roundTripSmokeTests": []
+    },
+    {
+      "id": "bip143-preimage-layout",
+      "description": "The BIP-143 sighash preimage: nVersion || hashPrevouts || hashSequence || outpoint || scriptCode (var-int prefixed) || value (8B LE) || nSequence || hashOutputs || nLocktime || sighashType. Consumed on-chain by OP_PUSH_TX covenants and off-chain by every tier's signer. A one-field divergence between two tiers is a signature that no other tier can produce or verify.",
+      "producedBy": [
+        "packages/runar-sdk/src/oppushtx.ts",
+        "packages/runar-go/sdk_oppushtx.go",
+        "packages/runar-rs/src/sdk/oppushtx.rs",
+        "packages/runar-py/runar/sdk/oppushtx.py",
+        "packages/runar-zig/src/sdk_oppushtx.zig",
+        "packages/runar-rb/lib/runar/sdk/oppushtx.rb",
+        "packages/runar-java/src/main/java/runar/lang/sdk/OpPushTx.java"
+      ],
+      "consumedBy": [
+        "conformance/sdk-bip143/generate-fixtures.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-bip143/fixtures.json",
+          "note": "Frozen preimageHex / digestHex / sigHex per scenario (a P2PKH spend and a stateful Counter call with a compiled scriptCode). Each consuming tier is given only {unsignedTxHex, inputIndex, prevScriptHex, prevValueSats, sighashFlags} and must INDEPENDENTLY recompute the preimage, then assert byte-equality. CI re-derives the committed fixture with `generate-fixtures.ts --check` so the golden cannot drift silently."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-go/sdk_bip143_interop_test.go",
+          "note": "Go recomputes and asserts `gotPreimage == s.PreimageHex`, then verifies the TS-produced sigHex under its own digest."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-rs/tests/bip143_interop.rs",
+          "note": "Rust side of the same fixture."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-py/tests/test_bip143_interop.py",
+          "note": "Python side of the same fixture."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-zig/src/sdk_bip143_interop_test.zig",
+          "note": "Zig side of the same fixture."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-rb/spec/runar/sdk/bip143_interop_spec.rb",
+          "note": "Ruby side of the same fixture."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-java/src/test/java/runar/lang/sdk/Bip143InteropTest.java",
+          "note": "Java side of the same fixture. CI additionally greps every tier's interop test for the string `sdk-bip143` (.github/workflows/ci.yml), so deleting the fixture reference from one tier fails rather than silently narrowing the matrix."
+        },
+        {
+          "kind": "spend-execution",
+          "path": "integration/ts/bip143-crosstier.test.ts",
+          "note": "Assembles the final transaction from the fixture's sigHex and broadcasts it, so the pinned preimage is additionally graded by consensus rather than only by six re-implementations."
+        }
+      ],
+      "roundTripSmokeTests": [],
+      "residual": "Every vector is derived from the TS reference (@bsv/sdk `TransactionSignature.format`); no external BIP-143 specification KAT is checked in. Seven-tier independent recomputation plus a real broadcast is the standing evidence that the TS reference itself is right. Adding the BIP-143 document's own vectors would make this row spec-anchored rather than reference-anchored."
+    },
+    {
+      "id": "signed-envelope-bytes",
+      "description": "The `SignedEnvelope` wire protocol used by overlay apps: the exact payload string that is signed (canonicalJson of {...data, nonce, expiresAt}), the DER signature over sha256(payload), and the `VerifyEnvelopeReason` returned for each rejection class. All seven SDKs must accept the same envelope shape, produce signatures verifiable by every other tier, and reject identically.",
+      "producedBy": [
+        "packages/runar-sdk/src/envelope.ts",
+        "packages/runar-go/sdk_envelope.go",
+        "packages/runar-rs/src/sdk/envelope.rs",
+        "packages/runar-py/runar/sdk/envelope.py",
+        "packages/runar-zig/src/sdk_envelope.zig",
+        "packages/runar-rb/lib/runar/sdk/envelope.rb",
+        "packages/runar-java/src/main/java/runar/lang/sdk/Envelope.java"
+      ],
+      "consumedBy": [
+        "conformance/sdk-envelope/validate-fixtures.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-envelope/fixtures.json",
+          "note": "The bytes really are pinned, not just self-verified. `signing_vectors[]` carries expected_payload (the exact canonical string) AND expected_sig (the exact DER hex, deterministic RFC-6979 + low-S with priv=1); every tier must REBUILD the payload from the raw fields and match the string, then re-sign and match the DER. `valid_envelope` is a frozen TS-signed envelope every tier must verify, and `rejection_vectors[]` pins the reason string per rejection class."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-go/sdk_envelope_interop_test.go",
+          "note": "Asserts payload == expected_payload and der == expected_sig, not merely that its own sign/verify pair agrees."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-rs/tests/envelope_interop.rs",
+          "note": "Rust side, including the per-reason rejection mapping."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-py/tests/test_envelope_interop.py",
+          "note": "Python side."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-zig/src/sdk_envelope_interop_test.zig",
+          "note": "Zig side."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-rb/spec/runar/sdk/envelope_interop_spec.rb",
+          "note": "Ruby side."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-java/src/test/java/runar/lang/sdk/EnvelopeInteropTest.java",
+          "note": "Java side."
+        },
+        {
+          "kind": "kat",
+          "path": "conformance/sdk-envelope/validate-fixtures.ts",
+          "note": "The TS tier's drift guard, run in CI. It LOADS the committed fixture and never rewrites it, so the six consumers cannot end up validating against a fixture that silently followed a TS regression."
+        }
+      ],
+      "roundTripSmokeTests": [
+        "packages/runar-sdk/src/__tests__/envelope.test.ts"
+      ],
+      "residual": "packages/runar-sdk/src/__tests__/envelope.test.ts is listed as a smoke test for its signEnvelope -> verifyEnvelope block, which is a self-inverse; its canonicalJson literals are absolute but are pinned for the canonicalJson row instead. The lone-surrogate and clock-dependent rejection vectors are owned per-tier rather than by the shared fixture (documented in validate-fixtures.ts)."
+    },
+    {
+      "id": "canonicalJson",
+      "description": "The RFC 8785 / JCS serializer used to produce the bytes that are hashed before signing. Sorted object keys by UTF-16 code unit, no whitespace, ES number formatting, JCS string escaping. Two tiers producing different bytes for the same value silently break every cross-tier signature — the failure is invisible until a signature from tier A is checked by tier B.",
+      "producedBy": [
+        "packages/runar-ir-schema/src/canonical-json.ts",
+        "packages/runar-go/sdk_envelope.go",
+        "packages/runar-rs/src/sdk/envelope.rs",
+        "packages/runar-py/runar/sdk/envelope.py",
+        "packages/runar-zig/src/sdk_envelope.zig",
+        "packages/runar-rb/lib/runar/sdk/envelope.rb",
+        "packages/runar-java/src/main/java/runar/lang/sdk/Envelope.java"
+      ],
+      "consumedBy": [
+        "packages/runar-sdk/src/envelope.ts",
+        "conformance/sdk-envelope/validate-fixtures.ts",
+        "conformance/fuzzer/canonical-java-gate.ts"
+      ],
+      "absolutePins": [
+        {
+          "kind": "cross-tier-golden",
+          "path": "conformance/sdk-envelope/fixtures.json",
+          "note": "`canonical_json_vectors[]` — 21 {input, expected} pairs with the expected CANONICAL STRING frozen in the repo, replayed by all six non-TS tiers and by the TS drift guard. This is the answer to 'does sdk-envelope really pin bytes cross-tier, or only verify each tier against itself?': it pins the string, and six independent implementations must reproduce it. `canonical_json_rejection_vectors[]` additionally pins the lone-surrogate rejection."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-go/sdk_envelope_interop_test.go",
+          "note": "Go asserts got == v.Expected for every vector (with UseNumber semantics so JSON numbers are not silently re-formatted by the decoder)."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-rs/tests/envelope_interop.rs",
+          "note": "Rust side."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-py/tests/test_envelope_interop.py",
+          "note": "Python side."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-zig/src/sdk_envelope_interop_test.zig",
+          "note": "Zig side — the tier where the UTF-16 code-unit key sort divergence (D1) was found and fixed."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-rb/spec/runar/sdk/envelope_interop_spec.rb",
+          "note": "Ruby side."
+        },
+        {
+          "kind": "cross-tier-golden",
+          "path": "packages/runar-java/src/test/java/runar/lang/sdk/EnvelopeInteropTest.java",
+          "note": "Java side."
+        },
+        {
+          "kind": "kat",
+          "path": "packages/runar-ir-schema/src/__tests__/canonical-json.test.ts",
+          "note": "Absolute expected strings for the TS reference across key ordering, whitespace, number formatting and escaping — derived from RFC 8785 first, then asserted."
+        },
+        {
+          "kind": "kat",
+          "path": "compilers/java/src/test/java/runar/compiler/canonical/JcsTest.java",
+          "note": "The Java compiler tier's JCS conformance assertions."
+        }
+      ],
+      "roundTripSmokeTests": [],
+      "residual": "The vectors are repo-authored RFC 8785 derivations (catalogued with their fix sites in audits/canonical-json-rfc8785-parity.md), not the upstream JCS conformance-suite files. That audit also records one open framing item (D2) that is not reachable on the v1 wire schema."
+    }
+  ]
+}

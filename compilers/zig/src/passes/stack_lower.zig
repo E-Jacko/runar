@@ -3995,6 +3995,59 @@ const LowerCtx = struct {
     // if_expr
     // ========================================================================
 
+    /// The stack depth of the ONE slot both arms of an `if` rebound in place,
+    /// or null when the `if` does not have that shape.
+    ///
+    /// The shape: ANF lowering merged a SINGLE local across the arms, so
+    /// instead of appending a __merge$<i> result block it aliased the local to
+    /// the if-expression itself. Both arms then read that local and rebound it,
+    /// which makes the arm ROLL the parent's slot away and leave its own result
+    /// in the same position -- the arms' net stack effect is zero, so none of
+    /// the depth-growth cases in lowerIfExprImpl fire and the if's value would
+    /// go unregistered.
+    ///
+    /// Every condition below is required:
+    ///   - no normalised K-merge block (that is the K>=2 path, which grows
+    ///     depth by K and is adopted by name),
+    ///   - both arms end on a binding of the SAME name, and that name is a
+    ///     local, not a contract property (properties have their own
+    ///     reconcile),
+    ///   - both arms, and the reconciled parent, hold that name at the same
+    ///     depth -- i.e. the slot really was rebound where it stood,
+    ///   - both arms are at the parent's depth, so the slot is the only effect,
+    ///   - bind_name is read after the `if`. Without a reader there is nothing
+    ///     to repair and renaming would only lose a name; with one, the pre-fix
+    ///     compiler failed with "value not found on stack". That is what makes
+    ///     adopting the slot byte-neutral for every program that compiled
+    ///     before.
+    fn branchInPlaceRebindDepth(
+        self: *const LowerCtx,
+        then_bindings: []const types.ANFBinding,
+        else_bindings: []const types.ANFBinding,
+        then_ctx: *const LowerCtx,
+        else_ctx: *const LowerCtx,
+        merged_result_count: usize,
+        binding_is_read_later: bool,
+    ) ?usize {
+        if (!binding_is_read_later or merged_result_count != 0) return null;
+        if (then_ctx.stack.depth() != self.stack.depth()) return null;
+        if (else_ctx.stack.depth() != self.stack.depth()) return null;
+        if (then_bindings.len == 0 or else_bindings.len == 0) return null;
+
+        const name = then_bindings[then_bindings.len - 1].name;
+        if (name.len == 0) return null;
+        if (!std.mem.eql(u8, name, else_bindings[else_bindings.len - 1].name)) return null;
+        for (self.program.properties) |prop| {
+            if (std.mem.eql(u8, prop.name, name)) return null;
+        }
+
+        const depth = then_ctx.stack.findDepth(name) orelse return null;
+        const else_depth = else_ctx.stack.findDepth(name) orelse return null;
+        const parent_depth = self.stack.findDepth(name) orelse return null;
+        if (else_depth != depth or parent_depth != depth) return null;
+        return depth;
+    }
+
     fn lowerIfExprTerminal(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr, terminal_assert: bool) !void {
         return self.lowerIfExprImpl(bind_name, ie, terminal_assert);
     }
@@ -4284,6 +4337,38 @@ const LowerCtx = struct {
             }
         } else if (else_ctx.stack.depth() > self.stack.depth()) {
             try self.stack.push(self.allocator, bind_name);
+        } else if (self.branchInPlaceRebindDepth(
+            ie.then_bindings,
+            else_bindings,
+            &then_ctx,
+            &else_ctx,
+            merged_result_count,
+            self.last_uses.contains(bind_name),
+        )) |in_place_depth| {
+            // Single branch-merged local rebound IN PLACE by both arms.
+            //
+            // At K=1 ANF lowering does not append a __merge$<i> result block;
+            // it ALIASES the local to the if-expression's binding name instead,
+            // so every post-branch read of the local names the `if`. That works
+            // when the arms PUSH their new value -- depth grows by one and the
+            // then_ctx.depth > self.depth arm above registers bind_name.
+            //
+            // But when both arms READ the local and rebind it (m0 = m0 + 1),
+            // the local is not live under its own name after the `if` (the
+            // alias moved every reader to the `if`), so it is not
+            // outer-protected and each arm ROLLS the parent slot away and
+            // leaves its result in the same position. Net depth change: zero.
+            // Control then fell straight through, nothing was registered for
+            // bind_name, and the very next binding failed with "value not found
+            // on stack" -- a compile-time rejection of source that compiles at
+            // K=2 and compiles without an `else`. The value IS on the stack;
+            // only its NAME was wrong.
+            //
+            // Adopt it: rename the slot the arms rebound to the if's binding
+            // name. No opcode is emitted -- bookkeeping only, gated on bind_name
+            // actually being referenced later, which is precisely the case that
+            // used to fail.
+            try self.stack.renameAtDepth(self.allocator, in_place_depth, bind_name);
         }
         self.trackDepth();
 
@@ -4391,6 +4476,133 @@ const LowerCtx = struct {
         }
     }
 
+    /// Collect the locals a loop body REBINDS and then READS AGAIN in the same
+    /// iteration. Mirrors the TS reference compiler's
+    /// `collectLoopCarriedRebinds` (05-stack-lower.ts).
+    ///
+    /// `computeLastUses` maps a name to the MAXIMUM index that references it,
+    /// so for a body like
+    ///
+    ///     t3   = acc + step     (index 1 — reads the value carried in)
+    ///     acc  = @ref:t3        (index 2 — rebinds: renames t3's slot to acc)
+    ///     t4   = wacc + acc     (index 3 — reads the value just rebound)
+    ///
+    /// `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies
+    /// (PICK) instead of consuming, leaving the incoming slot on the stack
+    /// under the same name as the rebound one; index 3 then IS the last use,
+    /// and findDepth resolves to the topmost match — so it consumes the
+    /// UPDATED value and leaves the dead incoming one. The next iteration
+    /// reads that dead slot, and every iteration recomputes from the pre-loop
+    /// value: `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc +
+    /// acc; }` produced `wacc = step*N` where the source says
+    /// `step*N*(N+1)/2` — silently in a stateless contract, and as a
+    /// permanently unspendable UTXO in a stateful one (the covenant commits to
+    /// a continuation the SDK never builds). `outer_refs` does not cover it:
+    /// `acc` is excluded there precisely because the body binds it.
+    ///
+    /// The value these names hold at the end of an iteration is live at the
+    /// start of the next one, so `lowerForLoop` protects them from consumption
+    /// exactly like an outer ref. The incoming slot each rebinding shadows is
+    /// left behind and drained with the rest of the frame at method exit — a
+    /// name always resolves to its newest slot, so the reads stay correct.
+    ///
+    /// Both halves of the predicate are load-bearing:
+    ///   - read BEFORE the first rebinding: the name is carried IN from the
+    ///     enclosing scope, rather than being a body-private temp that merely
+    ///     happens to be read after it is bound;
+    ///   - read AFTER the last rebinding: without it the rebound value is dead
+    ///     at the end of the iteration and consuming it is correct. This is
+    ///     what keeps every shipped accumulator (`sum = sum + i`, `off = off +
+    ///     len`) byte-for-byte unchanged.
+    ///
+    /// NESTED loops: the scan runs over `flattenNestedLoopBodies(body)`, not
+    /// over `body` itself. A name rebound only inside an INNER loop is bound
+    /// at no top-level index of the outer body, so the raw scan classified it
+    /// as neither an outer ref (`collectDeepBindingNames` excludes it — the
+    /// body does bind it, deeply) nor a carried rebind, and the outer loop
+    /// never marked it live. The inner loop's final iteration then consumed
+    /// it, because `used_after_loop` asks the enclosing scope and the
+    /// enclosing scope had not been told either, so every outer iteration
+    /// restarted from the slot the previous one left behind:
+    /// `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }` with
+    /// step = 3 produced `wacc = 24` where the source says 30. Splicing the
+    /// inner body in at the loop's position preserves the read/rebind/read
+    /// ordering the inner level already sees, so the outer level draws the
+    /// same conclusion.
+    fn collectLoopCarriedRebinds(
+        allocator: Allocator,
+        body: []const types.ANFBinding,
+        out: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        var flat_buf: std.ArrayListUnmanaged(types.ANFBinding) = .empty;
+        defer flat_buf.deinit(allocator);
+        try flattenNestedLoopBodies(allocator, body, &flat_buf);
+        const flat = flat_buf.items;
+
+        var first_bind: std.StringHashMapUnmanaged(usize) = .empty;
+        defer first_bind.deinit(allocator);
+        var last_bind: std.StringHashMapUnmanaged(usize) = .empty;
+        defer last_bind.deinit(allocator);
+        for (flat, 0..) |binding, i| {
+            if (!first_bind.contains(binding.name)) {
+                try first_bind.put(allocator, binding.name, i);
+            }
+            try last_bind.put(allocator, binding.name, i);
+        }
+
+        var read_before: std.StringHashMapUnmanaged(void) = .empty;
+        defer read_before.deinit(allocator);
+        var read_after: std.StringHashMapUnmanaged(void) = .empty;
+        defer read_after.deinit(allocator);
+        for (flat, 0..) |binding, i| {
+            var refs: std.StringHashMapUnmanaged(void) = .empty;
+            defer refs.deinit(allocator);
+            try collectValueRefs(allocator, binding.value, &refs);
+            var it = refs.iterator();
+            while (it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                if (first_bind.get(ref)) |first| {
+                    if (i < first) try read_before.put(allocator, ref, {});
+                }
+                if (last_bind.get(ref)) |last| {
+                    if (i > last) try read_after.put(allocator, ref, {});
+                }
+            }
+        }
+
+        var before_it = read_before.iterator();
+        while (before_it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (read_after.contains(ref)) try out.put(allocator, ref, {});
+        }
+    }
+
+    /// Append `body` to `out` with every nested `loop` binding replaced, in
+    /// place, by its own (recursively flattened) body.
+    ///
+    /// Only `collectLoopCarriedRebinds` uses this, and only to order reads
+    /// against rebindings. The loop binding itself contributes no stack slot
+    /// (loops are statements), so dropping it loses nothing; splicing the body
+    /// in at its position is what lets an outer loop see a rebinding that
+    /// happens one level down. `if` branches are deliberately NOT flattened —
+    /// their two arms are alternatives, not a sequence, and reassignments
+    /// inside them are reconciled by `lowerIfExpr`, not by protection here.
+    ///
+    /// A body with no nested loop is appended entry-for-entry unchanged, which
+    /// is what makes this byte-neutral for every non-nesting loop.
+    fn flattenNestedLoopBodies(
+        allocator: Allocator,
+        body: []const types.ANFBinding,
+        out: *std.ArrayListUnmanaged(types.ANFBinding),
+    ) !void {
+        for (body) |binding| {
+            switch (binding.value) {
+                .loop => |lp| try flattenNestedLoopBodies(allocator, lp.body, out),
+                else => try out.append(allocator, binding),
+            }
+        }
+    }
+
     fn lowerForLoop(self: *LowerCtx, bind_name: []const u8, fl: *const types.ANFForLoop) !void {
         var body_binding_names: std.StringHashMapUnmanaged(void) = .empty;
         defer body_binding_names.deinit(self.allocator);
@@ -4426,6 +4638,22 @@ const LowerCtx = struct {
         while (all_refs_it.next()) |entry| {
             const ref = entry.key_ptr.*;
             if (!std.mem.eql(u8, ref, fl.var_name) and !deep_body_names.contains(ref)) {
+                try outer_refs.put(self.allocator, ref, {});
+            }
+        }
+
+        // A local the body REBINDS and then READS AGAIN in the same iteration
+        // is carried across iterations through the rebound slot, so it must
+        // survive the body exactly like an outer ref. `deep_body_names` above
+        // excludes it precisely because the body binds it — which is what made
+        // the updated value consumable. See `collectLoopCarriedRebinds`.
+        var carried_rebinds: std.StringHashMapUnmanaged(void) = .empty;
+        defer carried_rebinds.deinit(self.allocator);
+        try collectLoopCarriedRebinds(self.allocator, fl.body_bindings, &carried_rebinds);
+        var carried_it = carried_rebinds.iterator();
+        while (carried_it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (!std.mem.eql(u8, ref, fl.var_name)) {
                 try outer_refs.put(self.allocator, ref, {});
             }
         }

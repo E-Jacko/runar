@@ -1,4 +1,13 @@
 /**
+ * SCOPE (testing-gap remediation, plan design principle P8): this fuzzer's
+ * oracle is ABSOLUTE (the real engine), but it is scoped to STATELESS
+ * fragments against a synthetic transaction context and it compares VERDICTS
+ * ONLY. A miscompile that leaves the script acceptable while committing the
+ * WRONG continuation state is invisible here. Full transaction context plus a
+ * post-state VALUE pin is `--spend-oracle`. See `conformance/fuzzer/README.md`.
+ */
+
+/**
  * Randomized source-vs-script EXECUTION oracle (TS-GAP-001 randomized half,
  * TS-GAP-005).
  *
@@ -10,13 +19,24 @@
  * INDEPENDENT engines via the shared differential-execution oracle
  * (`packages/runar-testing/src/oracle`):
  *
- *   1. source semantics — the ANF `RunarInterpreter` (via `TestContract`)
+ *   1. source semantics — the AST-walking `RunarInterpreter` (via `TestContract`).
+ *      It reads the parsed `ContractNode` directly; `04-anf-lower.ts` sits
+ *      DOWNSTREAM of its input and is NOT shared with the compiled side. That
+ *      is precisely why this comparison can catch an ANF-lowering miscompile —
+ *      but only one that flips accept/reject (see the caveat below).
  *   2. script semantics — the compiler's fold-ON deployed bytes executed on the
  *      `@bsv/sdk`-backed `ScriptVM`
  *
  * and asserts they AGREE on accept/reject. A divergence
  * (`interpreterAccepted !== vmAccepted`) is a real, shared-design compiler bug:
  * the two engines are independent implementations of the same source semantics.
+ *
+ * What AGREEMENT does not prove: this is a VERDICT-ONLY comparison. A
+ * miscompile that leaves the script acceptable while committing the wrong
+ * continuation state is invisible here — both engines report accept and the
+ * oracle agrees while the state is wrong. Catching that needs an independent,
+ * hand-authored pin (`expectedState` in `conformance/witnesses/real-crypto/`)
+ * or the Spend-oracle fuzzer's byte-level state check, not this agreement.
  *
  * Scope (why this subset): the in-process oracle cannot execute contracts whose
  * spend needs a real transaction context or real crypto. We therefore restrict

@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use runar_lang::sdk::script_utils::build_p2pkh_script;
 use runar_lang::sdk::{
     DeployOptions, LocalSigner, MockProvider, RunarContract, SdkValue, Signer, Utxo,
 };
@@ -60,9 +61,13 @@ fn input0_script_sig(tx_hex: &str) -> String {
     tx_hex[off..off + script_len * 2].to_string()
 }
 
-/// Deploy the trivial contract, funding from a single coin filed under the
-/// method signer's address (its script content is irrelevant — the pushed
-/// pubkey comes from the signer, not the coin). Returns the deploy tx hex.
+/// Deploy the trivial contract, funding from a single coin DISCOVERED under
+/// the method signer's address but LOCKED to whichever key actually owns it —
+/// the real-world shape issue #134 is about. Returns the deploy tx hex.
+///
+/// The coin's script is NOT irrelevant: the old fixture locked it to a hash
+/// nobody holds ("76a914" + "11"*20 + "88ac"), which built an unspendable
+/// funding input that only the pre-Phase-A5 always-ack MockProvider accepted.
 fn deploy_tx(funding_signer: Option<FundingSigner>) -> (String, String, String) {
     let method_signer = LocalSigner::new(METHOD_KEY).unwrap();
     let funding_ls = LocalSigner::new(FUNDING_KEY).unwrap();
@@ -75,7 +80,7 @@ fn deploy_tx(funding_signer: Option<FundingSigner>) -> (String, String, String) 
         txid: "a1".repeat(32),
         output_index: 0,
         satoshis: 100_000,
-        script: format!("76a914{}88ac", "11".repeat(20)),
+        script: build_p2pkh_script(if funding_signer.is_some() { &funding_pub } else { &method_pub }),
     });
 
     let mut contract = RunarContract::new(trivial_artifact(), Vec::<SdkValue>::new());

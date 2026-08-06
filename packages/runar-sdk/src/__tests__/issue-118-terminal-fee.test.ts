@@ -70,7 +70,10 @@ const FEE_SATS = 5_000;
 
 async function setup() {
   const methodSigner = new LocalSigner(METHOD_KEY);
-  const provider = new MockProvider();
+  // This file's whole subject is a terminal payout that pays fee 0 without
+  // `feeUtxo` (the pre-#118 bug this option fixes) — opt out of P1-2's fee
+  // floor only; Spend + conservation still run via trySpend()/outputSum().
+  const provider = new MockProvider('testnet', { enforceFeeFloor: false });
   // Deploy funding coin under the method signer (locked to method signer).
   const methodAddr = await methodSigner.getAddress();
   provider.addUtxo(methodAddr, {

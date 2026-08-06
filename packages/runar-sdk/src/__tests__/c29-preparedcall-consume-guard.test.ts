@@ -16,6 +16,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import type { RunarArtifact } from 'runar-ir-schema';
 
 const SIGNER_KEY = '0000000000000000000000000000000000000000000000000000000000000006';
@@ -52,7 +53,7 @@ const SRC = `
 
 async function deployOwnerBump() {
   const artifact = compileSource(SRC, 'OwnerBump.runar.ts');
-  const provider = new MockProvider();
+  const provider = new MockProvider('testnet');
   const signer = new LocalSigner(SIGNER_KEY);
   const address = await signer.getAddress();
   const pubKeyHex = await signer.getPublicKey();
@@ -60,7 +61,7 @@ async function deployOwnerBump() {
     txid: SIGNER_KEY.slice(0, 64),
     outputIndex: 0,
     satoshis: 500_000,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(pubKeyHex),
   });
   const contract = new RunarContract(artifact, [pubKeyHex, 0n]);
   contract.connect(provider, signer);

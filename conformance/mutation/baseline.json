@@ -227,6 +227,93 @@
         "fold-execution"
       ],
       "documentedSurvivor": false
+    },
+    {
+      "id": "anflower-merge-locals-single-only",
+      "class": "branch-merge regression",
+      "stage": "anf-lower",
+      "caught": true,
+      "survived": false,
+      "caughtBy": [
+        "branch-merged-locals-vm"
+      ],
+      "expectCaughtBy": [
+        "branch-merged-locals-vm"
+      ],
+      "documentedSurvivor": false
+    },
+    {
+      "id": "stacklower-merge-locals-property-only",
+      "class": "branch-merge regression",
+      "stage": "stack-lower",
+      "caught": true,
+      "survived": false,
+      "caughtBy": [
+        "branch-merged-locals-vm"
+      ],
+      "expectCaughtBy": [
+        "branch-merged-locals-vm"
+      ],
+      "documentedSurvivor": false
+    },
+    {
+      "id": "sdkstate-encode-minimaldata-opn",
+      "class": "state-framing regression",
+      "stage": "sdk-state",
+      "caught": true,
+      "survived": false,
+      "caughtBy": [
+        "state-push-framing-vm",
+        "c28-state-strict"
+      ],
+      "expectCaughtBy": [
+        "state-push-framing-vm",
+        "c28-state-strict"
+      ],
+      "documentedSurvivor": false
+    },
+    {
+      "id": "sdkstate-decode-opn-as-length",
+      "class": "state-framing regression",
+      "stage": "sdk-state",
+      "caught": true,
+      "survived": false,
+      "caughtBy": [
+        "c28-state-strict"
+      ],
+      "expectCaughtBy": [
+        "state-push-framing-vm",
+        "c28-state-strict"
+      ],
+      "documentedSurvivor": false
+    },
+    {
+      "id": "sdksplice-constructor-slot-wrong-length",
+      "class": "constructor-slot splice regression",
+      "stage": "sdk-splice",
+      "caught": true,
+      "survived": false,
+      "caughtBy": [
+        "sdk-vertical-constructor-slots"
+      ],
+      "expectCaughtBy": [
+        "sdk-vertical-constructor-slots"
+      ],
+      "documentedSurvivor": false
+    },
+    {
+      "id": "sdksplice-codeseparator-off-by-one",
+      "class": "codeSeparator off-by-one",
+      "stage": "sdk-splice",
+      "caught": true,
+      "survived": false,
+      "caughtBy": [
+        "sdk-vertical-codeseparator"
+      ],
+      "expectCaughtBy": [
+        "sdk-vertical-codeseparator"
+      ],
+      "documentedSurvivor": false
     }
   ]
 }

@@ -38,7 +38,7 @@ import { verify as ecdsaVerifyRaw, sign as ecdsaSign } from '@bsv/sdk/primitives
 import { canonicalJsonStringify as canonicalJson } from '../../packages/runar-ir-schema/src/canonical-json.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const ALICE_PUB_HEX = new PrivateKey(1n).toPublicKey().toDER('hex') as string;
+const ALICE_PUB_HEX = new PrivateKey(1).toPublicKey().toDER('hex') as string;
 
 function fail(msg: string): never {
   console.error(`FAIL: ${msg}`);
@@ -95,7 +95,7 @@ function main(): void {
   //    canonicalJson or its RFC 6979 (plain-SHA-256-nonce) ECDSA path drifts
   //    from the committed bytes, this fails before any non-TS tier replays
   //    against a stale expected_sig.
-  const alicePriv = new PrivateKey(1n);
+  const alicePriv = new PrivateKey(1);
   const signingVectors = fixture.signing_vectors as Array<{
     _vector_id?: string;
     data: Record<string, unknown>;

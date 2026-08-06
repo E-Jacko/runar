@@ -40,6 +40,7 @@
 use std::path::Path;
 
 use runar_lang::sdk::types::RunarArtifact;
+use runar_lang::sdk::script_utils::build_p2pkh_script;
 use runar_lang::sdk::{DeployOptions, LocalSigner, MockProvider, RunarContract, SdkValue, Signer, Utxo};
 
 const DEPLOYER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000003";
@@ -72,7 +73,7 @@ fn deploy() -> (RunarContract, MockProvider, LocalSigner) {
         txid: "cc".repeat(32),
         output_index: 0,
         satoshis: 500_000,
-        script: format!("76a914{}88ac", "00".repeat(20)),
+        script: build_p2pkh_script(&address),
     });
 
     let mut contract = RunarContract::new(compile_example(), vec![SdkValue::Int(0)]);

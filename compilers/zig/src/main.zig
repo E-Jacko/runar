@@ -425,7 +425,13 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
     const expanded_contract = expanded.contract;
 
     // Pass 4: ANF Lower
-    var program = try anf_lower.lowerToANF(work_allocator, expanded_contract);
+    var lower_diag: anf_lower.LowerDiagnostic = .{};
+    var program = anf_lower.lowerToANFWithDiagnostic(work_allocator, expanded_contract, &lower_diag) catch |err| {
+        if (lower_diag.message) |message| {
+            std.debug.print("  anf lowering error: {s}\n", .{message});
+        }
+        return err;
+    };
 
     // Pass 4.25: Constant Fold
     if (!opts.disable_constant_folding) {

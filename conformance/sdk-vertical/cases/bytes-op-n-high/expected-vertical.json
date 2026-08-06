@@ -1,0 +1,85 @@
+{
+  "case": "bytes-op-n-high",
+  "contract": "SlotMatrix",
+  "valueClass": "ByteString 0x10 → OP_16, top of the collapse range",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "7"
+    },
+    {
+      "type": "ByteString",
+      "value": "10"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 79,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 0,
+      "valueByteLength": 1,
+      "encoding": "data",
+      "pushedHex": "10"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 3,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 3,
+      "valueByteLength": 1,
+      "encoding": "scriptnum",
+      "pushedHex": "07"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 6,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 6,
+      "valueByteLength": 1,
+      "encoding": "data",
+      "pushedHex": "10"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 7,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 8,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 44,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 45,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

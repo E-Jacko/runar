@@ -25,7 +25,7 @@ def setup_funded_contract(satoshis: int = 50_000):
         AbiMethod(name='cancel', params=[], is_public=True),
     ])
     contract = RunarContract(artifact, [])
-    provider = MockProvider(network='testnet')
+    provider = MockProvider.always_ack('testnet')
     signer = MockSigner()
     address = signer.get_address()
 

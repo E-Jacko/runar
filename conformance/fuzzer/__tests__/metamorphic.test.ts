@@ -5,7 +5,7 @@ import {
   introduceLet,
   insertDeadCode,
 } from '../metamorphic.js';
-import { runDifferentialExecution, type WitnessArg } from 'runar-testing';
+import { runDifferentialExecution, type WitnessArg } from '../../../packages/runar-testing/src/index.js';
 
 // A tiny stateless-arithmetic contract with a local `const`, two params, one
 // property, and a commutative (`===`) top-level assert condition — enough

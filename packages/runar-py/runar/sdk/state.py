@@ -126,10 +126,10 @@ def serialize_state(fields: list[StateField], values: dict) -> str:
                     elem = flat_from_arr[i]
                 else:
                     elem = None
-                hex_str += _encode_state_value(elem, leaf_type)
+                hex_str += _encode_state_value(elem, leaf_type, synth_name)
         else:
             value = values.get(field.name)
-            hex_str += _encode_state_value(value, field.type)
+            hex_str += _encode_state_value(value, field.type, field.name)
     return hex_str
 
 
@@ -218,8 +218,37 @@ def find_last_op_return(script_hex: str) -> int:
 # Encoding helpers
 # ---------------------------------------------------------------------------
 
-def _encode_num2bin(n: int, width: int) -> str:
-    """Encode an integer as fixed-width LE sign-magnitude bytes (NUM2BIN format)."""
+def _encode_num2bin(n: int, width: int, label: str = '?') -> str:
+    """Encode an integer as fixed-width LE sign-magnitude bytes (NUM2BIN format).
+
+    FAILS CLOSED on an out-of-range magnitude. ``width`` bytes of
+    sign-magnitude hold ``8*width - 1`` magnitude bits — the top bit of the
+    last byte is the sign. The loop below writes the low ``width`` bytes and
+    drops everything above, then ORs the sign bit in on top of whatever landed
+    there, so an oversized value used to serialise to a plausible but WRONG
+    word::
+
+        2^63      -> 0000000000000080   reads back as 0   (negative zero)
+        2^63 + 5  -> 0500000000000080   reads back as -5  (sign flip)
+        2^64      -> 0000000000000000   reads back as 0
+
+    The deploy then succeeded and the UTXO was unspendable: the covenant
+    rebuilds the continuation with the compiler's own OP_NUM2BIN ``width``,
+    which cannot produce those bytes from that number, so ``hash256(outputs)``
+    never matches. Raising here is the only place a runtime-computed state
+    value can be stopped — ``±(2^(8*width-1) - 1)`` remains representable and
+    is unaffected.
+    """
+    limit = 1 << (8 * width - 1)
+    if n >= limit or n <= -limit:
+        raise ValueError(
+            f'serialize_state: bigint state field "{label}" = {n} does not fit the '
+            f'fixed {width}-byte sign-magnitude state word (magnitude must be < '
+            f'2^{8 * width - 1}). Serializing it would write a different number into '
+            f"the state section than the contract's on-chain OP_NUM2BIN {width} "
+            f'rebuilds, leaving the output unspendable.'
+        )
+
     result_bytes = bytearray(width)
     negative = n < 0
     abs_val = abs(n)
@@ -377,7 +406,7 @@ _TYPE_WIDTHS = {
 }
 
 
-def _encode_state_value(value, field_type: str) -> str:
+def _encode_state_value(value, field_type: str, label: str = '?') -> str:
     if field_type in ('int', 'bigint'):
         if value is None:
             n = 0
@@ -386,7 +415,7 @@ def _encode_state_value(value, field_type: str) -> str:
             n = int(value[:-1])
         else:
             n = int(value)
-        return _encode_num2bin(n, 8)
+        return _encode_num2bin(n, 8, label)
     elif field_type == 'bool':
         return '01' if value else '00'
     elif field_type in _TYPE_WIDTHS:

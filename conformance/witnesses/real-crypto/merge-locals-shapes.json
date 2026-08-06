@@ -1,0 +1,133 @@
+{
+  "fixture": "merge-locals-shapes",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "The three branch-merge arities that had only a Script-VM unit test behind them: k=2 symmetric (`bothArms`), k=3 (`three`) and merged-at-the-outer-level nesting (`nested`). Plan Phase D1 asks for the same real-secp256k1 / real-BIP-143 continuation proof `branch-merged-locals` gets for the asymmetric k=2 case. Every accept pins expectedState, so a merge that resurrects a dead pre-branch binding fails on the VALUE even when the spend would still be accepted. Constructor state is (a,b,c) = (0,0,9); `c` is the untouched control field — a merge that shifts a stack slot corrupts it.",
+  "constructorArgs": [
+    "0n",
+    "0n",
+    "9n"
+  ],
+  "spends": [
+    {
+      "method": "bothArms",
+      "args": [
+        "10n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "k=2 symmetric, then-arm: na=x+1=11, nb=x+2=12, c untouched",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "11n",
+        "b": "12n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "bothArms",
+      "args": [
+        "10n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "k=2 symmetric, else-arm: na=x+3=13, nb=x+4=14, c untouched",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "13n",
+        "b": "14n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "three",
+      "args": [
+        "20n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "k=3, then-arm: 21, 22, 23 — all three merged locals reach the continuation",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "21n",
+        "b": "22n",
+        "c": "23n"
+      }
+    },
+    {
+      "method": "three",
+      "args": [
+        "20n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "k=3, else-arm: 24, 25, 26",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "24n",
+        "b": "25n",
+        "c": "26n"
+      }
+    },
+    {
+      "method": "nested",
+      "args": [
+        "30n",
+        "1n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "nested: outer taken, inner then-arm rebinds na only — nb must survive from before the OUTER if",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "31n",
+        "b": "0n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "nested",
+      "args": [
+        "30n",
+        "1n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "nested: outer taken, inner else-arm rebinds nb only — na must survive",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "0n",
+        "b": "32n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "nested",
+      "args": [
+        "30n",
+        "0n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "nested: outer NOT taken (no else) — the implicit fallthrough arm rebinds neither local, so both originals must reach the continuation",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "0n",
+        "b": "0n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "three",
+      "args": [
+        "20n",
+        "1n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the k=3 merged result block must be committed to by hashOutputs",
+      "satoshis": 1000
+    }
+  ]
+}

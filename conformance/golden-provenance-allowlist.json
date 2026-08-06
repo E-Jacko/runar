@@ -1,11 +1,11 @@
 {
   "_comment": [
-    "GOLDEN-REGENERATION INTEGRITY GATE — provenance allowlist (issue #122).",
+    "GOLDEN-REGENERATION INTEGRITY GATE \u2014 provenance allowlist (issue #122).",
     "Goldens/vectors are self-produced by the implementation-under-test. This file",
     "is how a PR carries an INDEPENDENT justification for changing one. Every entry",
     "pins a specific golden file to the exact NEW content it is authorizing, via a",
     "sha256 of that file's bytes. Because the pin is content-addressed, an entry can",
-    "only ever justify the ONE value it was reviewed for — a later, different",
+    "only ever justify the ONE value it was reviewed for \u2014 a later, different",
     "regeneration of the same file fails the gate again and forces a fresh entry.",
     "See conformance/README.md -> 'Golden-regeneration integrity gate' for the full",
     "design and the two ways to satisfy the gate.",
@@ -29,7 +29,7 @@
       "path": "conformance/runtime-vectors/blake3-official-kat.json",
       "sha256": "6bbc509a9e6dfa3a6a5cba24ba0f4b9744fe65e9df18f5edda101eaa60318c0a",
       "verified-against": "official-KAT",
-      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9…. These ARE the independent oracle, not compiler-produced bytes — the fix for the BUG-101 self-golden gap.",
+      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9\u2026. These ARE the independent oracle, not compiler-produced bytes \u2014 the fix for the BUG-101 self-golden gap.",
       "reviewer": "gh:icellan",
       "date": "2026-07-08"
     },
@@ -117,7 +117,7 @@
       "path": "conformance/tests/bounded-loop/expected-ir.json",
       "sha256": "35b23e46b5fbfbfdb56160d64599f7e5cb80fa4b0cee06cd6d4e506fbded5077",
       "verified-against": "intentional-spec-change",
-      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change — the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
+      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change \u2014 the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
       "reviewer": "gh:icellan",
       "date": "2026-07-09"
     },
@@ -133,7 +133,7 @@
       "path": "conformance/tests/branched-readonly-len/expected-script.hex",
       "sha256": "0554576be0abe18bd269f1c922ba9a340532b6c954183c0b11e3235a3cc4724e",
       "verified-against": "differential-oracle",
-      "reason": "Regenerated for deep-review finding C27 (else-present N-field stack reconcile). spend()'s len(scratch)-driven if/else writes BOTH state fields (count:bigint + tag:ByteString) on each arm; the pre-fix 05-stack-lower N-result reconcile was gated on empty-else, so this else-present multi-field write fell through to a single stackMap name for N results and emitted an unspendable OP_NUM2BIN continuation (silently uniform across all 7 tiers — parity-green-but-wrong). The fix broadens the reconcile to the else-present path, growing the script +5 bytes (1081->1086). Verified against the differential-execution oracle: conformance/witnesses/real-crypto/branched-readonly-len.json drives deploy->call->@bsv/sdk Spend for BOTH branches (count 5->6/tag->4142 and count 5->4/tag->3030) plus a tampered-output reject — all validate. Also corroborated by 7-tier cross-compiler byte-identical parity (fold-off and fold-on).",
+      "reason": "Regenerated for deep-review finding C27 (else-present N-field stack reconcile). spend()'s len(scratch)-driven if/else writes BOTH state fields (count:bigint + tag:ByteString) on each arm; the pre-fix 05-stack-lower N-result reconcile was gated on empty-else, so this else-present multi-field write fell through to a single stackMap name for N results and emitted an unspendable OP_NUM2BIN continuation (silently uniform across all 7 tiers \u2014 parity-green-but-wrong). The fix broadens the reconcile to the else-present path, growing the script +5 bytes (1081->1086). Verified against the differential-execution oracle: conformance/witnesses/real-crypto/branched-readonly-len.json drives deploy->call->@bsv/sdk Spend for BOTH branches (count 5->6/tag->4142 and count 5->4/tag->3030) plus a tampered-output reject \u2014 all validate. Also corroborated by 7-tier cross-compiler byte-identical parity (fold-off and fold-on).",
       "reviewer": "gh:icellan",
       "date": "2026-07-26"
     },
@@ -445,43 +445,1123 @@
       "path": "conformance/tests/convergence-proof/expected-script.hex",
       "sha256": "ccc59a1ea7032b77b3d9f7bd4eaa1fef78f110e89eb53bf33524e0b2e5a2e866",
       "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script \u2014 byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements \u2014 ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
       "reviewer": "gh:icellan"
     },
     {
       "path": "conformance/tests/ec-demo/expected-script.hex",
       "sha256": "cf7dac2c75d649b28d0ba7c29b719d96458b9e045a03aed291a96895a4703b90",
       "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script \u2014 byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements \u2014 ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
       "reviewer": "gh:icellan"
     },
     {
       "path": "conformance/tests/ec-primitives/expected-script.hex",
       "sha256": "84f7c121db70927932f7313bd9bca9f7a2d69c9f2987ac7ef03d65748a61a97b",
       "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script \u2014 byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements \u2014 ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
       "reviewer": "gh:icellan"
     },
     {
       "path": "conformance/tests/ec-unit/expected-script.hex",
       "sha256": "d543af1444b1cacbb763420a28108a63fd70f9db2bddb8da925a20ff168f9182",
       "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script \u2014 byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements \u2014 ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
       "reviewer": "gh:icellan"
     },
     {
       "path": "conformance/tests/schnorr-zkp/expected-script.hex",
       "sha256": "7c7501b30f34e2dc256dfd4f59f6a47a718abdbd18b54ef03a670f0c3cba65b7",
       "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
+      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script \u2014 byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements \u2014 ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
       "reviewer": "gh:icellan"
     },
     {
       "path": "conformance/script-size-baseline.json",
-      "sha256": "d0ba1a09307b2c61b4d3e2370c9519a641b05444e587ee86dc9ab8dac2c1d894",
+      "sha256": "e2c79708accabc052b96af1762f45e813a9c4bb578c62e0f054d61d2ce4a773b",
       "verified-against": "intentional-spec-change",
-      "reason": "Re-stamped after the ecAdd doubling fix. Only the five EC fixtures moved, by +0.05%..+0.09% (convergence-proof, ec-demo, ec-primitives, ec-unit, schnorr-zkp) — the tangent-slope selection adds 124 ops and reuses the single existing fieldInv. All 60 other fixtures are byte-unchanged.",
+      "reason": "Re-stamped after the ecAdd doubling fix. Only the five EC fixtures moved, by +0.05%..+0.09% (convergence-proof, ec-demo, ec-primitives, ec-unit, schnorr-zkp) \u2014 the tangent-slope selection adds 124 ops and reuses the single existing fieldInv. All 60 other fixtures are byte-unchanged. 2026-08-05 (plan Phase D1/D3): three ADDITIVE rows only \u2014 merge-locals-shapes 3031, merge-locals-prop-updates 1006, state-bigint-edges 952 \u2014 for three brand-new fixtures. No existing fixture's recorded size changed, so this re-stamp cannot mask a size regression in any pre-existing contract (script-size-check: ok=69 warn=0 fail=0 missing=0).",
       "reviewer": "gh:icellan"
+    },
+    {
+      "path": "conformance/tests/merge-locals-shapes/expected-ir.json",
+      "sha256": "201c163910f9ef3e8652b0248396833ea9329820e0962f22ffc0bf1fc2bce2eb",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture added by plan Phase D1/D3 (construct-ledger rows merge-locals-k2-both-arms / merge-locals-k3 / merge-locals-nested-if). These bytes are the first-ever golden for the fixture, produced fold-OFF by the TS reference compiler. INDEPENDENT ORACLE: conformance/witnesses/real-crypto/merge-locals-shapes.json executes the same contract through @bsv/sdk's production Spend interpreter with real secp256k1 and a real BIP-143 state-continuation preimage, and every accepting spend additionally pins the decoded on-chain continuation state against a hand-computed expectation (so a self-consistent wrong lowering fails on the VALUE, not just accept/reject) plus a tamperOutput reject. That engine did not produce these bytes. The plain differential oracle (conformance/witnesses/<fixture>.json) cannot be used here: it drives a synthetic tx context with no signature, so a StatefulSmartContract fails at OP_CHECKSIGVERIFY before the state logic runs. Cross-tier: all 7 compilers emit byte-identical IR + hex for all 9 source formats (27 multi-format runs, 0 failures); all 7 SDKs reproduce the deploy locking script (conformance/sdk-output/tests/merge-locals-shapes).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/tests/merge-locals-shapes/expected-script.hex",
+      "sha256": "4566708a7e710f27a89a5236aa5bb915487a491a6e66678dc1eee83e1624305e",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture added by plan Phase D1/D3 (construct-ledger rows merge-locals-k2-both-arms / merge-locals-k3 / merge-locals-nested-if). These bytes are the first-ever golden for the fixture, produced fold-OFF by the TS reference compiler. INDEPENDENT ORACLE: conformance/witnesses/real-crypto/merge-locals-shapes.json executes the same contract through @bsv/sdk's production Spend interpreter with real secp256k1 and a real BIP-143 state-continuation preimage, and every accepting spend additionally pins the decoded on-chain continuation state against a hand-computed expectation (so a self-consistent wrong lowering fails on the VALUE, not just accept/reject) plus a tamperOutput reject. That engine did not produce these bytes. The plain differential oracle (conformance/witnesses/<fixture>.json) cannot be used here: it drives a synthetic tx context with no signature, so a StatefulSmartContract fails at OP_CHECKSIGVERIFY before the state logic runs. Cross-tier: all 7 compilers emit byte-identical IR + hex for all 9 source formats (27 multi-format runs, 0 failures); all 7 SDKs reproduce the deploy locking script (conformance/sdk-output/tests/merge-locals-shapes).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/tests/merge-locals-prop-updates/expected-ir.json",
+      "sha256": "5e285d8f8d3d9d7b85f1aa0beb0f77eb5e5556fbd3e7038f1176de1a53dfdc01",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture added by plan Phase D1/D3 (construct-ledger rows merge-locals-with-prop-updates). These bytes are the first-ever golden for the fixture, produced fold-OFF by the TS reference compiler. INDEPENDENT ORACLE: conformance/witnesses/real-crypto/merge-locals-prop-updates.json executes the same contract through @bsv/sdk's production Spend interpreter with real secp256k1 and a real BIP-143 state-continuation preimage, and every accepting spend additionally pins the decoded on-chain continuation state against a hand-computed expectation (so a self-consistent wrong lowering fails on the VALUE, not just accept/reject) plus a tamperOutput reject. That engine did not produce these bytes. The plain differential oracle (conformance/witnesses/<fixture>.json) cannot be used here: it drives a synthetic tx context with no signature, so a StatefulSmartContract fails at OP_CHECKSIGVERIFY before the state logic runs. Cross-tier: all 7 compilers emit byte-identical IR + hex for all 9 source formats (27 multi-format runs, 0 failures); all 7 SDKs reproduce the deploy locking script (conformance/sdk-output/tests/merge-locals-prop-updates).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/tests/merge-locals-prop-updates/expected-script.hex",
+      "sha256": "68ad89b46634a98239c27271a725a00a6aa34cb4ad5a24eb6e307e3514757644",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture added by plan Phase D1/D3 (construct-ledger rows merge-locals-with-prop-updates). These bytes are the first-ever golden for the fixture, produced fold-OFF by the TS reference compiler. INDEPENDENT ORACLE: conformance/witnesses/real-crypto/merge-locals-prop-updates.json executes the same contract through @bsv/sdk's production Spend interpreter with real secp256k1 and a real BIP-143 state-continuation preimage, and every accepting spend additionally pins the decoded on-chain continuation state against a hand-computed expectation (so a self-consistent wrong lowering fails on the VALUE, not just accept/reject) plus a tamperOutput reject. That engine did not produce these bytes. The plain differential oracle (conformance/witnesses/<fixture>.json) cannot be used here: it drives a synthetic tx context with no signature, so a StatefulSmartContract fails at OP_CHECKSIGVERIFY before the state logic runs. Cross-tier: all 7 compilers emit byte-identical IR + hex for all 9 source formats (27 multi-format runs, 0 failures); all 7 SDKs reproduce the deploy locking script (conformance/sdk-output/tests/merge-locals-prop-updates).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/tests/state-bigint-edges/expected-ir.json",
+      "sha256": "60089f57245708f85637c81e7f62046b9d014d53861944e68804b0de09b6f595",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture added by plan Phase D1/D3 (construct-ledger rows state-bigint-edges). These bytes are the first-ever golden for the fixture, produced fold-OFF by the TS reference compiler. INDEPENDENT ORACLE: conformance/witnesses/real-crypto/state-bigint-edges.json executes the same contract through @bsv/sdk's production Spend interpreter with real secp256k1 and a real BIP-143 state-continuation preimage, and every accepting spend additionally pins the decoded on-chain continuation state against a hand-computed expectation (so a self-consistent wrong lowering fails on the VALUE, not just accept/reject) plus a tamperOutput reject. That engine did not produce these bytes. The plain differential oracle (conformance/witnesses/<fixture>.json) cannot be used here: it drives a synthetic tx context with no signature, so a StatefulSmartContract fails at OP_CHECKSIGVERIFY before the state logic runs. Cross-tier: all 7 compilers emit byte-identical IR + hex for all 9 source formats (27 multi-format runs, 0 failures); all 7 SDKs reproduce the deploy locking script (conformance/sdk-output/tests/state-bigint-edges + state-bigint-edges-large).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/tests/state-bigint-edges/expected-script.hex",
+      "sha256": "16996c8b5c6c0d273ffc2458e08c1cbbf37dec5e1ed887910991b3032b40a9cd",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture added by plan Phase D1/D3 (construct-ledger rows state-bigint-edges). These bytes are the first-ever golden for the fixture, produced fold-OFF by the TS reference compiler. INDEPENDENT ORACLE: conformance/witnesses/real-crypto/state-bigint-edges.json executes the same contract through @bsv/sdk's production Spend interpreter with real secp256k1 and a real BIP-143 state-continuation preimage, and every accepting spend additionally pins the decoded on-chain continuation state against a hand-computed expectation (so a self-consistent wrong lowering fails on the VALUE, not just accept/reject) plus a tamperOutput reject. That engine did not produce these bytes. The plain differential oracle (conformance/witnesses/<fixture>.json) cannot be used here: it drives a synthetic tx context with no signature, so a StatefulSmartContract fails at OP_CHECKSIGVERIFY before the state logic runs. Cross-tier: all 7 compilers emit byte-identical IR + hex for all 9 source formats (27 multi-format runs, 0 failures); all 7 SDKs reproduce the deploy locking script (conformance/sdk-output/tests/state-bigint-edges + state-bigint-edges-large).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/sdk-output/tests/merge-locals-shapes/expected-locking.hex",
+      "sha256": "f3b280d77e978323f2b409318e7a4974e413a33be1a9143f121013bc22623ecf",
+      "verified-against": "second-implementation",
+      "reason": "Deploy locking script for the new merge-locals-shapes fixture (a,b,c = 0,0,9). First-ever golden for this fixture. INDEPENDENT ORACLE: cross-implementation \u2014 all SEVEN SDK tools (TS, Go, Python, Ruby, Rust, Zig, Java) independently reproduce these exact bytes from the same artifact + constructor args (conformance/sdk-output run: 52/52 pass), and the same contract is executed end to end on @bsv/sdk's Spend engine by conformance/witnesses/real-crypto/merge-locals-shapes.json with hand-computed expectedState on all 7 accepting spends.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/sdk-output/tests/merge-locals-prop-updates/expected-locking.hex",
+      "sha256": "0bedd7b253ec6508388464c8d184e05c5c346d0b3d642fffc3bb91f9ff7eb5e6",
+      "verified-against": "second-implementation",
+      "reason": "Deploy locking script for the new merge-locals-prop-updates fixture (a,b,total = 3,5,8). First-ever golden for this fixture. INDEPENDENT ORACLE: cross-implementation \u2014 all SEVEN SDK tools reproduce these exact bytes, and conformance/witnesses/real-crypto/merge-locals-prop-updates.json executes the contract on @bsv/sdk Spend with hand-computed expectedState for all three properties plus a tamperOutput reject.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges/expected-locking.hex",
+      "sha256": "02cf2697e884d9f273fb273d6823f6fdd3fe05c652837d7f80e03c240d3b7b84",
+      "verified-against": "second-implementation",
+      "reason": "Deploy locking script for a stateful contract carrying a NEGATIVE bigint state value (lo = -1, hi = +1). This is the first sdk-output golden anywhere that exercises the bigint sign bit: every pre-existing bigint state golden pinned 0/100/1000/10000/1000000, all non-negative. DERIVATION OF THE STATE BYTES (independent of any implementation): a bigint state field is OP_NUM2BIN(n, 8) \u2014 a fixed 8-byte LITTLE-ENDIAN SIGN-MAGNITUDE word, magnitude in bytes 0..6 LE, sign in bit 0x80 of byte 7. |-1| = 0x01 -> LE 01 00 00 00 00 00 00 00; negative -> byte7 |= 0x80 -> `0100000000000080`. |+1| -> `0100000000000000`. The golden's tail after OP_RETURN (0x6a) is exactly `0100000000000080` `0100000000000000` \u2014 hand-derived from the encoding rule FIRST, then confirmed against the emitted file, NOT read off serializeState. INDEPENDENT ORACLES: all seven SDK tools reproduce the bytes, and conformance/witnesses/real-crypto/state-bigint-edges.json deploys negative state and SPENDS it on @bsv/sdk Spend \u2014 the covenant rebuilds the state section on-chain with the COMPILER's framing, so an SDK/compiler disagreement on the sign byte would surface as an unspendable UTXO rather than a round-trip that agrees with itself.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges-large/expected-locking.hex",
+      "sha256": "bca7bd2deef034623ce395d28da67a009c6dab7581cb09a59e513df739ca36c8",
+      "verified-against": "second-implementation",
+      "reason": "Same contract with a 5-byte magnitude either side of zero (lo = -9999999999, hi = +9999999999) so the sign byte is exercised with a magnitude that spans several bytes. DERIVATION: 9999999999 = 0x02540BE3FF; little-endian over 8 bytes = ff e3 0b 54 02 00 00 00 -> `ffe30b5402000000`; negating sets bit 0x80 of byte 7 -> `ffe30b5402000080`. The golden's tail after OP_RETURN is exactly those two words. Hand-derived from the OP_NUM2BIN rule, then confirmed against the emitted file. INDEPENDENT ORACLES: all seven SDK tools reproduce the bytes; the same value pair is deployed and spent in conformance/witnesses/real-crypto/state-bigint-edges.json with expectedState pinned.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-05"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges-zero/expected-locking.hex",
+      "sha256": "a7ab6681c7bf7cc3059059f403c08441f53db917ccca6a5a7596d2f984898700",
+      "verified-against": "second-implementation",
+      "reason": "Absolute cross-SDK byte golden for bigint state values 0 / +1 (construct-ledger row `state-bigint-edges`, plan Phase D3). Same StateBigintEdges artifact, different constructor args, so the fixture family pins the whole documented edge set rather than one sample. DERIVATION (from the encoding rule, not from serializeState): a bigint state field is OP_NUM2BIN(n, 8) \u2014 a fixed 8-byte LITTLE-ENDIAN SIGN-MAGNITUDE word, magnitude in bytes 0..6 LE, sign in bit 0x80 of byte 7. 0 -> `0000000000000000` (all-zero magnitude, sign clear) and +1 -> `0100000000000000`. The zero word is the control: a negative-zero encoder would put 0x80 in byte 7 here. The expected tail was written out from that rule first and only then compared against the emitted file, and the byte immediately before it is 0x6a (OP_RETURN). INDEPENDENT ORACLE: all SEVEN SDK tools (TS, Go, Python, Ruby, Rust, Zig, Java) reproduce these exact bytes from the same artifact, so this is cross-implementation, not an encoder graded against its own inverse; the same value classes are additionally deployed and SPENT on @bsv/sdk's Spend engine by conformance/witnesses/real-crypto/state-bigint-edges.json.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges-127/expected-locking.hex",
+      "sha256": "385ac444ab679f44a4cd4d2dac33e23d65bd50463c2345d57e8a39e42bca118e",
+      "verified-against": "second-implementation",
+      "reason": "Absolute cross-SDK byte golden for bigint state values -127 / +127 (construct-ledger row `state-bigint-edges`, plan Phase D3). Same StateBigintEdges artifact, different constructor args, so the fixture family pins the whole documented edge set rather than one sample. DERIVATION (from the encoding rule, not from serializeState): a bigint state field is OP_NUM2BIN(n, 8) \u2014 a fixed 8-byte LITTLE-ENDIAN SIGN-MAGNITUDE word, magnitude in bytes 0..6 LE, sign in bit 0x80 of byte 7. |127| = 0x7f -> LE 7f 00 00 00 00 00 00 00; sign sets bit 0x80 of byte 7 -> `7f00000000000080`, positive -> `7f00000000000000`. The largest magnitude that leaves byte 0 below 0x80. The expected tail was written out from that rule first and only then compared against the emitted file, and the byte immediately before it is 0x6a (OP_RETURN). INDEPENDENT ORACLE: all SEVEN SDK tools (TS, Go, Python, Ruby, Rust, Zig, Java) reproduce these exact bytes from the same artifact, so this is cross-implementation, not an encoder graded against its own inverse; the same value classes are additionally deployed and SPENT on @bsv/sdk's Spend engine by conformance/witnesses/real-crypto/state-bigint-edges.json.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges-128/expected-locking.hex",
+      "sha256": "7b691b0f5a1d2f9cad9eee2138d8e45986a937e699243ed7ee08eb5c311aebeb",
+      "verified-against": "second-implementation",
+      "reason": "Absolute cross-SDK byte golden for bigint state values -128 / +128 (construct-ledger row `state-bigint-edges`, plan Phase D3). Same StateBigintEdges artifact, different constructor args, so the fixture family pins the whole documented edge set rather than one sample. DERIVATION (from the encoding rule, not from serializeState): a bigint state field is OP_NUM2BIN(n, 8) \u2014 a fixed 8-byte LITTLE-ENDIAN SIGN-MAGNITUDE word, magnitude in bytes 0..6 LE, sign in bit 0x80 of byte 7. |128| = 0x80 -> LE 80 00 ... -> `8000000000000080` / `8000000000000000`. Byte 0 now has its own high bit set, which is where a two's-complement or a minimal-scriptnum encoder first diverges from the fixed 8-byte sign-magnitude word. The expected tail was written out from that rule first and only then compared against the emitted file, and the byte immediately before it is 0x6a (OP_RETURN). INDEPENDENT ORACLE: all SEVEN SDK tools (TS, Go, Python, Ruby, Rust, Zig, Java) reproduce these exact bytes from the same artifact, so this is cross-implementation, not an encoder graded against its own inverse; the same value classes are additionally deployed and SPENT on @bsv/sdk's Spend engine by conformance/witnesses/real-crypto/state-bigint-edges.json.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges-255/expected-locking.hex",
+      "sha256": "e7ca36086614bb1025de4459e29a97f0037ca80dc184fa8ddb61d971b23c032b",
+      "verified-against": "second-implementation",
+      "reason": "Absolute cross-SDK byte golden for bigint state values -255 / +255 (construct-ledger row `state-bigint-edges`, plan Phase D3). Same StateBigintEdges artifact, different constructor args, so the fixture family pins the whole documented edge set rather than one sample. DERIVATION (from the encoding rule, not from serializeState): a bigint state field is OP_NUM2BIN(n, 8) \u2014 a fixed 8-byte LITTLE-ENDIAN SIGN-MAGNITUDE word, magnitude in bytes 0..6 LE, sign in bit 0x80 of byte 7. |255| = 0xff -> LE ff 00 ... -> `ff00000000000080` / `ff00000000000000`. Byte 0 saturated, magnitude still one byte. The expected tail was written out from that rule first and only then compared against the emitted file, and the byte immediately before it is 0x6a (OP_RETURN). INDEPENDENT ORACLE: all SEVEN SDK tools (TS, Go, Python, Ruby, Rust, Zig, Java) reproduce these exact bytes from the same artifact, so this is cross-implementation, not an encoder graded against its own inverse; the same value classes are additionally deployed and SPENT on @bsv/sdk's Spend engine by conformance/witnesses/real-crypto/state-bigint-edges.json.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-output/tests/state-bigint-edges-256/expected-locking.hex",
+      "sha256": "edf6e0ec800c7d1530c7d495753e713eb9799dbc176d59d9d887491183b3ea61",
+      "verified-against": "second-implementation",
+      "reason": "Absolute cross-SDK byte golden for bigint state values -256 / +256 (construct-ledger row `state-bigint-edges`, plan Phase D3). Same StateBigintEdges artifact, different constructor args, so the fixture family pins the whole documented edge set rather than one sample. DERIVATION (from the encoding rule, not from serializeState): a bigint state field is OP_NUM2BIN(n, 8) \u2014 a fixed 8-byte LITTLE-ENDIAN SIGN-MAGNITUDE word, magnitude in bytes 0..6 LE, sign in bit 0x80 of byte 7. |256| = 0x0100 -> LE 00 01 00 ... -> `0001000000000080` / `0001000000000000`. Magnitude spills into byte 1 while the sign stays in byte 7 \u2014 the pair that catches a big-endian or a sign-follows-magnitude encoder. The expected tail was written out from that rule first and only then compared against the emitted file, and the byte immediately before it is 0x6a (OP_RETURN). INDEPENDENT ORACLE: all SEVEN SDK tools (TS, Go, Python, Ruby, Rust, Zig, Java) reproduce these exact bytes from the same artifact, so this is cross-implementation, not an encoder graded against its own inverse; the same value classes are additionally deployed and SPENT on @bsv/sdk's Spend engine by conformance/witnesses/real-crypto/state-bigint-edges.json.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-0/expected-code-part.hex",
+      "sha256": "1697ca28059ebea7f4ef96eb5fbe6db9351241d1f5a895d2f2b192a6b2e061ee",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-0/expected-vertical.json",
+      "sha256": "8bc740985848a58297ae9ff26b4f3429afe18de56ecbe5742a4ce30a128f8ba5",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-0/expected-locking.hex",
+      "sha256": "1697ca28059ebea7f4ef96eb5fbe6db9351241d1f5a895d2f2b192a6b2e061ee",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-1/expected-code-part.hex",
+      "sha256": "f4f33a3c40704ca15a788eaff254aaf2cf04e152c814be8636afb5c19afe82f5",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-1/expected-vertical.json",
+      "sha256": "99cd6223286053a53abf0aeaf374b7c0e2beee061ae13ff34871dd5e5669de81",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-1/expected-locking.hex",
+      "sha256": "f4f33a3c40704ca15a788eaff254aaf2cf04e152c814be8636afb5c19afe82f5",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg1/expected-code-part.hex",
+      "sha256": "ddbf057aa3cf020c7cc81f6432db51c4edcbc95a6daf8f288d2f013026298752",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg1/expected-vertical.json",
+      "sha256": "539fb5ca1198851993ddb97a3751e4847f954d6d7084b9753b83869ca215e347",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg1/expected-locking.hex",
+      "sha256": "ddbf057aa3cf020c7cc81f6432db51c4edcbc95a6daf8f288d2f013026298752",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-16/expected-code-part.hex",
+      "sha256": "0c9b6fce597d504dbfe0c48fd70181987b5e9478c11e7c72ca7d51bee8bd44ae",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-16/expected-vertical.json",
+      "sha256": "f77c4ce320f0cac2c0084be7f94f9fb393e24380d93e1079cf95d2567b1005fb",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-16/expected-locking.hex",
+      "sha256": "0c9b6fce597d504dbfe0c48fd70181987b5e9478c11e7c72ca7d51bee8bd44ae",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-17/expected-code-part.hex",
+      "sha256": "9a135b5e0b0cb62eda2875ffbe1f24e452ab5b754a5eca7ba68266e1bb3230dc",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-17/expected-vertical.json",
+      "sha256": "bcfdccb39cf8500bd704092319d32701f05d75cef3f33e0a9f0b7851da715085",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-17/expected-locking.hex",
+      "sha256": "9a135b5e0b0cb62eda2875ffbe1f24e452ab5b754a5eca7ba68266e1bb3230dc",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-127/expected-code-part.hex",
+      "sha256": "3419f6af305f8a49de8c9affb6a1ade36194eea28cac3c490ce9d29caba0a8fd",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-127/expected-vertical.json",
+      "sha256": "187bd58550d1c825e7a729d484523206999e55e0e1d5318fb956004b7ad4396a",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-127/expected-locking.hex",
+      "sha256": "3419f6af305f8a49de8c9affb6a1ade36194eea28cac3c490ce9d29caba0a8fd",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-128/expected-code-part.hex",
+      "sha256": "2185b7dfebc9987a79d438987d5187c75cb348151af147906d00cb71c6d18b49",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-128/expected-vertical.json",
+      "sha256": "b4b64bb183173764a0f13425a8bc037851e928efb5fd90708f5dd663f19028ca",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-128/expected-locking.hex",
+      "sha256": "2185b7dfebc9987a79d438987d5187c75cb348151af147906d00cb71c6d18b49",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg128/expected-code-part.hex",
+      "sha256": "f877e2ae5c02a788844db1f2295e93e820324201bd6b59e9e15a1f2fa3adb953",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg128/expected-vertical.json",
+      "sha256": "3296bab01daef83c8428bf2b1bdf1445bae55e0c1394cae4ba950f329fc51f2d",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg128/expected-locking.hex",
+      "sha256": "f877e2ae5c02a788844db1f2295e93e820324201bd6b59e9e15a1f2fa3adb953",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-large/expected-code-part.hex",
+      "sha256": "8306dcd62d75f51bde13c7193401ea522f18b7498d3737476f6764342a14556f",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-large/expected-vertical.json",
+      "sha256": "7979024ec7d577723288632c49059d52e36d8271a752945b0cf4a65e3f85013b",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-large/expected-locking.hex",
+      "sha256": "8306dcd62d75f51bde13c7193401ea522f18b7498d3737476f6764342a14556f",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg16/expected-code-part.hex",
+      "sha256": "fcdc19e4c8b4725216b2173b442197fb09ab27de64333fba336f987cd48cc0fb",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg16/expected-vertical.json",
+      "sha256": "4950184c91018cddf69417035391fe3c1662749ac61daf430f0addba31ab9cea",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg16/expected-locking.hex",
+      "sha256": "fcdc19e4c8b4725216b2173b442197fb09ab27de64333fba336f987cd48cc0fb",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg17/expected-code-part.hex",
+      "sha256": "6cc85e7b911ee77446d33a5546ec2e57c1666e8d998a51c37298266eb139fff7",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg17/expected-vertical.json",
+      "sha256": "1b5b0e989e1d5dc324253885bd8e13f1d3a831cb8213d8669dbb898a8ef2064e",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg17/expected-locking.hex",
+      "sha256": "6cc85e7b911ee77446d33a5546ec2e57c1666e8d998a51c37298266eb139fff7",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg129/expected-code-part.hex",
+      "sha256": "7d9ce2e737fe3d887e28026781ecd7b87ea1811ebacfd68814a3c2d365a00491",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg129/expected-vertical.json",
+      "sha256": "db6c30ae983c3fdf400bf1f3b47b892ab378a656bf9edb686993b68759cfbc0e",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg129/expected-locking.hex",
+      "sha256": "7d9ce2e737fe3d887e28026781ecd7b87ea1811ebacfd68814a3c2d365a00491",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg-large/expected-code-part.hex",
+      "sha256": "25ffeca04136dfc6e99791077d3812a1828b458b4b4ccb25442cccfa678d7d89",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg-large/expected-vertical.json",
+      "sha256": "496b7922ae5821c4b8b5b1ec5d39c5c294269d5a11b53d0554a9ffcb36066a9d",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the bigint (scriptnum) value-class matrix (remediation plan C1/C3). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts, which re-derives the spliced code part from the compiler's OWN artifact claims (constructorSlots[].byteOffset + valueEncoding) using an independently-written scriptnum encoder (reference/encode.ts's encodeScriptNumber, from the OP_0/OP_1..16/OP_1NEGATE/sign-magnitude push rules, not copied from any SDK) and a fresh opcode walk of the resulting bytes (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/* (mechanically enforced by conformance/sdk-vertical/vertical-pins.test.ts's 'P2: reference/** imports nothing...' suite). generate.ts refuses to write this golden if the derivation finds ANY violation against the compiler's own template self-claims (T2-T8) or the deployed-script semantic checks (D2-D5).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bigint-neg-large/expected-locking.hex",
+      "sha256": "25ffeca04136dfc6e99791077d3812a1828b458b4b4ccb25442cccfa678d7d89",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs (typescript/go/rust/python/zig/ruby/java): every tier's deployed locking script begins with the SAME independently-derived bytes and all seven agree byte-for-byte with each other (conformance/sdk-vertical/runner/vertical-runner.ts --update-golden; re-verified green without --update-golden immediately after). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-empty/expected-code-part.hex",
+      "sha256": "884b6bd274ff94f2ba363ebc828bb84bb3dcae17c1cc85ae8b4a437112ab9403",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-empty/expected-vertical.json",
+      "sha256": "aa8f27f4741cd7c7956b65fed6dc7f8fb465484f22da33c88040d8a422516345",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-empty/expected-locking.hex",
+      "sha256": "884b6bd274ff94f2ba363ebc828bb84bb3dcae17c1cc85ae8b4a437112ab9403",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-zero/expected-code-part.hex",
+      "sha256": "9173e83912e931e639c52f7953e8e52bdee2746052cc1cd46dc0af20644876d6",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-zero/expected-vertical.json",
+      "sha256": "897c7cc359af92731c5dea204cf5b56829c77d6db10e0d9eff6a499819d26107",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-zero/expected-locking.hex",
+      "sha256": "9173e83912e931e639c52f7953e8e52bdee2746052cc1cd46dc0af20644876d6",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-low/expected-code-part.hex",
+      "sha256": "992fd28e05dd6e29bd62a7e2246420ce9a11eb7ddfe8f1b0879a8bc4927eab5e",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-low/expected-vertical.json",
+      "sha256": "1f5ade6d0d50abbd1ede7ceafe4d72299e091f680c1b71193f97fd2fe69d8802",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-low/expected-locking.hex",
+      "sha256": "992fd28e05dd6e29bd62a7e2246420ce9a11eb7ddfe8f1b0879a8bc4927eab5e",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-code-part.hex",
+      "sha256": "99b033d4ec8cec2c9e9c3432ab742000927a5a35008167d9086ff00119839dc0",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-vertical.json",
+      "sha256": "3b537581e107f3cdcdfbbd347444649deb723ca41121659956e1eecd954696ce",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-mid/expected-locking.hex",
+      "sha256": "99b033d4ec8cec2c9e9c3432ab742000927a5a35008167d9086ff00119839dc0",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-high/expected-code-part.hex",
+      "sha256": "b79b6ac27717e233710148bc542eac0960ab6f021704d9ffa5d1bdcb03a551a3",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-high/expected-vertical.json",
+      "sha256": "99fd47195fd8666b6a33358eda0e3a3f1c10249db658ef93d04eb7b7fb26e689",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op-n-high/expected-locking.hex",
+      "sha256": "b79b6ac27717e233710148bc542eac0960ab6f021704d9ffa5d1bdcb03a551a3",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op1negate/expected-code-part.hex",
+      "sha256": "62563014b66451d9d0c4ccde22dff452b86d47755793568f5e9649445152c7ed",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op1negate/expected-vertical.json",
+      "sha256": "f6e73d1cc25c9990fb130772812838833f3005082c3a0629031754b8da616c9e",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-op1negate/expected-locking.hex",
+      "sha256": "62563014b66451d9d0c4ccde22dff452b86d47755793568f5e9649445152c7ed",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-outside-low/expected-code-part.hex",
+      "sha256": "36ce55d146df67aa1c7e537778950afa388fc4e54ed3b5873e4679f2305d9372",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-outside-low/expected-vertical.json",
+      "sha256": "fdf5c26673a102becdf00e7a84b6bcfd6bf06cf4c4d8f5209e33c9218c305c70",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-outside-low/expected-locking.hex",
+      "sha256": "36ce55d146df67aa1c7e537778950afa388fc4e54ed3b5873e4679f2305d9372",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-outside-high/expected-code-part.hex",
+      "sha256": "2148f8d1c01814cf0180e9a22f714d47f222e726fec40e416d9abeccd6fb8807",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-outside-high/expected-vertical.json",
+      "sha256": "6204ff425adc4bcebca944a1665f8615b57394063c7bd190c9597d545b99fce6",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-outside-high/expected-locking.hex",
+      "sha256": "2148f8d1c01814cf0180e9a22f714d47f222e726fec40e416d9abeccd6fb8807",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-ab-trap/expected-code-part.hex",
+      "sha256": "1be110e767833f8efe3501529db11e4779ab4b056210dca43274464d20629f3e",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-ab-trap/expected-vertical.json",
+      "sha256": "eee0ca7cbdee0528cfd88dac735405ca274ed5d047e1ecd14edc053ac9439fe8",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-ab-trap/expected-locking.hex",
+      "sha256": "1be110e767833f8efe3501529db11e4779ab4b056210dca43274464d20629f3e",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-multi-2/expected-code-part.hex",
+      "sha256": "9e8415e553522ceeb8a379ea217b2483823a68d0aebf6bbab91028d42d226176",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-multi-2/expected-vertical.json",
+      "sha256": "aa506068aa57a87898d442f1b64df3185c7c5e1664eeb4deeebea136d83fa8d2",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-multi-2/expected-locking.hex",
+      "sha256": "9e8415e553522ceeb8a379ea217b2483823a68d0aebf6bbab91028d42d226176",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-multi-4/expected-code-part.hex",
+      "sha256": "c043cc4e36fdc8b8142395ef6df4ef3b0b4490af5669fad001ba6aee6babc69f",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-multi-4/expected-vertical.json",
+      "sha256": "454517abf1ac4a622959f302776e5abf07876b3a389f1cf84967f07bf84861a2",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-multi-4/expected-locking.hex",
+      "sha256": "c043cc4e36fdc8b8142395ef6df4ef3b0b4490af5669fad001ba6aee6babc69f",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-pushdata1/expected-code-part.hex",
+      "sha256": "8a854b2cbeca69c91e6dda32dfd58a9e932f43e0249908b28bcfbafc4f5e3766",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-pushdata1/expected-vertical.json",
+      "sha256": "daae965248df2516dad0df73dcbcc96698fc04e181d20e22a47515afe9363ad1",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-pushdata1/expected-locking.hex",
+      "sha256": "8a854b2cbeca69c91e6dda32dfd58a9e932f43e0249908b28bcfbafc4f5e3766",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-75/expected-code-part.hex",
+      "sha256": "50b44f067f355a8a93ffdd203d89e6608da3a061c720dbc8435b786e63982827",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-75/expected-vertical.json",
+      "sha256": "5325a1b402238513192aa5d3d5f4b1c43f1853a9f6df45c3daba371cd49717a5",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-75/expected-locking.hex",
+      "sha256": "50b44f067f355a8a93ffdd203d89e6608da3a061c720dbc8435b786e63982827",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-255/expected-code-part.hex",
+      "sha256": "7d626dfb3f19c5daea8efe09a0cb5cb814a902bb87808657017935ff6fcf624d",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-255/expected-vertical.json",
+      "sha256": "7a7d1c0dab33d4d11363f7519faa9a00992372c2f99d05a49a50c7ef434668bc",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-255/expected-locking.hex",
+      "sha256": "7d626dfb3f19c5daea8efe09a0cb5cb814a902bb87808657017935ff6fcf624d",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-256/expected-code-part.hex",
+      "sha256": "329dca9cf4be6ebe7065d717d7f209432cea1af7c1917c07c776880980df3530",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-256/expected-vertical.json",
+      "sha256": "d1d38f7025c6c93981cdd129fd3bd6ec1e13f8fb1e77e3b504cd61973fa14949",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-256/expected-locking.hex",
+      "sha256": "329dca9cf4be6ebe7065d717d7f209432cea1af7c1917c07c776880980df3530",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-pushdata2/expected-code-part.hex",
+      "sha256": "4849e97b96bb2339f04db4c3b16de3e398791378dfe1667d18069f338313c31f",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-pushdata2/expected-vertical.json",
+      "sha256": "8d3f351ee2073ebb550ce83273c3a75e09f76fa321575e1c90806182e9a94b8a",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix constructor-slot splice for the ByteString push-data value-class matrix (remediation plan C1/C3), including the direct-push/OP_PUSHDATA1/OP_PUSHDATA2 boundary classes (75/76/255/256/300 bytes). The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts using an independently-written push-data encoder (reference/encode.ts's encodePushData, from the Bitcoin push-data rules \u2014 the <=75/<=0xff/<=0xffff header-width thresholds and the OP_N/OP_1NEGATE MINIMALDATA collapse for 1-byte 0x01..0x10/0x81 payloads, deliberately NOT collapsing 0x00 \u2014 not copied from any SDK) and a fresh opcode walk of the result (reference/script.ts). reference/** imports nothing from packages/**, runar-*, or @bsv/*. generate.ts refuses to write this golden if the derivation finds any violation.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bytes-pushdata2/expected-locking.hex",
+      "sha256": "4849e97b96bb2339f04db4c3b16de3e398791378dfe1667d18069f338313c31f",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs. The bytes-75/255/256/pushdata2 rows are NEW (remediation plan P1-4) and are the first cases in this suite to exercise the direct-push/OP_PUSHDATA1 boundary (75 vs 76 bytes) and the OP_PUSHDATA2 branch with BOTH length bytes non-zero (300 bytes, catching a byte-swapped little-endian length). All seven tiers agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers, 0 tier disagreements.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/multi-slot-mixed-a/expected-code-part.hex",
+      "sha256": "32650d6278725e52586ab5c13caf809b2d7d1d06c372ca41b63ec9cbd3e53b63",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix multi-slot combination rows (mixed scriptnum + data value classes in one deployment, remediation plan C1/C3). Same independent derive.ts/encode.ts/script.ts provenance as the single-value-class SlotMatrix rows; these rows additionally exercise the case where an EARLIER slot's expansion must be accounted for when resolving a LATER slot's deployed byte offset.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/multi-slot-mixed-a/expected-vertical.json",
+      "sha256": "3664c1f6205b55de25097c9816694756f598ff96bc5758c1ebf3e9040bd70cec",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix multi-slot combination rows (mixed scriptnum + data value classes in one deployment, remediation plan C1/C3). Same independent derive.ts/encode.ts/script.ts provenance as the single-value-class SlotMatrix rows; these rows additionally exercise the case where an EARLIER slot's expansion must be accounted for when resolving a LATER slot's deployed byte offset.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/multi-slot-mixed-a/expected-locking.hex",
+      "sha256": "32650d6278725e52586ab5c13caf809b2d7d1d06c372ca41b63ec9cbd3e53b63",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs; all seven agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/multi-slot-mixed-b/expected-code-part.hex",
+      "sha256": "a2b5e09b878d379f3c862fc28f87c88b1939c363592fb4a8c80c3b3ad6998b22",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix multi-slot combination rows (mixed scriptnum + data value classes in one deployment, remediation plan C1/C3). Same independent derive.ts/encode.ts/script.ts provenance as the single-value-class SlotMatrix rows; these rows additionally exercise the case where an EARLIER slot's expansion must be accounted for when resolving a LATER slot's deployed byte offset.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/multi-slot-mixed-b/expected-vertical.json",
+      "sha256": "313b83ce84957c25986ebdb6834155605c9259e43fcb1852d46a6edbc83c909a",
+      "verified-against": "second-implementation",
+      "reason": "SlotMatrix multi-slot combination rows (mixed scriptnum + data value classes in one deployment, remediation plan C1/C3). Same independent derive.ts/encode.ts/script.ts provenance as the single-value-class SlotMatrix rows; these rows additionally exercise the case where an EARLIER slot's expansion must be accounted for when resolving a LATER slot's deployed byte offset.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/multi-slot-mixed-b/expected-locking.hex",
+      "sha256": "a2b5e09b878d379f3c862fc28f87c88b1939c363592fb4a8c80c3b3ad6998b22",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs; all seven agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bool-true/expected-code-part.hex",
+      "sha256": "040851729ba78fde925d7c721c364c9863235a42fd62731418b65949703173b4",
+      "verified-against": "second-implementation",
+      "reason": "SlotBool constructor-slot splice for the bool value class (remediation plan C1/C3): valueEncoding 'bool' is a single-opcode encoding (true -> OP_TRUE 0x51, false -> OP_0 0x00) with NO push header, the class a 'header + value' splice assumption gets wrong. Written by reference/derive.ts's independent encoder/opcode-walker pair; reference/** imports nothing from packages/**, runar-*, or @bsv/*.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bool-true/expected-vertical.json",
+      "sha256": "1d4a88ed220a09f864dc890e1f317f8908916037698ea2b117a119f892b75819",
+      "verified-against": "second-implementation",
+      "reason": "SlotBool constructor-slot splice for the bool value class (remediation plan C1/C3): valueEncoding 'bool' is a single-opcode encoding (true -> OP_TRUE 0x51, false -> OP_0 0x00) with NO push header, the class a 'header + value' splice assumption gets wrong. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts's independent encoder/opcode-walker pair; reference/** imports nothing from packages/**, runar-*, or @bsv/*.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bool-true/expected-locking.hex",
+      "sha256": "040851729ba78fde925d7c721c364c9863235a42fd62731418b65949703173b4",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs; all seven agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bool-false/expected-code-part.hex",
+      "sha256": "f255c78ca689eebdf4c2f47307d810049667916010fdb1229e1215865dad6c93",
+      "verified-against": "second-implementation",
+      "reason": "SlotBool constructor-slot splice for the bool value class (remediation plan C1/C3): valueEncoding 'bool' is a single-opcode encoding (true -> OP_TRUE 0x51, false -> OP_0 0x00) with NO push header, the class a 'header + value' splice assumption gets wrong. Written by reference/derive.ts's independent encoder/opcode-walker pair; reference/** imports nothing from packages/**, runar-*, or @bsv/*.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bool-false/expected-vertical.json",
+      "sha256": "dc5f59298f4dc292e66d58f41df8e78f78239e5fcbd27ad13730ecb48ad6ed01",
+      "verified-against": "second-implementation",
+      "reason": "SlotBool constructor-slot splice for the bool value class (remediation plan C1/C3): valueEncoding 'bool' is a single-opcode encoding (true -> OP_TRUE 0x51, false -> OP_0 0x00) with NO push header, the class a 'header + value' splice assumption gets wrong. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts's independent encoder/opcode-walker pair; reference/** imports nothing from packages/**, runar-*, or @bsv/*.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/bool-false/expected-locking.hex",
+      "sha256": "f255c78ca689eebdf4c2f47307d810049667916010fdb1229e1215865dad6c93",
+      "verified-against": "second-implementation",
+      "reason": "The independently-derived code part (expected-code-part.hex, same case) cross-checked against ALL SEVEN deployment SDKs; all seven agree byte-for-byte (conformance/sdk-vertical/runner/vertical-runner.ts). Measured 2026-08-06: 39/39 cases pass across all 7 tiers.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-empty/expected-code-part.hex",
+      "sha256": "a4271c29e1ccb2f158ae576f1c40bbdd7b06432da1a1bd91f4e6a1d69788ef8a",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-empty/expected-vertical.json",
+      "sha256": "a507b4f775e4c04b03b9bea6970f56928249c217d97b5f0707e70fa635ebc40e",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-empty/expected-locking.hex",
+      "sha256": "d3af9d190054006ed43e88215da0953ab3f43f752716491a935059d23aca2afc",
+      "verified-against": "second-implementation",
+      "reason": "P0-1 fix: before `reseal` was added to CodeSepMatrix.runar.ts, this suite's ONLY codeSepIndexSlot always targeted bump's own OP_CODESEPARATOR (template offset 6, before every ctor slot), so every row baked the SAME constant (6) regardless of `tag` \u2014 a tier that omitted the shift term entirely would still have passed all 6 rows. `reseal`'s own codeSepIndexSlot targets a separator AFTER the `tag` ctor slot, so its baked value now moves with `tag`'s encoded length (1074/1074/1075/1078/1077/1151 across these 6 rows) and requires a multi-byte scriptnum push (never previously exercised). This is the FIRST time any tier was asked for a shifted, multi-byte codesep bake. Per the STOP-CONDITION plan for this fix, this byte string was NOT pinned until measured: conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep (all 7 tiers) showed every tier's deployed locking script begins with the independently-derived code part BEFORE this golden was written \u2014 i.e. all seven tiers already agreed with the reference derivation on the new shifted/multi-byte bake; only then was --update-golden run. Measured 2026-08-06: 6/6 codesep cases pass across all 7 tiers, 0 tier disagreements \u2014 no fund-safety finding.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-op-n/expected-code-part.hex",
+      "sha256": "33fe8b6a4c9420fb6d49e10e6bf2684b1e607fd6e1cb2555faa72379a9c073b9",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-op-n/expected-vertical.json",
+      "sha256": "e45ecffc9673f6e6b849491a7dbd0d6fd38425e307723e959b512b8950dcd498",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-op-n/expected-locking.hex",
+      "sha256": "55de906e9adcccd4a33b4858430c4fe1a85b17208d3b0849d0aebe738c2f2234",
+      "verified-against": "second-implementation",
+      "reason": "P0-1 fix: before `reseal` was added to CodeSepMatrix.runar.ts, this suite's ONLY codeSepIndexSlot always targeted bump's own OP_CODESEPARATOR (template offset 6, before every ctor slot), so every row baked the SAME constant (6) regardless of `tag` \u2014 a tier that omitted the shift term entirely would still have passed all 6 rows. `reseal`'s own codeSepIndexSlot targets a separator AFTER the `tag` ctor slot, so its baked value now moves with `tag`'s encoded length (1074/1074/1075/1078/1077/1151 across these 6 rows) and requires a multi-byte scriptnum push (never previously exercised). This is the FIRST time any tier was asked for a shifted, multi-byte codesep bake. Per the STOP-CONDITION plan for this fix, this byte string was NOT pinned until measured: conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep (all 7 tiers) showed every tier's deployed locking script begins with the independently-derived code part BEFORE this golden was written \u2014 i.e. all seven tiers already agreed with the reference derivation on the new shifted/multi-byte bake; only then was --update-golden run. Measured 2026-08-06: 6/6 codesep cases pass across all 7 tiers, 0 tier disagreements \u2014 no fund-safety finding.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-zero/expected-code-part.hex",
+      "sha256": "19b2743224aed88a69acc76974be89ac9d8f12cefde208452013aae19007904b",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-zero/expected-vertical.json",
+      "sha256": "9c03a80b59289f4ff60113ca8f9d40ef01feec8a763cf011cf86efbc36af23e7",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-zero/expected-locking.hex",
+      "sha256": "51f13176acaf2fe260b427166d6ad7816ecaea6b3ca0717e23f820f866011544",
+      "verified-against": "second-implementation",
+      "reason": "P0-1 fix: before `reseal` was added to CodeSepMatrix.runar.ts, this suite's ONLY codeSepIndexSlot always targeted bump's own OP_CODESEPARATOR (template offset 6, before every ctor slot), so every row baked the SAME constant (6) regardless of `tag` \u2014 a tier that omitted the shift term entirely would still have passed all 6 rows. `reseal`'s own codeSepIndexSlot targets a separator AFTER the `tag` ctor slot, so its baked value now moves with `tag`'s encoded length (1074/1074/1075/1078/1077/1151 across these 6 rows) and requires a multi-byte scriptnum push (never previously exercised). This is the FIRST time any tier was asked for a shifted, multi-byte codesep bake. Per the STOP-CONDITION plan for this fix, this byte string was NOT pinned until measured: conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep (all 7 tiers) showed every tier's deployed locking script begins with the independently-derived code part BEFORE this golden was written \u2014 i.e. all seven tiers already agreed with the reference derivation on the new shifted/multi-byte bake; only then was --update-golden run. Measured 2026-08-06: 6/6 codesep cases pass across all 7 tiers, 0 tier disagreements \u2014 no fund-safety finding.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-multi/expected-code-part.hex",
+      "sha256": "19f882d849d7f178e087617866d711833046d8f334ddae7a67f49783f62d6dbe",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-multi/expected-vertical.json",
+      "sha256": "6aff2cd6e8a515a23220b9d461b9b8ea0f58ec78b1f00e71760725540666af74",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-multi/expected-locking.hex",
+      "sha256": "a3982c7c9f7f5f2b91f13430fda399e9b9063049a01493be6671ee987852d796",
+      "verified-against": "second-implementation",
+      "reason": "P0-1 fix: before `reseal` was added to CodeSepMatrix.runar.ts, this suite's ONLY codeSepIndexSlot always targeted bump's own OP_CODESEPARATOR (template offset 6, before every ctor slot), so every row baked the SAME constant (6) regardless of `tag` \u2014 a tier that omitted the shift term entirely would still have passed all 6 rows. `reseal`'s own codeSepIndexSlot targets a separator AFTER the `tag` ctor slot, so its baked value now moves with `tag`'s encoded length (1074/1074/1075/1078/1077/1151 across these 6 rows) and requires a multi-byte scriptnum push (never previously exercised). This is the FIRST time any tier was asked for a shifted, multi-byte codesep bake. Per the STOP-CONDITION plan for this fix, this byte string was NOT pinned until measured: conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep (all 7 tiers) showed every tier's deployed locking script begins with the independently-derived code part BEFORE this golden was written \u2014 i.e. all seven tiers already agreed with the reference derivation on the new shifted/multi-byte bake; only then was --update-golden run. Measured 2026-08-06: 6/6 codesep cases pass across all 7 tiers, 0 tier disagreements \u2014 no fund-safety finding.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-ab-trap/expected-code-part.hex",
+      "sha256": "55911c3e0d95c40d69e4c417d409ee05b3bf70904e0885130dc2fcd6f2b6ce84",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-ab-trap/expected-vertical.json",
+      "sha256": "7aa061d8fdc9f27bdb3d6eb9ed33d9a16c50a7169c8e25720a3a22250422301f",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-ab-trap/expected-locking.hex",
+      "sha256": "5f643299b5265a9500bf3d997e59a1fdf612a75e9d444a6ebf1051e62095965e",
+      "verified-against": "second-implementation",
+      "reason": "P0-1 fix: before `reseal` was added to CodeSepMatrix.runar.ts, this suite's ONLY codeSepIndexSlot always targeted bump's own OP_CODESEPARATOR (template offset 6, before every ctor slot), so every row baked the SAME constant (6) regardless of `tag` \u2014 a tier that omitted the shift term entirely would still have passed all 6 rows. `reseal`'s own codeSepIndexSlot targets a separator AFTER the `tag` ctor slot, so its baked value now moves with `tag`'s encoded length (1074/1074/1075/1078/1077/1151 across these 6 rows) and requires a multi-byte scriptnum push (never previously exercised). This is the FIRST time any tier was asked for a shifted, multi-byte codesep bake. Per the STOP-CONDITION plan for this fix, this byte string was NOT pinned until measured: conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep (all 7 tiers) showed every tier's deployed locking script begins with the independently-derived code part BEFORE this golden was written \u2014 i.e. all seven tiers already agreed with the reference derivation on the new shifted/multi-byte bake; only then was --update-golden run. Measured 2026-08-06: 6/6 codesep cases pass across all 7 tiers, 0 tier disagreements \u2014 no fund-safety finding.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-pushdata1/expected-code-part.hex",
+      "sha256": "25fc71bda4e9eab1474a1c91f250438ada2759bf5b429dee6963030ec4971dd7",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-pushdata1/expected-vertical.json",
+      "sha256": "34168a521c9cc690d723f73f5e37913258100039676bf9330d0811c8e4986874",
+      "verified-against": "second-implementation",
+      "reason": "CodeSepMatrix codeSeparator-offset matrix (remediation plan C4, P0-1 fix). CodeSepMatrix has three public methods (bump, reseal, close), each auto-injecting its own OP_CODESEPARATOR; the `tag` ctor slot sits inside bump's branch, so its encoded width shifts reseal's and close's own separators. The SLOT LAYOUT + codesep-offset half of the same derivation (expected-code-part.hex, same case, carries the SPEC-layer bytes). Written by reference/derive.ts: the code part is independently spliced (reference/encode.ts) and re-walked (reference/script.ts) to find the REAL OP_CODESEPARATOR positions and what each codeSepIndexSlot actually bakes, cross-checked against the compiler's own declared codeSeparatorIndex(-ices)/codeSepIndexSlots (T5-T7, D4-D5). reference/** imports nothing from packages/**.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/cases/codesep-tag-pushdata1/expected-locking.hex",
+      "sha256": "a818478b84beb53efe58f7e57c61489f96156c83da8d0ee8d938888685f12b28",
+      "verified-against": "second-implementation",
+      "reason": "P0-1 fix: before `reseal` was added to CodeSepMatrix.runar.ts, this suite's ONLY codeSepIndexSlot always targeted bump's own OP_CODESEPARATOR (template offset 6, before every ctor slot), so every row baked the SAME constant (6) regardless of `tag` \u2014 a tier that omitted the shift term entirely would still have passed all 6 rows. `reseal`'s own codeSepIndexSlot targets a separator AFTER the `tag` ctor slot, so its baked value now moves with `tag`'s encoded length (1074/1074/1075/1078/1077/1151 across these 6 rows) and requires a multi-byte scriptnum push (never previously exercised). This is the FIRST time any tier was asked for a shifted, multi-byte codesep bake. Per the STOP-CONDITION plan for this fix, this byte string was NOT pinned until measured: conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep (all 7 tiers) showed every tier's deployed locking script begins with the independently-derived code part BEFORE this golden was written \u2014 i.e. all seven tiers already agreed with the reference derivation on the new shifted/multi-byte bake; only then was --update-golden run. Measured 2026-08-06: 6/6 codesep cases pass across all 7 tiers, 0 tier disagreements \u2014 no fund-safety finding.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/artifacts/SlotMatrix.json",
+      "sha256": "471f08a3aa3f72c2b6c18a81055d3fc5f3e0fabe78b536277b6798e50afee898",
+      "verified-against": "second-implementation",
+      "reason": "Compiled by the TS reference compiler (packages/runar-cli) from conformance/sdk-vertical/contracts/SlotMatrix.runar.ts. Every declared claim about this script's own bytes (constructorSlots[].byteOffset/valueEncoding/fixedValueByteLength/fixedPushHeaderBytes) is cross-checked against an INDEPENDENT opcode walker (reference/derive.ts's checkTemplateClaims, T2-T8; reference/** imports nothing from packages/**) \u2014 before this suite, nothing in the repo walked a compiled script and compared the result to its own declared constructorSlots at all.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/artifacts/SlotBool.json",
+      "sha256": "32503a934851400d0653ffce603eae8645ca0f1a8cf00ff1479c40348019dd9f",
+      "verified-against": "second-implementation",
+      "reason": "Compiled by the TS reference compiler from conformance/sdk-vertical/contracts/SlotBool.runar.ts. Same independent T2-T8 opcode-walk cross-check as SlotMatrix.json, covering the single-opcode 'bool' valueEncoding class (OP_TRUE/OP_0, no push header).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/sdk-vertical/artifacts/CodeSepMatrix.json",
+      "sha256": "816761859a70aed5c824bbc9cc31fc1f6d5da64433064903b9e74134782ade52",
+      "verified-against": "second-implementation",
+      "reason": "Compiled by the TS reference compiler from conformance/sdk-vertical/contracts/CodeSepMatrix.runar.ts, NOW with a third public method `reseal` (remediation plan P0-1 fix: the artifact previously carried only ONE codeSepIndexSlot, always targeting bump's own separator at template offset 6 \u2014 before every ctor slot \u2014 so it always baked the constant 6 regardless of `tag`). Every declared claim (constructorSlots, codeSepIndexSlots, codeSeparatorIndex/Indices = [6, 1074, 2135]) is cross-checked against an independent opcode walker (reference/derive.ts T2-T8; reference/** imports nothing from packages/**). reseal's own codeSepIndexSlot (byteOffset 1910, codeSepIndex 1074) targets a separator AFTER the `tag` ctor slot (byteOffset 878), so its baked value is cross-tier-verified to shift correctly with `tag`'s encoded length by ALL SEVEN deployment SDKs (conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep, measured 2026-08-06: 6/6 cases x 7 tiers green, 0 disagreements) before this artifact was pinned.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
     }
   ]
 }

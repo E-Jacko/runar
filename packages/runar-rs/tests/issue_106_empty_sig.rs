@@ -31,6 +31,7 @@ use bsv::transaction::transaction::Transaction;
 use bsv::transaction::transaction_input::TransactionInput;
 
 use runar_lang::sdk::types::{Abi, AbiConstructor, AbiMethod, AbiParam, RunarArtifact};
+use runar_lang::sdk::script_utils::build_p2pkh_script;
 use runar_lang::sdk::{DeployOptions, LocalSigner, MockProvider, RunarContract, SdkValue, Signer, Utxo};
 
 // Alice authorizes branch A; Bob's key is embedded but never signs (branch B).
@@ -94,7 +95,7 @@ fn deploy() -> (RunarContract, MockProvider, LocalSigner, String) {
         txid: "cc".repeat(32),
         output_index: 0,
         satoshis: 200_000,
-        script: format!("76a914{}88ac", "00".repeat(20)),
+        script: build_p2pkh_script(&address),
     });
 
     let mut contract = RunarContract::new(or_checksig_artifact(&pk_a, &pk_b), Vec::<SdkValue>::new());

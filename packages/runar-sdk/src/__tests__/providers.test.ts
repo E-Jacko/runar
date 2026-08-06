@@ -4,11 +4,16 @@ import { RPCProvider } from '../providers/rpc-provider.js';
 import { Transaction as BsvTransaction, LockingScript, UnlockingScript } from '@bsv/sdk';
 import type { TransactionData, UTXO } from '../types.js';
 
-/** Create a minimal valid BsvTransaction for broadcast testing. */
+const FUNDING_TXID = '00'.repeat(32);
+
+/** Create a minimal valid BsvTransaction for broadcast testing. Spends
+ * `FUNDING_TXID:0`, an OP_TRUE UTXO — pair with `registerFundingUtxo()` on
+ * the provider under test before broadcasting, or the default-on C8
+ * validation has nothing to validate (P1-1) and `broadcast()` throws. */
 function makeBsvTx(marker?: string): BsvTransaction {
   const tx = new BsvTransaction();
   tx.addInput({
-    sourceTXID: '00'.repeat(32),
+    sourceTXID: FUNDING_TXID,
     sourceOutputIndex: 0,
     unlockingScript: new UnlockingScript(),
     sequence: 0xffffffff,
@@ -18,6 +23,19 @@ function makeBsvTx(marker?: string): BsvTransaction {
     lockingScript: LockingScript.fromHex(marker || '51'),
   });
   return tx;
+}
+
+/** Register `makeBsvTx()`'s funding outpoint (OP_TRUE, well past any fee
+ * floor at the default 100 sat/KB rate) so the provider's C8 broadcast
+ * validation actually runs `Spend.validate()` against a known input instead
+ * of vacuously passing with zero validated inputs. */
+function registerFundingUtxo(provider: MockProvider): void {
+  provider.addContractUtxo('providers-test-funding', {
+    txid: FUNDING_TXID,
+    outputIndex: 0,
+    satoshis: 100000,
+    script: '51', // OP_TRUE
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -147,15 +165,18 @@ describe('MockProvider: contract UTXOs', () => {
 describe('MockProvider: broadcast', () => {
   it('broadcast returns a txid', async () => {
     const provider = new MockProvider();
+    registerFundingUtxo(provider);
     const tx = makeBsvTx();
     const txid = await provider.broadcast(tx);
     expect(txid).toBeDefined();
     expect(typeof txid).toBe('string');
     expect(txid.length).toBe(64); // txid should be 64 hex chars
+    expect(provider.getValidationStats().validated).toBeGreaterThan(0);
   });
 
   it('records broadcasted transactions', async () => {
     const provider = new MockProvider();
+    registerFundingUtxo(provider);
     const tx1 = makeBsvTx('5151'); // distinct script
     const tx2 = makeBsvTx('5252'); // distinct script
 
@@ -166,10 +187,12 @@ describe('MockProvider: broadcast', () => {
     expect(broadcasted.length).toBe(2);
     expect(broadcasted[0]).toBe(tx1.toHex());
     expect(broadcasted[1]).toBe(tx2.toHex());
+    expect(provider.getValidationStats().validated).toBe(2);
   });
 
   it('records broadcasted Transaction objects', async () => {
     const provider = new MockProvider();
+    registerFundingUtxo(provider);
     const tx = makeBsvTx();
     await provider.broadcast(tx);
     const txObjects = provider.getBroadcastedTxObjects();
@@ -179,6 +202,7 @@ describe('MockProvider: broadcast', () => {
 
   it('returns different txids for different broadcasts', async () => {
     const provider = new MockProvider();
+    registerFundingUtxo(provider);
     const txid1 = await provider.broadcast(makeBsvTx('aa'));
     const txid2 = await provider.broadcast(makeBsvTx('bb'));
     expect(txid1).not.toBe(txid2);
@@ -186,6 +210,7 @@ describe('MockProvider: broadcast', () => {
 
   it('returns the same txid for the same transaction broadcasted twice (deterministic) (row 411)', async () => {
     const provider = new MockProvider();
+    registerFundingUtxo(provider);
     // Build two identical transactions
     const tx1 = makeBsvTx('5151');
     const tx2 = makeBsvTx('5151');
@@ -201,6 +226,7 @@ describe('MockProvider: broadcast', () => {
 
   it('auto-stores raw hex for getRawTransaction after broadcast', async () => {
     const provider = new MockProvider();
+    registerFundingUtxo(provider);
     const tx = makeBsvTx();
     const txid = await provider.broadcast(tx);
     const rawHex = await provider.getRawTransaction(txid);

@@ -1,3 +1,5 @@
+// INTERPRETER-ONLY: spendability covered by conformance/witnesses/real-crypto/math-demo.json
+// (real deploy->call->@bsv/sdk Spend on THIS source, with a pinned expectedState).
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';

@@ -31,6 +31,8 @@ test {
     _ = @import("passes/embed_always_warn.zig");
     _ = @import("tests/e2e.zig");
     _ = @import("tests/repeated_operand_consume.zig");
+    _ = @import("tests/branch_outputs_merged_locals.zig");
+    _ = @import("tests/branch_merge_dead_arm_k1.zig");
     _ = @import("tests/private_varlen_state_read.zig");
     _ = @import("tests/private_check_preimage_recursion.zig");
     _ = @import("tests/math_builtins.zig");

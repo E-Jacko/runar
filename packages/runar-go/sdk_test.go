@@ -1750,9 +1750,16 @@ func TestMockProvider_AddAndGetUtxos(t *testing.T) {
 
 func TestMockProvider_Broadcast(t *testing.T) {
 	provider := NewMockProvider("testnet")
+	// Seed the spent outpoint so the default (fail-closed) broadcast check has
+	// something to actually execute — a validating provider rejects a tx none
+	// of whose inputs it knows rather than passing vacuously.
+	provider.AddUtxo("mock", UTXO{
+		Txid: strings.Repeat("00", 32), OutputIndex: 0, Satoshis: 100000, Script: "51",
+	})
 	// Build a minimal transaction for broadcast
 	bcastTx := transaction.NewTransaction()
 	_ = bcastTx.AddInputFrom(strings.Repeat("00", 32), 0, "51", 100000, nil)
+	bcastTx.Inputs[0].UnlockingScript, _ = sdkscript.NewFromHex("") // OP_TRUE coin: empty (but present) scriptSig
 	outLS, _ := sdkscript.NewFromHex("51")
 	bcastTx.AddOutput(&transaction.TransactionOutput{
 		Satoshis:      50000,
@@ -1799,7 +1806,7 @@ func TestDeployCallLifecycle(t *testing.T) {
 
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -1886,7 +1893,7 @@ func TestCallThrowsUnknownMethod(t *testing.T) {
 	})
 
 	contract := NewRunarContract(artifact, nil)
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -1925,7 +1932,7 @@ func TestCallThrowsWrongArgCount(t *testing.T) {
 	})
 
 	contract := NewRunarContract(artifact, nil)
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -1967,7 +1974,7 @@ func TestStatefulDeployCallLifecycle(t *testing.T) {
 
 	contract := NewRunarContract(artifact, []interface{}{int64(0)})
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -2027,7 +2034,7 @@ func TestCall_FundingSelectsSmallestSufficient_Issue133(t *testing.T) {
 	// A wallet with 3 spare 100k UTXOs must build a 2-input call tx (1 contract
 	// + 1 funding), NOT sweep all 3 into a 4-input tx (issue #133).
 	contract := NewRunarContract(makeCounterArtifactForFunding(), []interface{}{int64(0)})
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 	script := "76a914" + strings.Repeat("00", 20) + "88ac"
@@ -2056,7 +2063,7 @@ func TestCall_MaxFundingInputsCapErrors_Issue133(t *testing.T) {
 	// Small coins force >1 funding input for a value-increasing continuation;
 	// capping at 1 must fail loudly rather than broadcast underfunded.
 	contract := NewRunarContract(makeCounterArtifactForFunding(), []interface{}{int64(0)})
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 	script := "76a914" + strings.Repeat("00", 20) + "88ac"
@@ -2536,7 +2543,7 @@ func TestTerminalCall_SetsUtxoToNil(t *testing.T) {
 
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -2579,7 +2586,7 @@ func TestTerminalCall_SubsequentCallFails(t *testing.T) {
 
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -2624,7 +2631,7 @@ func TestTerminalCall_MultipleOutputs(t *testing.T) {
 
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -2667,7 +2674,7 @@ func TestTerminalCall_TxStructure(t *testing.T) {
 
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 
@@ -3045,8 +3052,14 @@ func TestMockProvider_UnknownAddress_EmptySlice(t *testing.T) {
 
 func TestMockProvider_Broadcast_TxidAllHexLower(t *testing.T) {
 	provider := NewMockProvider("mainnet")
+	// Seed the spent outpoint (see TestMockProvider_Broadcast) so the
+	// fail-closed default has a real input to execute.
+	provider.AddUtxo("mock", UTXO{
+		Txid: strings.Repeat("aa", 32), OutputIndex: 0, Satoshis: 100000, Script: "51",
+	})
 	bcastTx := transaction.NewTransaction()
 	_ = bcastTx.AddInputFrom(strings.Repeat("aa", 32), 0, "51", 100000, nil)
+	bcastTx.Inputs[0].UnlockingScript, _ = sdkscript.NewFromHex("") // OP_TRUE coin: empty (but present) scriptSig
 	outLS, _ := sdkscript.NewFromHex("51")
 	bcastTx.AddOutput(&transaction.TransactionOutput{
 		Satoshis:      50000,

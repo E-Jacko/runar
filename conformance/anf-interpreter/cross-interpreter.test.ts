@@ -3,8 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { computeNewStateAndDataOutputs } from 'runar-sdk';
-import type { ANFProgram } from 'runar-ir-schema';
+import { computeNewStateAndDataOutputs } from '../../packages/runar-sdk/src/index.js';
+import type { ANFProgram } from '../../packages/runar-ir-schema/src/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');

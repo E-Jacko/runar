@@ -463,7 +463,7 @@ export async function runDifferentialFuzzing(
 
     for (const o of outputs) {
       const key = `${o.name}Output` as keyof DifferentialResult;
-      (result as Record<string, unknown>)[key] = o.output;
+      (result as unknown as Record<string, unknown>)[key] = o.output;
     }
 
     results.push(result);

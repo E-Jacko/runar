@@ -83,7 +83,7 @@ func c19Deploy(t *testing.T) (*RunarContract, *MockProvider, *LocalSigner) {
 		Txid:        strings.Repeat("aa", 32),
 		OutputIndex: 0,
 		Satoshis:    500000,
-		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+		Script:      BuildP2PKHScript(addr),
 	})
 
 	c := NewRunarContract(&art, []interface{}{int64(5), pubKey})

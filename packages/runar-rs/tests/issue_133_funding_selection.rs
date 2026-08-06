@@ -74,7 +74,7 @@ fn deploy_with_wallet(
     let signer = MockSigner::new();
     let address = signer.get_address().unwrap();
 
-    let mut deploy_provider = MockProvider::testnet();
+    let mut deploy_provider = MockProvider::always_ack("testnet");
     deploy_provider.add_utxo(&address, Utxo {
         txid: "aa".repeat(32),
         output_index: 0,
@@ -85,7 +85,7 @@ fn deploy_with_wallet(
         .deploy(&mut deploy_provider, &signer, &DeployOptions { satoshis: deploy_sats, change_address: None, funding_signer: None })
         .unwrap();
 
-    let mut call_provider = MockProvider::testnet();
+    let mut call_provider = MockProvider::always_ack("testnet");
     for (i, &sats) in funding.iter().enumerate() {
         call_provider.add_utxo(&address, Utxo {
             txid: format!("{:02x}", i + 0x40).repeat(32),

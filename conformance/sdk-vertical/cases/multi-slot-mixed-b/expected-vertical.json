@@ -1,0 +1,85 @@
+{
+  "case": "multi-slot-mixed-b",
+  "contract": "SlotMatrix",
+  "valueClass": "mixed: multi-byte scriptnum + 1-byte 0x00 data + fixed 33B",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "128"
+    },
+    {
+      "type": "ByteString",
+      "value": "00"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 83,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 2,
+      "headerBytes": 1,
+      "valueByteOffset": 1,
+      "valueByteLength": 1,
+      "encoding": "data",
+      "pushedHex": "00"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 4,
+      "byteLength": 3,
+      "headerBytes": 1,
+      "valueByteOffset": 5,
+      "valueByteLength": 2,
+      "encoding": "scriptnum",
+      "pushedHex": "8000"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 9,
+      "byteLength": 2,
+      "headerBytes": 1,
+      "valueByteOffset": 10,
+      "valueByteLength": 1,
+      "encoding": "data",
+      "pushedHex": "00"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 11,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 12,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 48,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 49,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

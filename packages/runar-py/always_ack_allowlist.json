@@ -1,0 +1,45 @@
+{
+  "$comment": "Python tier. Test files permitted to disable MockProvider broadcast validation (MockProvider.always_ack / disable_broadcast_validation / enable_broadcast_validation(False)). See docs/audit/2026-08-testing-gap-remediation-plan.md Phase A5 and packages/runar-py/README.md 'How fund-path tests fail closed in the Python tier'. Fund-path deploy/call tests with a real LocalSigner and a real compiled contract MUST NOT appear here.",
+  "entries": [
+    {
+      "file": "tests/test_mock_broadcast_validation.py",
+      "reason": "Directly tests the opt-out surface itself (MockProvider.always_ack, disable_broadcast_validation, enable_broadcast_validation(False)) so those escape hatches keep working. Every other test in the file uses the default validating provider, including a real LocalSigner deploy+call fund path.",
+      "category": "negative-api"
+    },
+    {
+      "file": "tests/test_contract_lifecycle.py",
+      "reason": "The shared _funded_provider() helper drives a synthetic _make_artifact('51', ...) OP_TRUE contract with MockSigner, whose signatures are placeholders that no OP_CHECKSIG can verify. Those tests assert SDK wiring — state tracking, arg validation, UTXO bookkeeping — not spendability. The TestMockProvider bookkeeping tests in the same file were converted to REAL transactions under the default validating provider.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/test_empty_sig.py",
+      "reason": "Issue #106 empty-signature regression on a synthetic OP_TRUE artifact signed by MockSigner; asserts the unlocking script's Sig push shape (a 0-length push, not a placeholder), which is a wire-byte property rather than script validity.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/test_intent_witness_values.py",
+      "reason": "Synthetic OP_TRUE artifact signed by MockSigner; asserts unlocking-script WIRE BYTES (auto-injected witness param filtering, prevOutScript/serialisedOutputs ordering) and the typed WitnessValueMissingError, not spendability.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/test_null_bytestring_arg.py",
+      "reason": "Synthetic OP_TRUE artifact signed by MockSigner; asserts that a None ByteString arg is rejected at build time with the offending parameter named. The deploy step is setup, not the assertion under test.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/test_sdk_remediation_fixes.py",
+      "reason": "Issue #118 / #133 / #134 regressions on synthetic OP_TRUE artifacts signed by MockSigner; assert input/output counts, coin-selection behaviour and which pubkey a funding input pushes — transaction STRUCTURE, not script validity.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/test_sighash_sdk.py",
+      "reason": "Asserts the sighash-type BYTE the SDK appends to a preimage (0x41 / 0xC1 / 0x43) on a synthetic artifact signed by MockSigner. The assertion is on preimage bytes; a MockSigner signature can never satisfy a real OP_CHECKSIG.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/test_terminal_call.py",
+      "reason": "Terminal-call output shape on a synthetic OP_TRUE artifact signed by MockSigner; asserts the built transaction's outputs and that the tracked UTXO is cleared, not spendability.",
+      "category": "structure-only"
+    }
+  ]
+}

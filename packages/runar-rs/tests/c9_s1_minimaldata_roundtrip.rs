@@ -1,3 +1,6 @@
+//! round-trip only — absolute pin: packages/runar-rs/tests/state_push_framing.rs (C9, state half)
+//! and packages/runar-rs/tests/encode_push_data_minimaldata.rs (S1, ctor-arg half).
+//!
 //! C9 + S1 — single-byte MINIMALDATA ByteString roundtrip (state + ctor-arg).
 //!
 //! `encode_push_data` (packages/runar-rs/src/sdk/state.rs) applies the BSV

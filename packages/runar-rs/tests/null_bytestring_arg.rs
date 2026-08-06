@@ -65,7 +65,7 @@ fn make_artifact(byte_string_param_name: &str) -> RunarArtifact {
 fn deploy_helper(artifact: RunarArtifact) -> (RunarContract, MockProvider, MockSigner) {
     let mut contract = RunarContract::new(artifact, vec![SdkValue::Int(0)]);
     let signer = MockSigner::new();
-    let mut provider = MockProvider::testnet();
+    let mut provider = MockProvider::always_ack("testnet");
     let address = signer.get_address().unwrap();
     provider.add_utxo(&address, Utxo {
         txid: "aa".repeat(32),

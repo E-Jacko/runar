@@ -86,6 +86,41 @@ export const GATES: Record<string, GateSpec> = {
     cwd: 'packages/runar-compiler',
     argv: ['npx', 'vitest', 'run', 'src/__tests__/peephole-exhaustive.test.ts'],
   },
+  // --- Phase E1 / TG-007 (2026-08): Palmer-class corpus additions ----------
+  // branch-merged-locals-vm / state-push-framing-vm / c28-state-strict run
+  // from the repo root because they live under packages/runar-testing and
+  // packages/runar-sdk, which have no nearer vitest config (same root SRC
+  // alias as the gates above).
+  'branch-merged-locals-vm': {
+    cwd: '.',
+    argv: ['npx', 'vitest', 'run', 'packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts'],
+  },
+  'state-push-framing-vm': {
+    cwd: '.',
+    argv: ['npx', 'vitest', 'run', 'packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts'],
+  },
+  'c28-state-strict': {
+    cwd: '.',
+    argv: ['npx', 'vitest', 'run', 'packages/runar-sdk/src/__tests__/c28-state-strict.test.ts'],
+  },
+  // Compiler<->SDK vertical pin (conformance/sdk-vertical, Phase C3/C4). TS
+  // tier only (--tiers typescript) to stay consistent with this corpus's
+  // TS-only scope and to avoid the native SDK-tool builds (Rust/Zig/Java)
+  // the other 6 tiers need. --filter pins each gate to ONE currently-green
+  // case; conformance/sdk-vertical is still being built out by a parallel
+  // work stream and 2 of its 31 cases (bigint-neg1, multi-slot-mixed-a) are
+  // missing goldens as of this writing — do not remove --filter or widen it
+  // without first confirming the whole case set is green, or these gates
+  // will "catch" every mutant for a reason that has nothing to do with the
+  // mutation.
+  'sdk-vertical-constructor-slots': {
+    cwd: 'conformance',
+    argv: ['npx', 'tsx', 'sdk-vertical/runner/vertical-runner.ts', '--tiers', 'typescript', '--filter', 'bigint-0'],
+  },
+  'sdk-vertical-codeseparator': {
+    cwd: 'conformance',
+    argv: ['npx', 'tsx', 'sdk-vertical/runner/vertical-runner.ts', '--tiers', 'typescript', '--filter', 'codesep-tag-zero'],
+  },
 };
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,55 @@
+{
+  "$comment": "Tests permitted to disable MockProvider broadcast validation. See docs/audit/2026-08-testing-gap-remediation-plan.md Phase A2. Fund-path deploy/call tests MUST NOT appear here without a fundPathJustification (see always-ack-allowlist.test.ts, P0-1). This list can only shrink: entry count is ratcheted against a committed ceiling in always-ack-allowlist.test.ts. SCOPE (P1-4): this allowlist governs MockProvider's always-ack escape hatches only — a test can still hand-roll an inline Provider object whose broadcast() acks anything, and that surface is outside this gate's visibility.",
+  "entries": [
+    {
+      "file": "src/__tests__/c8-mockprovider-broadcast-validation.test.ts",
+      "reason": "Directly tests the always-ack opt-out surface itself (constructor { validateBroadcasts: false }, disableBroadcastValidation(), enableBroadcastValidation(false), newAlwaysAckMockProvider()) so those escape hatches keep working; not a fund-path deploy/call test.",
+      "category": "negative-api"
+    },
+    {
+      "file": "src/__tests__/c19-multisig-sighash-digest.test.ts",
+      "reason": "Only the 'control: signing the OLD single-SHA256 value directly is REJECTED by Spend' test opts out (deployOwnerBump(true)): it deliberately broadcasts a script-invalid call tx (wrong-digest signature) to prove the digests differ at the script layer, then verifies rejection itself via spendRejects(). A validating provider would refuse that broadcast before the test could inspect it. All other tests in the file use the default validating provider.",
+      "category": "negative-api",
+      "fundPathJustification": "deployOwnerBump(true) does call .deploy() and the test calls .finalizeCall() through the always-ack provider, but the test's own assertion is spendRejects(callTx, 0, deployTx, 0) — an independent replay through the SAME @bsv/sdk Spend interpreter MockProvider's C8 gate uses. Bypassing C8 does not launder an unverified tx: the test itself re-proves invalidity via the identical validation mechanism, on the specific input under test."
+    },
+    {
+      "file": "src/__tests__/c20-c27-branch-semantics.test.ts",
+      "reason": "Only the 'out-of-range selector set(2,99) is REJECTED' test opts out (deploySelector(true)): it deliberately calls a selector that the fixed compiler now aborts on-chain (regression coverage for the dropped assert(false) bug), then verifies rejection itself via spendRejects(). A validating provider would refuse that broadcast before the test could inspect it. All other tests in the file use the default validating provider.",
+      "category": "negative-api",
+      "fundPathJustification": "deploySelector(true) does call .deploy() and the test calls .call() through the always-ack provider, but the test's own assertion is spendRejects(callTx, 0, deployTx, 0) — an independent replay through the SAME @bsv/sdk Spend interpreter MockProvider's C8 gate uses. Bypassing C8 does not launder an unverified tx: the test itself re-proves invalidity via the identical validation mechanism, on the specific input under test."
+    },
+    {
+      "file": "src/__tests__/intent-witness-values.test.ts",
+      "reason": "4 of 9 tests use a synthetic artifact whose on-chain script is a bare OP_TRUE (documented in makeArtifactWithIntentWitness) that never consumes the witness pushes the call unlocking script carries, so real Spend trips the clean-stack rule. Those tests assert unlocking-script WIRE BYTES (arg-count filtering, witness push ordering), not spendability of a real compiled contract. The other 5 tests (arg-count mismatch, missing-witness errors, hex-format validation) use the default validating provider.",
+      "category": "structure-only",
+      "fundPathJustification": "The 4 always-ack tests do call .deploy()/.call(), but against a synthetic OP_TRUE artifact that can never pass Spend validation for ANY call (valid or invalid) — the unconsumed witness pushes trip the clean-stack rule unconditionally. There is no real covenant here for C8 to protect; the tests assert SDK-internal wire-format plumbing (arg-count filtering, witness push ordering), not fund movement."
+    },
+    {
+      "file": "src/__tests__/issue-134-funding-signer.test.ts",
+      "reason": "Every test deliberately broadcasts a deploy/call tx whose FUNDING input is signed by the wrong key (methodSigner instead of the coin's real owner) to reproduce and then fix issue #134, and verifies script validity itself via an independent trySpend() replay per input. A validating provider would refuse the intentionally-invalid broadcasts before the test's own trySpend() assertions could run.",
+      "category": "negative-api",
+      "fundPathJustification": "Every test calls .deploy()/.call() through the always-ack provider, but each asserts trySpend(tx, inputIdx, fundingScript, satoshis) — an independent per-input replay through the SAME @bsv/sdk Spend interpreter MockProvider's C8 gate uses, on the exact funding input the test is about. Bypassing C8 does not launder an unverified tx: the test itself re-proves the funding input's validity/invalidity via the identical validation mechanism."
+    },
+    {
+      "file": "src/__tests__/sdk-fixes.test.ts",
+      "reason": "4 of 37 tests (state-mutation-during-call + auto-compute-state-from-ANF-IR) use synthetic OP_TRUE artifacts that never consume the auto-injected continuation witnesses (_changePKH/_changeAmount/_newAmount/txPreimage), so real Spend trips the clean-stack rule. Those tests assert SDK-internal state-mutation/auto-compute wiring, not spendability of a real compiled contract. The other 33 tests use the default validating provider.",
+      "category": "structure-only",
+      "fundPathJustification": "The 4 always-ack tests do call .deploy()/.call(), but against synthetic OP_TRUE artifacts that can never pass Spend validation for ANY call (valid or invalid) — the unconsumed auto-injected continuation witnesses trip the clean-stack rule unconditionally. There is no real covenant here for C8 to protect; the tests assert SDK-internal state-mutation/auto-compute wiring, not fund movement."
+    },
+    {
+      "file": "src/__tests__/p1-1-zero-validated-inputs.test.ts",
+      "reason": "1 of 7 tests ('does not throw for an unregistered input when validation is disabled') directly exercises the { validateBroadcasts: false } opt-out to prove P1-1's zero-validated-inputs guard is itself gated by validateBroadcasts, not unconditional; not a fund-path deploy/call test. The other 6 tests use the default validating provider.",
+      "category": "negative-api"
+    },
+    {
+      "file": "src/__tests__/fixtures/always-ack-side-door-fixture.ts",
+      "reason": "P1-4 regression fixture: a non-*.test.ts/*.spec.ts .ts file under __tests__/ that references an always-ack escape hatch, proving the gate scans every .ts file under __tests__/ (not just test-named ones). Never imported by a real test.",
+      "category": "fixture-shape"
+    },
+    {
+      "file": "src/__tests__/p1-3-always-ack-not-public.test.ts",
+      "reason": "References the identifier `newAlwaysAckMockProvider` by name to assert it is ABSENT from both public barrel exports (P1-3) — it never calls the factory or disables validation; the match is unavoidable prose/property-access, not usage.",
+      "category": "negative-api"
+    }
+  ]
+}

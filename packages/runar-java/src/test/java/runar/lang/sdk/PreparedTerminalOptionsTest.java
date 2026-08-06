@@ -40,11 +40,15 @@ class PreparedTerminalOptionsTest {
         }
     }
 
-    private static RunarContract deployedContract(LocalSigner methodSigner) throws Exception {
+    private static RunarContract deployedContract(MockProvider provider, LocalSigner methodSigner) throws Exception {
         RunarArtifact artifact = loadArtifact("basic-p2pkh.runar.json");
         String pkhHex = HexFormat.of().formatHex(Hash160.hash160(methodSigner.pubKey()));
         RunarContract contract = new RunarContract(artifact, List.of(pkhHex));
         contract.setCurrentUtxo(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
         return contract;
     }
 
@@ -67,12 +71,12 @@ class PreparedTerminalOptionsTest {
             .withLocktime(500_000);
 
         // ---- Primary path ----
-        RunarContract primary = deployedContract(methodSigner);
+        RunarContract primary = deployedContract(provider, methodSigner);
         RunarContract.CallOutcome primaryOut = primary.callWithOptions(
             "unlock", Arrays.asList(null, null), opts, provider, methodSigner);
 
         // ---- Multi-signer prepare/finalize path ----
-        RunarContract prep = deployedContract(methodSigner);
+        RunarContract prep = deployedContract(provider, methodSigner);
         PreparedCall prepared = prep.prepareCallWithOptions(
             "unlock", Arrays.asList(null, null), opts, provider, methodSigner);
         assertEquals(1, prepared.sigIndices().size(), "one Sig placeholder expected");

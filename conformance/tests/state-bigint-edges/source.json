@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./StateBigintEdges.runar.ts",
+    ".runar.sol": "./StateBigintEdges.runar.sol",
+    ".runar.move": "./StateBigintEdges.runar.move",
+    ".runar.go": "./StateBigintEdges.runar.go",
+    ".runar.rs": "./StateBigintEdges.runar.rs",
+    ".runar.py": "./StateBigintEdges.runar.py",
+    ".runar.zig": "./StateBigintEdges.runar.zig",
+    ".runar.rb": "./StateBigintEdges.runar.rb",
+    ".runar.java": "./StateBigintEdges.runar.java"
+  }
+}

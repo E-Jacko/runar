@@ -12,6 +12,7 @@ import type {
   GeneratedMethod as _GeneratedMethod,
   Expr,
   Stmt,
+  ForStmt,
   RuinarType,
 } from './contract-ir.js';
 import {
@@ -21,14 +22,38 @@ import {
   collectUsedTypes,
 } from './contract-ir.js';
 
-// `ForStmt` is exec-oracle-only (issue #124): the tri-modal execution oracle
-// generates loops + byte-ops and renders them to TypeScript only. The native
-// cross-tier `--ir` renderers deliberately do NOT emit loops (that would force
-// 7-compiler byte-identical loop parity, out of #124's scope), so they reject
-// a ForStmt loudly rather than emit unverified per-language loop syntax.
+// ---------------------------------------------------------------------------
+// Loop rendering — the CROSS-TIER SUBSET
+// ---------------------------------------------------------------------------
+//
+// Until 2026-08 the six non-TS renderers refused every `ForStmt`: loops were
+// exec-oracle-only (issue #124, TypeScript-rendered), so the `--ir` cross-tier
+// parity fuzzer had never compiled a single loop in any tier. A lowering fix
+// that moved bytes identically across all seven tiers was therefore invisible
+// to it. They now render loops — but only the form EVERY surface syntax can
+// express losslessly, which is narrower than `ForStmt` itself:
+//
+//   * Rust DSL loops are `for i in start..end` (`parser_rustmacro.rs`) — a
+//     half-open ascending range. There is no `.rev()` and no `..=`, so
+//     countdowns and `<=` bounds have NO Rust surface form.
+//   * Zig loops are `var i: i64 = S; while (i < N) : (i += 1)`, and the
+//     `var` decl must IMMEDIATELY precede the `while` for `parse_zig.zig`'s
+//     parseBlock to merge the two into one ForStmt.
+//
+// So the native renderers accept `step: 1` + `op: '<'` and reject anything
+// else loudly, rather than emit per-language loop syntax whose 7-tier parity
+// has never been demonstrated. The exec-oracle shapes that need a countdown or
+// an inclusive bound are still TypeScript-only.
 const FOR_STMT_UNSUPPORTED =
-  'ForStmt is exec-oracle-only (issue #124); render loop contracts to ' +
-  'TypeScript via renderTypeScript, not the native cross-tier renderers.';
+  'ForStmt form is exec-oracle-only (issue #124): the native cross-tier ' +
+  'renderers express only ascending unit-step half-open loops ' +
+  "(step: 1, op: '<'). Render this contract to TypeScript via " +
+  'renderTypeScript instead.';
+
+/** Throw unless `stmt` is in the cross-tier-renderable loop subset. */
+function requireNativeLoopForm(stmt: ForStmt): void {
+  if (stmt.step !== 1 || stmt.op !== '<') throw new Error(FOR_STMT_UNSUPPORTED);
+}
 
 // ---------------------------------------------------------------------------
 // TypeScript renderer (.runar.ts)
@@ -225,8 +250,16 @@ function goStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      const lines = [
+        `${indent}for ${stmt.iterVar} := runar.Int(${stmt.start}); ` +
+          `${stmt.iterVar} < ${stmt.bound}; ${stmt.iterVar}++ {`,
+      ];
+      for (const s of stmt.body) lines.push(goStmt(s, indent + '\t'));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${goExpr(stmt.expr)}`;
   }
@@ -321,8 +354,13 @@ function rsStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      const lines = [`${indent}for ${stmt.iterVar} in ${stmt.start}..${stmt.bound} {`];
+      for (const s of stmt.body) lines.push(rsStmt(s, indent + '    '));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${rsExpr(stmt.expr)};`;
   }
@@ -425,8 +463,13 @@ function pyStmt(stmt: Stmt, indent: string): string {
       }
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      const lines = [`${indent}for ${toSnakeCase(stmt.iterVar)} in range(${stmt.start}, ${stmt.bound}):`];
+      for (const s of stmt.body) lines.push(pyStmt(s, indent + '    '));
+      if (stmt.body.length === 0) lines.push(`${indent}    pass`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${pyExpr(stmt.expr)}`;
   }
@@ -567,8 +610,19 @@ function zigStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      // `parse_zig.zig`'s parseBlock merges a `var <iter>` decl into the
+      // FOLLOWING `while` only when the two are adjacent in the same block, so
+      // the declaration is emitted here rather than hoisted.
+      const lines = [
+        `${indent}var ${stmt.iterVar}: i64 = ${stmt.start};`,
+        `${indent}while (${stmt.iterVar} < ${stmt.bound}) : (${stmt.iterVar} += 1) {`,
+      ];
+      for (const s of stmt.body) lines.push(zigStmt(s, indent + '    '));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${zigExpr(stmt.expr)};`;
   }
@@ -672,8 +726,14 @@ function rbStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}end`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      // `...` is Ruby's EXCLUSIVE range — matches the half-open `<` bound.
+      const lines = [`${indent}for ${toSnakeCase(stmt.iterVar)} in ${stmt.start}...${stmt.bound}`];
+      for (const s of stmt.body) lines.push(rbStmt(s, indent + '  '));
+      lines.push(`${indent}end`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${rbExpr(stmt.expr)}`;
   }
@@ -931,8 +991,19 @@ function javaStmt(
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      // The loop variable is a bigint in scope for the whole body.
+      bigintVars.add(stmt.iterVar);
+      const lines = [
+        `${indent}for (Bigint ${stmt.iterVar} = ${javaBigintLiteral(stmt.start)}; ` +
+          `${stmt.iterVar}.lt(${javaBigintLiteral(stmt.bound)}); ` +
+          `${stmt.iterVar} = ${stmt.iterVar}.plus(Bigint.ONE)) {`,
+      ];
+      for (const s of stmt.body) lines.push(javaStmt(s, indent + '    ', bigintVars, boolVars));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${javaExpr(stmt.expr, bigintVars, boolVars)};`;
   }

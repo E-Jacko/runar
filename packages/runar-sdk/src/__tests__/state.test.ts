@@ -1,3 +1,13 @@
+// round-trip only — absolute pin: packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts
+//
+// Every case below is deserializeState(serializeState(x)) === x, which holds
+// for any self-consistent framing -- including a wrong one (exactly how the
+// 2026-08 OP_N state-framing bug shipped in all seven SDKs: encode and decode
+// moved together, so every round-trip stayed green). The two exceptions are
+// the byte-level 'boolean' literal assertions and the decodeNum2Bin negative-
+// zero block near the bottom of this file, which assert a hard-coded expected
+// hex string on one side only and are absolute pins in their own right (see
+// their inline comments) -- everything else here is smoke, not evidence.
 import { describe, it, expect } from 'vitest';
 import { serializeState, deserializeState } from '../state.js';
 import type { StateField } from 'runar-ir-schema';

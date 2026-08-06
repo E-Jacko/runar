@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./MergeLocalsPropUpdates.runar.ts",
+    ".runar.sol": "./MergeLocalsPropUpdates.runar.sol",
+    ".runar.move": "./MergeLocalsPropUpdates.runar.move",
+    ".runar.go": "./MergeLocalsPropUpdates.runar.go",
+    ".runar.rs": "./MergeLocalsPropUpdates.runar.rs",
+    ".runar.py": "./MergeLocalsPropUpdates.runar.py",
+    ".runar.zig": "./MergeLocalsPropUpdates.runar.zig",
+    ".runar.rb": "./MergeLocalsPropUpdates.runar.rb",
+    ".runar.java": "./MergeLocalsPropUpdates.runar.java"
+  }
+}

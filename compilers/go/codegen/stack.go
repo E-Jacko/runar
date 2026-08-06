@@ -329,6 +329,126 @@ func collectDeepBindingNames(bindings []ir.ANFBinding) map[string]bool {
 	return names
 }
 
+// collectLoopCarriedRebinds returns the locals a loop body REBINDS and then
+// READS AGAIN in the same iteration.
+//
+// computeLastUses maps a name to the MAXIMUM index that references it, so for
+// a body like
+//
+//	t3   = acc + step     (index 1 — reads the value carried in)
+//	acc  = @ref:t3        (index 2 — rebinds: renames t3's slot to `acc`)
+//	t4   = wacc + acc     (index 3 — reads the value just rebound)
+//
+// `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies (PICK)
+// instead of consuming, leaving the incoming slot on the stack under the same
+// name as the rebound one; index 3 then IS the last use, and findDepth
+// resolves to the topmost match — so it consumes the UPDATED value and leaves
+// the dead incoming one. The next iteration reads that dead slot, and every
+// iteration recomputes from the pre-loop value:
+// `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc + acc; }`
+// produced `wacc = step*N` where the source says `step*N*(N+1)/2` — silently
+// in a stateless contract, and as a permanently unspendable UTXO in a stateful
+// one (the covenant commits to a continuation the SDK never builds). outerRefs
+// does not cover it: `acc` is excluded there precisely because the body binds
+// it.
+//
+// The value these names hold at the end of an iteration is live at the start of
+// the next one, so lowerLoop protects them from consumption exactly like an
+// outer ref. The incoming slot each rebinding shadows is left behind and
+// drained with the rest of the frame at method exit — a name always resolves to
+// its newest slot, so the reads stay correct.
+//
+// Both halves of the predicate are load-bearing:
+//   - read BEFORE the first rebinding: the name is carried IN from the
+//     enclosing scope, rather than being a body-private temp that merely
+//     happens to be read after it is bound;
+//   - read AFTER the last rebinding: without it the rebound value is dead at
+//     the end of the iteration and consuming it is correct. This is what keeps
+//     every shipped accumulator (`sum = sum + i`, `off = off + len`)
+//     byte-for-byte unchanged.
+//
+// NESTED loops: the scan runs over flattenNestedLoopBodies(body), not over body
+// itself. A name rebound only inside an INNER loop is bound at no top-level
+// index of the outer body, so the raw scan classified it as neither an outer
+// ref (collectDeepBindingNames excludes it — the body does bind it, deeply) nor
+// a carried rebind, and the outer loop never marked it live. The inner loop's
+// final iteration then consumed it, because usedAfterLoop asks the enclosing
+// scope and the enclosing scope had not been told either, so every outer
+// iteration restarted from the slot the previous one left behind:
+// `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }` with
+// step = 3 produced `wacc = 24` where the source says 30. Splicing the inner
+// body in at the loop's position preserves the read/rebind/read ordering the
+// inner level already sees, so the outer level draws the same conclusion.
+func collectLoopCarriedRebinds(body []ir.ANFBinding) map[string]bool {
+	flat := flattenNestedLoopBodies(body)
+
+	firstBind := make(map[string]int, len(flat))
+	lastBind := make(map[string]int, len(flat))
+	for i := range flat {
+		name := flat[i].Name
+		if _, ok := firstBind[name]; !ok {
+			firstBind[name] = i
+		}
+		lastBind[name] = i
+	}
+
+	readBeforeBind := make(map[string]bool)
+	readAfterBind := make(map[string]bool)
+	for i := range flat {
+		for _, ref := range collectRefs(&flat[i].Value) {
+			if first, ok := firstBind[ref]; ok && i < first {
+				readBeforeBind[ref] = true
+			}
+			if last, ok := lastBind[ref]; ok && i > last {
+				readAfterBind[ref] = true
+			}
+		}
+	}
+
+	carried := make(map[string]bool)
+	for ref := range readBeforeBind {
+		if readAfterBind[ref] {
+			carried[ref] = true
+		}
+	}
+	return carried
+}
+
+// flattenNestedLoopBodies returns the binding sequence with every nested loop
+// binding replaced, in place, by its own (recursively flattened) body.
+//
+// Only collectLoopCarriedRebinds uses this, and only to order reads against
+// rebindings. The loop binding itself contributes no stack slot (loops are
+// statements), so dropping it loses nothing; splicing the body in at its
+// position is what lets an outer loop see a rebinding that happens one level
+// down. if-branches are deliberately NOT flattened — their two arms are
+// alternatives, not a sequence, and reassignments inside them are reconciled by
+// lowerIf, not by protection here.
+//
+// A body with no nested loop is returned entry-for-entry unchanged, which is
+// what makes this byte-neutral for every non-nesting loop.
+func flattenNestedLoopBodies(body []ir.ANFBinding) []ir.ANFBinding {
+	nested := false
+	for i := range body {
+		if body[i].Value.Kind == "loop" {
+			nested = true
+			break
+		}
+	}
+	if !nested {
+		return body
+	}
+	flat := make([]ir.ANFBinding, 0, len(body))
+	for i := range body {
+		if body[i].Value.Kind == "loop" {
+			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Body)...)
+		} else {
+			flat = append(flat, body[i])
+		}
+	}
+	return flat
+}
+
 // countMergedLocalResults reports how many branch-merged locals an
 // if-statement's two arms carry as results.
 //
@@ -1791,6 +1911,68 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 	}
 }
 
+// lastUsesHas reports whether any later binding references name.
+func lastUsesHas(lastUses map[string]int, name string) bool {
+	_, ok := lastUses[name]
+	return ok
+}
+
+// branchInPlaceRebindDepth returns the stack depth of the ONE slot both arms of
+// an `if` rebound in place, and whether the `if` has that shape at all.
+//
+// The shape: ANF lowering merged a SINGLE local across the arms, so instead of
+// appending a __merge$<i> result block it aliased the local to the
+// if-expression itself. Both arms then read that local and rebound it, which
+// makes the arm ROLL the parent's slot away and leave its own result in the
+// same position — the arms' net stack effect is zero, so none of the
+// depth-growth cases in lowerIf fire and the if's value would go unregistered.
+//
+// Every condition below is required:
+//   - no normalised K-merge block (that is the K>=2 path, which grows depth by
+//     K and is adopted by name),
+//   - both arms end on a binding of the SAME name, and that name is a local,
+//     not a contract property (properties have their own reconcile),
+//   - both arms, and the reconciled parent, hold that name at the same depth —
+//     i.e. the slot really was rebound where it stood,
+//   - both arms are at the parent's depth, so the slot is the only effect,
+//   - bindingName is read after the `if`. Without a reader there is nothing to
+//     repair and renaming would only lose a name; with one, the pre-fix
+//     compiler failed with "value not found on stack". This is what makes
+//     adopting the slot byte-neutral for every program that compiled before.
+func (ctx *loweringContext) branchInPlaceRebindDepth(
+	thenBindings, elseBindings []ir.ANFBinding,
+	thenCtx, elseCtx *loweringContext,
+	mergedResultCount int,
+	bindingIsReadLater bool,
+) (int, bool) {
+	if !bindingIsReadLater || mergedResultCount != 0 {
+		return 0, false
+	}
+	if thenCtx.sm.depth() != ctx.sm.depth() || elseCtx.sm.depth() != ctx.sm.depth() {
+		return 0, false
+	}
+	if len(thenBindings) == 0 || len(elseBindings) == 0 {
+		return 0, false
+	}
+	name := thenBindings[len(thenBindings)-1].Name
+	if name == "" || name != elseBindings[len(elseBindings)-1].Name {
+		return 0, false
+	}
+	for _, p := range ctx.properties {
+		if p.Name == name {
+			return 0, false
+		}
+	}
+	if !thenCtx.sm.has(name) || !elseCtx.sm.has(name) || !ctx.sm.has(name) {
+		return 0, false
+	}
+	depth := thenCtx.sm.findDepth(name)
+	if elseCtx.sm.findDepth(name) != depth || ctx.sm.findDepth(name) != depth {
+		return 0, false
+	}
+	return depth, true
+}
+
 func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
 	ta := len(terminalAssert) > 0 && terminalAssert[0]
 
@@ -2139,6 +2321,32 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	} else if elseCtx.sm.depth() > ctx.sm.depth() {
 		ctx.sm.push(bindingName)
+	} else if depth, ok := ctx.branchInPlaceRebindDepth(
+		thenBindings, elseBindings, thenCtx, elseCtx, mergedResultCount, lastUsesHas(lastUses, bindingName),
+	); ok {
+		// Single branch-merged local rebound IN PLACE by both arms.
+		//
+		// At K=1 ANF lowering does not append a __merge$<i> result block; it
+		// ALIASES the local to the if-expression's binding name instead, so
+		// every post-branch read of the local names the `if`. That works when
+		// the arms PUSH their new value — depth grows by one and the
+		// thenCtx.depth > ctx.depth arm above registers bindingName.
+		//
+		// But when both arms READ the local and rebind it (m0 = m0 + 1), the
+		// local is not live under its own name after the `if` (the alias moved
+		// every reader to the `if`), so it is not outer-protected and each arm
+		// ROLLS the parent slot away and leaves its result in the same
+		// position. Net depth change: zero. Control then fell into the "void
+		// if" case below, nothing was registered for bindingName, and the very
+		// next binding failed with "value not found on stack" — a compile-time
+		// rejection of source that compiles at K=2 and compiles without an
+		// else. The value IS on the stack; only its NAME was wrong.
+		//
+		// Adopt it: rename the slot the arms rebound to the if's binding name.
+		// No opcode is emitted — bookkeeping only, gated on bindingName
+		// actually being referenced later, which is precisely the case that
+		// used to fail.
+		ctx.sm.renameAtDepth(depth, bindingName)
 	} else {
 		// Void if — don't push phantom
 	}
@@ -2185,6 +2393,17 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 			if ref != iterVar && !deepBodyBindingNames[ref] {
 				outerRefs[ref] = true
 			}
+		}
+	}
+
+	// A local the body REBINDS and then READS AGAIN in the same iteration is
+	// carried across iterations through the rebound slot, so it must survive
+	// the body exactly like an outer ref. deepBodyBindingNames above excludes
+	// it precisely because the body binds it — which is what made the updated
+	// value consumable. See collectLoopCarriedRebinds.
+	for ref := range collectLoopCarriedRebinds(body) {
+		if ref != iterVar {
+			outerRefs[ref] = true
 		}
 	}
 

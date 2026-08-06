@@ -17,6 +17,7 @@ import type { RunarArtifact } from 'runar-ir-schema';
 import { RunarContract } from '../../../packages/runar-sdk/src/contract.js';
 import { MockProvider } from '../../../packages/runar-sdk/src/providers/mock.js';
 import { LocalSigner } from '../../../packages/runar-sdk/src/signers/local.js';
+import { buildP2PKHScript } from '../../../packages/runar-sdk/src/script-utils.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(__dirname, 'Grid2x2.runar.sol'), 'utf8');
@@ -79,7 +80,7 @@ describe('Grid2x2 (Solidity) — nested FixedArray acceptance', () => {
       txid: PLAYER_KEY.slice(0, 64),
       outputIndex: 0,
       satoshis: 500_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: buildP2PKHScript(await signer.getPublicKey()),
     });
 
     const contract = new RunarContract(artifact, []);
@@ -99,7 +100,7 @@ describe('Grid2x2 (Solidity) — nested FixedArray acceptance', () => {
       txid: PLAYER_KEY.slice(0, 64),
       outputIndex: 0,
       satoshis: 500_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: buildP2PKHScript(await signer.getPublicKey()),
     });
 
     const contract = new RunarContract(artifact, []);

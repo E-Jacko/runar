@@ -152,6 +152,7 @@ func lowerProperties(contract *ContractNode) []ir.ANFProperty {
 		}
 		if prop.Initializer != nil {
 			props[i].InitialValue = extractLiteralValue(prop.Initializer)
+			checkStateBigintMagnitude(&props[i])
 		}
 		if len(prop.SyntheticArrayChain) > 0 {
 			chain := make([]ir.ANFSyntheticArrayLevel, len(prop.SyntheticArrayChain))
@@ -166,6 +167,53 @@ func lowerProperties(contract *ContractNode) []ir.ANFProperty {
 		}
 	}
 	return props
+}
+
+// stateBigintMagnitudeLimit is the magnitude a bigint state field gets:
+// num2bin-le8 is a fixed 8-byte little-endian SIGN-MAGNITUDE word, so bytes
+// 0..6 plus the low 7 bits of byte 7 carry the magnitude and 0x80 of byte 7
+// carries the sign.
+var stateBigintMagnitudeLimit = new(big.Int).Lsh(big.NewInt(1), 63)
+
+// checkStateBigintMagnitude rejects a MUTABLE bigint property initialised
+// beyond the 8-byte state word.
+//
+// The state section writes every bigint field with OP_NUM2BIN 8, which cannot
+// represent a magnitude of 2^63 or more. Nothing used to check: the compiler
+// stamped `encoding: "num2bin-le8"` on the field and carried the initializer
+// verbatim, the SDK wrote the low 8 bytes of it into the deployed state
+// section, and the covenant then rebuilt the continuation with its own
+// OP_NUM2BIN 8 — which produces different bytes — so hash256(outputs) never
+// matched and the UTXO was permanently unspendable. It deployed cleanly, with
+// no diagnostic at compile time or deploy time.
+//
+// This catches the statically-known half. Values that only exist at call time
+// are stopped by the SDK serializer (packages/runar-go/sdk_state.go).
+//
+// READONLY properties are deliberately exempt: they are baked into the locking
+// script as script-number pushes, never into the state section, and BSV script
+// numbers are arbitrary-precision after Genesis.
+func checkStateBigintMagnitude(prop *ir.ANFProperty) {
+	if prop.Readonly {
+		return
+	}
+	if prop.Type != "bigint" && prop.Type != "int" {
+		return
+	}
+	v, ok := prop.InitialValue.(*big.Int)
+	if !ok {
+		return
+	}
+	if v.CmpAbs(stateBigintMagnitudeLimit) < 0 {
+		return
+	}
+	panic(fmt.Sprintf(
+		"Cannot compile state property '%s' initialised to %s: it does not fit "+
+			"the fixed 8-byte sign-magnitude state word (magnitude must be < 2^63). "+
+			"Reduce the value, or make the property readonly if it is a constant "+
+			"rather than state.",
+		prop.Name, v.String(),
+	))
 }
 
 func extractLiteralValue(expr Expression) interface{} {
@@ -858,6 +906,13 @@ func (ctx *lowerCtx) syncCounter(sub *lowerCtx) {
 // ---------------------------------------------------------------------------
 
 func (ctx *lowerCtx) lowerStatements(stmts []Statement) {
+	ctx.lowerStatementsWithReads(stmts, nil)
+}
+
+// lowerStatementsWithReads lowers a statement block, threading down the set of
+// identifiers the enclosing blocks still read after this block ends. Only the
+// block-forming statements (if / for) consume it; see readsAfterStatement.
+func (ctx *lowerCtx) lowerStatementsWithReads(stmts []Statement, readsAfterBlock map[string]bool) {
 	for i, stmt := range stmts {
 		// Early-return nesting: when an if-statement's then-block ends with a
 		// return and there is no else-branch, the remaining statements after the
@@ -876,12 +931,112 @@ func (ctx *lowerCtx) lowerStatements(stmts []Statement) {
 				Else:           remaining,
 				SourceLocation: ifStmt.SourceLocation,
 			}
-			ctx.lowerStatement(modifiedIf)
+			ctx.lowerStatementWithReads(modifiedIf, readsAfterBlock)
 			return // remaining stmts are now inside the else branch
 		}
 
-		ctx.lowerStatement(stmt)
+		// Only the block-forming statements need to know what the code after
+		// them still reads; computing it for every statement would be
+		// quadratic for no benefit.
+		var readsAfter map[string]bool
+		switch stmt.(type) {
+		case IfStmt, ForStmt:
+			readsAfter = readsAfterStatement(stmts, i, readsAfterBlock)
+		}
+		ctx.lowerStatementWithReads(stmt, readsAfter)
 	}
+}
+
+// readsAfterStatement returns the identifiers still readable once statement
+// `index` of this block has run: everything the following statements in this
+// block read, plus whatever the enclosing blocks read after this block.
+//
+// Used by lowerIfStatement to tell a branch-merged local that is dead after the
+// `if` (safe) from one that is still live (not representable alongside a branch
+// output — see branchOutputRejectionReason).
+func readsAfterStatement(stmts []Statement, index int, readsAfterBlock map[string]bool) map[string]bool {
+	reads := make(map[string]bool, len(readsAfterBlock))
+	for name := range readsAfterBlock {
+		reads[name] = true
+	}
+	for j := index + 1; j < len(stmts); j++ {
+		collectStatementReads(stmts[j], reads)
+	}
+	return reads
+}
+
+// collectStatementReads collects every identifier a statement READS. The `x` in
+// `x = expr` is a write, not a read, so a plain identifier assignment target is
+// skipped; every other target form can still read locals.
+func collectStatementReads(stmt Statement, out map[string]bool) {
+	switch s := stmt.(type) {
+	case VariableDeclStmt:
+		collectExpressionReads(s.Init, out)
+	case AssignmentStmt:
+		if _, isIdent := s.Target.(Identifier); !isIdent {
+			collectExpressionReads(s.Target, out)
+		}
+		collectExpressionReads(s.Value, out)
+	case IfStmt:
+		collectExpressionReads(s.Condition, out)
+		for _, inner := range s.Then {
+			collectStatementReads(inner, out)
+		}
+		for _, inner := range s.Else {
+			collectStatementReads(inner, out)
+		}
+	case ForStmt:
+		collectExpressionReads(s.Init.Init, out)
+		collectExpressionReads(s.Condition, out)
+		if s.Update != nil {
+			collectStatementReads(s.Update, out)
+		}
+		for _, inner := range s.Body {
+			collectStatementReads(inner, out)
+		}
+	case ReturnStmt:
+		if s.Value != nil {
+			collectExpressionReads(s.Value, out)
+		}
+	case ExpressionStmt:
+		collectExpressionReads(s.Expr, out)
+	}
+}
+
+// collectExpressionReads collects every identifier an expression reads.
+func collectExpressionReads(expr Expression, out map[string]bool) {
+	switch e := expr.(type) {
+	case Identifier:
+		out[e.Name] = true
+	case BinaryExpr:
+		collectExpressionReads(e.Left, out)
+		collectExpressionReads(e.Right, out)
+	case UnaryExpr:
+		collectExpressionReads(e.Operand, out)
+	case CallExpr:
+		collectExpressionReads(e.Callee, out)
+		for _, a := range e.Args {
+			collectExpressionReads(a, out)
+		}
+	case MemberExpr:
+		collectExpressionReads(e.Object, out)
+	case TernaryExpr:
+		collectExpressionReads(e.Condition, out)
+		collectExpressionReads(e.Consequent, out)
+		collectExpressionReads(e.Alternate, out)
+	case IndexAccessExpr:
+		collectExpressionReads(e.Object, out)
+		collectExpressionReads(e.Index, out)
+	case IncrementExpr:
+		collectExpressionReads(e.Operand, out)
+	case DecrementExpr:
+		collectExpressionReads(e.Operand, out)
+	case ArrayLiteralExpr:
+		for _, el := range e.Elements {
+			collectExpressionReads(el, out)
+		}
+	}
+	// Literals and `this.x` property access read no locals.
 }
 
 // branchEndsWithReturn checks whether a statement list always terminates with a return.
@@ -901,6 +1056,10 @@ func branchEndsWithReturn(stmts []Statement) bool {
 }
 
 func (ctx *lowerCtx) lowerStatement(stmt Statement) {
+	ctx.lowerStatementWithReads(stmt, nil)
+}
+
+func (ctx *lowerCtx) lowerStatementWithReads(stmt Statement, readsAfter map[string]bool) {
 	// Propagate source location to emitted ANF bindings
 	ctx.currentSourceLoc = stmtSourceLoc(stmt)
 	defer func() { ctx.currentSourceLoc = nil }()
@@ -911,9 +1070,9 @@ func (ctx *lowerCtx) lowerStatement(stmt Statement) {
 	case AssignmentStmt:
 		ctx.lowerAssignment(s)
 	case IfStmt:
-		ctx.lowerIfStatement(s)
+		ctx.lowerIfStatement(s, readsAfter)
 	case ForStmt:
-		ctx.lowerForStatement(s)
+		ctx.lowerForStatement(s, readsAfter)
 	case ExpressionStmt:
 		ctx.lowerExprToRef(s.Expr)
 	case ReturnStmt:
@@ -992,18 +1151,18 @@ func (ctx *lowerCtx) lowerAssignment(stmt AssignmentStmt) {
 	ctx.lowerExprToRef(stmt.Target)
 }
 
-func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
+func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt, readsAfter map[string]bool) {
 	condRef := ctx.lowerExprToRef(stmt.Condition)
 
 	// Lower then-block into sub-context
 	thenCtx := ctx.subContext()
-	thenCtx.lowerStatements(stmt.Then)
+	thenCtx.lowerStatementsWithReads(stmt.Then, readsAfter)
 	ctx.syncCounter(thenCtx)
 
 	// Lower else-block into sub-context
 	elseCtx := ctx.subContext()
 	if len(stmt.Else) > 0 {
-		elseCtx.lowerStatements(stmt.Else)
+		elseCtx.lowerStatementsWithReads(stmt.Else, readsAfter)
 	}
 	ctx.syncCounter(elseCtx)
 
@@ -1021,9 +1180,11 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 	branchHasOutputs := len(thenOutputRefs) > 0 || len(elseOutputRefs) > 0 ||
 		len(thenDataRefs) > 0 || len(elseDataRefs) > 0
 
+	thenOutputBytes := ""
+	elseOutputBytes := ""
 	if branchHasOutputs {
-		appendBranchOutputConcat(thenCtx)
-		appendBranchOutputConcat(elseCtx)
+		thenOutputBytes = appendBranchOutputConcat(thenCtx)
+		elseOutputBytes = appendBranchOutputConcat(elseCtx)
 	}
 
 	// Branch-merged locals (2 or more). An `if` expression carries exactly ONE
@@ -1038,18 +1199,20 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 	// Fix: give both arms the SAME result set in the SAME order by appending
 	// an explicit rebind of every merged local to each arm.
 	mergedLocals := ctx.collectBranchMergedLocals(thenCtx, elseCtx)
-	if len(mergedLocals) >= 2 {
-		if branchHasOutputs {
-			// The arms' single value is already spoken for: it is the output
-			// concat the continuation hash consumes. Refuse at compile time
-			// rather than emit the unspendable script this used to produce.
+
+	if branchHasOutputs {
+		if reason := branchOutputRejectionReason(
+			thenCtx, elseCtx, thenOutputBytes, elseOutputBytes, mergedLocals, readsAfter,
+		); reason != "" {
 			panic(fmt.Sprintf(
-				"Cannot compile conditional that both declares outputs and merges "+
-					"%d local variables (%s). Move the addOutput/addRawOutput/"+
-					"addDataOutput call after the if-statement, or give each branch "+
-					"its own complete addOutput.",
-				len(mergedLocals), strings.Join(mergedLocals, ", ")))
+				"Cannot compile conditional that both declares outputs and %s. "+
+					"Move the addOutput/addRawOutput/addDataOutput call after the "+
+					"if-statement.",
+				reason))
 		}
+	}
+
+	if len(mergedLocals) >= 2 {
 		appendMergedLocalResults(thenCtx, mergedLocals)
 		ctx.syncCounter(thenCtx)
 		appendMergedLocalResults(elseCtx, mergedLocals)
@@ -1189,15 +1352,126 @@ func appendBranchOutputConcat(branchCtx *lowerCtx) string {
 	return accumulated
 }
 
-func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
+// branchOutputRejectionReason returns why an `if` whose arms declare outputs
+// cannot be represented — or "" when it can. The result is the reason clause
+// the diagnostic embeds.
+//
+// An `if` expression carries exactly ONE value, and when an arm emits an output
+// that value is already spoken for: it is the output bytes the continuation
+// hash consumes (appendBranchOutputConcat). Anything ELSE the arm leaves behind
+// breaks one of two invariants that nothing downstream enforces:
+//
+//	INV-A  the parent registers the if-expression's value as the branch's
+//	       contribution to the continuation hash, so "the branch's output
+//	       bytes" really means "whatever the arm's LAST binding is". A binding
+//	       that lands after the output — a rebound local, a property write —
+//	       silently replaces the serialized output with an unrelated value,
+//	       and the residue drain then physically drops the real output because
+//	       it is no longer on top.
+//	INV-B  an arm that emits an output AND leaves any other slot the parent
+//	       can still name — a property write anywhere in the arm, or a rebound
+//	       local that is still read after the `if` — leaves 2+ results against
+//	       the ONE stackMap name the stack lowerer registers, desyncing the
+//	       parent stack by a slot from there on. The residue drain cannot save
+//	       it: it filters BY NAME and those names are all pre-`if` names.
+//
+// Neither is visible off-chain, so both shipped as permanently unspendable
+// locking scripts. Refuse at compile time rather than emit one. See
+// packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+// for the real-Script-VM proof of each shape.
+//
+// The clauses are checked in a fixed order so all seven tiers report the same
+// reason for a source that trips more than one.
+func branchOutputRejectionReason(
+	thenCtx, elseCtx *lowerCtx,
+	thenOutputBytes, elseOutputBytes string,
+	mergedLocals []string,
+	readsAfter map[string]bool,
+) string {
+	// 1. Two or more merged locals: normalising them would need a multi-result
+	//    `if` node, and the arms' single value is already the output concat.
+	if len(mergedLocals) >= 2 {
+		return fmt.Sprintf("merges %d local variables (%s)",
+			len(mergedLocals), strings.Join(mergedLocals, ", "))
+	}
+
+	// 2. INV-A: the arm's terminal binding must BE its output bytes.
+	labels := []string{"then", "else"}
+	branches := []*lowerCtx{thenCtx, elseCtx}
+	outputBytes := []string{thenOutputBytes, elseOutputBytes}
+	for i, branchCtx := range branches {
+		if len(branchCtx.bindings) == 0 ||
+			branchCtx.bindings[len(branchCtx.bindings)-1].Name != outputBytes[i] {
+			return fmt.Sprintf("continues past its output in the %s-branch", labels[i])
+		}
+	}
+
+	// 3. INV-B: a property write leaves a slot the parent can still name,
+	//    wherever in the arm it sits.
+	var writtenProps []string
+	seenProps := map[string]bool{}
+	for _, branchCtx := range branches {
+		collectUpdatedProps(branchCtx.bindings, seenProps, &writtenProps)
+	}
+	if len(writtenProps) > 0 {
+		return fmt.Sprintf("assigns contract properties (%s) inside the branch",
+			strings.Join(writtenProps, ", "))
+	}
+
+	// 4. INV-B: a rebound local that survives the `if` is protected from being
+	//    rolled away, so the arm ends one slot deeper than lowerIf accounts for.
+	var liveMerged []string
+	for _, name := range mergedLocals {
+		if readsAfter[name] {
+			liveMerged = append(liveMerged, name)
+		}
+	}
+	if len(liveMerged) > 0 {
+		return fmt.Sprintf("reassigns local variables read after it (%s)",
+			strings.Join(liveMerged, ", "))
+	}
+
+	return ""
+}
+
+// collectUpdatedProps appends every property name an ANF binding list assigns,
+// including the ones nested inside an `if` arm or a `loop` body — a nested
+// write is just as much a named slot the enclosing arm leaves behind.
+func collectUpdatedProps(bindings []ir.ANFBinding, seen map[string]bool, out *[]string) {
+	for _, binding := range bindings {
+		switch binding.Value.Kind {
+		case "update_prop":
+			if !seen[binding.Value.Name] {
+				seen[binding.Value.Name] = true
+				*out = append(*out, binding.Value.Name)
+			}
+		case "if":
+			collectUpdatedProps(binding.Value.Then, seen, out)
+			collectUpdatedProps(binding.Value.Else, seen, out)
+		case "loop":
+			collectUpdatedProps(binding.Value.Body, seen, out)
+		}
+	}
+}
+
+func (ctx *lowerCtx) lowerForStatement(stmt ForStmt, readsAfter map[string]bool) {
 	// Resolve the loop's compile-time shape: start value, step direction, and
 	// iteration count. Rúnar requires bounded loops, so all three must be
 	// statically determinable (issue #121).
 	start, step, count := extractLoopShape(stmt)
 
-	// Lower body into sub-context
+	// Lower body into sub-context. The body repeats, so every read anywhere in
+	// it is a read that happens after any given statement inside it.
+	bodyReads := make(map[string]bool, len(readsAfter))
+	for name := range readsAfter {
+		bodyReads[name] = true
+	}
+	for _, s := range stmt.Body {
+		collectStatementReads(s, bodyReads)
+	}
+
 	bodyCtx := ctx.subContext()
-	bodyCtx.lowerStatements(stmt.Body)
+	bodyCtx.lowerStatementsWithReads(stmt.Body, bodyReads)
 	ctx.syncCounter(bodyCtx)
 
 	ctx.emit(ir.ANFValue{

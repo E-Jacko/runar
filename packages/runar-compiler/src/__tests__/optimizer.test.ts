@@ -389,7 +389,17 @@ describe('Optimizer: Constant Folding', () => {
   // ---------------------------------------------------------------------------
 
   describe('if-branch folding', () => {
-    it('folds away false branch when condition is known true', () => {
+    // A statically-known condition must NOT blank the untaken arm.
+    //
+    // The folder used to return `else: []` (or `then: []`) while leaving the
+    // `if` node itself in place. An arm is not a free-floating binding list —
+    // it carries the stack-shape contract 04-anf-lower builds (the
+    // `__merge$<i>` result block for K>=2 merged locals) and 05-stack-lower
+    // consumes. Erasing one arm made `lowerIf` register ONE stackMap slot for
+    // K physical results, which at K=2 silently miscompiled the guard (the
+    // deployed script accepted spends the source rejects) and at K=1 rejected
+    // source that compiles with folding disabled.
+    it('keeps BOTH arms when the condition is known true', () => {
       const program = makeProgram([
         makeMethod('m', [
           b('t0', { kind: 'load_const', value: true }),
@@ -406,11 +416,11 @@ describe('Optimizer: Constant Folding', () => {
       expect(ifValue.kind).toBe('if');
       if (ifValue.kind === 'if') {
         expect(ifValue.then).toHaveLength(1);
-        expect(ifValue.else).toHaveLength(0);
+        expect(ifValue.else).toHaveLength(1);
       }
     });
 
-    it('folds away true branch when condition is known false', () => {
+    it('keeps BOTH arms when the condition is known false', () => {
       const program = makeProgram([
         makeMethod('m', [
           b('t0', { kind: 'load_const', value: false }),
@@ -424,10 +434,31 @@ describe('Optimizer: Constant Folding', () => {
       ]);
       const folded = foldConstants(program);
       const ifValue = folded.methods[0]!.body[1]!.value;
+      expect(ifValue.kind).toBe('if');
       if (ifValue.kind === 'if') {
-        expect(ifValue.then).toHaveLength(0);
+        expect(ifValue.then).toHaveLength(1);
         expect(ifValue.else).toHaveLength(1);
       }
+    });
+
+    // A statically-known condition must not leak an arm's constants into the
+    // enclosing environment either: the `if` survives the pass, so both arms
+    // are still emitted and either can run.
+    it('does not propagate a taken arm\'s constants past the if', () => {
+      const program = makeProgram([
+        makeMethod('m', [
+          b('t0', { kind: 'load_const', value: true }),
+          b('t1', {
+            kind: 'if',
+            cond: 't0',
+            then: [b('x', { kind: 'load_const', value: 42n })],
+            else: [b('x', { kind: 'load_const', value: 99n })],
+          }),
+          b('t2', { kind: 'bin_op', op: '+', left: 'x', right: 't0' }),
+        ]),
+      ]);
+      const folded = foldConstants(program);
+      expect(folded.methods[0]!.body[2]!.value.kind).toBe('bin_op');
     });
 
     it('folds constants inside both branches when condition is unknown', () => {

@@ -2,6 +2,12 @@ package runar
 
 import "testing"
 
+// round-trip only — absolute pin: packages/runar-go/sdk_state_push_framing_test.go (C9, state half).
+// The S1 (constructor-arg) half has no Go-local literal-byte KAT; its only
+// absolute evidence is indirect, via the deploy-time splice path
+// (conformance/sdk-vertical) -- see the "unlocking-encodeArg-minimaldata"
+// residual note in conformance/wire-primitives.json.
+//
 // ---------------------------------------------------------------------------
 // C9 + S1 — single-byte MINIMALDATA ByteString roundtrip (state + ctor-arg).
 //

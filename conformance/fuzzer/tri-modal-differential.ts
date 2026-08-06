@@ -1,4 +1,13 @@
 /**
+ * SCOPE (testing-gap remediation, plan design principle P8): this fuzzer's
+ * oracle is ABSOLUTE (the real engine), but it is scoped to STATELESS
+ * fragments against a synthetic transaction context and it compares VERDICTS
+ * ONLY. A miscompile that leaves the script acceptable while committing the
+ * WRONG continuation state is invisible here. Full transaction context plus a
+ * post-state VALUE pin is `--spend-oracle`. See `conformance/fuzzer/README.md`.
+ */
+
+/**
  * Tri-modal source-vs-script EXECUTION oracle (issue #124) — fast-check
  * PROPERTY-mode harness.
  *
@@ -6,7 +15,7 @@
  * interpreter vs. `ScriptVM`) and drives a `fc.sample` corpus (no shrinking).
  * This harness upgrades both axes:
  *
- *   - Tri-modal: every generated spend runs through the ANF `RunarInterpreter`
+ *   - Tri-modal: every generated spend runs through the AST-walking `RunarInterpreter`
  *     (source semantics — the one genuinely independent implementation),
  *     `ScriptVM` (the upstream `@bsv/sdk` `Spend` engine stepped opcode by
  *     opcode, consensus wrappers off), and a strict `Spend.validate()` that

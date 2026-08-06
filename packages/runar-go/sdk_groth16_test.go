@@ -156,7 +156,7 @@ func TestGroth16WASDK_SerializeWitnessToUnlock_NilWitness(t *testing.T) {
 
 func TestGroth16WASDK_CallWithWitness_NoUtxo(t *testing.T) {
 	g := NewGroth16WAContract(buildFakeGroth16WAArtifact())
-	provider := NewMockProvider("mocknet")
+	provider := NewAlwaysAckMockProvider("mocknet")
 	signer := NewMockSigner("", "")
 	w := buildFakeWitness()
 	_, _, err := g.CallWithWitness(provider, signer, w, "fakeaddr", "")
@@ -193,7 +193,7 @@ func TestGroth16WASDK_CallWithWitness_NilWitness(t *testing.T) {
 		Satoshis:    50000,
 		Script:      "51",
 	})
-	provider := NewMockProvider("mocknet")
+	provider := NewAlwaysAckMockProvider("mocknet")
 	signer := NewMockSigner("", "")
 	_, _, err := g.CallWithWitness(provider, signer, nil, "fakeaddr", "")
 	if err == nil {
@@ -209,7 +209,7 @@ func TestGroth16WASDK_CallWithWitness_BothDestinationsError(t *testing.T) {
 		Satoshis:    50000,
 		Script:      "51",
 	})
-	provider := NewMockProvider("mocknet")
+	provider := NewAlwaysAckMockProvider("mocknet")
 	signer := NewMockSigner("", "")
 	_, _, err := g.CallWithWitness(provider, signer, buildFakeWitness(), "fakeaddr", "deadbeef")
 	if err == nil {
@@ -228,7 +228,7 @@ func TestGroth16WASDK_CallWithWitness_NeitherDestinationError(t *testing.T) {
 		Satoshis:    50000,
 		Script:      "51",
 	})
-	provider := NewMockProvider("mocknet")
+	provider := NewAlwaysAckMockProvider("mocknet")
 	signer := NewMockSigner("", "")
 	_, _, err := g.CallWithWitness(provider, signer, buildFakeWitness(), "", "")
 	if err == nil {
@@ -251,7 +251,7 @@ func TestGroth16WASDK_CallWithWitness_EndToEndMock(t *testing.T) {
 	}
 	g.SetCurrentUTXO(utxo)
 
-	provider := NewMockProvider("mocknet")
+	provider := NewAlwaysAckMockProvider("mocknet")
 	signer := NewMockSigner("", "")
 
 	// Use a raw P2PKH-ish script hex as the destination; we don't care

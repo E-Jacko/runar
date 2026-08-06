@@ -2,9 +2,10 @@
 pub mod crypto;
 
 use runar_lang::sdk::{
-    ExternalSigner, LocalSigner, Provider, RPCProvider, RunarArtifact, Signer,
-    TransactionData, Utxo,
+    extract_state_from_script, ExternalSigner, LocalSigner, Provider, RPCProvider, RunarArtifact,
+    SdkValue, Signer, TransactionData, Utxo,
 };
+use std::collections::HashMap;
 use bsv::transaction::Transaction as BsvTransaction;
 use sha2::{Digest, Sha256};
 use ripemd::Ripemd160;
@@ -59,6 +60,44 @@ impl Provider for LoggingRPCProvider {
     fn get_raw_transaction(&self, txid: &str) -> Result<String, String> {
         self.inner.get_raw_transaction(txid)
     }
+}
+
+// ---------------------------------------------------------------------------
+// On-chain state read-back
+// ---------------------------------------------------------------------------
+
+/// Fetch `utxo`'s transaction from the node and decode the state section of
+/// `utxo.output_index`'s output script using `artifact`'s state field layout.
+///
+/// This reads the ACTUAL bytes the node accepted, NOT `RunarContract::state()`
+/// (the SDK's in-memory next-state prediction). The SDK auto-computes the
+/// next state by running the contract's ANF off-chain -- the same IR the
+/// compiled Script executes. A miscompilation that makes the on-chain script
+/// commit a wrong-but-accepted state can produce an off-chain prediction that
+/// silently agrees with it (PALMER-1, commit 23ef2d2b -- "the off-chain
+/// interpreter agreed... because it evaluates the same ANF"). Decoding the
+/// state section back out of the broadcast transaction's own script bytes
+/// does not go through that computation at all.
+pub fn read_on_chain_state(
+    provider: &dyn Provider,
+    artifact: &RunarArtifact,
+    utxo: &Utxo,
+) -> HashMap<String, SdkValue> {
+    let tx = provider
+        .get_transaction(&utxo.txid)
+        .unwrap_or_else(|e| panic!("read_on_chain_state: get_transaction({}): {}", utxo.txid, e));
+    let output = tx.outputs.get(utxo.output_index as usize).unwrap_or_else(|| {
+        panic!(
+            "read_on_chain_state: tx {} has no output {}",
+            utxo.txid, utxo.output_index
+        )
+    });
+    extract_state_from_script(artifact, &output.script).unwrap_or_else(|| {
+        panic!(
+            "read_on_chain_state: tx {} output {} script has no decodable state section",
+            utxo.txid, utxo.output_index
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

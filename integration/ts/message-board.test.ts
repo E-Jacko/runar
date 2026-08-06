@@ -15,6 +15,7 @@ import { compileContract } from './helpers/compile.js';
 import { RunarContract } from 'runar-sdk';
 import { createFundedWallet } from './helpers/wallet.js';
 import { createProvider } from './helpers/node.js';
+import { readOnChainState } from './helpers/on-chain-state.js';
 
 describe('MessageBoard', () => {
   it('should post a message (auto-computed state)', async () => {
@@ -32,6 +33,11 @@ describe('MessageBoard', () => {
     const { txid: callTxid } = await contract.call('post', ['48656c6c6f'], provider, signer);
     expect(callTxid).toBeTruthy();
     expect(contract.state.message).toBe('48656c6c6f');
+
+    // Read the value back out of the ACTUAL output script the node accepted,
+    // not the SDK's predicted next state (contract.state above).
+    const onChain = await readOnChainState(provider, artifact, contract.getUtxo()!);
+    expect(onChain.message).toBe('48656c6c6f');
   });
 
   it('should chain posts (auto-computed state)', async () => {
@@ -44,9 +50,11 @@ describe('MessageBoard', () => {
 
     await contract.call('post', ['aabb'], provider, signer);
     expect(contract.state.message).toBe('aabb');
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).message).toBe('aabb');
 
     await contract.call('post', ['ccddee'], provider, signer);
     expect(contract.state.message).toBe('ccddee');
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).message).toBe('ccddee');
   });
 
   it('should burn with owner signature', async () => {
@@ -93,5 +101,6 @@ describe('MessageBoard', () => {
     const { txid: callTxid } = await contract.call('post', ['48656c6c6f'], provider, signer);
     expect(callTxid).toBeTruthy();
     expect(contract.state.message).toBe('48656c6c6f');
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).message).toBe('48656c6c6f');
   });
 });

@@ -22,7 +22,12 @@ const input_limits = @import("frontend/input_limits.zig");
 pub const SourceSizeExceededError = input_limits.SourceSizeError;
 pub const MAX_SOURCE_BYTES = input_limits.MAX_SOURCE_BYTES;
 
-pub const CompileError = error{
+/// Pass 4's own error set is merged in rather than flattened: a lowering
+/// refusal like `UnrepresentableBranchOutputs` names the offending construct,
+/// and collapsing it to the anonymous `ANFLowerFailed` left callers with an
+/// unactionable diagnostic. `ANFLowerFailed` remains for the pass-4.25 /
+/// pass-4.5 optimizers, which carry no such distinctions.
+pub const CompileError = anf_lower.LowerError || error{
     ParseFailed,
     ValidationFailed,
     TypeCheckFailed,
@@ -129,6 +134,22 @@ pub fn compileSource(
     source: []const u8,
     file_name: []const u8,
 ) CompileError!CompileResult {
+    return compileSourceWithOptions(allocator, source, file_name, false);
+}
+
+/// As `compileSource`, but choosing the constant-folding mode.
+///
+/// The CLI (`main.zig`) has always been able to run either mode via
+/// `--disable-constant-folding`; this API could only run fold-ON, so nothing
+/// built on it could compare the two. Both modes matter: the 2026-08-06
+/// dead-arm miscompile was fold-ON only, and the k=1 merge rejection it sits
+/// beside was fold-OFF too — telling those apart needs both from one caller.
+pub fn compileSourceWithOptions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file_name: []const u8,
+    disable_constant_folding: bool,
+) CompileError!CompileResult {
     // Pass 0: DoS-bound size guard. Reject oversized source BEFORE any
     // tokenizer / arena allocator touches the input. BUG-008 follow-up.
     input_limits.assertSourceBytesUnderLimit(source) catch return error.SourceSizeExceeded;
@@ -154,11 +175,20 @@ pub fn compileSource(
     const tc_result = typecheck_pass.typeCheck(work, contract) catch return error.TypeCheckFailed;
     if (tc_result.errors.len > 0) return error.TypeCheckFailed;
 
-    // Pass 4: ANF Lower
-    var program = anf_lower.lowerToANF(work, contract) catch return error.ANFLowerFailed;
+    // Pass 4: ANF Lower. The refusal detail is logged here rather than handed
+    // back, because `work` is the arena this frame tears down on return.
+    var lower_diag: anf_lower.LowerDiagnostic = .{};
+    var program = anf_lower.lowerToANFWithDiagnostic(work, contract, &lower_diag) catch |err| {
+        if (lower_diag.message) |message| {
+            std.log.warn("anf lowering: {s}", .{message});
+        }
+        return err;
+    };
 
     // Pass 4.25: Constant Fold
-    program = constant_fold.foldConstants(work, program) catch return error.ANFLowerFailed;
+    if (!disable_constant_folding) {
+        program = constant_fold.foldConstants(work, program) catch return error.ANFLowerFailed;
+    }
 
     // Pass 4.5: EC Optimize (includes internal DCE when EC rewrites produce dead code)
     program = ec_optimizer.optimize(work, program) catch return error.ANFLowerFailed;

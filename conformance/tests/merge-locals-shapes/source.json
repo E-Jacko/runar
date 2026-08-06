@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./MergeLocalsShapes.runar.ts",
+    ".runar.sol": "./MergeLocalsShapes.runar.sol",
+    ".runar.move": "./MergeLocalsShapes.runar.move",
+    ".runar.go": "./MergeLocalsShapes.runar.go",
+    ".runar.rs": "./MergeLocalsShapes.runar.rs",
+    ".runar.py": "./MergeLocalsShapes.runar.py",
+    ".runar.zig": "./MergeLocalsShapes.runar.zig",
+    ".runar.rb": "./MergeLocalsShapes.runar.rb",
+    ".runar.java": "./MergeLocalsShapes.runar.java"
+  }
+}

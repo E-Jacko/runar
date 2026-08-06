@@ -2032,3 +2032,79 @@ guarantees, locking the trait surface for the entire `1.x` line.
 - **SDK output conformance** — [`conformance/sdk-output/`](../../conformance/sdk-output/)
 - **Issue tracker** — <https://github.com/icellan/runar/issues>
 - **License** — MIT
+
+---
+
+## How fund-path tests fail closed in the Rust tier
+
+`MockProvider::broadcast` used to ack every transaction and return a fake txid.
+Testing-gap remediation Phase A5 flipped it to **fail-closed by default**, and —
+because this tier's interpreter is genuinely weaker than Go's — made every
+*un*checked input visible instead of letting it look checked.
+
+### What runs on every `broadcast`
+
+1. **Script execution** — inputs the bundled `bsv-sdk` `Spend` can actually
+   judge are replayed with full transaction context (real secp256k1, real
+   BIP-143 sighash).
+2. **Non-vacuity** — `broadcast` refuses when **nothing at all** could be
+   checked: no script executed *and* value conservation could not run. The
+   TypeScript reference (`packages/runar-sdk/src/providers/mock.ts`) accepts a
+   transaction none of whose inputs it knows; this port does not.
+3. **Value conservation** — when every input's outpoint is known, outputs may
+   not exceed inputs.
+
+`last_validation_report()` returns a `BroadcastValidationReport` with four
+mutually exclusive buckets, so a not-checked input can never masquerade as a
+passing one:
+
+| bucket | meaning |
+|---|---|
+| `validated` | a script really ran and really passed |
+| `unknown` | the provider does not know that outpoint |
+| `unvalidatable` | `bsv-sdk` cannot parse the script (see below) |
+| `unsupported_index` | input index > 0, which `bsv-sdk` cannot sighash (see below) |
+
+### Two upstream limitations, stated rather than papered over
+
+`bsv-sdk` 0.1.72 has two defects that bound what a Rust-tier gate can honestly
+assert. Both are pinned by tests in `tests/mock_broadcast_validation.rs` that go
+**RED if either is fixed upstream**, at which point the carve-out in
+`src/sdk/provider.rs::validate_broadcast_tx` should be deleted and the gate
+tightened.
+
+1. **Only `input_index == 0` gets a correct BIP-143 preimage.** `spend_ops.rs`
+   builds `hashPrevouts` as *current input's outpoint first, then
+   `other_inputs`* — transaction input order only for index 0. A valid BIP-143
+   signature on input 1 (produced by this SDK's own `LocalSigner`, and accepted
+   by the Go tier's go-sdk interpreter) evaluates to FALSE. Inputs at index > 0
+   are therefore counted as `unsupported_index`, never as validated.
+2. **Rúnar OP_PUSH_TX covenants do not parse.** The compiled covenant embeds a
+   `0x8d` byte; the parser desyncs and aborts with `disabled opcode: OP_2MUL`
+   (`spend_ops.rs:779`, hard-disabled with no config escape). Those inputs are
+   counted as `unvalidatable`.
+
+**Honest claim:** in practice this means a *deploy* transaction's P2PKH funding
+input is fully script-validated, while a *call* transaction is covered by the
+structural + value-conservation layer plus whatever input 0 can be judged on.
+Script-level correctness of covenant spends in this tier is proven elsewhere:
+byte-level cross-tier conformance goldens and the on-chain integration spends.
+
+### The opt-out, and how it is governed
+
+`MockProvider::always_ack(network)`, `disable_broadcast_validation()` and
+`enable_broadcast_validation(false)` restore the old behaviour. Every file that
+uses one must have an entry in **`always_ack_allowlist.json`** with a file, a
+reason and a category; `tests/always_ack_allowlist.rs` fails on unlisted usage
+**and** on stale entries, so the list can only shrink.
+
+Fund-path tests with a real `LocalSigner` and a real compiled contract are **not
+allowlisted**. The allowlist covers only synthetic OP_TRUE artifacts signed by
+`MockSigner`, whose placeholder signatures no OP_CHECKSIG can ever verify.
+
+### What this caught
+
+Every Rust fund-path test funded its transactions from a P2PKH coin locked to
+`76a914 <20 zero bytes> 88ac` — a hash nobody holds — so the funding input was
+unspendable and the always-ack provider reported success anyway. They now use
+`build_p2pkh_script(&address)` and pass under real script validation.

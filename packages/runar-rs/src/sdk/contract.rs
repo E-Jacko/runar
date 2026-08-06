@@ -3142,7 +3142,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3175,7 +3175,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3275,7 +3275,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3312,7 +3312,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3565,7 +3565,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3601,7 +3601,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3638,7 +3638,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),
@@ -3673,7 +3673,7 @@ mod tests {
         let mut contract = RunarContract::new(artifact, vec![]);
 
         let signer = MockSigner::new();
-        let mut provider = MockProvider::testnet();
+        let mut provider = MockProvider::always_ack("testnet");
         let address = signer.get_address().unwrap();
         provider.add_utxo(&address, Utxo {
             txid: "aa".repeat(32),

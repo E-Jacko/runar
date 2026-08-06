@@ -1,0 +1,35 @@
+{
+  "$comment": "Rust tier. Files permitted to disable MockProvider broadcast validation (MockProvider::always_ack / disable_broadcast_validation() / enable_broadcast_validation(false)). See docs/audit/2026-08-testing-gap-remediation-plan.md Phase A5 and packages/runar-rs/README.md 'How fund-path tests fail closed in the Rust tier'. Fund-path deploy/call tests with a real LocalSigner and a real compiled contract MUST NOT appear here.",
+  "entries": [
+    {
+      "file": "tests/mock_broadcast_validation.rs",
+      "reason": "Directly tests the opt-out surface itself (MockProvider::always_ack, disable_broadcast_validation, enable_broadcast_validation(false)) so those escape hatches keep working. Every other test in the file uses the default validating provider, including a real LocalSigner deploy fund path.",
+      "category": "negative-api"
+    },
+    {
+      "file": "src/sdk/contract.rs",
+      "reason": "8 of ~120 inline #[cfg(test)] tests (deploy_broadcasts_transaction, deploy_tracks_utxo_for_call, call_fails_unknown_method, call_fails_wrong_arg_count and the four terminal_call_* tests) drive a synthetic make_artifact(\"51\", ...) OP_TRUE contract with MockSigner, whose signatures are placeholders no OP_CHECKSIG can verify. They assert SDK wiring — UTXO tracking, arg validation, terminal output shape — not spendability. Every other test in the file uses the default validating provider.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/intent_witness_values.rs",
+      "reason": "Synthetic OP_TRUE artifact signed by MockSigner; the tests assert unlocking-script WIRE BYTES (auto-injected witness param filtering, prevOutScript/serialisedOutputs ordering), not spendability.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/null_bytestring_arg.rs",
+      "reason": "Synthetic OP_TRUE artifact signed by MockSigner; asserts that a nil ByteString arg is rejected at build time with the offending parameter named. The deploy step is setup, not the assertion under test.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/script_size_guard.rs",
+      "reason": "Synthetic oversized/OP_TRUE artifacts signed by MockSigner; asserts the SDK's own MAX_SCRIPT_BYTES guard fires. The transactions are deliberately pathological in size, not spendable.",
+      "category": "structure-only"
+    },
+    {
+      "file": "tests/issue_133_funding_selection.rs",
+      "reason": "Synthetic OP_TRUE artifact signed by MockSigner; asserts the coin-selection algorithm's input COUNT and the maxFundingInputs cap error, not script validity of the resulting transaction.",
+      "category": "structure-only"
+    }
+  ]
+}

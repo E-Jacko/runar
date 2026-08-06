@@ -1,0 +1,32 @@
+{
+  "$comment": [
+    "Tier divergences the vertical gate has FOUND and that are not yet fixed.",
+    "",
+    "An entry here does not make a divergence acceptable — it makes it tracked.",
+    "The runner treats a listed (tier, case) pair as KNOWN rather than FAIL, and",
+    "then fails in the other direction: an entry whose divergence no longer",
+    "reproduces is stale and must be deleted in the same commit that fixes the",
+    "bug. Any divergence NOT listed here fails the suite outright.",
+    "",
+    "Adding an entry requires the exact bytes and a fund-safety assessment, so",
+    "'allowlist it' costs about as much as reading the bug.",
+    "",
+    "expectedFirstDiff is REQUIRED for every listed case (the runner throws at",
+    "load time otherwise): { byte, golden, tier }, all derived from the",
+    "checked-in expected-code-part.hex vs. the tier's actual bytes. 'golden' is",
+    "the byte the independent derivation says belongs at that offset; 'tier' is",
+    "the byte the DIVERGENT TIER actually produces there (not the tier's name —",
+    "the tier name is already the entry's top-level 'tier' field). A listed",
+    "(tier, case) pair is classified KNOWN only when its divergence reproduces",
+    "this EXACT byte; any other divergence on that pair (a different byte, a",
+    "truncated/empty result) is NEW and fails the suite outright — see",
+    "vertical-runner.ts's knownFor().",
+    "",
+    "Previously listed here: 'ruby-scriptnum-minus-one' (Ruby encoded a bigint",
+    "-1 constructor/method arg as the direct push '0181' instead of OP_1NEGATE",
+    "'4f'). Fixed in packages/runar-rb/lib/runar/sdk/state.rb — the entry",
+    "stopped reproducing (the runner's stale-entry gate caught it) and was",
+    "deleted in the same change that landed the fix."
+  ],
+  "divergences": []
+}

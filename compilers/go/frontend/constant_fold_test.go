@@ -443,7 +443,16 @@ func TestFoldConstants_DoesNotFoldWithParam(t *testing.T) {
 // If-branch folding
 // ---------------------------------------------------------------------------
 
-func TestFoldConstants_FoldsAwayFalseBranch(t *testing.T) {
+// A statically-known condition must NOT blank the untaken arm.
+//
+// The folder used to return an empty Else (or Then) while leaving the `if` node
+// itself in place. An arm is not a free-floating binding list — it carries the
+// stack-shape contract ANF lowering builds (the __merge$<i> result block for
+// K>=2 merged locals) and stack lowering consumes. Erasing one arm made lowerIf
+// register ONE stack slot for K physical results, which at K=2 silently
+// miscompiled the guard (the deployed script accepted spends the source
+// rejects) and at K=1 rejected source that compiles with folding disabled.
+func TestFoldConstants_KeepsBothArmsWhenConditionKnownTrue(t *testing.T) {
 	p := makeTestANFProgram([]ir.ANFMethod{
 		makeTestMethod("m", []ir.ANFBinding{
 			b("t0", mkBool(true)),
@@ -463,12 +472,12 @@ func TestFoldConstants_FoldsAwayFalseBranch(t *testing.T) {
 	if len(ifVal.Then) != 1 {
 		t.Fatalf("expected 1 then binding, got %d", len(ifVal.Then))
 	}
-	if len(ifVal.Else) != 0 {
-		t.Fatalf("expected 0 else bindings, got %d", len(ifVal.Else))
+	if len(ifVal.Else) != 1 {
+		t.Fatalf("expected 1 else binding, got %d", len(ifVal.Else))
 	}
 }
 
-func TestFoldConstants_FoldsAwayTrueBranch(t *testing.T) {
+func TestFoldConstants_KeepsBothArmsWhenConditionKnownFalse(t *testing.T) {
 	p := makeTestANFProgram([]ir.ANFMethod{
 		makeTestMethod("m", []ir.ANFBinding{
 			b("t0", mkBool(false)),
@@ -482,11 +491,36 @@ func TestFoldConstants_FoldsAwayTrueBranch(t *testing.T) {
 	})
 	result := foldConstantsOnly(p)
 	ifVal := result.Methods[0].Body[1].Value
-	if len(ifVal.Then) != 0 {
-		t.Fatalf("expected 0 then bindings, got %d", len(ifVal.Then))
+	if ifVal.Kind != "if" {
+		t.Fatalf("expected if, got %s", ifVal.Kind)
+	}
+	if len(ifVal.Then) != 1 {
+		t.Fatalf("expected 1 then binding, got %d", len(ifVal.Then))
 	}
 	if len(ifVal.Else) != 1 {
 		t.Fatalf("expected 1 else binding, got %d", len(ifVal.Else))
+	}
+}
+
+// A statically-known condition must not leak an arm's constants into the
+// enclosing environment either: the `if` survives the pass, so both arms are
+// still emitted and either can run.
+func TestFoldConstants_DoesNotPropagateTakenArmConstants(t *testing.T) {
+	p := makeTestANFProgram([]ir.ANFMethod{
+		makeTestMethod("m", []ir.ANFBinding{
+			b("t0", mkBool(true)),
+			b("t1", ir.ANFValue{
+				Kind: "if",
+				Cond: "t0",
+				Then: []ir.ANFBinding{b("x", mkInt(42))},
+				Else: []ir.ANFBinding{b("x", mkInt(99))},
+			}),
+			b("t2", ir.ANFValue{Kind: "bin_op", Op: "+", Left: "x", Right: "t0"}),
+		}),
+	})
+	result := foldConstantsOnly(p)
+	if got := result.Methods[0].Body[2].Value.Kind; got != "bin_op" {
+		t.Fatalf("expected the post-if bin_op to survive unfolded, got %s", got)
 	}
 }
 

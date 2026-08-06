@@ -404,6 +404,125 @@ public final class StackLower {
         }
     }
 
+    /**
+     * Locals a loop body REBINDS and then READS AGAIN in the same iteration.
+     *
+     * <p>{@code computeLastUses} maps a name to the MAXIMUM index that
+     * references it, so for a body like
+     *
+     * <pre>
+     * t3   = acc + step     (index 1 — reads the value carried in)
+     * acc  = &#64;ref:t3         (index 2 — rebinds: renames t3's slot to `acc`)
+     * t4   = wacc + acc     (index 3 — reads the value just rebound)
+     * </pre>
+     *
+     * <p>{@code acc} gets last-use 3. Index 1 is therefore NOT a last use and
+     * copies (PICK) instead of consuming, leaving the incoming slot on the
+     * stack under the same name as the rebound one; index 3 then IS the last
+     * use, and findDepth resolves to the topmost match — so it consumes the
+     * UPDATED value and leaves the dead incoming one. The next iteration reads
+     * that dead slot, and every iteration recomputes from the pre-loop value:
+     * {@code for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc +
+     * acc; }} produced {@code wacc = step*N} where the source says
+     * {@code step*N*(N+1)/2} — silently in a stateless contract, and as a
+     * permanently unspendable UTXO in a stateful one (the covenant commits to a
+     * continuation the SDK never builds). {@code outerRefs} does not cover it:
+     * {@code acc} is excluded there precisely because the body binds it.
+     *
+     * <p>The value these names hold at the end of an iteration is live at the
+     * start of the next one, so lowerLoop protects them from consumption
+     * exactly like an outer ref. The incoming slot each rebinding shadows is
+     * left behind and drained with the rest of the frame at method exit — a
+     * name always resolves to its newest slot, so the reads stay correct.
+     *
+     * <p>Both halves of the predicate are load-bearing:
+     * <ul>
+     *   <li>read BEFORE the first rebinding: the name is carried IN from the
+     *       enclosing scope, rather than being a body-private temp that merely
+     *       happens to be read after it is bound;</li>
+     *   <li>read AFTER the last rebinding: without it the rebound value is dead
+     *       at the end of the iteration and consuming it is correct. This is
+     *       what keeps every shipped accumulator ({@code sum = sum + i},
+     *       {@code off = off + len}) byte-for-byte unchanged.</li>
+     * </ul>
+     *
+     * <p>NESTED loops: the scan runs over {@code flattenNestedLoopBodies(body)},
+     * not over {@code body} itself. A name rebound only inside an INNER loop is
+     * bound at no top-level index of the outer body, so the raw scan classified
+     * it as neither an outer ref ({@code collectDeepBindingNames} excludes it —
+     * the body does bind it, deeply) nor a carried rebind, and the outer loop
+     * never marked it live. The inner loop's final iteration then consumed it,
+     * because {@code usedAfterLoop} asks the enclosing scope and the enclosing
+     * scope had not been told either, so every outer iteration restarted from
+     * the slot the previous one left behind:
+     * {@code for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }}
+     * with step = 3 produced {@code wacc = 24} where the source says 30.
+     * Splicing the inner body in at the loop's position preserves the
+     * read/rebind/read ordering the inner level already sees, so the outer
+     * level draws the same conclusion.
+     */
+    static Set<String> collectLoopCarriedRebinds(List<AnfBinding> body) {
+        List<AnfBinding> flat = flattenNestedLoopBodies(body);
+
+        Map<String, Integer> firstBind = new HashMap<>();
+        Map<String, Integer> lastBind = new HashMap<>();
+        for (int i = 0; i < flat.size(); i++) {
+            String name = flat.get(i).name();
+            firstBind.putIfAbsent(name, i);
+            lastBind.put(name, i);
+        }
+
+        Set<String> readBeforeBind = new LinkedHashSet<>();
+        Set<String> readAfterBind = new LinkedHashSet<>();
+        for (int i = 0; i < flat.size(); i++) {
+            for (String ref : collectRefs(flat.get(i).value())) {
+                Integer first = firstBind.get(ref);
+                if (first != null && i < first) readBeforeBind.add(ref);
+                Integer last = lastBind.get(ref);
+                if (last != null && i > last) readAfterBind.add(ref);
+            }
+        }
+
+        readBeforeBind.retainAll(readAfterBind);
+        return readBeforeBind;
+    }
+
+    /**
+     * The binding sequence with every nested {@code loop} binding replaced, in
+     * place, by its own (recursively flattened) body.
+     *
+     * <p>Only {@code collectLoopCarriedRebinds} uses this, and only to order
+     * reads against rebindings. The loop binding itself contributes no stack
+     * slot (loops are statements), so dropping it loses nothing; splicing the
+     * body in at its position is what lets an outer loop see a rebinding that
+     * happens one level down. {@code if} branches are deliberately NOT
+     * flattened — their two arms are alternatives, not a sequence, and
+     * reassignments inside them are reconciled by {@code lowerIf}, not by
+     * protection here.
+     *
+     * <p>A body with no nested loop is returned entry-for-entry unchanged,
+     * which is what makes this byte-neutral for every non-nesting loop.
+     */
+    static List<AnfBinding> flattenNestedLoopBodies(List<AnfBinding> body) {
+        boolean nested = false;
+        for (AnfBinding b : body) {
+            if (b.value() instanceof Loop) {
+                nested = true;
+                break;
+            }
+        }
+        if (!nested) return body;
+        List<AnfBinding> flat = new ArrayList<>(body.size());
+        for (AnfBinding b : body) {
+            if (b.value() instanceof Loop l) {
+                flat.addAll(flattenNestedLoopBodies(l.body()));
+            } else {
+                flat.add(b);
+            }
+        }
+        return flat;
+    }
+
     static List<String> collectRefs(AnfValue value) {
         List<String> refs = new ArrayList<>();
         if (value instanceof LoadParam lp) {
@@ -2102,6 +2221,53 @@ public final class StackLower {
 
         // ---------------- if ----------------
 
+        /**
+         * The stack depth of the ONE slot both arms of an {@code if} rebound in place, or
+         * {@code null} when the {@code if} does not have that shape.
+         *
+         * <p>The shape: ANF lowering merged a SINGLE local across the arms, so instead of
+         * appending a {@code __merge$<i>} result block it aliased the local to the
+         * if-expression itself. Both arms then read that local and rebound it, which makes the
+         * arm ROLL the parent's slot away and leave its own result in the same position — the
+         * arms' net stack effect is zero, so none of the depth-growth cases in
+         * {@code lowerIf} fire and the if's value would go unregistered.
+         *
+         * <p>Every condition below is required:
+         * <ul>
+         *   <li>no normalised K-merge block (that is the K&gt;=2 path, which grows depth by K
+         *       and is adopted by name),
+         *   <li>both arms end on a binding of the SAME name, and that name is a local, not a
+         *       contract property (properties have their own reconcile),
+         *   <li>both arms, and the reconciled parent, hold that name at the same depth — i.e.
+         *       the slot really was rebound where it stood,
+         *   <li>both arms are at the parent's depth, so the slot is the only effect,
+         *   <li>{@code bindingName} is read after the {@code if}. Without a reader there is
+         *       nothing to repair and renaming would only lose a name; with one, the pre-fix
+         *       compiler failed with "value not found on stack". That is what makes adopting
+         *       the slot byte-neutral for every program that compiled before.
+         * </ul>
+         */
+        private Integer branchInPlaceRebindDepth(List<AnfBinding> thenB, List<AnfBinding> elseB,
+                                                 LoweringContext thenCtx, LoweringContext elseCtx,
+                                                 int mergedResultCount,
+                                                 boolean bindingIsReadLater) {
+            if (!bindingIsReadLater || mergedResultCount != 0) return null;
+            if (thenCtx.sm.depth() != sm.depth() || elseCtx.sm.depth() != sm.depth()) return null;
+            if (thenB == null || thenB.isEmpty() || elseB == null || elseB.isEmpty()) return null;
+
+            String name = thenB.get(thenB.size() - 1).name();
+            if (name == null || name.isEmpty()) return null;
+            if (!name.equals(elseB.get(elseB.size() - 1).name())) return null;
+            for (AnfProperty p : properties) {
+                if (name.equals(p.name())) return null;
+            }
+            if (!thenCtx.sm.has(name) || !elseCtx.sm.has(name) || !sm.has(name)) return null;
+
+            int depth = thenCtx.sm.findDepth(name);
+            if (elseCtx.sm.findDepth(name) != depth || sm.findDepth(name) != depth) return null;
+            return depth;
+        }
+
         void lowerIf(String bindingName, String cond,
                      List<AnfBinding> thenB, List<AnfBinding> elseB,
                      int idx, Map<String, Integer> lastUses,
@@ -2354,6 +2520,35 @@ public final class StackLower {
                 }
             } else if (elseCtx.sm.depth() > sm.depth()) {
                 sm.push(bindingName);
+            } else {
+                Integer inPlaceDepth = branchInPlaceRebindDepth(
+                    thenB, elseB, thenCtx, elseCtx, mergedResultCount,
+                    lastUses.containsKey(bindingName));
+                if (inPlaceDepth != null) {
+                    // Single branch-merged local rebound IN PLACE by both arms.
+                    //
+                    // At K=1 ANF lowering does not append a __merge$<i> result block; it
+                    // ALIASES the local to the if-expression's binding name instead, so every
+                    // post-branch read of the local names the `if`. That works when the arms
+                    // PUSH their new value — depth grows by one and the
+                    // thenCtx.depth > sm.depth arm above registers bindingName.
+                    //
+                    // But when both arms READ the local and rebind it (m0 = m0 + 1), the local
+                    // is not live under its own name after the `if` (the alias moved every
+                    // reader to the `if`), so it is not outer-protected and each arm ROLLS the
+                    // parent slot away and leaves its result in the same position. Net depth
+                    // change: zero. Control then fell straight through, nothing was registered
+                    // for bindingName, and the very next binding failed with "value not found
+                    // on stack" — a compile-time rejection of source that compiles at K=2 and
+                    // compiles without an `else`. The value IS on the stack; only its NAME was
+                    // wrong.
+                    //
+                    // Adopt it: rename the slot the arms rebound to the if's binding name. No
+                    // opcode is emitted — bookkeeping only, gated on bindingName actually being
+                    // referenced later, which is precisely the case that used to fail.
+                    sm.renameAtDepth(inPlaceDepth, bindingName);
+                }
+                // Otherwise a void if — don't push a phantom.
             }
 
             trackDepth();
@@ -2429,6 +2624,18 @@ public final class StackLower {
                     if (!ref.equals(iterVar) && !deepBodyBindingNames.contains(ref)) {
                         outerRefs.add(ref);
                     }
+                }
+            }
+
+            // A local the body REBINDS and then READS AGAIN in the same
+            // iteration is carried across iterations through the rebound slot,
+            // so it must survive the body exactly like an outer ref.
+            // deepBodyBindingNames above excludes it precisely because the body
+            // binds it — which is what made the updated value consumable. See
+            // collectLoopCarriedRebinds.
+            for (String ref : collectLoopCarriedRebinds(body)) {
+                if (!ref.equals(iterVar)) {
+                    outerRefs.add(ref);
                 }
             }
 

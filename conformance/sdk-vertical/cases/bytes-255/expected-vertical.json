@@ -1,0 +1,85 @@
+{
+  "case": "bytes-255",
+  "contract": "SlotMatrix",
+  "valueClass": "ByteString 255 bytes → OP_PUSHDATA1 top (0x4c ff + data)",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "7"
+    },
+    {
+      "type": "ByteString",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 591,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 257,
+      "headerBytes": 2,
+      "valueByteOffset": 2,
+      "valueByteLength": 255,
+      "encoding": "data",
+      "pushedHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 259,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 259,
+      "valueByteLength": 1,
+      "encoding": "scriptnum",
+      "pushedHex": "07"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 262,
+      "byteLength": 257,
+      "headerBytes": 2,
+      "valueByteOffset": 264,
+      "valueByteLength": 255,
+      "encoding": "data",
+      "pushedHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 519,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 520,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 556,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 557,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

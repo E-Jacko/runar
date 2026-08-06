@@ -361,6 +361,114 @@ function collectDeepBindingNames(bindings: ANFBinding[]): Set<string> {
   return names;
 }
 
+/**
+ * Locals a loop body REBINDS and then READS AGAIN in the same iteration.
+ *
+ * `computeLastUses` maps a name to the MAXIMUM index that references it, so
+ * for a body like
+ *
+ *     t3   = acc + step     (index 1 — reads the value carried in)
+ *     acc  = @ref:t3        (index 2 — rebinds: renames t3's slot to `acc`)
+ *     t4   = wacc + acc     (index 3 — reads the value just rebound)
+ *
+ * `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies
+ * (PICK) instead of consuming, leaving the incoming slot on the stack under
+ * the same name as the rebound one; index 3 then IS the last use, and
+ * `StackMap.findDepth` resolves to the topmost match — so it consumes the
+ * UPDATED value and leaves the dead incoming one. The next iteration reads
+ * that dead slot, and every iteration recomputes from the pre-loop value:
+ * `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc + acc; }`
+ * produced `wacc = step*N` where the source says `step*N*(N+1)/2` — silently
+ * in a stateless contract, and as a permanently unspendable UTXO in a
+ * stateful one (the covenant commits to a continuation the SDK never builds).
+ * `outerRefs` above does not cover it: `acc` is excluded there precisely
+ * because the body binds it.
+ *
+ * The value these names hold at the end of an iteration is live at the start
+ * of the next one, so `lowerLoop` protects them from consumption exactly like
+ * an outer ref. The incoming slot each rebinding shadows is left behind and
+ * drained with the rest of the frame at method exit — a name always resolves
+ * to its newest slot, so the reads stay correct.
+ *
+ * Both halves of the predicate are load-bearing:
+ *   - read BEFORE the first rebinding: the name is carried IN from the
+ *     enclosing scope, rather than being a body-private temp that merely
+ *     happens to be read after it is bound;
+ *   - read AFTER the last rebinding: without it the rebound value is dead at
+ *     the end of the iteration and consuming it is correct. This is what
+ *     keeps every shipped accumulator (`sum = sum + i`, `off = off + len`)
+ *     byte-for-byte unchanged.
+ *
+ * NESTED loops: the scan runs over `flattenNestedLoopBodies(body)`, not over
+ * `body` itself. A name rebound only inside an INNER loop is bound at no
+ * top-level index of the outer body, so the raw scan classified it as neither
+ * an outer ref (`deepBodyBindingNames` excludes it — the body does bind it,
+ * deeply) nor a carried rebind, and the outer loop never marked it live. The
+ * inner loop's final iteration then consumed it, because `usedAfterLoop` asks
+ * the enclosing scope and the enclosing scope had not been told either, so
+ * every outer iteration restarted from the slot the previous one left behind:
+ * `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }` with
+ * step = 3 produced `wacc = 24` where the source says 30. Splicing the inner
+ * body in at the loop's position preserves the read/rebind/read ordering the
+ * inner level already sees, so the outer level draws the same conclusion.
+ */
+function collectLoopCarriedRebinds(body: ANFBinding[]): Set<string> {
+  const flat = flattenNestedLoopBodies(body);
+
+  const firstBind = new Map<string, number>();
+  const lastBind = new Map<string, number>();
+  for (let i = 0; i < flat.length; i++) {
+    const name = flat[i]!.name;
+    if (!firstBind.has(name)) firstBind.set(name, i);
+    lastBind.set(name, i);
+  }
+
+  const readBeforeBind = new Set<string>();
+  const readAfterBind = new Set<string>();
+  for (let i = 0; i < flat.length; i++) {
+    for (const ref of collectRefs(flat[i]!.value)) {
+      const first = firstBind.get(ref);
+      if (first !== undefined && i < first) readBeforeBind.add(ref);
+      const last = lastBind.get(ref);
+      if (last !== undefined && i > last) readAfterBind.add(ref);
+    }
+  }
+
+  const carried = new Set<string>();
+  for (const name of readBeforeBind) {
+    if (readAfterBind.has(name)) carried.add(name);
+  }
+  return carried;
+}
+
+/**
+ * A binding sequence with every nested `loop` binding replaced, in place, by
+ * its own (recursively flattened) body.
+ *
+ * Only `collectLoopCarriedRebinds` uses this, and only to order reads against
+ * rebindings. The loop binding itself contributes no stack slot (loops are
+ * statements), so dropping it loses nothing; splicing the body in at its
+ * position is what lets an outer loop see a rebinding that happens one level
+ * down. `if` branches are deliberately NOT flattened — their two arms are
+ * alternatives, not a sequence, and reassignments inside them are reconciled
+ * by `lowerIf`, not by protection here.
+ *
+ * A body with no nested loop is returned entry-for-entry unchanged, which is
+ * what makes this byte-neutral for every non-nesting loop.
+ */
+function flattenNestedLoopBodies(body: ANFBinding[]): ANFBinding[] {
+  if (!body.some(b => b.value.kind === 'loop')) return body;
+  const flat: ANFBinding[] = [];
+  for (const b of body) {
+    if (b.value.kind === 'loop') {
+      flat.push(...flattenNestedLoopBodies(b.value.body));
+    } else {
+      flat.push(b);
+    }
+  }
+  return flat;
+}
+
 function collectRefs(value: ANFValue): string[] {
   const refs: string[] = [];
 
@@ -1992,6 +2100,59 @@ class LoweringContext {
     this.stackMap.pop();
   }
 
+  /**
+   * The stack depth of the ONE slot both arms of an `if` rebound in place, or
+   * `null` when the `if` does not have that shape.
+   *
+   * The shape: 04-anf-lower merged a SINGLE local across the arms, so instead
+   * of appending a `__merge$<i>` result block it aliased the local to the
+   * if-expression itself. Both arms then read that local and rebound it, which
+   * makes the arm ROLL the parent's slot away and leave its own result in the
+   * same position — the arms' net stack effect is zero, so none of the
+   * depth-growth cases in `lowerIf` fire and the if's value would go
+   * unregistered.
+   *
+   * Every condition below is required:
+   *   - no normalised K-merge block (that is the K>=2 path, which grows depth
+   *     by K and is adopted by name),
+   *   - both arms end on a binding of the SAME name, and that name is a local,
+   *     not a contract property (properties have their own reconcile),
+   *   - both arms, and the reconciled parent, hold that name at the same
+   *     depth — i.e. the slot really was rebound where it stood,
+   *   - both arms are at the parent's depth, so the slot is the only effect,
+   *   - `bindingName` is read after the `if`. Without a reader there is nothing
+   *     to repair and renaming would only lose a name; with one, the pre-fix
+   *     compiler threw `Value '<if>' not found on stack`. This is what makes
+   *     adopting the slot byte-neutral for every program that compiled before.
+   */
+  private branchInPlaceRebindDepth(
+    thenBindings: ANFBinding[],
+    elseBindings: ANFBinding[],
+    thenCtx: LoweringContext,
+    elseCtx: LoweringContext,
+    mergedResultCount: number,
+    bindingIsReadLater: boolean,
+  ): number | null {
+    if (!bindingIsReadLater) return null;
+    if (mergedResultCount !== 0) return null;
+    if (thenCtx.stackMap.depth !== this.stackMap.depth) return null;
+    if (elseCtx.stackMap.depth !== this.stackMap.depth) return null;
+
+    const thenLast = thenBindings[thenBindings.length - 1];
+    const elseLast = elseBindings[elseBindings.length - 1];
+    if (!thenLast || !elseLast || thenLast.name !== elseLast.name) return null;
+
+    const name = thenLast.name;
+    if (this._properties.some((p) => p.name === name)) return null;
+    if (!thenCtx.stackMap.has(name) || !elseCtx.stackMap.has(name)) return null;
+    if (!this.stackMap.has(name)) return null;
+
+    const depth = thenCtx.stackMap.findDepth(name);
+    if (elseCtx.stackMap.findDepth(name) !== depth) return null;
+    if (this.stackMap.findDepth(name) !== depth) return null;
+    return depth;
+  }
+
   private lowerIf(
     bindingName: string,
     cond: string,
@@ -2259,6 +2420,14 @@ class LoweringContext {
         return tn !== null && tn === elseCtx.stackMap.peekAtDepth(i);
       });
 
+    // Depth of the slot both arms rebound in place, when that is the whole of
+    // the `if`'s stack effect (K=1 merged local, read and rebound by both
+    // arms). `null` in every other shape. See the branch that consumes it.
+    const inPlaceRebindDepth = this.branchInPlaceRebindDepth(
+      thenBindings, elseBindings, thenCtx, elseCtx, mergedResultCount,
+      lastUses.has(bindingName),
+    );
+
     // The if expression may produce a result value on top.
     if (thenCtx.stackMap.depth > this.stackMap.depth &&
         nResults >= 2 &&
@@ -2351,6 +2520,30 @@ class LoweringContext {
     } else if (elseCtx.stackMap.depth > this.stackMap.depth) {
       // The else-branch produced a value even though the then-branch didn't.
       this.stackMap.push(bindingName);
+    } else if (inPlaceRebindDepth !== null) {
+      // Single branch-merged local rebound IN PLACE by both arms.
+      //
+      // At K=1 04-anf-lower does not append a `__merge$<i>` result block; it
+      // ALIASES the local to the if-expression's binding name instead, so every
+      // post-branch read of the local names the `if` (`setLocalAlias`). That
+      // works when the arms PUSH their new value — depth grows by one and the
+      // `thenCtx.depth > this.depth` arm above registers `bindingName`.
+      //
+      // But when both arms READ the local and rebind it (`m0 = m0 + 1n`), the
+      // local is not live under its own name after the `if` (the alias moved
+      // every reader to the `if`), so it is not in `outerProtectedRefs` and
+      // each arm ROLLS the parent slot away and leaves its result in the same
+      // position. Net depth change: zero. Control then fell into the "void if"
+      // case below, nothing was registered for `bindingName`, and the very next
+      // binding failed with `Value '<if>' not found on stack` — a compile-time
+      // rejection of source that compiles at K=2 and compiles without an
+      // `else`. The value IS on the stack; only its NAME was wrong.
+      //
+      // Adopt it: rename the slot the arms rebound to the if's binding name.
+      // No opcode is emitted — this is bookkeeping only, and it is gated on
+      // `bindingName` actually being referenced later, which is precisely the
+      // case that used to throw.
+      this.stackMap.renameAtDepth(inPlaceRebindDepth, bindingName);
     } else {
       // Neither branch increased depth beyond the (post-reconciliation) parent
       // depth. This is a void if (e.g., both branches end with assert or both
@@ -2399,6 +2592,15 @@ class LoweringContext {
           outerRefs.add(ref);
         }
       }
+    }
+
+    // A local the body REBINDS and then READS again in the same iteration is
+    // carried across iterations through the rebound slot, so it must survive
+    // the body exactly like an outer ref. `deepBodyBindingNames` above
+    // excludes it precisely because the body binds it — which is what made
+    // the updated value consumable. See `collectLoopCarriedRebinds`.
+    for (const name of collectLoopCarriedRebinds(body)) {
+      if (name !== _iterVar) outerRefs.add(name);
     }
 
     // Temporarily extend localBindings with body binding names so

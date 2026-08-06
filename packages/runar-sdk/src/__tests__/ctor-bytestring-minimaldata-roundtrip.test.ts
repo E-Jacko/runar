@@ -1,3 +1,9 @@
+// round-trip only — absolute pin: packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts
+//
+// Every case below is extractConstructorArgs(splice(encodeArg(x))) === x --
+// encode and restore sharing the same implementation's assumptions. The
+// literal expected bytes for encodeArg itself (the encoder this file only
+// exercises indirectly) live in encode-push-data-minimaldata.test.ts.
 /**
  * S1 — single-byte MINIMALDATA ByteString constructor-arg roundtrip.
  *

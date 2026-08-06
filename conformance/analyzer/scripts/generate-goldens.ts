@@ -53,9 +53,9 @@ function reorder<T extends Record<string, unknown>>(obj: T, order: readonly stri
 }
 
 function buildReport(result: ReturnType<typeof analyzeScript>): Record<string, unknown> {
-  const orderedFindings = result.findings.map((f) => reorder(f as Record<string, unknown>, FINDING_KEY_ORDER));
-  const orderedPaths = result.paths.map((p) => reorder(p as Record<string, unknown>, PATH_KEY_ORDER));
-  const orderedSummary = reorder(result.summary as Record<string, unknown>, SUMMARY_KEY_ORDER);
+  const orderedFindings = result.findings.map((f) => reorder(f as unknown as Record<string, unknown>, FINDING_KEY_ORDER));
+  const orderedPaths = result.paths.map((p) => reorder(p as unknown as Record<string, unknown>, PATH_KEY_ORDER));
+  const orderedSummary = reorder(result.summary as unknown as Record<string, unknown>, SUMMARY_KEY_ORDER);
   return reorder(
     {
       script: result.script,

@@ -87,7 +87,7 @@ func setupContractAndDeploy(t *testing.T, art *RunarArtifact) (*RunarContract, *
 	t.Helper()
 	contract := NewRunarContract(art, []interface{}{int64(0)})
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 

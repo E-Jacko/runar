@@ -75,7 +75,17 @@ module Runar
       # Special cases:
       #   0         → OP_0  (0x00)
       #   1–16      → OP_1–OP_16 (0x51–0x60)
-      #   otherwise → sign-magnitude little-endian bytes with a direct push prefix
+      #   -1        → OP_1NEGATE (0x4f), via encode_push_data's MINIMALDATA rule
+      #   otherwise → sign-magnitude little-endian bytes with a minimal push prefix
+      #
+      # The final push MUST go through encode_push_data rather than emitting a
+      # direct "LL <bytes>" prefix inline: the sign-magnitude byte for -1 is
+      # 0x81, and a 1-byte 0x81 payload is only minimally encoded as OP_1NEGATE.
+      # Emitting '0181' here made Ruby's locking scripts one byte longer than
+      # every other SDK's for a -1 constructor arg (shifting OP_CODESEPARATOR
+      # positions, so a peer tier's continuation hashOutputs no longer matched
+      # and the output could not be spent), and made -1 method args non-relayable
+      # under minimal-push enforcement.
       #
       # @param n [Integer] the integer to encode
       # @return [String] hex-encoded push opcode + (optional) data
@@ -105,7 +115,7 @@ module Runar
         end
 
         data_hex = bytes.map { |b| format('%02x', b) }.join
-        format('%02x', bytes.length) + data_hex
+        encode_push_data(data_hex)
       end
 
       # Find the hex-char offset of the last OP_RETURN (0x6a) at a real opcode
@@ -180,9 +190,9 @@ module Runar
             flat = flatten_nested_value(values[field.name], dims)
             raise ArgumentError, "state field '#{field.name}': expected #{names.length} flattened elements, got #{flat.length}" if flat.length != names.length
 
-            flat.map { |v| encode_state_value(v, leaf_type) }.join
+            flat.each_with_index.map { |v, i| encode_state_value(v, leaf_type, names[i]) }.join
           else
-            encode_state_value(values[field.name], field.type)
+            encode_state_value(values[field.name], field.type, field.name)
           end
         end.join
       end
@@ -378,11 +388,11 @@ module Runar
 
       # @param field_type [String] Runar type name
       # @return [String] hex-encoded bytes
-      def encode_state_value(value, field_type)
+      def encode_state_value(value, field_type, label = '?')
         case field_type
         when 'int', 'bigint'
           n = coerce_to_integer(value)
-          encode_num2bin(n, 8)
+          encode_num2bin(n, 8, label)
         when 'bool', 'boolean'
           value ? '01' : '00'
         else
@@ -475,10 +485,40 @@ module Runar
       # Encode an integer as fixed-width little-endian sign-magnitude bytes
       # (Bitcoin's NUM2BIN format).
       #
+      # FAILS CLOSED on an out-of-range magnitude. +width+ bytes of
+      # sign-magnitude hold +8*width - 1+ magnitude bits — the top bit of the
+      # last byte is the sign. The loop below writes the low +width+ bytes and
+      # drops everything above, then ORs the sign bit in on top of whatever
+      # landed there, so an oversized value used to serialise to a plausible
+      # but WRONG word:
+      #
+      #   2^63      -> 0000000000000080   reads back as 0   (negative zero)
+      #   2^63 + 5  -> 0500000000000080   reads back as -5  (sign flip)
+      #   2^64      -> 0000000000000000   reads back as 0
+      #
+      # The deploy then succeeded and the UTXO was unspendable: the covenant
+      # rebuilds the continuation with the compiler's own OP_NUM2BIN +width+,
+      # which cannot produce those bytes from that number, so
+      # +hash256(outputs)+ never matches. Raising here is the only place a
+      # runtime-computed state value can be stopped — +±(2^(8*width-1) - 1)+
+      # remains representable and is unaffected.
+      #
       # @param n     [Integer] the value to encode
       # @param width [Integer] output byte width
+      # @param label [String] state field name, for the error message
       # @return [String] hex string of exactly width bytes
-      def encode_num2bin(n, width)
+      # @raise [ArgumentError] if the magnitude does not fit the state word
+      def encode_num2bin(n, width, label = '?')
+        limit = 1 << ((8 * width) - 1)
+        if n >= limit || n <= -limit
+          raise ArgumentError,
+                "serialize_state: bigint state field '#{label}' = #{n} does not fit the fixed " \
+                "#{width}-byte sign-magnitude state word (magnitude must be < " \
+                "2^#{(8 * width) - 1}). Serializing it would write a different number into the " \
+                "state section than the contract's on-chain OP_NUM2BIN #{width} rebuilds, " \
+                'leaving the output unspendable.'
+        end
+
         negative = n.negative?
         abs_val  = n.abs
         result   = Array.new(width, 0)

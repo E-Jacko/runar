@@ -1,8 +1,7 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": ".",
+    "noEmit": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noUncheckedIndexedAccess": false,
@@ -13,9 +12,9 @@
     "baseUrl": "."
   },
   "include": [
-    "runner/**/*.ts",
-    "fuzzer/**/*.ts",
-    "fuzz-regressions/*.ts",
-    "tests/**/*.runar.ts"
+    "**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
   ]
 }
