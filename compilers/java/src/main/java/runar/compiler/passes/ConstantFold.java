@@ -197,7 +197,11 @@ public final class ConstantFold {
             Map<String, ConstSlot> elseEnv = new HashMap<>(env);
             List<AnfBinding> foldedThen = foldBindings(orEmpty(ifv.thenBranch()), thenEnv);
             List<AnfBinding> foldedElse = foldBindings(orEmpty(ifv.elseBranch()), elseEnv);
-            return new If(ifv.cond(), foldedThen, foldedElse);
+            // The declared result list survives folding untouched: folding an
+            // arm's bindings cannot change WHICH slots the arm leaves, and
+            // dropping the list would silently return the `if` to the
+            // single-result reconcile it was migrated off.
+            return new If(ifv.cond(), foldedThen, foldedElse, ifv.results());
         }
 
         if (value instanceof Loop lp) {

@@ -30,11 +30,16 @@
  *     identical `__merge$<i>` block that `lowerIf` counts to learn K. Blanking
  *     one arm made `countMergedLocalResults` see 0, so ONE stackMap slot was
  *     registered for K physical results. The folder no longer blanks arms.
- *   - (2): at k=1 04-anf-lower aliases the local to the `if` binding instead of
- *     appending a merge block. When both arms READ and rebind the local they
- *     roll the parent slot and leave the result in place — net depth zero — so
- *     no depth-growth case in `lowerIf` fired and the `if`'s value went
- *     unregistered. `branchInPlaceRebindDepth` now adopts that slot by name.
+ *   - (2): at k=1 04-anf-lower used to alias the local to the `if` binding
+ *     instead of appending a merge block. When both arms READ and rebind the
+ *     local they roll the parent slot and leave the result in place — net depth
+ *     zero — so no depth-growth case in `lowerIf` fired and the `if`'s value
+ *     went unregistered. That was first patched with a `branchInPlaceRebindDepth`
+ *     predicate; the multi-result branch node SUBSUMES it. k=1 with an `else`
+ *     now declares `results: ["m0"]` and both arms materialise it, so there is
+ *     no alias, no in-place special case, and no depth arithmetic to get wrong.
+ *     The k=1 hexes below moved in that change (the arms gained the two-binding
+ *     copy-then-rebind block) and are re-pinned to the new seven-tier value.
  *
  * The hexes below are the SEVEN-TIER agreed output. The peer tiers pin the same
  * strings (each tier's own `branch_merge_k1_dead_arm` test), which is what
@@ -97,13 +102,13 @@ export const BRANCH_MERGE_K1_GOLDEN = {
   'dead-arm-k2/fold-off':
     '00014e8f006351537a6e7b757b75676e547a7568527a75527a757ca1',
   'self-read-both-arms/fold-on':
-    '000340420f0340428f7b7ca069517b00a0638b678c680340420f0340428f7b7ca07777',
+    '000340420f0340428f7b7ca069517b00a06351787c9376776751787c94767768517a750340420f0340428f7b7ca07777',
   'self-read-both-arms/fold-off':
-    '000340420f8fa069517c00a0638b678c680340420f8fa0',
+    '000340420f8fa069517c00a06351787c9376776751787c94767768517a750340420f8fa0',
   'const-condition-k1/fold-on':
-    '000340420f0340428f7b7ca069515163526753680340420f0340428f7b7ca077777777',
+    '000340420f0340428f7b7ca0695151635276776753767768517a750340420f0340428f7b7ca0777777',
   'const-condition-k1/fold-off':
-    '000340420f8fa069515163526753680340420f8fa07777',
+    '000340420f8fa0695151635276776753767768517a750340420f8fa077',
 } as const;
 
 const CASES: ReadonlyArray<readonly [keyof typeof BRANCH_MERGE_K1_GOLDEN, string, boolean]> = [

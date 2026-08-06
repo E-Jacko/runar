@@ -36,7 +36,7 @@ import org.junit.jupiter.api.Test;
  * <p>Fixes: {@link ConstantFold} no longer blanks a statically-dead arm (that
  * erased the {@code __merge$<i>} result block both arms carry, so ONE stack slot
  * was registered for K physical results), and {@link StackLower}'s
- * {@code branchInPlaceRebindDepth} adopts the slot both arms rebound in place at
+ * {@code the multi-result branch node} adopts the slot both arms rebound in place at
  * k=1.
  *
  * <p>The hexes are the SEVEN-TIER agreed output. Every tier pins the same
@@ -118,13 +118,13 @@ class BranchMergeDeadArmK1Test {
         new Case("dead-arm-k2/fold-off", DEAD_ARM_K2, true,
             "00014e8f006351537a6e7b757b75676e547a7568527a75527a757ca1"),
         new Case("self-read-both-arms/fold-on", SELF_READ_BOTH_ARMS, false,
-            "000340420f0340428f7b7ca069517b00a0638b678c680340420f0340428f7b7ca07777"),
+            "000340420f0340428f7b7ca069517b00a06351787c9376776751787c94767768517a750340420f0340428f7b7ca07777"),
         new Case("self-read-both-arms/fold-off", SELF_READ_BOTH_ARMS, true,
-            "000340420f8fa069517c00a0638b678c680340420f8fa0"),
+            "000340420f8fa069517c00a06351787c9376776751787c94767768517a750340420f8fa0"),
         new Case("const-condition-k1/fold-on", CONST_CONDITION_K1, false,
-            "000340420f0340428f7b7ca069515163526753680340420f0340428f7b7ca077777777"),
+            "000340420f0340428f7b7ca0695151635276776753767768517a750340420f0340428f7b7ca0777777"),
         new Case("const-condition-k1/fold-off", CONST_CONDITION_K1, true,
-            "000340420f8fa069515163526753680340420f8fa07777"));
+            "000340420f8fa0695151635276776753767768517a750340420f8fa077"));
 
     @Test
     void sevenTierScript() throws Exception {

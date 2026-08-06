@@ -22,7 +22,7 @@ stack carrier asked to hold N live values") at the k=1 / k=2 arities the
 Fixes: ``frontend/constant_fold.py`` no longer blanks a statically-dead arm
 (that erased the ``__merge$<i>`` result block both arms carry, so ONE stack slot
 was registered for K physical results), and ``codegen/stack.py``'s
-``_branch_in_place_rebind_depth`` adopts the slot both arms rebound in place at
+``_the multi-result branch node`` adopts the slot both arms rebound in place at
 k=1.
 
 The hexes are the SEVEN-TIER agreed output.  Every tier pins the same strings,
@@ -124,19 +124,19 @@ def compile_script_hex(source: str, disable_constant_folding: bool) -> str:
         ),
         (
             "self-read-both-arms/fold-on", SELF_READ_BOTH_ARMS, False,
-            "000340420f0340428f7b7ca069517b00a0638b678c680340420f0340428f7b7ca07777",
+            "000340420f0340428f7b7ca069517b00a06351787c9376776751787c94767768517a750340420f0340428f7b7ca07777",
         ),
         (
             "self-read-both-arms/fold-off", SELF_READ_BOTH_ARMS, True,
-            "000340420f8fa069517c00a0638b678c680340420f8fa0",
+            "000340420f8fa069517c00a06351787c9376776751787c94767768517a750340420f8fa0",
         ),
         (
             "const-condition-k1/fold-on", CONST_CONDITION_K1, False,
-            "000340420f0340428f7b7ca069515163526753680340420f0340428f7b7ca077777777",
+            "000340420f0340428f7b7ca0695151635276776753767768517a750340420f0340428f7b7ca0777777",
         ),
         (
             "const-condition-k1/fold-off", CONST_CONDITION_K1, True,
-            "000340420f8fa069515163526753680340420f8fa07777",
+            "000340420f8fa0695151635276776753767768517a750340420f8fa077",
         ),
     ],
 )

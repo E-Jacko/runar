@@ -24,7 +24,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { compile } from '../index';
+import { compile } from '../index.js';
 
 function compileSource(source: string, disableConstantFolding: boolean) {
   return compile(source, { fileName: 'Inv.runar.ts', disableConstantFolding });
@@ -125,30 +125,39 @@ describe('lowerIf stackMap-vs-physical-depth invariant', () => {
   for (const disableConstantFolding of [true, false]) {
     const mode = disableConstantFolding ? 'fold-OFF' : 'fold-ON';
 
-    // The one shape the invariant was built to catch. Before the invariant it
-    // compiled "successfully" to a script `Spend` rejects outright — the funds
-    // are locked. A compile error is strictly better than an unspendable UTXO.
-    it(`${mode}: rejects a property write beside a K=2 merged local`, () => {
+    // The two shapes the invariant was built to catch. They used to compile
+    // "successfully" to a script `Spend` rejects outright (locked funds); the
+    // invariant then turned them into a compile error, which was containment,
+    // not a fix — the source is legal Rúnar.
+    //
+    // CONVERTED TO ACCEPTING TESTS when the `if` node gained its multi-result
+    // contract: an arm-written property is now a declared result of the `if`
+    // alongside the merged locals, both arms materialise the whole result set
+    // in the declared order, and the invariant holds because the compiler no
+    // longer under-counts. The spend-level proof (deploy -> call -> `Spend`,
+    // with the hand-derived post-state) lives in
+    // packages/runar-testing/src/__tests__/branch-prop-write-with-merged-local-vm.ts.
+    it(`${mode}: accepts a property write beside a K=2 merged local`, () => {
       const r = compileSource(PROP_WRITE_K2, disableConstantFolding);
-      expect(r.success).toBe(false);
-      expect(r.diagnostics.map((d) => d.message).join('\n')).toMatch(
-        /branch result depth/i,
+      expect(r.diagnostics.map((d: { message: string }) => d.message).join('\n')).not.toMatch(
+        /branch result depth|branch result layout/i,
       );
+      expect(r.success).toBe(true);
     });
 
-    it(`${mode}: rejects a property write beside a K=1 merged local`, () => {
+    it(`${mode}: accepts a property write beside a K=1 merged local`, () => {
       const r = compileSource(PROP_WRITE_K1, disableConstantFolding);
-      expect(r.success).toBe(false);
-      expect(r.diagnostics.map((d) => d.message).join('\n')).toMatch(
-        /branch result depth/i,
+      expect(r.diagnostics.map((d: { message: string }) => d.message).join('\n')).not.toMatch(
+        /branch result depth|branch result layout/i,
       );
+      expect(r.success).toBe(true);
     });
 
     for (const [label, source] of GOOD) {
       it(`${mode}: accepts ${label}`, () => {
         const r = compileSource(source, disableConstantFolding);
-        const messages = r.diagnostics.map((d) => d.message).join('\n');
-        expect(messages).not.toMatch(/branch result depth/i);
+        const messages = r.diagnostics.map((d: { message: string }) => d.message).join('\n');
+        expect(messages).not.toMatch(/branch result depth|branch result layout/i);
         expect(r.success).toBe(true);
       });
     }

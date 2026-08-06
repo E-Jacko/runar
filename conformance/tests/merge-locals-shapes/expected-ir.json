@@ -322,6 +322,10 @@
               }
             ],
             "kind": "if",
+            "results": [
+              "na",
+              "nb"
+            ],
             "then": [
               {
                 "name": "t15",
@@ -863,6 +867,11 @@
               }
             ],
             "kind": "if",
+            "results": [
+              "na",
+              "nb",
+              "nc"
+            ],
             "then": [
               {
                 "name": "t16",
@@ -1383,6 +1392,10 @@
                     }
                   ],
                   "kind": "if",
+                  "results": [
+                    "na",
+                    "nb"
+                  ],
                   "then": [
                     {
                       "name": "t18",

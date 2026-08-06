@@ -103,6 +103,32 @@ export interface If {
   cond: string;             // reference to a temp name
   then: ANFBinding[];
   else: ANFBinding[];
+  /**
+   * The ordered list of named slots BOTH arms leave behind — the `if`'s
+   * multi-result contract (see `appendBranchResults` in 04-anf-lower.ts).
+   *
+   * `results[0]` is the DEEPEST of the block, `results[n-1]` the top. Entries
+   * name either a branch-merged LOCAL or a contract PROPERTY written inside an
+   * arm; stack lowering tells them apart from the contract's property list, so
+   * the wire format stays a plain array of strings.
+   *
+   * When present, both arms end with the normalisation block that materialises
+   * exactly these slots in exactly this order, and stack lowering trims each
+   * arm to `results.length` slots and adopts them BY THE DECLARED ORDER rather
+   * than inferring the count from a trailing `__merge$` block or the arms'
+   * relative depths. That inference is what produced the 2026-08 branch
+   * miscompile family: an arm that reordered its slots (a property write
+   * beneath a rebound local) or that rebound its local IN PLACE while the other
+   * arm pushed a fresh one left `lowerIf` registering ONE stackMap name for two
+   * physical results, or padding the shorter arm with an EMPTY placeholder that
+   * the parent then read as the merged value.
+   *
+   * ABSENT (not `[]`) when the `if` carries at most one result — a plain value
+   * `if`, a ternary, an arm that emits output bytes, or an `if` without an
+   * `else` — so every golden that never took the multi-result path keeps its
+   * bytes. Absent and empty mean the same thing; emit it only when non-empty.
+   */
+  results?: string[];
 }
 
 export interface Loop {

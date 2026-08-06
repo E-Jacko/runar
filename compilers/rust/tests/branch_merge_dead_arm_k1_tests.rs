@@ -110,13 +110,13 @@ fn seven_tier_script_for_k1_merge_and_dead_arms() {
         ("dead-arm-k2/fold-off", DEAD_ARM_K2, true,
             "00014e8f006351537a6e7b757b75676e547a7568527a75527a757ca1"),
         ("self-read-both-arms/fold-on", SELF_READ_BOTH_ARMS, false,
-            "000340420f0340428f7b7ca069517b00a0638b678c680340420f0340428f7b7ca07777"),
+            "000340420f0340428f7b7ca069517b00a06351787c9376776751787c94767768517a750340420f0340428f7b7ca07777"),
         ("self-read-both-arms/fold-off", SELF_READ_BOTH_ARMS, true,
-            "000340420f8fa069517c00a0638b678c680340420f8fa0"),
+            "000340420f8fa069517c00a06351787c9376776751787c94767768517a750340420f8fa0"),
         ("const-condition-k1/fold-on", CONST_CONDITION_K1, false,
-            "000340420f0340428f7b7ca069515163526753680340420f0340428f7b7ca077777777"),
+            "000340420f0340428f7b7ca0695151635276776753767768517a750340420f0340428f7b7ca0777777"),
         ("const-condition-k1/fold-off", CONST_CONDITION_K1, true,
-            "000340420f8fa069515163526753680340420f8fa07777"),
+            "000340420f8fa0695151635276776753767768517a750340420f8fa077"),
     ];
 
     for (label, source, disable, want) in cases {

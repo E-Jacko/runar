@@ -981,10 +981,61 @@ class _LowerCtx:
                     "call after the if-statement."
                 )
 
-        if len(merged_locals) >= 2:
-            _append_merged_local_results(then_ctx, merged_locals)
+        # The ``if``'s multi-result contract. Locals first, in the canonical
+        # merge order both arms agree on, then the properties either arm
+        # writes, in contract declaration order -- so all seven tiers derive the
+        # same list from the same source. ``results[0]`` is the deepest slot.
+        arm_props: list[str] = []
+        _collect_updated_props(then_ctx.bindings, arm_props)
+        _collect_updated_props(else_ctx.bindings, arm_props)
+        result_names = list(merged_locals) + [
+            p.name for p in self._contract.properties if p.name in arm_props
+        ]
+
+        # When to materialise the contract instead of leaving the arms to the
+        # stack-lowerer's inference:
+        #
+        #   - two or more merged locals -- the pre-existing normalisation. Kept
+        #     on exactly its old trigger so the four ``__merge$`` goldens do not
+        #     move.
+        #   - any result at all when the ELSE arm carries code. This is the new
+        #     case, and it is where every measured miscompile lives: one arm
+        #     rebinds its local IN PLACE (net depth 0) while the other pushes a
+        #     fresh slot (net +1), or an arm writes a property beside a rebound
+        #     local, or the two arms write the same properties in a different
+        #     order. The arms then leave different LAYOUTS, which no depth or
+        #     liveness predicate can see.
+        #
+        # An ``if`` WITHOUT an else keeps the preserve-the-old-value path in
+        # ``lower_if`` (phase 3 copies each missing slot's same-named parent
+        # value), which already produces exactly these results by construction
+        # -- deliberately left intact. An arm that emits outputs is excluded:
+        # its single value is the serialised output bytes, and
+        # ``_branch_output_rejection_reason`` above already refuses every
+        # combination that would need a second result.
+        #
+        # EXCLUDED: an ``if`` that ``_lift_branch_update_props`` will rewrite.
+        # That pass (deep-review finding C20) turns a
+        # conditional-property-assignment chain into one flat single-valued
+        # ``if`` per property plus a top-level ``update_prop``, so the surviving
+        # ``if``s carry no property result and need no declaration. Appending
+        # the normalisation block first would ALSO silently disable that pass:
+        # its recogniser requires the arm's last binding to be the
+        # ``update_prop`` with everything before it side-effect free, and the
+        # block adds a second ``update_prop`` behind it. TicTacToe's position
+        # dispatch is exactly that shape, and losing the lift there produced an
+        # unspendable ``move`` script.
+        declares_results = not branch_has_outputs and _collect_update_branches(
+            cond_ref, then_ctx.bindings, else_ctx.bindings
+        ) is None and (
+            len(merged_locals) >= 2
+            or (len(result_names) >= 1 and bool(else_ctx.bindings))
+        )
+
+        if declares_results:
+            _append_branch_results(then_ctx, result_names, arm_props)
             self.sync_counter(then_ctx)
-            _append_merged_local_results(else_ctx, merged_locals)
+            _append_branch_results(else_ctx, result_names, arm_props)
             self.sync_counter(else_ctx)
 
         if_name = self.emit(ANFValue(
@@ -992,6 +1043,7 @@ class _LowerCtx:
             cond=cond_ref,
             then=then_ctx.bindings,
             else_=else_ctx.bindings,
+            results=list(result_names) if declares_results else None,
         ))
 
         if branch_has_outputs:
@@ -1016,10 +1068,10 @@ class _LowerCtx:
         # If both branches end by reassigning the same single local variable,
         # alias that variable to the if-expression result.
         #
-        # Skipped when the arms were normalised above: there the ``if`` has N
-        # results, not one, and each merged local keeps its OWN name through the
+        # Skipped when the arms were normalised above: there the ``if``
+        # DECLARES its results, and each one keeps its OWN name through the
         # reconcile in the stack lowerer.
-        if len(merged_locals) < 2 and then_ctx.bindings and else_ctx.bindings:
+        if not declares_results and then_ctx.bindings and else_ctx.bindings:
             then_last = then_ctx.bindings[-1]
             else_last = else_ctx.bindings[-1]
             if then_last.name == else_last.name and self.is_local(then_last.name):
@@ -1695,29 +1747,38 @@ def _make_call(func_name: str, args: list[str]) -> ANFValue:
     )
 
 
-def _append_merged_local_results(branch_ctx, merged_locals: list[str]) -> None:
-    """Append the canonical merged-local result block to one arm of an
-    if-statement: a copy of every merged local, in canonical order, rebound
-    under the local's own name.
+def _append_branch_results(
+    branch_ctx, result_names: list[str], props: list[str]
+) -> None:
+    """Append the canonical result block to one arm of an if-statement: a copy
+    of every declared result, in the declared order, rebound under its own
+    name. This is what makes the ``if`` node's ``results`` contract true rather
+    than hoped-for.
 
-    Two passes on purpose. Pass 1 always COPIES: ``@ref:<local>`` resolves to
-    the arm's own new value if it rebound one, else to the enclosing scope's
-    value, and either way stack lowering picks (never rolls) it, because a local
-    live after the ``if`` is outer-protected. Pass 2 always CONSUMES, because
-    the temps are bound in this arm and this is their last use. The arm's stack
-    effect is therefore exactly +K regardless of which of the K locals it
-    reassigned.
+    Two passes on purpose. Pass 1 always COPIES: for a LOCAL, ``@ref:<local>``
+    resolves to the arm's own new value if it rebound one, else to the
+    enclosing scope's value; for a PROPERTY, ``load_prop`` picks the arm's
+    updated slot when the arm wrote it and otherwise the enclosing value.
+    Either way stack lowering picks (never rolls) it, because a declared result
+    is outer-protected. Pass 2 always CONSUMES, because the temps are bound in
+    this arm and this is their last use. The arm's stack effect is therefore
+    exactly +N regardless of which of the N results it assigned.
+
+    Semantically a no-op for the off-chain ANF interpreters: every binding is
+    an ordinary read-then-write of a value the arm already holds.
     """
-    for i, name in enumerate(merged_locals):
-        branch_ctx.emit_named(
-            f"{MERGED_LOCAL_TEMP_PREFIX}{i}",
-            _make_load_const_string(f"@ref:{name}"),
-        )
-    for i, name in enumerate(merged_locals):
-        branch_ctx.emit_named(
-            name,
-            _make_load_const_string(f"@ref:{MERGED_LOCAL_TEMP_PREFIX}{i}"),
-        )
+    for i, name in enumerate(result_names):
+        temp = f"{MERGED_LOCAL_TEMP_PREFIX}{i}"
+        if name in props:
+            branch_ctx.emit_named(temp, ANFValue(kind="load_prop", name=name))
+        else:
+            branch_ctx.emit_named(temp, _make_load_const_string(f"@ref:{name}"))
+    for i, name in enumerate(result_names):
+        temp = f"{MERGED_LOCAL_TEMP_PREFIX}{i}"
+        if name in props:
+            branch_ctx.emit(_make_update_prop(name, temp))
+        else:
+            branch_ctx.emit_named(name, _make_load_const_string(f"@ref:{temp}"))
 
 
 def _append_branch_output_concat(branch_ctx: "_LowerCtx") -> str:

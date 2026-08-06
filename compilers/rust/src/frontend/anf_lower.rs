@@ -466,6 +466,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                     cond: change_nonzero_ref,
                     then: change_then_ctx.bindings,
                     else_branch: change_else_ctx.bindings,
+                    results: Vec::new(),
                 });
 
                 if !add_output_refs.is_empty() {
@@ -1349,10 +1350,60 @@ fn lower_if_statement(
         }
     }
 
-    if merged_locals.len() >= 2 {
-        append_merged_local_results(&mut then_ctx, &merged_locals);
+    // The `if`'s multi-result contract. Locals first, in the canonical merge
+    // order both arms agree on, then the properties either arm writes, in
+    // contract declaration order — so all seven tiers derive the same list from
+    // the same source. `results[0]` is the deepest slot of the block.
+    let mut arm_props: Vec<String> = Vec::new();
+    collect_updated_props(&then_ctx.bindings, &mut arm_props);
+    collect_updated_props(&else_ctx.bindings, &mut arm_props);
+    let mut result_names = merged_locals.clone();
+    for p in ctx.contract.properties.iter() {
+        if arm_props.contains(&p.name) {
+            result_names.push(p.name.clone());
+        }
+    }
+
+    // When to materialise the contract instead of leaving the arms to the
+    // stack-lowerer's inference:
+    //
+    //   - two or more merged locals — the pre-existing normalisation. Kept on
+    //     exactly its old trigger so the four `__merge$` goldens do not move.
+    //   - any result at all when the ELSE arm carries code. This is the new
+    //     case, and it is where every measured miscompile lives: one arm
+    //     rebinds its local IN PLACE (net depth 0) while the other pushes a
+    //     fresh slot (net +1), or an arm writes a property beside a rebound
+    //     local, or the two arms write the same properties in a different
+    //     order. The arms then leave different LAYOUTS, which no depth or
+    //     liveness predicate can see.
+    //
+    // An `if` WITHOUT an else keeps the preserve-the-old-value path in
+    // `lower_if` (phase 3 copies each missing slot's same-named parent value),
+    // which already produces exactly these results by construction —
+    // deliberately left intact. An arm that emits outputs is excluded: its
+    // single value is the serialised output bytes, and
+    // `branch_output_rejection_reason` above already refuses every combination
+    // that would need a second result.
+    //
+    // EXCLUDED: an `if` that `lift_branch_update_props` will rewrite. That pass
+    // (deep-review finding C20) turns a conditional-property-assignment chain
+    // into one flat single-valued `if` per property plus a top-level
+    // `update_prop`, so the surviving `if`s carry no property result and need
+    // no declaration. Appending the normalisation block first would ALSO
+    // silently disable that pass: its recogniser requires the arm's last
+    // binding to be the `update_prop` with everything before it side-effect
+    // free, and the block adds a second `update_prop` behind it. TicTacToe's
+    // position dispatch is exactly that shape, and losing the lift there
+    // produced an unspendable `move` script.
+    let declares_results = !branch_has_outputs
+        && collect_update_branches(&cond_ref, &then_ctx.bindings, &else_ctx.bindings).is_none()
+        && (merged_locals.len() >= 2
+            || (!result_names.is_empty() && !else_ctx.bindings.is_empty()));
+
+    if declares_results {
+        append_branch_results(&mut then_ctx, &result_names, &arm_props);
         ctx.sync_counter(&then_ctx);
-        append_merged_local_results(&mut else_ctx, &merged_locals);
+        append_branch_results(&mut else_ctx, &result_names, &arm_props);
         ctx.sync_counter(&else_ctx);
     }
 
@@ -1363,14 +1414,14 @@ fn lower_if_statement(
     // alias that variable to the if-expression result so that subsequent
     // references resolve to the branch output, not the dead initial value.
     //
-    // Skipped when the arms were normalised above: there the `if` has N
-    // results, not one, and each merged local keeps its OWN name through the
-    // reconcile in the stack lowerer.
+    // Skipped when the arms were normalised above: there the `if` DECLARES its
+    // results, and each one keeps its OWN name through the reconcile in the
+    // stack lowerer.
     let then_last = then_bindings.last();
     let else_last = else_bindings.last();
     let alias_local = match (then_last, else_last) {
         (Some(tl), Some(el))
-            if merged_locals.len() < 2 && tl.name == el.name && ctx.is_local(&tl.name) =>
+            if !declares_results && tl.name == el.name && ctx.is_local(&tl.name) =>
         {
             Some(tl.name.clone())
         }
@@ -1381,6 +1432,11 @@ fn lower_if_statement(
         cond: cond_ref,
         then: then_bindings,
         else_branch: else_bindings,
+        results: if declares_results {
+            result_names
+        } else {
+            Vec::new()
+        },
     });
 
     if branch_has_outputs {
@@ -1445,36 +1501,55 @@ fn collect_branch_merged_locals(
     merged
 }
 
-/// Append the canonical merged-local result block to one arm of an
-/// if-statement: a copy of every merged local, in canonical order, rebound
-/// under the local's own name.
+/// Append the canonical result block to one arm of an if-statement: a copy of
+/// every declared result, in the declared order, rebound under its own name.
+/// This is what makes the `if` node's `results` contract true rather than
+/// hoped-for.
 ///
-/// Two passes on purpose. Pass 1 always COPIES: `@ref:<local>` resolves to the
-/// arm's own new value if it rebound one, else to the enclosing scope's value,
-/// and either way stack lowering picks (never rolls) it, because a local live
-/// after the `if` is outer-protected. Pass 2 always CONSUMES, because the
-/// temps are bound in this arm and this is their last use. The arm's stack
-/// effect is therefore exactly +K regardless of which of the K locals it
-/// reassigned.
-fn append_merged_local_results(branch_ctx: &mut LoweringContext, merged_locals: &[String]) {
-    for (i, name) in merged_locals.iter().enumerate() {
-        branch_ctx.emit_named(
-            &format!("{}{}", MERGED_LOCAL_TEMP_PREFIX, i),
-            ANFValue::LoadConst {
-                value: serde_json::Value::String(format!("@ref:{}", name)),
-            },
-        );
+/// Two passes on purpose. Pass 1 always COPIES: for a LOCAL, `@ref:<local>`
+/// resolves to the arm's own new value if it rebound one, else to the
+/// enclosing scope's value; for a PROPERTY, `load_prop` picks the arm's
+/// updated slot when the arm wrote it and otherwise the enclosing value.
+/// Either way stack lowering picks (never rolls) it, because a declared result
+/// is outer-protected. Pass 2 always CONSUMES, because the temps are bound in
+/// this arm and this is their last use. The arm's stack effect is therefore
+/// exactly +N regardless of which of the N results it assigned.
+///
+/// Semantically a no-op for the off-chain ANF interpreters: every binding is
+/// an ordinary read-then-write of a value the arm already holds.
+fn append_branch_results(
+    branch_ctx: &mut LoweringContext,
+    result_names: &[String],
+    props: &[String],
+) {
+    for (i, name) in result_names.iter().enumerate() {
+        let temp = format!("{}{}", MERGED_LOCAL_TEMP_PREFIX, i);
+        if props.contains(name) {
+            branch_ctx.emit_named(&temp, ANFValue::LoadProp { name: name.clone() });
+        } else {
+            branch_ctx.emit_named(
+                &temp,
+                ANFValue::LoadConst {
+                    value: serde_json::Value::String(format!("@ref:{}", name)),
+                },
+            );
+        }
     }
-    for (i, name) in merged_locals.iter().enumerate() {
-        branch_ctx.emit_named(
-            name,
-            ANFValue::LoadConst {
-                value: serde_json::Value::String(format!(
-                    "@ref:{}{}",
-                    MERGED_LOCAL_TEMP_PREFIX, i
-                )),
-            },
-        );
+    for (i, name) in result_names.iter().enumerate() {
+        let temp = format!("{}{}", MERGED_LOCAL_TEMP_PREFIX, i);
+        if props.contains(name) {
+            branch_ctx.emit(ANFValue::UpdateProp {
+                name: name.clone(),
+                value: temp,
+            });
+        } else {
+            branch_ctx.emit_named(
+                name,
+                ANFValue::LoadConst {
+                    value: serde_json::Value::String(format!("@ref:{}", temp)),
+                },
+            );
+        }
     }
 }
 
@@ -2511,6 +2586,7 @@ fn lower_ternary_expr(
         cond: cond_ref,
         then: then_ctx.bindings,
         else_branch: else_ctx.bindings,
+        results: Vec::new(),
     })
 }
 
@@ -2928,7 +3004,7 @@ fn collect_update_branches(
 
     // Check if else is another if (else-if chain)
     let last_else = &else_bindings[else_bindings.len() - 1];
-    if let ANFValue::If { cond, then, else_branch } = &last_else.value {
+    if let ANFValue::If { cond, then, else_branch, .. } = &last_else.value {
         let cond_setup = &else_bindings[..else_bindings.len() - 1];
         if !all_bindings_side_effect_free(cond_setup) {
             return None;
@@ -3036,10 +3112,11 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
         ANFValue::ArrayLiteral { elements } => ANFValue::ArrayLiteral {
             elements: elements.iter().map(|e| r(e)).collect(),
         },
-        ANFValue::If { cond, then, else_branch } => ANFValue::If {
+        ANFValue::If { cond, then, else_branch, results } => ANFValue::If {
             cond: r(cond),
             then: then.clone(),
             else_branch: else_branch.clone(),
+            results: results.clone(),
         },
         ANFValue::Loop { count, body, iter_var, start, step } => ANFValue::Loop {
             count: *count,
@@ -3065,7 +3142,7 @@ fn lift_branch_update_props(bindings: Vec<ANFBinding>) -> Vec<ANFBinding> {
 
     for binding in &bindings {
         let if_val = match &binding.value {
-            ANFValue::If { cond, then, else_branch } => Some((cond, then, else_branch)),
+            ANFValue::If { cond, then, else_branch, .. } => Some((cond, then, else_branch)),
             _ => None,
         };
 
@@ -3265,6 +3342,7 @@ fn lift_branch_update_props(bindings: Vec<ANFBinding>) -> Vec<ANFBinding> {
                     cond: effective_conds[i].clone(),
                     then: then_bindings,
                     else_branch: else_bindings,
+                    results: Vec::new(),
                 },
                 source_loc: None,
             });

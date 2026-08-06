@@ -450,6 +450,11 @@ module RunarCompiler
           new_v.cond = value.cond
           new_v.then = folded_then
           new_v.else_ = folded_else
+          # The declared result list survives folding untouched: folding an
+          # arm's bindings cannot change WHICH slots the arm leaves, and
+          # dropping the list would silently return the +if+ to the
+          # single-result reconcile it was migrated off.
+          new_v.results = value.results
           return new_v
         end
 

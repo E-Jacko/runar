@@ -464,6 +464,11 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
                 .cond = if_node.cond,
                 .then = folded_then,
                 .@"else" = folded_else,
+                // The declared result list survives folding untouched: folding
+                // an arm's bindings cannot change WHICH slots the arm leaves,
+                // and dropping the list would silently return the `if` to the
+                // single-result reconcile it was migrated off.
+                .results = if_node.results,
             };
             return .{ .@"if" = new_if };
         },

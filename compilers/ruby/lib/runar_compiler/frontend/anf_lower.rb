@@ -1117,10 +1117,61 @@ module RunarCompiler
           end
         end
 
-        if merged_locals.length >= 2
-          Frontend._append_merged_local_results(then_ctx, merged_locals)
+        # The +if+'s multi-result contract. Locals first, in the canonical
+        # merge order both arms agree on, then the properties either arm
+        # writes, in contract declaration order -- so all seven tiers derive
+        # the same list from the same source. results[0] is the deepest slot.
+        arm_props = []
+        Frontend._collect_updated_props(then_ctx.bindings, arm_props)
+        Frontend._collect_updated_props(else_ctx.bindings, arm_props)
+        result_names = merged_locals.dup
+        @contract.properties.each do |p|
+          result_names << p.name if arm_props.include?(p.name)
+        end
+
+        # When to materialise the contract instead of leaving the arms to the
+        # stack-lowerer's inference:
+        #
+        #   - two or more merged locals -- the pre-existing normalisation. Kept
+        #     on exactly its old trigger so the four +__merge$+ goldens do not
+        #     move.
+        #   - any result at all when the ELSE arm carries code. This is the new
+        #     case, and it is where every measured miscompile lives: one arm
+        #     rebinds its local IN PLACE (net depth 0) while the other pushes a
+        #     fresh slot (net +1), or an arm writes a property beside a rebound
+        #     local, or the two arms write the same properties in a different
+        #     order. The arms then leave different LAYOUTS, which no depth or
+        #     liveness predicate can see.
+        #
+        # An +if+ WITHOUT an else keeps the preserve-the-old-value path in
+        # lower_if (phase 3 copies each missing slot's same-named parent
+        # value), which already produces exactly these results by construction
+        # -- deliberately left intact. An arm that emits outputs is excluded:
+        # its single value is the serialised output bytes, and
+        # _branch_output_rejection_reason above already refuses every
+        # combination that would need a second result.
+        #
+        # EXCLUDED: an +if+ that _lift_branch_update_props will rewrite. That
+        # pass (deep-review finding C20) turns a conditional-property-assignment
+        # chain into one flat single-valued +if+ per property plus a top-level
+        # +update_prop+, so the surviving +if+s carry no property result and
+        # need no declaration. Appending the normalisation block first would
+        # ALSO silently disable that pass: its recogniser requires the arm's
+        # last binding to be the +update_prop+ with everything before it
+        # side-effect free, and the block adds a second +update_prop+ behind it.
+        # TicTacToe's position dispatch is exactly that shape, and losing the
+        # lift there produced an unspendable +move+ script.
+        declares_results = !branch_has_outputs &&
+                           Frontend.send(:_collect_update_branches,
+                                         cond_ref, then_ctx.bindings,
+                                         else_ctx.bindings).nil? &&
+                           (merged_locals.length >= 2 ||
+                            (!result_names.empty? && else_ctx.bindings.any?))
+
+        if declares_results
+          Frontend._append_branch_results(then_ctx, result_names, arm_props)
           sync_counter(then_ctx)
-          Frontend._append_merged_local_results(else_ctx, merged_locals)
+          Frontend._append_branch_results(else_ctx, result_names, arm_props)
           sync_counter(else_ctx)
         end
 
@@ -1128,6 +1179,7 @@ module RunarCompiler
           v.cond = cond_ref
           v.then = then_ctx.bindings
           v.else_ = else_ctx.bindings
+          v.results = result_names.dup if declares_results
         end)
 
         if branch_has_outputs
@@ -1153,10 +1205,10 @@ module RunarCompiler
         # If both branches end by reassigning the same SINGLE local variable,
         # alias that variable to the if-expression result.
         #
-        # Skipped when the arms were normalised above: there the +if+ has N
-        # results, not one, and each merged local keeps its OWN name through the
-        # reconcile in the stack lowerer.
-        if merged_locals.length < 2 && then_ctx.bindings.any? && else_ctx.bindings.any?
+        # Skipped when the arms were normalised above: there the +if+ DECLARES
+        # its results, and each one keeps its OWN name through the reconcile in
+        # the stack lowerer.
+        if !declares_results && then_ctx.bindings.any? && else_ctx.bindings.any?
           then_last = then_ctx.bindings.last
           else_last = else_ctx.bindings.last
           if then_last.name == else_last.name && local?(then_last.name)
@@ -1777,34 +1829,43 @@ module RunarCompiler
       end
     end
 
+    # Append the canonical result block to one arm of an if-statement: a copy
+    # of every declared result, in the declared order, rebound under its own
+    # name. This is what makes the +if+ node's +results+ contract true rather
+    # than hoped-for.
+    #
+    # Two passes on purpose. Pass 1 always COPIES: +@ref:<local>+ resolves to
+    # the arm's own new value if it rebound one, else to the enclosing scope's
+    # value, and either way stack lowering picks (never rolls) it, because a
+    # declared result is outer-protected. Pass 2 always CONSUMES, because the
+    # temps are bound in this arm and this is their last use. The arm's stack
+    # effect is therefore exactly +N regardless of which of the N results it
+    # assigned. Semantically a no-op for the off-chain ANF interpreters.
+    def self._append_branch_results(branch_ctx, result_names, props)
+      result_names.each_with_index do |name, i|
+        temp = "#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"
+        if props.include?(name)
+          branch_ctx.emit_named(temp, IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = name })
+        else
+          branch_ctx.emit_named(temp, _make_load_const_string("@ref:#{name}"))
+        end
+      end
+      result_names.each_with_index do |name, i|
+        temp = "#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"
+        if props.include?(name)
+          branch_ctx.emit(_make_update_prop(name, temp))
+        else
+          branch_ctx.emit_named(name, _make_load_const_string("@ref:#{temp}"))
+        end
+      end
+    end
+
     # Concatenate a branch's output refs (state then data, in
     # declaration order) into a single bytes-ref appended to the
     # branch's bindings. If the branch has no outputs, emits an empty
     # +load_const+ so the branch still leaves one item on the stack —
     # required to balance the if's branch shapes when the OTHER
     # branch has outputs. 2026-04-30 audit finding F2 fix.
-    # Append the canonical merged-local result block to one arm of an
-    # if-statement: a copy of every merged local, in canonical order, rebound
-    # under the local's own name.
-    #
-    # Two passes on purpose. Pass 1 always COPIES: +@ref:<local>+ resolves to
-    # the arm's own new value if it rebound one, else to the enclosing scope's
-    # value, and either way stack lowering picks (never rolls) it, because a
-    # local live after the +if+ is outer-protected. Pass 2 always CONSUMES,
-    # because the temps are bound in this arm and this is their last use. The
-    # arm's stack effect is therefore exactly +K regardless of which of the K
-    # locals it reassigned.
-    def self._append_merged_local_results(branch_ctx, merged_locals)
-      merged_locals.each_with_index do |name, i|
-        branch_ctx.emit_named("#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}",
-                              _make_load_const_string("@ref:#{name}"))
-      end
-      merged_locals.each_with_index do |name, i|
-        branch_ctx.emit_named(name,
-                              _make_load_const_string("@ref:#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"))
-      end
-    end
-
     def self._append_branch_output_concat(branch_ctx)
       all_refs = branch_ctx.get_add_output_refs.dup
       all_refs.concat(branch_ctx.get_add_data_output_refs)

@@ -410,6 +410,7 @@ fn fold_value(value: &ANFValue, env: &mut ConstEnv) -> ANFValue {
             cond,
             then,
             else_branch,
+            results,
         } => {
             // Fold both arms independently, ALWAYS — including when the
             // condition is a compile-time constant.
@@ -449,6 +450,11 @@ fn fold_value(value: &ANFValue, env: &mut ConstEnv) -> ANFValue {
                 cond: cond.clone(),
                 then: folded_then,
                 else_branch: folded_else,
+                // The declared result list survives folding untouched: folding
+                // an arm's bindings cannot change WHICH slots the arm leaves,
+                // and dropping the list would silently return the `if` to the
+                // single-result reconcile it was migrated off.
+                results: results.clone(),
             }
         }
 
@@ -972,6 +978,7 @@ mod tests {
                 cond: "t0".to_string(),
                 then: vec![b("t2", mk_int(42))],
                 else_branch: vec![b("t3", mk_int(99))],
+                results: Vec::new(),
             }),
         ])]);
         let r = fold_constants_only(&p);
@@ -991,6 +998,7 @@ mod tests {
                 cond: "t0".to_string(),
                 then: vec![b("t2", mk_int(42))],
                 else_branch: vec![b("t3", mk_int(99))],
+                results: Vec::new(),
             }),
         ])]);
         let r = fold_constants_only(&p);
@@ -1013,6 +1021,7 @@ mod tests {
                 cond: "t0".to_string(),
                 then: vec![b("x", mk_int(42))],
                 else_branch: vec![b("x", mk_int(99))],
+                results: Vec::new(),
             }),
             b("t2", bin_op("+", "x", "t0")),
         ])]);
@@ -1030,6 +1039,7 @@ mod tests {
                 cond: "t0".to_string(),
                 then: vec![b("t4", bin_op("+", "t1", "t2"))],
                 else_branch: vec![b("t5", bin_op("-", "t1", "t2"))],
+                results: Vec::new(),
             }),
         ])]);
         let r = fold_constants_only(&p);

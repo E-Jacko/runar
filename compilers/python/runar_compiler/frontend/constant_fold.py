@@ -484,6 +484,11 @@ def _fold_value(value: ANFValue, env: ConstEnv) -> ANFValue:
             cond=value.cond,
             then=folded_then,
             else_=folded_else,
+            # The declared result list survives folding untouched: folding an
+            # arm's bindings cannot change WHICH slots the arm leaves, and
+            # dropping the list would silently return the ``if`` to the
+            # single-result reconcile it was migrated off.
+            results=value.results,
         )
 
     if kind == "loop":

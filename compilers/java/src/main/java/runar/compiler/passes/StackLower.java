@@ -75,46 +75,6 @@ public final class StackLower {
 
     private static final int MAX_STACK_DEPTH = 800;
 
-    /**
-     * How many branch-merged locals an if-statement's two arms carry as
-     * results.
-     *
-     * <p>ANF lowering's {@code appendMergedLocalResults} ends both arms with
-     * the same K-binding block — {@code <local> = @ref:__merge$<i>} for i in
-     * 0..K-1 — so the merged values sit on top in the same canonical order
-     * whichever branch runs. Counting the trailing block is how stack lowering
-     * learns K: it must trim each arm down to exactly those K slots before the
-     * N&gt;=2 reconcile compares the arms, since everything beneath them is the
-     * arm's own (dead, and arm-specific) working values.
-     *
-     * <p>Returns 0 unless BOTH arms end with a block of the same size —
-     * anything else is not a normalised merge and must not be trimmed.
-     */
-    private static int countMergedLocalResults(List<AnfBinding> thenBindings,
-                                               List<AnfBinding> elseBindings) {
-        int thenCount = trailingMergedLocalResults(thenBindings);
-        return thenCount > 0 && thenCount == trailingMergedLocalResults(elseBindings)
-            ? thenCount : 0;
-    }
-
-    /**
-     * The names of the K branch-merged locals an if-statement's arms carry as
-     * results, in the canonical order {@code appendMergedLocalResults} emitted
-     * them.
-     *
-     * <p>Empty unless both arms carry a normalised block of the same size — the
-     * same gate {@code countMergedLocalResults} applies.
-     */
-    private static List<String> mergedLocalResultNames(List<AnfBinding> thenBindings,
-                                                       List<AnfBinding> elseBindings) {
-        int k = countMergedLocalResults(thenBindings, elseBindings);
-        if (k == 0) return List.of();
-        List<String> names = new ArrayList<>(k);
-        for (AnfBinding b : thenBindings.subList(thenBindings.size() - k, thenBindings.size())) {
-            names.add(b.name());
-        }
-        return names;
-    }
 
     private static int trailingMergedLocalResults(List<AnfBinding> bindings) {
         String prefix = "@ref:" + AnfValue.MERGED_LOCAL_TEMP_PREFIX;
@@ -1144,7 +1104,8 @@ public final class StackLower {
                     if (b.value() instanceof Assert a && i == lastAssertIdx) {
                         lowerAssert(a.value(), i, lastUses, true);
                     } else if (b.value() instanceof If iv && i == terminalIfIdx) {
-                        lowerIf(b.name(), iv.cond(), iv.thenBranch(), iv.elseBranch(), i, lastUses, true);
+                        lowerIf(b.name(), iv.cond(), iv.thenBranch(), iv.elseBranch(),
+                            iv.results() == null ? List.of() : iv.results(), i, lastUses, true);
                     } else {
                         lowerBinding(b, i, lastUses);
                     }
@@ -1175,7 +1136,8 @@ public final class StackLower {
             } else if (v instanceof MethodCall mc) {
                 lowerMethodCall(name, mc.object(), mc.method(), mc.args(), idx, lastUses);
             } else if (v instanceof If iv) {
-                lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(), idx, lastUses, false);
+                lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(),
+                    iv.results() == null ? List.of() : iv.results(), idx, lastUses, false);
             } else if (v instanceof Loop l) {
                 lowerLoop(name, l.count(), l.body(), l.iterVar(), l.start(), l.step(), idx, lastUses);
             } else if (v instanceof Assert a) {
@@ -2262,55 +2224,16 @@ public final class StackLower {
 
         // ---------------- if ----------------
 
+
         /**
-         * The stack depth of the ONE slot both arms of an {@code if} rebound in place, or
-         * {@code null} when the {@code if} does not have that shape.
-         *
-         * <p>The shape: ANF lowering merged a SINGLE local across the arms, so instead of
-         * appending a {@code __merge$<i>} result block it aliased the local to the
-         * if-expression itself. Both arms then read that local and rebound it, which makes the
-         * arm ROLL the parent's slot away and leave its own result in the same position — the
-         * arms' net stack effect is zero, so none of the depth-growth cases in
-         * {@code lowerIf} fire and the if's value would go unregistered.
-         *
-         * <p>Every condition below is required:
-         * <ul>
-         *   <li>no normalised K-merge block (that is the K&gt;=2 path, which grows depth by K
-         *       and is adopted by name),
-         *   <li>both arms end on a binding of the SAME name, and that name is a local, not a
-         *       contract property (properties have their own reconcile),
-         *   <li>both arms, and the reconciled parent, hold that name at the same depth — i.e.
-         *       the slot really was rebound where it stood,
-         *   <li>both arms are at the parent's depth, so the slot is the only effect,
-         *   <li>{@code bindingName} is read after the {@code if}. Without a reader there is
-         *       nothing to repair and renaming would only lose a name; with one, the pre-fix
-         *       compiler failed with "value not found on stack". That is what makes adopting
-         *       the slot byte-neutral for every program that compiled before.
-         * </ul>
+         * {@code results} is the {@code if} node's declared result slots,
+         * deepest first (see {@link If#results()}). Empty for an {@code if}
+         * that carries at most one result, and then every path below behaves
+         * exactly as it did before the multi-result contract existed.
          */
-        private Integer branchInPlaceRebindDepth(List<AnfBinding> thenB, List<AnfBinding> elseB,
-                                                 LoweringContext thenCtx, LoweringContext elseCtx,
-                                                 int mergedResultCount,
-                                                 boolean bindingIsReadLater) {
-            if (!bindingIsReadLater || mergedResultCount != 0) return null;
-            if (thenCtx.sm.depth() != sm.depth() || elseCtx.sm.depth() != sm.depth()) return null;
-            if (thenB == null || thenB.isEmpty() || elseB == null || elseB.isEmpty()) return null;
-
-            String name = thenB.get(thenB.size() - 1).name();
-            if (name == null || name.isEmpty()) return null;
-            if (!name.equals(elseB.get(elseB.size() - 1).name())) return null;
-            for (AnfProperty p : properties) {
-                if (name.equals(p.name())) return null;
-            }
-            if (!thenCtx.sm.has(name) || !elseCtx.sm.has(name) || !sm.has(name)) return null;
-
-            int depth = thenCtx.sm.findDepth(name);
-            if (elseCtx.sm.findDepth(name) != depth || sm.findDepth(name) != depth) return null;
-            return depth;
-        }
-
         void lowerIf(String bindingName, String cond,
                      List<AnfBinding> thenB, List<AnfBinding> elseB,
+                     List<String> results,
                      int idx, Map<String, Integer> lastUses,
                      boolean terminalAssert) {
             bringToTop(cond, isLastUse(cond, idx, lastUses));
@@ -2353,7 +2276,11 @@ public final class StackLower {
             // Byte-neutral for every program whose merged locals were already
             // live after the `if`: those names are already protected above,
             // which is precisely why those programs compiled correctly.
-            for (String name : mergedLocalResultNames(thenB, elseB)) {
+            //
+            // Now driven by the node's DECLARED results instead of by
+            // recognising a trailing `__merge$` block, so an arm-written
+            // property is protected on the same footing as a rebound local.
+            for (String name : results) {
                 if (sm.has(name)) protectedRefs.add(name);
             }
 
@@ -2429,57 +2356,50 @@ public final class StackLower {
             //
             // Runs AFTER the phase-2 consumption drops, so both arms have given
             // up the same parent slots and share one base depth.
-            int mergedResultCount = countMergedLocalResults(thenB, elseB);
-            if (mergedResultCount >= 2) {
+            int nDeclared = results.size();
+            if (nDeclared >= 1) {
                 Set<String> stillHeld = thenCtx.sm.namedSlots();
                 int consumedFromParent = 0;
                 for (String n : preIfNames) {
                     if (!stillHeld.contains(n) && sm.has(n)) consumedFromParent++;
                 }
-                int targetDepth = sm.depth() - consumedFromParent + mergedResultCount;
+                int targetDepth = sm.depth() - consumedFromParent + nDeclared;
                 for (LoweringContext armCtx : List.of(thenCtx, elseCtx)) {
                     while (armCtx.sm.depth() > targetDepth) {
-                        // Layer C (second half) — check the trim's stated
-                        // premise instead of assuming it.
-                        //
-                        // "Everything beneath the K results is dead" is true for
-                        // merged LOCALS: ANF lowering copied each one into a
-                        // __merge$ temp before rebinding, so the slot underneath
-                        // really is a spent working value. It is NOT true for a
-                        // contract PROPERTY written inside the arm. update_prop
-                        // in a branch leaves the new value as an extra slot
-                        // named after the property (the old value is
-                        // deliberately kept beneath for the same-property
-                        // reconcile), and properties get no __merge$
-                        // normalisation at all — merging is a locals-only
-                        // transform. So the arm's property write sits beneath
-                        // the K results and this loop would silently DROP it,
-                        // leaving the stale pre-`if` value in place. The arms
-                        // still end at equal depth and the parent stackMap still
-                        // names the right slots, so neither the branch-balance
-                        // guard nor the depth invariant below can see it — the
-                        // only symptom is that the emitted script serialises the
-                        // OLD property value while the interpreter serialises
-                        // the new one, which fails the state-continuation hash
-                        // check and locks the UTXO.
-                        //
-                        // Emits no opcodes; it only refuses to emit wrong ones.
-                        String doomed = armCtx.sm.peekAtDepth(mergedResultCount);
-                        if (doomed != null && !doomed.isEmpty()) {
-                            for (AnfProperty p : properties) {
-                                if (p.name().equals(doomed)) {
-                                    throw new IllegalStateException(
-                                        "Internal codegen error: branch result depth mismatch — an arm of "
-                                        + "the conditional writes contract property '" + doomed + "' AND "
-                                        + "rebinds " + mergedResultCount + " branch-merged local(s), but only "
-                                        + "the locals are carried as results. The property write sits beneath "
-                                        + "them and would be discarded, so the script would serialise the "
-                                        + "stale value of '" + doomed + "' and the state continuation would be "
-                                        + "unspendable. binding='" + bindingName + "'.");
-                                }
-                            }
+                        armCtx.dropSlotAtDepth(nDeclared);
+                    }
+                }
+
+                // The declared contract, checked rather than assumed: after the
+                // trim, each arm's top N slots must BE the declared results, in
+                // the declared order (results[0] deepest). appendBranchResults
+                // is what makes this true; if it ever stops being true the arms
+                // disagree on layout, which is precisely the failure that
+                // produced the 2026-08 miscompile family. Emits no opcodes.
+                String[] labels = { "then", "else" };
+                List<LoweringContext> arms = List.of(thenCtx, elseCtx);
+                for (int ai = 0; ai < arms.size(); ai++) {
+                    LoweringContext armCtx = arms.get(ai);
+                    if (armCtx.sm.depth() != targetDepth) {
+                        throw new IllegalStateException(
+                            "Internal codegen error: branch result layout mismatch — the "
+                            + labels[ai] + "-arm of the conditional ends at depth "
+                            + armCtx.sm.depth() + ", but its " + nDeclared
+                            + " declared result(s) require depth " + targetDepth
+                            + ". binding='" + bindingName + "'.");
+                    }
+                    for (int i = 0; i < nDeclared; i++) {
+                        String want = results.get(nDeclared - 1 - i);
+                        String got = armCtx.sm.peekAtDepth(i);
+                        if (!want.equals(got)) {
+                            throw new IllegalStateException(
+                                "Internal codegen error: branch result layout mismatch — the "
+                                + labels[ai] + "-arm of the conditional holds '" + got
+                                + "' where the node declares '" + want + "' (slot "
+                                + (nDeclared - 1 - i) + " of [" + String.join(", ", results)
+                                + "]). Every later operand would resolve to the wrong slot. "
+                                + "binding='" + bindingName + "'.");
                         }
-                        armCtx.dropSlotAtDepth(mergedResultCount);
                     }
                 }
             }
@@ -2594,7 +2514,41 @@ public final class StackLower {
             }
 
             // If expression may produce a result value on top
-            if (thenCtx.sm.depth() > sm.depth()
+            if (nDeclared >= 1) {
+                // DECLARED RESULTS. Both arms were normalised by
+                // appendBranchResults and the layout check above proved they
+                // hold exactly `results`, so the parent adopts them BY THE
+                // DECLARED ORDER — no counting of trailing `__merge$` bindings,
+                // no comparison of arm depths, no inference of which names are
+                // still live. results[0] is the deepest slot, matching the order
+                // pass 2 of the normalisation rebound them in.
+                //
+                // Then each parent slot the block shadows (the pre-`if` binding
+                // of a merged local, the stale value of a written property) is
+                // physically rolled out from under the results, exactly as the
+                // pre-existing N>=2 reconcile did — which is why the four
+                // `__merge$` goldens keep their bytes.
+                for (String name : results) {
+                    sm.push(name);
+                }
+                for (int i = nDeclared - 1; i >= 0; i--) {
+                    String name = results.get(i);
+                    for (int d = nDeclared; d < sm.depth(); d++) {
+                        if (name.equals(sm.peekAtDepth(d))) {
+                            emitOp(new PushOp(PushValue.of(d)));
+                            sm.push("");
+                            emitOp(new RollOp(d + 1));
+                            sm.pop();
+                            String rolled = sm.removeAtDepth(d);
+                            sm.push(rolled);
+                            emitOp(new DropOp());
+                            sm.pop();
+                            postEndifDrops++;
+                            break;
+                        }
+                    }
+                }
+            } else if (thenCtx.sm.depth() > sm.depth()
                 && nResults >= 2
                 && (elseB.isEmpty() || elseMatchesThenNResultLayout)) {
                 // #99 Bug 1: a conditional write of N>=2 state fields leaves N
@@ -2645,33 +2599,6 @@ public final class StackLower {
             } else if (elseCtx.sm.depth() > sm.depth()) {
                 sm.push(bindingName);
             } else {
-                Integer inPlaceDepth = branchInPlaceRebindDepth(
-                    thenB, elseB, thenCtx, elseCtx, mergedResultCount,
-                    lastUses.containsKey(bindingName));
-                if (inPlaceDepth != null) {
-                    // Single branch-merged local rebound IN PLACE by both arms.
-                    //
-                    // At K=1 ANF lowering does not append a __merge$<i> result block; it
-                    // ALIASES the local to the if-expression's binding name instead, so every
-                    // post-branch read of the local names the `if`. That works when the arms
-                    // PUSH their new value — depth grows by one and the
-                    // thenCtx.depth > sm.depth arm above registers bindingName.
-                    //
-                    // But when both arms READ the local and rebind it (m0 = m0 + 1), the local
-                    // is not live under its own name after the `if` (the alias moved every
-                    // reader to the `if`), so it is not outer-protected and each arm ROLLS the
-                    // parent slot away and leaves its result in the same position. Net depth
-                    // change: zero. Control then fell straight through, nothing was registered
-                    // for bindingName, and the very next binding failed with "value not found
-                    // on stack" — a compile-time rejection of source that compiles at K=2 and
-                    // compiles without an `else`. The value IS on the stack; only its NAME was
-                    // wrong.
-                    //
-                    // Adopt it: rename the slot the arms rebound to the if's binding name. No
-                    // opcode is emitted — bookkeeping only, gated on bindingName actually being
-                    // referenced later, which is precisely the case that used to fail.
-                    sm.renameAtDepth(inPlaceDepth, bindingName);
-                }
                 // Otherwise a void if — don't push a phantom.
             }
 

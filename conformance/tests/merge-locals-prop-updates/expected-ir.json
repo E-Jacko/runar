@@ -285,6 +285,10 @@
               }
             ],
             "kind": "if",
+            "results": [
+              "na",
+              "nb"
+            ],
             "then": [
               {
                 "name": "t15",

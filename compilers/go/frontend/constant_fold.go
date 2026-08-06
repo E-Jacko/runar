@@ -512,6 +512,11 @@ func foldValue(value *ir.ANFValue, env *constEnv) *ir.ANFValue {
 			Cond: value.Cond,
 			Then: foldedThen,
 			Else: foldedElse,
+			// The declared result list survives folding untouched: folding an
+			// arm's bindings cannot change WHICH slots the arm leaves, and
+			// dropping the list would silently return the `if` to the
+			// single-result reconcile it was migrated off.
+			Results: value.Results,
 		}
 
 	case "loop":

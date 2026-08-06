@@ -29,7 +29,7 @@ require "runar_compiler/compiler"
 # Fixes: frontend/constant_fold.rb no longer blanks a statically-dead arm (that
 # erased the __merge$<i> result block both arms carry, so ONE stack slot was
 # registered for K physical results), and codegen/stack.rb's
-# branch_in_place_rebind_depth adopts the slot both arms rebound in place at k=1.
+# the multi-result branch node adopts the slot both arms rebound in place at k=1.
 #
 # The hexes are the SEVEN-TIER agreed output. Every tier pins the same strings,
 # which is what makes this a parity gate: a tier that lowers the fix differently
@@ -106,13 +106,13 @@ class TestBranchMergeDeadArmK1 < Minitest::Test
     "dead-arm-k2/fold-off" =>
       "00014e8f006351537a6e7b757b75676e547a7568527a75527a757ca1",
     "self-read-both-arms/fold-on" =>
-      "000340420f0340428f7b7ca069517b00a0638b678c680340420f0340428f7b7ca07777",
+      "000340420f0340428f7b7ca069517b00a06351787c9376776751787c94767768517a750340420f0340428f7b7ca07777",
     "self-read-both-arms/fold-off" =>
-      "000340420f8fa069517c00a0638b678c680340420f8fa0",
+      "000340420f8fa069517c00a06351787c9376776751787c94767768517a750340420f8fa0",
     "const-condition-k1/fold-on" =>
-      "000340420f0340428f7b7ca069515163526753680340420f0340428f7b7ca077777777",
+      "000340420f0340428f7b7ca0695151635276776753767768517a750340420f0340428f7b7ca0777777",
     "const-condition-k1/fold-off" =>
-      "000340420f8fa069515163526753680340420f8fa07777"
+      "000340420f8fa0695151635276776753767768517a750340420f8fa077"
   }.freeze
 
   def compile_script_hex(source, disable_constant_folding)

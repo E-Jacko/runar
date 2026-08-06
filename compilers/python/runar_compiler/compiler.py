@@ -966,6 +966,8 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["then"] = [_ser_binding(b) for b in v.then]
         if v.else_ is not None:
             d["else"] = [_ser_binding(b) for b in v.else_]
+        if v.results:
+            d["results"] = list(v.results)
         if v.count is not None:
             d["count"] = v.count
         if v.iter_var is not None:

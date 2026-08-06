@@ -24,7 +24,7 @@
 //! Fixes: passes/constant_fold.zig no longer blanks a statically-dead arm (that
 //! erased the __merge$<i> result block both arms carry, so ONE stack slot was
 //! registered for K physical results), and passes/stack_lower.zig's
-//! branchInPlaceRebindDepth adopts the slot both arms rebound in place at k=1.
+//! the multi-result branch node adopts the slot both arms rebound in place at k=1.
 //!
 //! The hexes are the SEVEN-TIER agreed output. Every tier pins the same
 //! strings, which is what makes this a parity gate: a tier that lowers the fix
@@ -126,25 +126,25 @@ const CASES = [_]Case{
         .label = "self-read-both-arms/fold-on",
         .source = SELF_READ_BOTH_ARMS,
         .disable_constant_folding = false,
-        .want = "000340420f0340428f7b7ca069517b00a0638b678c680340420f0340428f7b7ca07777",
+        .want = "000340420f0340428f7b7ca069517b00a06351787c9376776751787c94767768517a750340420f0340428f7b7ca07777",
     },
     .{
         .label = "self-read-both-arms/fold-off",
         .source = SELF_READ_BOTH_ARMS,
         .disable_constant_folding = true,
-        .want = "000340420f8fa069517c00a0638b678c680340420f8fa0",
+        .want = "000340420f8fa069517c00a06351787c9376776751787c94767768517a750340420f8fa0",
     },
     .{
         .label = "const-condition-k1/fold-on",
         .source = CONST_CONDITION_K1,
         .disable_constant_folding = false,
-        .want = "000340420f0340428f7b7ca069515163526753680340420f0340428f7b7ca077777777",
+        .want = "000340420f0340428f7b7ca0695151635276776753767768517a750340420f0340428f7b7ca0777777",
     },
     .{
         .label = "const-condition-k1/fold-off",
         .source = CONST_CONDITION_K1,
         .disable_constant_folding = true,
-        .want = "000340420f8fa069515163526753680340420f8fa07777",
+        .want = "000340420f8fa0695151635276776753767768517a750340420f8fa077",
     },
 };
 

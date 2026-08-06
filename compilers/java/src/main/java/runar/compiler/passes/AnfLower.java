@@ -964,14 +964,69 @@ public final class AnfLower {
                 }
             }
 
-            if (mergedLocals.size() >= 2) {
-                appendMergedLocalResults(thenCtx, mergedLocals);
+            // The `if`'s multi-result contract. Locals first, in the canonical
+            // merge order both arms agree on, then the properties either arm
+            // writes, in contract declaration order — so all seven tiers derive
+            // the same list from the same source. results[0] is the deepest
+            // slot of the block.
+            List<String> armProps = new ArrayList<>();
+            collectUpdatedProps(thenCtx.bindings, armProps);
+            collectUpdatedProps(elseCtx.bindings, armProps);
+            List<String> resultNames = new ArrayList<>(mergedLocals);
+            for (PropertyNode p : contract.properties()) {
+                if (armProps.contains(p.name())) {
+                    resultNames.add(p.name());
+                }
+            }
+
+            // When to materialise the contract instead of leaving the arms to
+            // the stack-lowerer's inference:
+            //
+            //   - two or more merged locals — the pre-existing normalisation.
+            //     Kept on exactly its old trigger so the four `__merge$`
+            //     goldens do not move.
+            //   - any result at all when the ELSE arm carries code. This is the
+            //     new case, and it is where every measured miscompile lives:
+            //     one arm rebinds its local IN PLACE (net depth 0) while the
+            //     other pushes a fresh slot (net +1), or an arm writes a
+            //     property beside a rebound local, or the two arms write the
+            //     same properties in a different order. The arms then leave
+            //     different LAYOUTS, which no depth or liveness predicate can
+            //     see.
+            //
+            // An `if` WITHOUT an else keeps the preserve-the-old-value path in
+            // `lowerIf` (phase 3 copies each missing slot's same-named parent
+            // value), which already produces exactly these results by
+            // construction — deliberately left intact. An arm that emits
+            // outputs is excluded: its single value is the serialised output
+            // bytes, and `branchOutputRejectionReason` above already refuses
+            // every combination that would need a second result.
+            //
+            // EXCLUDED: an `if` that liftBranchUpdateProps will rewrite. That
+            // pass (deep-review finding C20) turns a
+            // conditional-property-assignment chain into one flat
+            // single-valued `if` per property plus a top-level update_prop, so
+            // the surviving `if`s carry no property result and need no
+            // declaration. Appending the normalisation block first would ALSO
+            // silently disable that pass: its recogniser requires the arm's
+            // last binding to be the update_prop with everything before it
+            // side-effect free, and the block adds a second update_prop behind
+            // it. TicTacToe's position dispatch is exactly that shape, and
+            // losing the lift there produced an unspendable `move` script.
+            boolean declaresResults = !branchHasOutputs
+                && collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings) == null
+                && (mergedLocals.size() >= 2
+                    || (!resultNames.isEmpty() && !elseCtx.bindings.isEmpty()));
+
+            if (declaresResults) {
+                appendBranchResults(thenCtx, resultNames, armProps);
                 syncCounter(thenCtx);
-                appendMergedLocalResults(elseCtx, mergedLocals);
+                appendBranchResults(elseCtx, resultNames, armProps);
                 syncCounter(elseCtx);
             }
 
-            String ifName = emit(new If(condRef, thenCtx.bindings, elseCtx.bindings));
+            String ifName = emit(new If(condRef, thenCtx.bindings, elseCtx.bindings,
+                declaresResults ? List.copyOf(resultNames) : null));
 
             if (branchHasOutputs) {
                 // Register the if's value once with the parent's
@@ -998,10 +1053,10 @@ public final class AnfLower {
             // If both branches end by reassigning the same SINGLE local
             // variable, alias that variable to the if-expression result.
             //
-            // Skipped when the arms were normalised above: there the `if` has N
-            // results, not one, and each merged local keeps its OWN name
-            // through the reconcile in the stack lowerer.
-            if (mergedLocals.size() < 2
+            // Skipped when the arms were normalised above: there the `if`
+            // DECLARES its results, and each one keeps its OWN name through the
+            // reconcile in the stack lowerer.
+            if (!declaresResults
                 && !thenCtx.bindings.isEmpty() && !elseCtx.bindings.isEmpty()) {
                 AnfBinding thenLast = thenCtx.bindings.get(thenCtx.bindings.size() - 1);
                 AnfBinding elseLast = elseCtx.bindings.get(elseCtx.bindings.size() - 1);
@@ -1047,27 +1102,44 @@ public final class AnfLower {
         }
 
         /**
-         * Append the canonical merged-local result block to one arm of an
-         * if-statement: a copy of every merged local, in canonical order,
-         * rebound under the local's own name.
+         * Append the canonical result block to one arm of an if-statement: a
+         * copy of every declared result, in the declared order, rebound under
+         * its own name. This is what makes the {@code if} node's
+         * {@code results} contract true rather than hoped-for.
          *
          * <p>Two passes on purpose. Pass 1 always COPIES: {@code @ref:<local>}
          * resolves to the arm's own new value if it rebound one, else to the
-         * enclosing scope's value, and either way stack lowering picks (never
-         * rolls) it, because a local live after the {@code if} is
-         * outer-protected. Pass 2 always CONSUMES, because the temps are bound
-         * in this arm and this is their last use. The arm's stack effect is
-         * therefore exactly +K regardless of which of the K locals it
-         * reassigned.
+         * enclosing scope's value; for a PROPERTY, {@code load_prop} picks the
+         * arm's updated slot when the arm wrote it and otherwise the enclosing
+         * value. Either way stack lowering picks (never rolls) it, because a
+         * declared result is outer-protected. Pass 2 always CONSUMES, because
+         * the temps are bound in this arm and this is their last use. The arm's
+         * stack effect is therefore exactly +N regardless of which of the N
+         * results it assigned.
+         *
+         * <p>Semantically a no-op for the off-chain ANF interpreters: every
+         * binding is an ordinary read-then-write of a value the arm already
+         * holds.
          */
-        private void appendMergedLocalResults(LowerCtx branchCtx, List<String> mergedLocals) {
-            for (int i = 0; i < mergedLocals.size(); i++) {
-                branchCtx.emitNamed(AnfValue.MERGED_LOCAL_TEMP_PREFIX + i,
-                    makeLoadConstString("@ref:" + mergedLocals.get(i)));
+        private void appendBranchResults(LowerCtx branchCtx, List<String> resultNames,
+                                         List<String> props) {
+            for (int i = 0; i < resultNames.size(); i++) {
+                String name = resultNames.get(i);
+                String temp = AnfValue.MERGED_LOCAL_TEMP_PREFIX + i;
+                if (props.contains(name)) {
+                    branchCtx.emitNamed(temp, new LoadProp(name));
+                } else {
+                    branchCtx.emitNamed(temp, makeLoadConstString("@ref:" + name));
+                }
             }
-            for (int i = 0; i < mergedLocals.size(); i++) {
-                branchCtx.emitNamed(mergedLocals.get(i),
-                    makeLoadConstString("@ref:" + AnfValue.MERGED_LOCAL_TEMP_PREFIX + i));
+            for (int i = 0; i < resultNames.size(); i++) {
+                String name = resultNames.get(i);
+                String temp = AnfValue.MERGED_LOCAL_TEMP_PREFIX + i;
+                if (props.contains(name)) {
+                    branchCtx.emit(new UpdateProp(name, temp));
+                } else {
+                    branchCtx.emitNamed(name, makeLoadConstString("@ref:" + temp));
+                }
             }
         }
 
@@ -2308,7 +2380,7 @@ public final class AnfLower {
             return new MethodCall(mapOr(mc.object(), nameMap), mc.method(), args);
         }
         if (value instanceof If ifv) {
-            return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch());
+            return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch(), ifv.results());
         }
         if (value instanceof Loop lp) {
             return new Loop(lp.count(), lp.body(), lp.iterVar(), lp.start(), lp.step());

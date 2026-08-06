@@ -1,23 +1,10 @@
 /**
- * KNOWN-OPEN DEFECT — an `if` arm that BOTH writes a contract property AND
- * rebinds a merged local cannot be compiled correctly.
+ * An `if` arm that BOTH writes a contract property AND rebinds a merged local.
  *
  * ===========================================================================
- * STILL NOT FIXED. Three sub-shapes; the Layer C branch result-depth invariant
- * (2026-08-06) contains TWO of them in all seven tiers — they are now REFUSED
- * at compile time instead of emitting the unspendable script they used to
- * emit. That is containment, not a fix: the source is legal Rúnar and a
- * correct compiler would accept it.
- *
- * The THIRD sub-shape (case E below) is not contained: it still compiles, and
- * the script is still unspendable. See E's own comment for why no cheap
- * invariant separates it from the legitimate K=1 alias rebind.
- *
- * Whoever gives the ANF `if` node an explicit multi-result contract
- * (packages/runar-compiler/docs/multi-result-branch-node.md) must convert all
- * three cases below into real deploy→call→`Spend` assertions with the
- * hand-derived post-state — the expectations are recorded in each case so
- * nothing has to be re-derived.
+ * FIXED by the multi-result branch node. All three sub-shapes below now
+ * compile and spend, and each is asserted against the post-state hand-derived
+ * from the source — not against anything the compiler produced.
  * ===========================================================================
  *
  * Found 2026-08-06 while auditing the branch/loop "one carrier, N live values"
@@ -30,52 +17,46 @@
  * TS and Go compilers emitted byte-identical (equally wrong) hex for it, which
  * is the signature every member of this family has had.
  *
- * WHAT BREAKS. The arm produces TWO results — the updated property and the
- * rebound local — but only the LOCAL goes through 04-anf-lower's merged-local
- * normalisation (`appendMergedLocalResults` merges LOCALS; a property written
- * in an arm is a different result kind it does not cover). The two arities
- * then fail in two different ways, which is why the invariant needs both
- * halves:
+ * WHAT USED TO BREAK. The arm produced TWO results — the updated property and
+ * the rebound local — but only the LOCAL went through 04-anf-lower's
+ * merged-local normalisation (`appendMergedLocalResults` merged LOCALS; a
+ * property written in an arm was a different result kind it did not cover).
+ * The two arities then failed in two different ways:
  *
- *   K=1 (case D) — no `__merge$` block is appended at all, so the arms end at
- *   different depths with different layouts:
+ *   K=1 (case D) — no `__merge$` block was appended at all, so the arms ended
+ *   at different depths with different layouts:
  *
  *     then: [ ..., p(new), na(new) ]   +2
  *     else: [ ..., na(new) ]           +1
  *
- *   `lowerIf`'s phase-3 padding pads the else arm on the assumption that the
- *   MISSING slots are the topmost ones — but here the missing slot is `p`,
- *   which sits BENEATH `na`. ONE stackMap name ends up registered for TWO
- *   physical results. Caught by the depth half of the invariant.
+ *   `lowerIf`'s phase-3 padding padded the else arm on the assumption that the
+ *   MISSING slots were the topmost ones — but the missing slot was `p`, which
+ *   sits BENEATH `na`. ONE stackMap name ended up registered for TWO physical
+ *   results.
  *
- *   K>=2 (case A) — the `__merge$` block IS appended, and the merged-local
- *   trim then drops everything beneath the K results on the premise that it is
- *   dead. The arm's property write is beneath them and is NOT dead, so the
- *   write is silently discarded and the script serialises the STALE value of
- *   `p` while the interpreter serialises the new one. Depths stay consistent,
- *   so only the trim-premise half of the invariant can see this one.
+ *   K>=2 (case A) — the `__merge$` block WAS appended, and the merged-local
+ *   trim then dropped everything beneath the K results on the premise that it
+ *   was dead. The arm's property write sat beneath them and was NOT dead, so
+ *   the write was silently discarded and the script serialised the STALE value
+ *   of `p` while the interpreter serialised the new one.
  *
  *   K=1 with the property READ AGAIN after the `if` (case E) — the extra read
- *   reorders the arm's slots so the depths agree exactly and only the LAYOUT is
- *   wrong. Neither half of the invariant can see it, and it is still live.
+ *   reordered the arm's slots so the depths agreed exactly and only the LAYOUT
+ *   was wrong. Neither half of the Layer C invariant could see it, so it kept
+ *   compiling to an unspendable script after A and D had been contained.
  *
- * All three run to the end and leave a falsy top of stack, so `@bsv/sdk`'s
- * `Spend` rejects the spend outright — the funds are locked.
+ * All three ran to the end and left a falsy top of stack, so `@bsv/sdk`'s
+ * `Spend` rejected the spend outright — the funds were locked.
  *
- * WHY IT IS NOT PATCHED HERE. Every sibling in this family was closed with a
- * targeted predicate. This one cannot be: the padding loop's slot SELECTION is
- * what is wrong, not a liveness question, and correcting it means making an
- * arm's result set include property writes — i.e. giving the `if` node an
- * explicit multi-result contract. That is the design change assessed in
- * packages/runar-compiler/docs/multi-result-branch-node.md, and this defect is
- * the primary evidence in it.
- *
- * NOT REACHED BY ANY SHIPPED ARTIFACT. A 2026-08-06 structural sweep of every
- * `.runar.*` in the repo found ZERO methods with a property write and a local
- * rebind in the same `if` arm. `conformance/tests/cond-write-multi-field`
- * writes only properties in its arm (control C1 below, which passes), and
- * `conformance/tests/merge-locals-prop-updates` writes its properties AFTER
- * the `if` — which is also the workaround for anyone who hits the rejection.
+ * WHY THE FIX IS THE NODE AND NOT A PREDICATE. Every sibling in this family
+ * was closed with a targeted predicate. This one could not be: the padding
+ * loop's slot SELECTION was what was wrong, not a liveness question, and
+ * correcting it meant making an arm's result set include property writes —
+ * i.e. giving the `if` node an explicit multi-result contract. The `if` node
+ * now declares `results` (see `If.results` in
+ * packages/runar-compiler/src/ir/anf-ir.ts), both arms materialise exactly
+ * that set in exactly that order, and stack lowering adopts them by the
+ * declared order instead of inferring count, liveness or layout by name.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -142,27 +123,19 @@ const D = contract('D', `    let na: bigint = 1n;
   'this.p, na, this.b');
 
 /**
- * E: THE THIRD SUB-SHAPE, AND STILL SILENT.
+ * E: the third sub-shape, and the one that survived the Layer C invariant.
  *
  * Same ingredients as D — a property write beside a K=1 merged local — but the
  * property is READ AGAIN after the `if` (`this.p = 32n + this.p`). That extra
- * read changes the arm's slot ORDER: the arm leaves `[ ..., p(new), na(new) ]`
- * while the parent models `[ ..., na, <if> ]`. The DEPTHS agree exactly, so
- * neither half of the Layer C invariant fires — position 1 simply holds the
- * wrong value, and the parent still believes `p` lives at its old, stale slot.
+ * read changed the arm's slot ORDER: the arm left `[ ..., p(new), na(new) ]`
+ * while the parent modelled `[ ..., na, <if> ]`. The DEPTHS agreed exactly, so
+ * neither half of the invariant fired — position 1 simply held the wrong value
+ * and the parent still believed `p` lived at its old, stale slot. It compiled,
+ * and the script was UNSPENDABLE.
  *
- * It compiles, and the script is UNSPENDABLE (`Spend` rejects on a falsy top of
- * stack, exactly as A and D used to). Found 2026-08-06 while validating the
- * invariant against the fuzzer's `prop-write-in-arm` samples: some of them
- * compiled, and this is why.
- *
- * A LAYOUT invariant — "the parent stack model must equal the arms' model minus
- * the result slots" — does catch it, but it was measured against the full suite
- * and fires on 37 legitimate cases: the K=1 alias rebind deliberately moves the
- * local's slot to the top and repairs the naming afterwards, so parent and arm
- * layouts differ by design there. Stating the invariant precisely enough to
- * separate the two means re-deriving what the reconcile intended — which is the
- * multi-result branch node itself. So this one stays pinned, not guarded.
+ * With the declared result list the `if` carries `results: ["na", "p"]`, both
+ * arms materialise both slots in that order, and the parent adopts them by the
+ * declared order — there is no ordering left to infer.
  */
 const E = contract('E', `    let na: bigint = 7n;
     if (flag > 0n) { this.p = na * 2n; na = 5n; } else { na = x; }
@@ -179,49 +152,50 @@ const C2 = contract('C2', `    let na: bigint = 1n;
     if (flag > 0n) { na = x + 1n; } else { nb = x + 2n; }`,
   'this.p, na, nb');
 
-describe('KNOWN OPEN: property write beside a merged local in one if arm', () => {
+describe('property write beside a merged local in one if arm', () => {
   for (const disableConstantFolding of [true, false]) {
     const mode = disableConstantFolding ? 'fold-OFF' : 'fold-ON';
 
-    // REFUSED, not fixed. When the multi-result branch node lands, replace
-    // each of these with the `run(...)` spend assertion in the comment — the
-    // post-state is hand-derived from the source with x = 10, flag = 1
-    // (then-arm taken) and does not need re-deriving.
-    //
-    //   A: expect(await run(A, 'A.runar.ts', disableConstantFolding, 1n))
-    //        .toMatchObject({ p: 110n, a: 11n, b: 2n });
-    //   D: expect(await run(D, 'D.runar.ts', disableConstantFolding, 1n))
-    //        .toMatchObject({ p: 110n, a: 11n, b: 0n });
-    it(`${mode} A: prop write + K=2 merge — refused at compile time`, () => {
-      const r = compile(A, { fileName: 'A.runar.ts', disableConstantFolding });
-      expect(r.success).toBe(false);
-      expect(r.diagnostics.map((d) => d.message).join('\n')).toMatch(
-        /branch result depth mismatch/i,
-      );
+    // Each expectation is hand-derived from the source with x = 10, and does
+    // not come from the compiler. THEN-arm (flag = 1) and ELSE-arm (flag = 0)
+    // are both spent, because the defect was a property of the `if`, not of
+    // the arm the spender happened to take.
+
+    // A, then-arm: this.p = 10 + 100 = 110; na = 10 + 1 = 11; nb untouched = 2.
+    it(`${mode} A: prop write + K=2 merge, then-arm`, async () => {
+      expect(await run(A, 'A.runar.ts', disableConstantFolding, 1n))
+        .toMatchObject({ p: 110n, a: 11n, b: 2n });
     });
 
-    it(`${mode} D: prop write + K=1 merge — refused at compile time`, () => {
-      const r = compile(D, { fileName: 'D.runar.ts', disableConstantFolding });
-      expect(r.success).toBe(false);
-      expect(r.diagnostics.map((d) => d.message).join('\n')).toMatch(
-        /branch result depth mismatch/i,
-      );
+    // A, else-arm: nb = 10 + 2 = 12; na untouched = 1; this.p untouched = 0.
+    it(`${mode} A: prop write + K=2 merge, else-arm`, async () => {
+      expect(await run(A, 'A.runar.ts', disableConstantFolding, 0n))
+        .toMatchObject({ p: 0n, a: 1n, b: 12n });
     });
 
-    // NOTE: `A`'s else-arm used to be exercised here as the arm the defect does
-    // NOT touch (it carries one result and reconciles correctly). It cannot be
-    // any more: the rejection is a property of the `if`, not of the arm the
-    // spender happens to take, so the contract does not compile at all. Restore
-    // that case together with the two above when the node lands.
+    // D, then-arm: this.p = 110; na = 11; this.b untouched = 0.
+    it(`${mode} D: prop write + K=1 merge, then-arm`, async () => {
+      expect(await run(D, 'D.runar.ts', disableConstantFolding, 1n))
+        .toMatchObject({ p: 110n, a: 11n, b: 0n });
+    });
 
-    // E compiles — the invariant cannot see it — and the script it produces is
-    // unspendable. `it.fails` passes only while that is true, and goes RED the
-    // moment someone fixes it; convert it to a plain assertion then.
-    // Hand-derived with x = 10, flag = 1 (then-arm taken):
-    //   na starts 7 -> this.p = 14, na = 5; then this.p = 32 + 14 = 46.
-    it.fails(`${mode} E: prop write read again after the if — UNSPENDABLE`, async () => {
+    // D, else-arm: na = 10 + 2 = 12; this.p untouched = 0.
+    it(`${mode} D: prop write + K=1 merge, else-arm`, async () => {
+      expect(await run(D, 'D.runar.ts', disableConstantFolding, 0n))
+        .toMatchObject({ p: 0n, a: 12n, b: 0n });
+    });
+
+    // E, then-arm: na starts 7 -> this.p = 7 * 2 = 14, na = 5; then
+    // this.p = 32 + 14 = 46.
+    it(`${mode} E: prop write read again after the if, then-arm`, async () => {
       expect(await run(E, 'E.runar.ts', disableConstantFolding, 1n))
         .toMatchObject({ p: 46n, a: 5n, b: 0n });
+    });
+
+    // E, else-arm: na = x = 10, this.p untouched 0; then this.p = 32 + 0 = 32.
+    it(`${mode} E: prop write read again after the if, else-arm`, async () => {
+      expect(await run(E, 'E.runar.ts', disableConstantFolding, 0n))
+        .toMatchObject({ p: 32n, a: 10n, b: 0n });
     });
 
     it(`${mode} C1 (control): property write alone in the arm`, async () => {

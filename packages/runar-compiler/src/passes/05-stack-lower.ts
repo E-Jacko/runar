@@ -19,7 +19,6 @@ import type {
   StackMethod,
   StackOp,
 } from '../ir/index.js';
-import { MERGED_LOCAL_TEMP_PREFIX } from '../ir/index.js';
 import { UnknownANFKindError } from 'runar-ir-schema';
 import { emitVerifySLHDSA } from './slh-dsa-codegen.js';
 import { emitVerifyWOTS } from './wots-codegen.js';
@@ -273,51 +272,6 @@ class StackMap {
 // ---------------------------------------------------------------------------
 // Use analysis — determine last-use sites for each variable
 // ---------------------------------------------------------------------------
-
-/**
- * How many branch-merged locals an if-statement's two arms carry as results.
- *
- * 04-anf-lower's `appendMergedLocalResults` ends both arms with the same
- * K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
- * merged values sit on top in the same canonical order whichever branch runs.
- * Counting the trailing block is how stack lowering learns K: it must trim
- * each arm down to exactly those K slots before the N>=2 reconcile compares
- * the arms, since everything beneath them is the arm's own (dead, and
- * arm-specific) working values.
- *
- * Returns 0 unless BOTH arms end with a block of the same size — anything else
- * is not a normalised merge and must not be trimmed.
- */
-function countMergedLocalResults(thenBindings: ANFBinding[], elseBindings: ANFBinding[]): number {
-  const trailing = (bindings: ANFBinding[]): number => {
-    let n = 0;
-    for (let i = bindings.length - 1; i >= 0; i--) {
-      const value = bindings[i]!.value;
-      if (value.kind !== 'load_const' || typeof value.value !== 'string') break;
-      if (!value.value.startsWith(`@ref:${MERGED_LOCAL_TEMP_PREFIX}`)) break;
-      n++;
-    }
-    return n;
-  };
-  const thenCount = trailing(thenBindings);
-  return thenCount > 0 && thenCount === trailing(elseBindings) ? thenCount : 0;
-}
-
-/**
- * The names of the K branch-merged locals an if-statement's arms carry as
- * results, in the canonical order `appendMergedLocalResults` emitted them.
- *
- * Empty unless both arms carry a normalised block of the same size — the same
- * gate `countMergedLocalResults` applies.
- */
-function mergedLocalResultNames(
-  thenBindings: ANFBinding[],
-  elseBindings: ANFBinding[],
-): string[] {
-  const k = countMergedLocalResults(thenBindings, elseBindings);
-  if (k === 0) return [];
-  return thenBindings.slice(thenBindings.length - k).map(b => b.name);
-}
 
 function computeLastUses(bindings: ANFBinding[]): Map<string, number> {
   const lastUse = new Map<string, number>();
@@ -1231,7 +1185,7 @@ class LoweringContext {
         this.lowerAssert(binding.value.value, i, lastUses, true);
       } else if (binding.value.kind === 'if' && i === terminalIfIdx) {
         // Terminal if: propagate terminalAssert into both branches
-        this.lowerIf(binding.name, binding.value.cond, binding.value.then, binding.value.else, i, lastUses, true);
+        this.lowerIf(binding.name, binding.value.cond, binding.value.then, binding.value.else, binding.value.results ?? [], i, lastUses, true);
       } else {
         this.lowerBinding(binding, i, lastUses);
       }
@@ -1270,7 +1224,7 @@ class LoweringContext {
         this.lowerMethodCall(name, value.object, value.method, value.args, bindingIndex, lastUses);
         break;
       case 'if':
-        this.lowerIf(name, value.cond, value.then, value.else, bindingIndex, lastUses);
+        this.lowerIf(name, value.cond, value.then, value.else, value.results ?? [], bindingIndex, lastUses);
         break;
       case 'loop':
         this.lowerLoop(name, value.count, value.body, value.iterVar, value.start, value.step, bindingIndex, lastUses);
@@ -2135,64 +2089,18 @@ class LoweringContext {
     this.stackMap.pop();
   }
 
-  /**
-   * The stack depth of the ONE slot both arms of an `if` rebound in place, or
-   * `null` when the `if` does not have that shape.
-   *
-   * The shape: 04-anf-lower merged a SINGLE local across the arms, so instead
-   * of appending a `__merge$<i>` result block it aliased the local to the
-   * if-expression itself. Both arms then read that local and rebound it, which
-   * makes the arm ROLL the parent's slot away and leave its own result in the
-   * same position — the arms' net stack effect is zero, so none of the
-   * depth-growth cases in `lowerIf` fire and the if's value would go
-   * unregistered.
-   *
-   * Every condition below is required:
-   *   - no normalised K-merge block (that is the K>=2 path, which grows depth
-   *     by K and is adopted by name),
-   *   - both arms end on a binding of the SAME name, and that name is a local,
-   *     not a contract property (properties have their own reconcile),
-   *   - both arms, and the reconciled parent, hold that name at the same
-   *     depth — i.e. the slot really was rebound where it stood,
-   *   - both arms are at the parent's depth, so the slot is the only effect,
-   *   - `bindingName` is read after the `if`. Without a reader there is nothing
-   *     to repair and renaming would only lose a name; with one, the pre-fix
-   *     compiler threw `Value '<if>' not found on stack`. This is what makes
-   *     adopting the slot byte-neutral for every program that compiled before.
-   */
-  private branchInPlaceRebindDepth(
-    thenBindings: ANFBinding[],
-    elseBindings: ANFBinding[],
-    thenCtx: LoweringContext,
-    elseCtx: LoweringContext,
-    mergedResultCount: number,
-    bindingIsReadLater: boolean,
-  ): number | null {
-    if (!bindingIsReadLater) return null;
-    if (mergedResultCount !== 0) return null;
-    if (thenCtx.stackMap.depth !== this.stackMap.depth) return null;
-    if (elseCtx.stackMap.depth !== this.stackMap.depth) return null;
-
-    const thenLast = thenBindings[thenBindings.length - 1];
-    const elseLast = elseBindings[elseBindings.length - 1];
-    if (!thenLast || !elseLast || thenLast.name !== elseLast.name) return null;
-
-    const name = thenLast.name;
-    if (this._properties.some((p) => p.name === name)) return null;
-    if (!thenCtx.stackMap.has(name) || !elseCtx.stackMap.has(name)) return null;
-    if (!this.stackMap.has(name)) return null;
-
-    const depth = thenCtx.stackMap.findDepth(name);
-    if (elseCtx.stackMap.findDepth(name) !== depth) return null;
-    if (this.stackMap.findDepth(name) !== depth) return null;
-    return depth;
-  }
-
   private lowerIf(
     bindingName: string,
     cond: string,
     thenBindings: ANFBinding[],
     elseBindings: ANFBinding[],
+    /**
+     * The `if` node's declared result slots, deepest first (see `If.results`
+     * in ir/anf-ir.ts). Empty for an `if` that carries at most one result, and
+     * then every path below behaves exactly as it did before the multi-result
+     * contract existed.
+     */
+    results: string[],
     bindingIndex: number,
     lastUses: Map<string, number>,
     terminalAssert = false,
@@ -2239,7 +2147,11 @@ class LoweringContext {
     // Byte-neutral for every program whose merged locals were already live
     // after the `if`: those names are already in `protectedRefs` above, which
     // is precisely why those programs compiled correctly.
-    for (const name of mergedLocalResultNames(thenBindings, elseBindings)) {
+    //
+    // Now driven by the node's DECLARED results instead of by recognising a
+    // trailing `__merge$` block, so an arm-written property is protected on the
+    // same footing as a rebound local.
+    for (const name of results) {
       if (this.stackMap.has(name)) protectedRefs.add(name);
     }
 
@@ -2369,50 +2281,47 @@ class LoweringContext {
     // parent's raw depth instead would be wrong for any arm that consumed a
     // parent value (`na = bidAmount` rolls `bidAmount` away when the parent has
     // no later use for it), which is the shape the filed reproducer hits.
-    const mergedResultCount = countMergedLocalResults(thenBindings, elseBindings);
-    if (mergedResultCount >= 2) {
+    const nDeclared = results.length;
+    if (nDeclared >= 1) {
       const stillHeld = thenCtx.stackMap.namedSlots();
       let consumedFromParent = 0;
       for (const name of preIfNames) {
         if (!stillHeld.has(name) && this.stackMap.has(name)) consumedFromParent++;
       }
-      const targetDepth = this.stackMap.depth - consumedFromParent + mergedResultCount;
+      const targetDepth = this.stackMap.depth - consumedFromParent + nDeclared;
       for (const ctx of [thenCtx, elseCtx]) {
         while (ctx.stackMap.depth > targetDepth) {
-          // Layer C (second half) — check the trim's stated premise instead of
-          // assuming it.
-          //
-          // "Everything beneath the K results is dead" is true for merged
-          // LOCALS: `appendMergedLocalResults` copied each one into a
-          // `__merge$` temp before rebinding, so the slot underneath really is
-          // a spent working value. It is NOT true for a contract PROPERTY
-          // written inside the arm. `update_prop` in a branch leaves the new
-          // value as an extra slot named after the property (the old value is
-          // deliberately kept beneath for the same-property reconcile), and
-          // properties get no `__merge$` normalisation at all — merging is a
-          // locals-only transform. So the arm's property write sits beneath
-          // the K results and this loop would silently DROP it, leaving the
-          // stale pre-`if` value in place. The arms still end at equal depth
-          // and the parent stackMap still names the right slots, so neither
-          // Layer B nor the depth invariant below can see it — the only
-          // symptom is that the emitted script serialises the OLD property
-          // value while the interpreter serialises the new one, which fails
-          // the state-continuation hash check and locks the UTXO.
-          //
-          // Emits no opcodes; it only refuses to emit wrong ones.
-          const doomed = ctx.stackMap.peekAtDepth(mergedResultCount);
-          if (doomed !== null && this._properties.some((p) => p.name === doomed)) {
+          ctx.dropSlotAtDepth(nDeclared);
+        }
+      }
+
+      // The declared contract, checked rather than assumed: after the trim,
+      // each arm's top N slots must BE the declared results, in the declared
+      // order (`results[0]` deepest). `appendBranchResults` in 04-anf-lower is
+      // what makes this true; if it ever stops being true the arms disagree on
+      // layout, which is precisely the failure that produced the 2026-08
+      // miscompile family. Emits no opcodes.
+      for (const [label, ctx] of [['then', thenCtx], ['else', elseCtx]] as const) {
+        if (ctx.stackMap.depth !== targetDepth) {
+          throw new Error(
+            `Internal codegen error: branch result layout mismatch — the ${label}-arm ` +
+            `of the conditional ends at depth ${ctx.stackMap.depth}, but its ` +
+            `${nDeclared} declared result(s) require depth ${targetDepth}. ` +
+            `binding='${bindingName}'.`,
+          );
+        }
+        for (let i = 0; i < nDeclared; i++) {
+          const want = results[nDeclared - 1 - i]!;
+          const got = ctx.stackMap.peekAtDepth(i);
+          if (got !== want) {
             throw new Error(
-              `Internal codegen error: branch result depth mismatch — an arm of ` +
-              `the conditional writes contract property '${doomed}' AND rebinds ` +
-              `${mergedResultCount} branch-merged local(s), but only the locals are ` +
-              `carried as results. The property write sits beneath them and would ` +
-              `be discarded, so the script would serialise the stale value of ` +
-              `'${doomed}' and the state continuation would be unspendable. ` +
+              `Internal codegen error: branch result layout mismatch — the ${label}-arm ` +
+              `of the conditional holds '${got}' where the node declares ` +
+              `'${want}' (slot ${nDeclared - 1 - i} of [${results.join(', ')}]). ` +
+              `Every later operand would resolve to the wrong slot. ` +
               `binding='${bindingName}'.`,
             );
           }
-          ctx.dropSlotAtDepth(mergedResultCount);
         }
       }
     }
@@ -2527,16 +2436,41 @@ class LoweringContext {
         return tn !== null && tn === elseCtx.stackMap.peekAtDepth(i);
       });
 
-    // Depth of the slot both arms rebound in place, when that is the whole of
-    // the `if`'s stack effect (K=1 merged local, read and rebound by both
-    // arms). `null` in every other shape. See the branch that consumes it.
-    const inPlaceRebindDepth = this.branchInPlaceRebindDepth(
-      thenBindings, elseBindings, thenCtx, elseCtx, mergedResultCount,
-      lastUses.has(bindingName),
-    );
-
     // The if expression may produce a result value on top.
-    if (thenCtx.stackMap.depth > this.stackMap.depth &&
+    if (nDeclared >= 1) {
+      // DECLARED RESULTS. Both arms were normalised by `appendBranchResults`
+      // and the layout check above proved they hold exactly `results`, so the
+      // parent adopts them BY THE DECLARED ORDER — no counting of trailing
+      // `__merge$` bindings, no comparison of arm depths, no inference of which
+      // names are still live. `results[0]` is the deepest slot, matching the
+      // order pass 2 of the normalisation rebound them in.
+      //
+      // Then each parent slot that the block shadows (the pre-`if` binding of a
+      // merged local, the stale value of a written property) is physically
+      // rolled out from under the results, exactly as the pre-existing N>=2
+      // reconcile did — which is why the four `__merge$` goldens keep their
+      // bytes.
+      for (const name of results) {
+        this.stackMap.push(name);
+      }
+      for (let i = nDeclared - 1; i >= 0; i--) {
+        const name = results[i]!;
+        for (let d = nDeclared; d < this.stackMap.depth; d++) {
+          if (this.stackMap.peekAtDepth(d) === name) {
+            this.emitOp({ op: 'push', value: BigInt(d) });
+            this.stackMap.push(null);
+            this.emitOp({ op: 'roll', depth: d + 1 });
+            this.stackMap.pop();
+            const rolled = this.stackMap.removeAtDepth(d);
+            this.stackMap.push(rolled);
+            this.emitOp({ op: 'drop' });
+            this.stackMap.pop();
+            postEndifDrops++;
+            break;
+          }
+        }
+      }
+    } else if (thenCtx.stackMap.depth > this.stackMap.depth &&
         nResults >= 2 &&
         (elseBindings.length === 0 || elseMatchesThenNResultLayout)) {
       // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
@@ -2630,30 +2564,6 @@ class LoweringContext {
     } else if (elseCtx.stackMap.depth > this.stackMap.depth) {
       // The else-branch produced a value even though the then-branch didn't.
       this.stackMap.push(bindingName);
-    } else if (inPlaceRebindDepth !== null) {
-      // Single branch-merged local rebound IN PLACE by both arms.
-      //
-      // At K=1 04-anf-lower does not append a `__merge$<i>` result block; it
-      // ALIASES the local to the if-expression's binding name instead, so every
-      // post-branch read of the local names the `if` (`setLocalAlias`). That
-      // works when the arms PUSH their new value — depth grows by one and the
-      // `thenCtx.depth > this.depth` arm above registers `bindingName`.
-      //
-      // But when both arms READ the local and rebind it (`m0 = m0 + 1n`), the
-      // local is not live under its own name after the `if` (the alias moved
-      // every reader to the `if`), so it is not in `outerProtectedRefs` and
-      // each arm ROLLS the parent slot away and leaves its result in the same
-      // position. Net depth change: zero. Control then fell into the "void if"
-      // case below, nothing was registered for `bindingName`, and the very next
-      // binding failed with `Value '<if>' not found on stack` — a compile-time
-      // rejection of source that compiles at K=2 and compiles without an
-      // `else`. The value IS on the stack; only its NAME was wrong.
-      //
-      // Adopt it: rename the slot the arms rebound to the if's binding name.
-      // No opcode is emitted — this is bookkeeping only, and it is gated on
-      // `bindingName` actually being referenced later, which is precisely the
-      // case that used to throw.
-      this.stackMap.renameAtDepth(inPlaceRebindDepth, bindingName);
     } else {
       // Neither branch increased depth beyond the (post-reconciliation) parent
       // depth. This is a void if (e.g., both branches end with assert or both

@@ -465,7 +465,8 @@ public final class AnfOptimize {
                     continue;
                 }
                 // Both branches non-empty: keep the If, but with optimized children.
-                out.add(new AnfBinding(b.name(), new If(ifv.cond(), thenOpt, elsOpt), b.sourceLoc()));
+                out.add(new AnfBinding(b.name(),
+                    new If(ifv.cond(), thenOpt, elsOpt, ifv.results()), b.sourceLoc()));
                 continue;
             }
             if (b.value() instanceof Loop lp) {
@@ -558,7 +559,8 @@ public final class AnfOptimize {
         if (v instanceof If ifv) {
             return new If(resolve(ifv.cond(), rename),
                 renameInBody(orEmpty(ifv.thenBranch()), rename),
-                renameInBody(orEmpty(ifv.elseBranch()), rename));
+                renameInBody(orEmpty(ifv.elseBranch()), rename),
+                ifv.results());
         }
         if (v instanceof Loop lp) {
             return new Loop(lp.count(), renameInBody(orEmpty(lp.body()), rename), lp.iterVar(), lp.start(), lp.step());

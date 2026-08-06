@@ -469,59 +469,6 @@ func flattenNestedLoopBodies(body []ir.ANFBinding) []ir.ANFBinding {
 	return flat
 }
 
-// mergedLocalResultNames returns the names of the K branch-merged locals an
-// if-statement's arms carry as results, in the canonical order
-// appendMergedLocalResults emitted them.
-//
-// Empty unless both arms carry a normalised block of the same size — the same
-// gate countMergedLocalResults applies.
-func mergedLocalResultNames(thenBindings, elseBindings []ir.ANFBinding) []string {
-	k := countMergedLocalResults(thenBindings, elseBindings)
-	if k == 0 {
-		return nil
-	}
-	names := make([]string, 0, k)
-	for _, b := range thenBindings[len(thenBindings)-k:] {
-		names = append(names, b.Name)
-	}
-	return names
-}
-
-// countMergedLocalResults reports how many branch-merged locals an
-// if-statement's two arms carry as results.
-//
-// ANF lowering's appendMergedLocalResults ends both arms with the same
-// K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
-// merged values sit on top in the same canonical order whichever branch runs.
-// Counting the trailing block is how stack lowering learns K: it must trim
-// each arm down to exactly those K slots before the N>=2 reconcile compares
-// the arms, since everything beneath them is the arm's own (dead, and
-// arm-specific) working values.
-//
-// Returns 0 unless BOTH arms end with a block of the same size — anything else
-// is not a normalised merge and must not be trimmed.
-func countMergedLocalResults(thenBindings, elseBindings []ir.ANFBinding) int {
-	trailing := func(bindings []ir.ANFBinding) int {
-		n := 0
-		for i := len(bindings) - 1; i >= 0; i-- {
-			v := &bindings[i].Value
-			if v.Kind != "load_const" || v.ConstString == nil {
-				break
-			}
-			if !strings.HasPrefix(*v.ConstString, "@ref:"+ir.MergedLocalTempPrefix) {
-				break
-			}
-			n++
-		}
-		return n
-	}
-	thenCount := trailing(thenBindings)
-	if thenCount > 0 && thenCount == trailing(elseBindings) {
-		return thenCount
-	}
-	return 0
-}
-
 // dropSlotAtDepth physically removes the stack slot `depth` places below the
 // top.
 func (ctx *loweringContext) dropSlotAtDepth(depth int) {
@@ -1215,7 +1162,7 @@ func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding, terminalAsse
 			ctx.lowerAssert(binding.Value.ValueRef, i, lastUses, true)
 		} else if binding.Value.Kind == "if" && i == terminalIfIdx {
 			// Terminal if: propagate terminalAssert into both branches
-			ctx.lowerIf(binding.Name, binding.Value.Cond, binding.Value.Then, binding.Value.Else, i, lastUses, true)
+			ctx.lowerIf(binding.Name, binding.Value.Cond, binding.Value.Then, binding.Value.Else, binding.Value.Results, i, lastUses, true)
 		} else {
 			ctx.lowerBinding(&binding, i, lastUses)
 		}
@@ -1267,7 +1214,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "method_call":
 		ctx.lowerMethodCall(name, value.Object, value.Method, value.Args, bindingIndex, lastUses)
 	case "if":
-		ctx.lowerIf(name, value.Cond, value.Then, value.Else, bindingIndex, lastUses)
+		ctx.lowerIf(name, value.Cond, value.Then, value.Else, value.Results, bindingIndex, lastUses)
 	case "loop":
 		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, value.Start, value.Step, bindingIndex, lastUses)
 	case "assert":
@@ -1949,69 +1896,11 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 	}
 }
 
-// lastUsesHas reports whether any later binding references name.
-func lastUsesHas(lastUses map[string]int, name string) bool {
-	_, ok := lastUses[name]
-	return ok
-}
-
-// branchInPlaceRebindDepth returns the stack depth of the ONE slot both arms of
-// an `if` rebound in place, and whether the `if` has that shape at all.
-//
-// The shape: ANF lowering merged a SINGLE local across the arms, so instead of
-// appending a __merge$<i> result block it aliased the local to the
-// if-expression itself. Both arms then read that local and rebound it, which
-// makes the arm ROLL the parent's slot away and leave its own result in the
-// same position — the arms' net stack effect is zero, so none of the
-// depth-growth cases in lowerIf fire and the if's value would go unregistered.
-//
-// Every condition below is required:
-//   - no normalised K-merge block (that is the K>=2 path, which grows depth by
-//     K and is adopted by name),
-//   - both arms end on a binding of the SAME name, and that name is a local,
-//     not a contract property (properties have their own reconcile),
-//   - both arms, and the reconciled parent, hold that name at the same depth —
-//     i.e. the slot really was rebound where it stood,
-//   - both arms are at the parent's depth, so the slot is the only effect,
-//   - bindingName is read after the `if`. Without a reader there is nothing to
-//     repair and renaming would only lose a name; with one, the pre-fix
-//     compiler failed with "value not found on stack". This is what makes
-//     adopting the slot byte-neutral for every program that compiled before.
-func (ctx *loweringContext) branchInPlaceRebindDepth(
-	thenBindings, elseBindings []ir.ANFBinding,
-	thenCtx, elseCtx *loweringContext,
-	mergedResultCount int,
-	bindingIsReadLater bool,
-) (int, bool) {
-	if !bindingIsReadLater || mergedResultCount != 0 {
-		return 0, false
-	}
-	if thenCtx.sm.depth() != ctx.sm.depth() || elseCtx.sm.depth() != ctx.sm.depth() {
-		return 0, false
-	}
-	if len(thenBindings) == 0 || len(elseBindings) == 0 {
-		return 0, false
-	}
-	name := thenBindings[len(thenBindings)-1].Name
-	if name == "" || name != elseBindings[len(elseBindings)-1].Name {
-		return 0, false
-	}
-	for _, p := range ctx.properties {
-		if p.Name == name {
-			return 0, false
-		}
-	}
-	if !thenCtx.sm.has(name) || !elseCtx.sm.has(name) || !ctx.sm.has(name) {
-		return 0, false
-	}
-	depth := thenCtx.sm.findDepth(name)
-	if elseCtx.sm.findDepth(name) != depth || ctx.sm.findDepth(name) != depth {
-		return 0, false
-	}
-	return depth, true
-}
-
-func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
+// results is the `if` node's declared result slots, deepest first (see
+// ir.ANFValue.Results). Empty for an `if` that carries at most one result,
+// and then every path below behaves exactly as it did before the
+// multi-result contract existed.
+func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, results []string, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
 	ta := len(terminalAssert) > 0 && terminalAssert[0]
 
 	isLast := ctx.isLastUse(cond, bindingIndex, lastUses)
@@ -2053,7 +1942,11 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	// Byte-neutral for every program whose merged locals were already live
 	// after the if: those names are already protected above, which is precisely
 	// why those programs compiled correctly.
-	for _, name := range mergedLocalResultNames(thenBindings, elseBindings) {
+	//
+	// Now driven by the node's DECLARED results instead of by recognising a
+	// trailing __merge$ block, so an arm-written property is protected on the
+	// same footing as a rebound local.
+	for _, name := range results {
 		if ctx.sm.has(name) {
 			protectedRefs[name] = true
 		}
@@ -2176,21 +2069,21 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
-	// Branch-merged locals: trim each arm down to exactly its K result slots.
+	// Trim each arm down to exactly its declared result slots.
 	//
-	// ANF lowering ends both arms with an identical K-binding block that
-	// rebinds every merged local from a `__merge$<i>` temp (see
-	// appendMergedLocalResults). That block leaves the K live values on top in
-	// the same canonical order in both arms — but BENEATH them each arm still
-	// holds whatever its own body produced, and those differ per arm, which is
-	// exactly what the N>=2 reconcile further down compares. Everything
-	// beneath the K results is dead: the block copied each merged local before
-	// rebinding it, and a branch-local binding is not visible after the `if`.
+	// ANF lowering ends both arms with an identical N-binding block that
+	// rebinds every declared result from a `__merge$<i>` temp (see
+	// appendBranchResults). That block leaves the N live values on top in the
+	// same canonical order in both arms — but BENEATH them each arm still
+	// holds whatever its own body produced, and those differ per arm.
+	// Everything beneath the N results is dead: the block copied each result
+	// before rebinding it, and a branch-local binding is not visible after the
+	// `if`.
 	//
 	// Runs AFTER the phase-2 consumption drops, so both arms have given up the
 	// same parent slots and share one base depth.
-	mergedResultCount := countMergedLocalResults(thenBindings, elseBindings)
-	if mergedResultCount >= 2 {
+	nDeclared := len(results)
+	if nDeclared >= 1 {
 		stillHeld := thenCtx.sm.namedSlots()
 		consumedFromParent := 0
 		for name := range preIfNames {
@@ -2198,41 +2091,32 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 				consumedFromParent++
 			}
 		}
-		targetDepth := ctx.sm.depth() - consumedFromParent + mergedResultCount
+		targetDepth := ctx.sm.depth() - consumedFromParent + nDeclared
 		for _, armCtx := range []*loweringContext{thenCtx, elseCtx} {
 			for armCtx.sm.depth() > targetDepth {
-				// Layer C (second half) — check the trim's stated premise
-				// instead of assuming it.
-				//
-				// "Everything beneath the K results is dead" is true for merged
-				// LOCALS: appendMergedLocalResults copied each one into a
-				// __merge$ temp before rebinding, so the slot underneath really
-				// is a spent working value. It is NOT true for a contract
-				// PROPERTY written inside the arm. update_prop in a branch
-				// leaves the new value as an extra slot named after the property
-				// (the old value is deliberately kept beneath for the
-				// same-property reconcile), and properties get no __merge$
-				// normalisation at all — merging is a locals-only transform. So
-				// the arm's property write sits beneath the K results and this
-				// loop would silently DROP it, leaving the stale pre-`if` value
-				// in place. The arms still end at equal depth and the parent
-				// stackMap still names the right slots, so neither the
-				// branch-balance guard nor the depth invariant below can see it
-				// — the only symptom is that the emitted script serialises the
-				// OLD property value while the interpreter serialises the new
-				// one, which fails the state-continuation hash check and locks
-				// the UTXO.
-				//
-				// Emits no opcodes; it only refuses to emit wrong ones.
-				doomed := armCtx.sm.peekAtDepth(mergedResultCount)
-				if doomed != "" {
-					for _, p := range ctx.properties {
-						if p.Name == doomed {
-							panic(fmt.Sprintf("internal codegen error: branch result depth mismatch — an arm of the conditional writes contract property %q AND rebinds %d branch-merged local(s), but only the locals are carried as results; the property write sits beneath them and would be discarded, so the script would serialise the stale value of %q and the state continuation would be unspendable; binding=%q", doomed, mergedResultCount, doomed, bindingName))
-						}
-					}
+				armCtx.dropSlotAtDepth(nDeclared)
+			}
+		}
+
+		// The declared contract, checked rather than assumed: after the trim,
+		// each arm's top N slots must BE the declared results, in the declared
+		// order (results[0] deepest). appendBranchResults is what makes this
+		// true; if it ever stops being true the arms disagree on layout, which
+		// is precisely the failure that produced the 2026-08 miscompile family.
+		// Emits no opcodes.
+		for _, arm := range []struct {
+			label string
+			c     *loweringContext
+		}{{"then", thenCtx}, {"else", elseCtx}} {
+			if arm.c.sm.depth() != targetDepth {
+				panic(fmt.Sprintf("internal codegen error: branch result layout mismatch — the %s-arm of the conditional ends at depth %d, but its %d declared result(s) require depth %d; binding=%q", arm.label, arm.c.sm.depth(), nDeclared, targetDepth, bindingName))
+			}
+			for i := 0; i < nDeclared; i++ {
+				want := results[nDeclared-1-i]
+				got := arm.c.sm.peekAtDepth(i)
+				if got != want {
+					panic(fmt.Sprintf("internal codegen error: branch result layout mismatch — the %s-arm of the conditional holds %q where the node declares %q (slot %d of [%s]); every later operand would resolve to the wrong slot; binding=%q", arm.label, got, want, nDeclared-1-i, strings.Join(results, ", "), bindingName))
 				}
-				armCtx.dropSlotAtDepth(mergedResultCount)
 			}
 		}
 	}
@@ -2332,7 +2216,40 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 
 	// The if expression may produce a result value on top.
-	if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {
+	if nDeclared >= 1 {
+		// DECLARED RESULTS. Both arms were normalised by appendBranchResults
+		// and the layout check above proved they hold exactly `results`, so the
+		// parent adopts them BY THE DECLARED ORDER — no counting of trailing
+		// __merge$ bindings, no comparison of arm depths, no inference of which
+		// names are still live. results[0] is the deepest slot, matching the
+		// order pass 2 of the normalisation rebound them in.
+		//
+		// Then each parent slot the block shadows (the pre-`if` binding of a
+		// merged local, the stale value of a written property) is physically
+		// rolled out from under the results, exactly as the pre-existing N>=2
+		// reconcile did — which is why the four __merge$ goldens keep their
+		// bytes.
+		for _, name := range results {
+			ctx.sm.push(name)
+		}
+		for i := nDeclared - 1; i >= 0; i-- {
+			name := results[i]
+			for d := nDeclared; d < ctx.sm.depth(); d++ {
+				if ctx.sm.peekAtDepth(d) == name {
+					ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(d))})
+					ctx.sm.push("")
+					ctx.emitOp(StackOp{Op: "roll", Depth: d + 1})
+					ctx.sm.pop()
+					rolled := ctx.sm.removeAtDepth(d)
+					ctx.sm.push(rolled)
+					ctx.emitOp(StackOp{Op: "drop"})
+					ctx.sm.pop()
+					postEndifDrops++
+					break
+				}
+			}
+		}
+	} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {
 		// #99 Bug 1: a conditional write of N>=2 state fields leaves N result
 		// values on top (new values if taken, preserved old values if skipped).
 		// Record the N results in their on-stack order, then physically remove
@@ -2433,32 +2350,6 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	} else if elseCtx.sm.depth() > ctx.sm.depth() {
 		ctx.sm.push(bindingName)
-	} else if depth, ok := ctx.branchInPlaceRebindDepth(
-		thenBindings, elseBindings, thenCtx, elseCtx, mergedResultCount, lastUsesHas(lastUses, bindingName),
-	); ok {
-		// Single branch-merged local rebound IN PLACE by both arms.
-		//
-		// At K=1 ANF lowering does not append a __merge$<i> result block; it
-		// ALIASES the local to the if-expression's binding name instead, so
-		// every post-branch read of the local names the `if`. That works when
-		// the arms PUSH their new value — depth grows by one and the
-		// thenCtx.depth > ctx.depth arm above registers bindingName.
-		//
-		// But when both arms READ the local and rebind it (m0 = m0 + 1), the
-		// local is not live under its own name after the `if` (the alias moved
-		// every reader to the `if`), so it is not outer-protected and each arm
-		// ROLLS the parent slot away and leaves its result in the same
-		// position. Net depth change: zero. Control then fell into the "void
-		// if" case below, nothing was registered for bindingName, and the very
-		// next binding failed with "value not found on stack" — a compile-time
-		// rejection of source that compiles at K=2 and compiles without an
-		// else. The value IS on the stack; only its NAME was wrong.
-		//
-		// Adopt it: rename the slot the arms rebound to the if's binding name.
-		// No opcode is emitted — bookkeeping only, gated on bindingName
-		// actually being referenced later, which is precisely the case that
-		// used to fail.
-		ctx.sm.renameAtDepth(depth, bindingName)
 	} else {
 		// Void if — don't push phantom
 	}

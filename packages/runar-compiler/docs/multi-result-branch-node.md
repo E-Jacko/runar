@@ -1,7 +1,9 @@
 # Should the ANF `if` node yield multiple results?
 
-**Status: assessed 2026-08-06, NOT implemented. Recommendation: do it, but not
-as the next change — land the two cheap prerequisites first (§7).**
+**Status: IMPLEMENTED 2026-08-06 in all seven tiers. §1-§8 below are the
+assessment that preceded it and are kept as written; §9 records the containment
+attempt that came first; §10 records what actually landed and where this note's
+predictions were wrong.**
 
 This note sits beside the passes it concerns (`src/passes/04-anf-lower.ts`,
 `src/passes/05-stack-lower.ts`) rather than under `docs/`, because it is a
@@ -287,3 +289,77 @@ Java's `rebalanceDuplicate` returns its drop count).
 compile time. The source is legal Rúnar; a correct compiler accepts it. The
 workaround is the one `merge-locals-prop-updates` already uses — write the
 property AFTER the `if`.
+
+
+---
+
+## 10. What landed — 2026-08-06
+
+The node shipped in all seven tiers. `If` gained an optional ordered
+`results: string[]` (deepest slot first); 04-anf-lower computes it as
+**merged locals (canonical merge order) ++ arm-written properties (contract
+declaration order)** and appends a copy-then-rebind block to BOTH arms that
+materialises exactly that list in exactly that order; 05-stack-lower trims each
+arm to `results.length`, **asserts** the arms' top-N names equal `results`, and
+adopts them by the declared order. `countMergedLocalResults`,
+`mergedLocalResultNames` and `branchInPlaceRebindDepth` are deleted in every
+tier — the count, the layout and the K=1 in-place special case were all
+inference, and the node replaces all three with a declaration.
+
+**When the node engages.** `results` is emitted, and the arms normalised, when
+the `if` has no branch outputs, is not a `liftBranchUpdateProps` chain, and
+either merges >=2 locals (the pre-existing trigger, kept exactly so the four
+`__merge$` goldens keep their bytes) or has a **non-empty else arm** and at
+least one result. An `if` without an else keeps `lowerIf`'s
+preserve-the-old-value path, which already produces the declared results by
+construction — deliberately left intact, and measured correct across the whole
+arm-shape sweep.
+
+**What this note got wrong.**
+
+- **The defect set was much larger than §6 and §9 described.** A 25-cell K=1
+  arm-shape sweep (5 then-arm styles x 5 else-arm styles x both spender
+  branches x both fold modes) found **20 interpreter-vs-VM divergences at
+  HEAD**, every one a *guard bypass* (`interpreter=false vm=true`). All of them
+  are one shape: one arm rebinds its local IN PLACE (net depth 0) while the
+  other pushes a fresh slot (net +1), so phase 3 padded the shorter arm with an
+  EMPTY push and the parent registered that as the merged value. Defect #8 is
+  one cell of that grid, not a singular finding. A parallel stateful sweep found
+  six more broken shapes the note never named: two arms writing the same
+  properties in a DIFFERENT order, two arms writing DIFFERENT property sets, an
+  empty THEN arm with a non-empty else, and a local rebound in one arm beside a
+  property written in the other.
+- **§5's scorecard on P2 was too cautious.** `branchInPlaceRebindDepth` is fully
+  subsumed and deleted; so are `countMergedLocalResults` /
+  `mergedLocalResultNames` and the whole "recognise the trailing `__merge$`
+  block" convention as an *inference* (the block itself survives as the
+  materialisation mechanism, which is what keeps the ANF interpreters unchanged).
+- **§4's byte-movement estimate was pessimistic in one direction and blind in
+  another.** Only **2** script goldens move (`if-else` 14 -> 20,
+  `branched-readonly-len` 1086 -> 1096) and **6** ANF goldens (the four
+  `__merge$` fixtures gain the `results` field and nothing else). But §4 never
+  considered `liftBranchUpdateProps`: appending the normalisation block breaks
+  that pass's recogniser (it needs the arm's last binding to be the
+  `update_prop`, with everything before it side-effect free), which silently
+  disabled the C20 lift for TicTacToe's position dispatch and produced an
+  **unspendable `move` script**. The fix is to exclude liftable `if`s from
+  declaring results — they are rewritten into flat single-valued `if`s anyway —
+  and it is also why `selector` (985 bytes) and TicTacToe (9494 bytes) do NOT
+  move.
+- **§3's "the seven SDK ANF interpreters must change" is wrong.** They need no
+  change at all: the normalisation block is ordinary bindings (a read then a
+  write of a value the arm already holds), so every interpreter executes it
+  correctly without knowing `results` exists. What DOES need touching per tier,
+  beyond the four files in the CLAUDE.md checklist, is the **constant folder**
+  (every tier rebuilds the `if` node and must carry `results` through — four
+  tiers silently dropped it and diverged fold-ON until fixed) and, for two
+  tiers, the ANF **JSON codec**: Ruby's `--emit-ir` has an explicit field list
+  and Python's from-dict loader has explicit field handling, so both omitted
+  `results` and broke `--ir-parity` until listed.
+
+**What it still does not fix.** §5's P3/P4 verdict stands: `collectLoopCarriedRebinds`
+and `flattenNestedLoopBodies` are loop-carried liveness, not branch results, and
+are untouched. And an `if` whose arm emits outputs still refuses every
+combination that would need a second result (`branchOutputRejectionReason`) —
+lifting that is a separate change, because the output-bytes slot would have to
+join the result list and `drainBranchPrivateResidue` interacts with it.

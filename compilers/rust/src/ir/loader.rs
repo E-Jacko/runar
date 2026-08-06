@@ -673,6 +673,7 @@ mod tests {
                                 },
                                 source_loc: None,
                             }],
+                            results: Vec::new(),
                         },
                         source_loc: None,
                     },
@@ -703,7 +704,7 @@ mod tests {
         let loaded = load_ir_from_str(&json).expect("round-trip load should succeed");
 
         // Verify If survived
-        if let ANFValue::If { cond, then, else_branch } = &loaded.methods[0].body[1].value {
+        if let ANFValue::If { cond, then, else_branch, .. } = &loaded.methods[0].body[1].value {
             assert_eq!(cond, "_cond");
             assert_eq!(then.len(), 1);
             assert_eq!(else_branch.len(), 1);

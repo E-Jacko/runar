@@ -1,0 +1,38 @@
+{
+  "id": "2026-08-06-branch-k1-empty-pad-guard-bypass",
+  "title": "K=1 branch merge padded the shorter arm with an EMPTY push and registered it as the merged value — the script accepted a spend the source rejects",
+  "discovered": "2026-08-06",
+  "oracle": "execute",
+  "sourceFile": "contract.runar.ts",
+  "fileName": "contract.runar.ts",
+  "method": "method1",
+  "constructorArgs": {
+    "prop13": "18025n",
+    "prop34": false,
+    "prop94": false
+  },
+  "args": [
+    true
+  ],
+  "expect": {
+    "interpreterAccepted": false,
+    "vmAccepted": false
+  },
+  "requiredOpcodes": [
+    "OP_IF",
+    "OP_ELSE",
+    "OP_ENDIF",
+    "OP_ABS",
+    "OP_LESSTHAN"
+  ],
+  "provenance": {
+    "finding": "fuzz-findings-execute/2026-08-06T08-01-03-605Z-FuzzContract20-method1",
+    "seed": 1,
+    "contractIndex": 28,
+    "fixedBy": [
+      "multi-result branch `if` node (results declaration + arm normalisation, 7 tiers)"
+    ],
+    "note": "Recorded divergence was `interpreter=false vm=true`: a GUARD BYPASS, the direction that loses funds. The findings directory is checked in, so this entry is the reproducer verbatim, not a reconstruction."
+  },
+  "rationale": "`merge0 = abs(this.prop13)` is 18025; the then-arm rebinds it IN PLACE (`merge0 = abs(merge0)`, net stack depth 0) while the else-arm PUSHES a fresh slot (`merge0 = 43n`, net +1). At K=1 the ANF lowerer aliased the local to the `if` binding instead of appending a result block, so `lowerIf` had no declared result to reconcile: phase-3 balanced the arms by pushing EMPTY onto the shorter (then) arm, and the parent then registered that EMPTY slot as the `if`'s value. `assert(merge0 < 3204n)` therefore compared 0, not 18025, and the compiled script ACCEPTED a spend the source REJECTS. Emitted as `OP_ABS; PUSH <>` in the then-arm — visible in the checked-in lockingHex. With the multi-result branch node the `if` declares `results: [\"merge0\"]`, both arms materialise it, and the empty pad is gone: both engines now reject."
+}
