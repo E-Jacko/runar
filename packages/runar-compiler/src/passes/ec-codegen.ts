@@ -415,22 +415,60 @@ function affineAdd(t: ECTracker): void {
   // exactly once. rx = s^2 - px - qx and ry = s*(px - rx) - py are already
   // correct for doubling (px == qx makes the first s^2 - 2px).
   //
-  //   cond = (px == qx)                      1 when doubling, else 0
-  //   num  = cond ? 3*px^2 : (qy - py)
-  //   den  = cond ? 2*py   : (qx - px)
+  //   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+  //   num    = cond ? 3*px^2 : (qy - py)
+  //   den    = cond ? 2*py   : (qx - px)
   //
   // selected as `b + cond*(a - b)` over the field, which needs no branch and
   // so keeps the emitted op sequence — and the tracker's static stack model —
   // identical on both paths.
   //
-  // NOT handled: P == -Q (px == qx, py == -qy), whose true result is the point
-  // at infinity. secp256k1 affine coordinates cannot represent it, so this
-  // returns a garbage point exactly as it did before this fix. Callers that
-  // can hit that case must guard it themselves.
+  // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+  // sends it down the tangent path and returns 2P — an on-curve, entirely
+  // plausible, WRONG point. Before the doubling fix the chord path ran there,
+  // divided by zero (fieldInv is Fermat, inv(0) = 0) and produced an OFF-curve
+  // blob, so `assert(ecOnCurve(ecAdd(a, b)))` — the idiom this codegen tells
+  // authors to write — happened to reject it. Selecting on px alone would have
+  // silently disarmed that.
+  //
+  // P + (-P) is the point at infinity, which affine x||y cannot represent. This
+  // codegen already has a representation for O: the ALL-ZERO blob, which is
+  // what `ecMul(P, 0n)` returns and what the `ec-mulgen-linear` rewrite in
+  // optimizer/ec-rules.json produces for k1 + k2 ≡ 0 (mod n). So return that,
+  // by masking the result with `notinf = NOT(px == qx AND NOT cond)`:
+  //
+  //   - it agrees with the rewrite, so the same source cannot give two answers
+  //     depending on whether the optimizer fired;
+  //   - O is not on the curve (0^2 != 0^3 + 7), so the on-curve gate rejects it
+  //     and the idiom above works again;
+  //   - it adds no failure channel to what is a pure value-producing
+  //     expression, the same reason emitScalarReduce reduces instead of
+  //     rejecting.
+  //
+  // The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+  // and notinf is 0 or 1, so the product is canonical either way.
   t.copyToTop('px', '_px_eq');
   t.copyToTop('qx', '_qx_eq');
-  t.rawBlock(['_px_eq', '_qx_eq'], '_cond', (e) => {
+  t.rawBlock(['_px_eq', '_qx_eq'], '_xeq', (e) => {
     e({ op: 'opcode', code: 'OP_NUMEQUAL' });
+  });
+  t.copyToTop('py', '_py_eq');
+  t.copyToTop('qy', '_qy_eq');
+  t.rawBlock(['_py_eq', '_qy_eq'], '_yeq', (e) => {
+    e({ op: 'opcode', code: 'OP_NUMEQUAL' });
+  });
+  t.copyToTop('_xeq', '_xeq_c');
+  t.toTop('_yeq');
+  t.rawBlock(['_xeq_c', '_yeq'], '_cond', (e) => {
+    e({ op: 'opcode', code: 'OP_BOOLAND' });
+  });
+  // notinf = NOT(xeq - cond): xeq - cond is 1 exactly when px == qx and the
+  // points are not equal, i.e. exactly the P == -Q case.
+  t.toTop('_xeq');
+  t.copyToTop('_cond', '_cond_c');
+  t.rawBlock(['_xeq', '_cond_c'], '_notinf', (e) => {
+    e({ op: 'opcode', code: 'OP_SUB' });
+    e({ op: 'opcode', code: 'OP_NOT' });
   });
 
   // chord numerator / denominator
@@ -488,6 +526,18 @@ function affineAdd(t: ECTracker): void {
   t.toTop('py'); t.drop();
   t.toTop('qx'); t.drop();
   t.toTop('qy'); t.drop();
+
+  // P == -Q -> force the all-zero point (see the header comment).
+  t.toTop('rx');
+  t.copyToTop('_notinf', '_notinf_x');
+  t.rawBlock(['rx', '_notinf_x'], 'rx', (e) => {
+    e({ op: 'opcode', code: 'OP_MUL' });
+  });
+  t.toTop('ry');
+  t.toTop('_notinf');
+  t.rawBlock(['ry', '_notinf'], 'ry', (e) => {
+    e({ op: 'opcode', code: 'OP_MUL' });
+  });
 }
 
 // ===========================================================================
@@ -700,10 +750,25 @@ function selectCoord(t: ECTracker, addName: string, dblName: string, condName: s
  *              true result the point at infinity, which affine coordinates
  *              cannot represent; it stays the all-zero point, as before.
  *
- * At i ≥ 1, c_i lies in [(3n+1)>>i, (4n-1)>>i], which contains no value
- * ≡ 0, 1 or 2 (mod n) that is also odd — c_256 = 2 is even, so no add runs.
- * Handling H == 0 at every one of the 257 steps would cost ~62% more script
- * bytes; handling it here costs 0.24%.
+ * At i ≥ 1, c_i lies in [3n>>i, (4n-1)>>i] — the lower bound is 3n, not 3n+1,
+ * because the reduce puts k = 0 in the domain — and that interval contains no
+ * value ≡ 0, 1 or 2 (mod n) that is also odd; c_256 = 2 is even, so no add
+ * runs. Handling H == 0 at every one of the 257 steps would cost ~62% more
+ * script bytes; handling it here costs 0.24%.
+ *
+ * THE ENTIRE ARGUMENT IS CONDITIONED ON k ∈ [0, n-1], which is only true
+ * because emitEcMul reduces k mod n before adding 3n. That reduce landed one
+ * commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS
+ * UNSOUND: a last-step-only select while the scalar is still unbounded leaves
+ * c_i free to hit 0, 1 or 2 (mod n) at other steps. The two commits must land
+ * together and must never be bisected, cherry-picked or reverted apart.
+ *
+ * The interval argument does 100% of the work; there is no defence in depth
+ * here. In particular c_i ≡ 1 (mod n) — a pre-add accumulator of O — is
+ * UNREACHABLE, not handled: were it reachable the select would still take the
+ * ADD path, because O is carried as Z1 = 0, which makes U2 = 0 and
+ * H = -X1 != 0. Anything that changes the +3n offset, the iteration count or
+ * the reduce must redo the interval check, not assume this still holds.
  *
  * This is NOT a "no honest input hits it" argument: the operand P is caller-
  * supplied and cannot move the exception, because the condition depends only

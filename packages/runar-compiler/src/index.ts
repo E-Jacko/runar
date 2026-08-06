@@ -50,6 +50,10 @@ export {
   emitP256EncodeCompressed,
   emitP384Add, emitP384Mul, emitP384MulGen, emitP384Negate, emitP384OnCurve,
   emitP384EncodeCompressed,
+  // The ECDSA verifiers were the only EC emitters NOT exported here, and
+  // consequently the only ones no test had ever executed — which is how
+  // `decompressPubKey` shipped without a square-check on the recovered y.
+  emitVerifyECDSA_P256, emitVerifyECDSA_P384,
 } from './passes/p256-p384-codegen.js';
 export {
   emitCheckPreimageBinding,

@@ -392,20 +392,53 @@ def _c_affine_add(t: ECTracker, field_p: int, p_minus_2: int) -> None:
     selected and the single expensive _c_field_inv still runs exactly once.
     rx and ry below are already correct for doubling.
 
-      cond = (px == qx)
-      num  = cond ? 3*px^2 - 3 : (qy - py)
-      den  = cond ? 2*py       : (qx - px)
+      cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+      num    = cond ? 3*px^2 - 3 : (qy - py)
+      den    = cond ? 2*py       : (qx - px)
 
     selected as ``b + cond*(a - b)``, which needs no branch and keeps the
     emitted op sequence identical on both paths.
 
-    NOT handled: P == -Q, whose true result is the point at infinity, which
-    affine coordinates cannot represent.
+    THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+    sends it down the tangent path and returns 2P -- an on-curve, entirely
+    plausible, WRONG point, which is strictly worse than the pre-fix chord
+    path: that one divided by zero (_c_field_inv is Fermat, inv(0) = 0) and
+    produced an OFF-curve blob, so ``assert(pNNNOnCurve(pNNNAdd(a, b)))`` --
+    the idiom examples/ts/p384-primitives writes verbatim -- rejected it.
+
+    P + (-P) is the point at infinity, which affine x||y cannot represent. This
+    codegen already has a representation for O: the ALL-ZERO blob, which is what
+    ``pNNNMul(P, 0n)`` returns. So return that, by masking the result with
+    ``notinf = NOT(px == qx AND NOT cond)``. O is not on the curve (0^2 != b),
+    so the on-curve gate rejects it and the idiom works again; and it adds no
+    failure channel to a pure value-producing expression, the same reason
+    _c_emit_scalar_reduce reduces instead of rejecting.
+
+    The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+    and notinf is 0 or 1, so the product is canonical either way.
     """
     t.copy_to_top("px", "_px_eq")
     t.copy_to_top("qx", "_qx_eq")
-    t.raw_block(["_px_eq", "_qx_eq"], "_cond",
+    t.raw_block(["_px_eq", "_qx_eq"], "_xeq",
                 lambda e: e(_make_stack_op(op="opcode", code="OP_NUMEQUAL")))
+    t.copy_to_top("py", "_py_eq")
+    t.copy_to_top("qy", "_qy_eq")
+    t.raw_block(["_py_eq", "_qy_eq"], "_yeq",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_NUMEQUAL")))
+    t.copy_to_top("_xeq", "_xeq_c")
+    t.to_top("_yeq")
+    t.raw_block(["_xeq_c", "_yeq"], "_cond",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
+    # notinf = NOT(xeq - cond): 1 exactly when px == qx and the points differ.
+    t.to_top("_xeq")
+    t.copy_to_top("_cond", "_cond_c")
+
+    def _sub_not(e: Callable) -> None:
+        e(_make_stack_op(op="opcode", code="OP_SUB"))
+        e(_make_stack_op(op="opcode", code="OP_NOT"))
+
+    t.raw_block(["_xeq", "_cond_c"], "_notinf", _sub_not)
 
     # chord numerator / denominator
     t.copy_to_top("qy", "_qy1")
@@ -464,6 +497,16 @@ def _c_affine_add(t: ECTracker, field_p: int, p_minus_2: int) -> None:
     t.drop()
     t.to_top("qy")
     t.drop()
+
+    # P == -Q -> force the all-zero point (see the header comment).
+    t.to_top("rx")
+    t.copy_to_top("_notinf", "_notinf_x")
+    t.raw_block(["rx", "_notinf_x"], "rx",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_MUL")))
+    t.to_top("ry")
+    t.to_top("_notinf")
+    t.raw_block(["ry", "_notinf"], "ry",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_MUL")))
 
 
 # ===========================================================================
@@ -692,12 +735,30 @@ def _c_build_jacobian_add_or_double_inline(
                  true result the point at infinity, which affine coordinates
                  cannot represent; it stays the all-zero point, as before.
 
+    At i >= 1, c_i lies in [3n>>i, (4n-1)>>i] -- the lower bound is 3n, not
+    3n+1, because the reduce puts k = 0 in the domain.
+
     Handling H == 0 at every step would cost ~75% more script bytes -- on P-384
     that is another 600 KB; handling it here costs ~0.2%. The operand P is
     caller-supplied but cannot move the exception, because the condition depends
     only on c_i mod ord(P) and ord(P) = n for every point on these curves.
     Points that are NOT on the curve carry no such guarantee -- gate untrusted
-    input on p256OnCurve / p384OnCurve first.
+    input on p256OnCurve / p384OnCurve first. _c_decompress_pub_key now enforces
+    that itself for the one in-tree caller that takes a pubkey as input.
+
+    THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true
+    because _c_emit_mul reduces k mod n before adding 3n. That reduce landed one
+    commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS
+    UNSOUND: a last-step-only select while the scalar is still unbounded leaves
+    c_i free to hit 0, 1 or 2 (mod n) at other steps. The two commits must land
+    together and must never be bisected, cherry-picked or reverted apart.
+
+    The interval argument does 100% of the work; there is no defence in depth
+    here. In particular c_i == 1 (mod n) -- a pre-add accumulator of O -- is
+    UNREACHABLE, not handled: were it reachable the select would still take the
+    ADD path, because O is carried as Z1 = 0, which makes U2 = 0 and
+    H = -X1 != 0. Anything that changes the +3n offset, the iteration count or
+    the reduce must redo the interval check, not assume this still holds.
 
     Stack layout: [..., ax, ay, _k, jx, jy, jz] -- same in and out.
     """
@@ -882,6 +943,34 @@ def _c_decompress_pub_key(
     curve_b: int,
     sqrt_exp: int,
 ) -> None:
+    """Decompress a compressed pubkey: [prefix||x] -> (x_num, y_num, valid).
+
+    For P-256/P-384 where a = -3:
+      y^2 = x^3 - 3x + b mod p
+      y = (y^2)^((p+1)/4) mod p
+      Select y or p-y based on prefix parity.
+
+    ``(y^2)^((p+1)/4)`` is a square root ONLY when y^2 is a quadratic residue;
+    both primes are == 3 (mod 4), so for a non-residue it returns a square root
+    of -y^2 instead and the recovered point is NOT on the curve. Nor is x
+    checked against p: _c_decompose_point-style BIN2NUM accepts any
+    width-fitting value and every field op silently reduces it, so a
+    non-canonical x decompresses happily too.
+
+    Both matter because the only consumer is _c_emit_verify_ecdsa, which feeds
+    the result straight into _c_emit_mul. That ladder's exception analysis (see
+    _c_build_jacobian_add_or_double_inline) is stated for points ON the curve,
+    where cofactor 1 pins ord(P) = n; an off-curve point lands on the twist,
+    whose order is composite, so the degenerate steps the interval argument
+    rules out become reachable. The pubkey is a caller-supplied unlock argument.
+
+    So this emits a third output, ``_dk_valid`` = (x < p) AND
+    (y_cand^2 == y^2), which the caller ANDs into the verifier's boolean result.
+    A flag, not an OP_VERIFY: ``verifyECDSA_*`` is a total boolean-valued
+    builtin and turning attacker-chosen bytes into a script abort would be a
+    liveness regression -- the same argument _c_emit_scalar_reduce makes for
+    reducing rather than rejecting.
+    """
     t.to_top(pk_name)
 
     def _split_prefix(e: Callable) -> None:
@@ -926,7 +1015,11 @@ def _c_decompress_pub_key(
     t.push_big_int("_dk_b", curve_b)
     _c_field_add(t, "_dk_x3m3x", "_dk_b", "_dk_y2", field_p)
 
-    # y = (y^2)^sqrtExp mod p
+    # y = (y^2)^sqrtExp mod p. _c_field_pow CONSUMES its base, so keep a copy of
+    # y^2 for the residue check at the end. It has to sit BELOW _dk_y_cand: the
+    # parity select below is an OP_IF whose branches are a bare drop / nip, so
+    # nothing may come between _dk_y_cand and the negated candidate.
+    t.copy_to_top("_dk_y2", "_dk_y2_keep")
     _c_field_pow(t, "_dk_y2", sqrt_exp, "_dk_y_cand", field_p, p_minus_2)
 
     # Check parity
@@ -974,6 +1067,26 @@ def _c_decompress_pub_key(
         if t.nm[i] == "_dk_x_save":
             t.nm[i] = qx_name
             break
+
+    # valid = (qy^2 == y^2) AND (qx < p).
+    # The selected qy is y_cand or p - y_cand, so squaring it tests the same
+    # residue property either way. The first conjunct rejects an x whose RHS is
+    # a quadratic non-residue -- the recovered point is then off the curve; the
+    # second rejects a non-canonical encoding of an otherwise fine x.
+    t.copy_to_top(qy_name, "_dk_y_sq_in")
+    _c_field_sqr(t, "_dk_y_sq_in", "_dk_y_sq", field_p)
+    t.to_top("_dk_y_sq")
+    t.to_top("_dk_y2_keep")
+    t.raw_block(["_dk_y_sq", "_dk_y2_keep"], "_dk_res_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_NUMEQUAL")))
+    t.copy_to_top(qx_name, "_dk_x_lt")
+    _c_push_field_p(t, "_dk_p_lt", field_p)
+    t.raw_block(["_dk_x_lt", "_dk_p_lt"], "_dk_x_ok",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.to_top("_dk_res_ok")
+    t.to_top("_dk_x_ok")
+    t.raw_block(["_dk_res_ok", "_dk_x_ok"], "_dk_valid",
+                lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
 
 # ===========================================================================
@@ -1038,7 +1151,9 @@ def _c_emit_verify_ecdsa(
 
     t.raw_block(["_s_bytes"], "_s", _s_to_num)
 
-    # Step 3: Decompress pubkey
+    # Step 3: Decompress pubkey. Also yields ``_dk_valid``: 0 when the pubkey
+    # bytes do not decompress to a canonical on-curve point, which is ANDed into
+    # the result below so such a key can never verify.
     _c_decompress_pub_key(
         t, "_pk", "_qx", "_qy",
         coord_bytes, reverse_bytes_fn,
@@ -1062,7 +1177,10 @@ def _c_emit_verify_ecdsa(
     t.push_bytes("_G", g_point_data)
     t.to_top("_u1")
 
-    # Stash items on altstack
+    # Stash items on altstack.
+    # _dk_valid goes DEEPEST -- the altstack is LIFO and it is popped last.
+    t.to_top("_dk_valid")
+    t.to_alt()
     t.to_top("_r_save")
     t.to_alt()
     t.to_top("_u2")
@@ -1130,14 +1248,26 @@ def _c_emit_verify_ecdsa(
 
     _c_group_mod(t, "rx", "_rx_mod_n", curve_n)
 
+    # Restore r, then the decompression verdict beneath it
     t.from_alt("_r_save")
+    t.from_alt("_dk_valid")
 
     t.to_top("_rx_mod_n")
     t.to_top("_r_save")
     t.raw_block(
         ["_rx_mod_n", "_r_save"],
-        "_result",
+        "_sig_ok",
         lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")),
+    )
+
+    # A pubkey that did not decompress to a canonical on-curve point can never
+    # verify, whatever the ladder made of it.
+    t.to_top("_dk_valid")
+    t.to_top("_sig_ok")
+    t.raw_block(
+        ["_dk_valid", "_sig_ok"],
+        "_result",
+        lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")),
     )
 
 

@@ -166,7 +166,12 @@ fn test_emit_reverse_32_deterministic() {
 #[test]
 fn test_ec_add_op_count_golden() {
     let ops = collect(|s| emit_ec_add(s));
-    assert_eq!(count_op_tree(&ops), 8202, "ecAdd op count drift");
+    // 8202 -> 8223 (+21 ops / +21 bytes) over the pre-P==-Q-fix shape: the
+    // second OP_NUMEQUAL on y, the OP_BOOLAND that folds it into `cond`, the
+    // OP_SUB/OP_NOT that build `notinf`, the two OP_MULs that mask rx/ry, and
+    // the picks/rolls feeding them. All 1-byte ops, so the op count and the
+    // byte count move together.
+    assert_eq!(count_op_tree(&ops), 8223, "ecAdd op count drift");
 }
 
 #[test]

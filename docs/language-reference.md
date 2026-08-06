@@ -504,7 +504,7 @@ On-chain elliptic curve operations over the secp256k1 curve. These are synthesiz
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `ecAdd` | `(a: Point, b: Point) => Point` | Affine point addition |
+| `ecAdd` | `(a: Point, b: Point) => Point` | Affine point addition. `a + (-a)` is the point at infinity and evaluates to the **all-zero point** |
 | `ecMul` | `(p: Point, k: bigint) => Point` | Scalar multiplication (256-iteration double-and-add, Jacobian coordinates internally). `k` is reduced mod `n` first, so any scalar is accepted |
 | `ecMulGen` | `(k: bigint) => Point` | Scalar multiplication by the hardcoded generator point G |
 | `ecNegate` | `(p: Point) => Point` | Point negation: `(x, p - y)` |
@@ -542,6 +542,15 @@ These can be combined with bitwise OR (e.g., `SigHash.ALL | SigHash.FORKID` = `0
 > **Note on `ecMul` and `ecMulGen`:** These use a 256-iteration double-and-add loop with Jacobian coordinates internally for efficiency, converting back to affine at the end. Each call generates substantial Bitcoin Script (~50-100 KB). For scalar multiplication by the generator G, prefer `ecMulGen(k)` over `ecMul(EC_G, k)` as the generator point is hardcoded, avoiding the need to push 64 bytes of point data.
 
 > **Note on the scalar domain:** the scalar is reduced to `[0, n-1]` before the ladder, so `k >= n` behaves as `k mod n` and a negative `k` as `((k mod n) + n) mod n`. `k ≡ 0 (mod n)` is the point at infinity, which the affine `x‖y` encoding cannot represent — it evaluates to the **all-zero point**, and a contract taking an untrusted scalar must treat that result as a rejection. The same applies to `p256Mul` / `p384Mul` and their `*MulGen` forms.
+
+> **Note on the point at infinity (`O`):** `O` has no affine `x‖y` encoding, so every operation that would produce it returns the **all-zero point** instead, from a script that SUCCEEDS. Three inputs do this: `ecMul(P, 0n)`, `ecMulGen(0n)` (and any `k ≡ 0 mod n`), and `ecAdd(P, ecNegate(P))` (and any `ecAdd(P, Q)` with `P.x == Q.x` and `P.y != Q.y`). The return value alone does not distinguish `O` from a real point — **`ecOnCurve` is the detector**, and it returns `false` for the all-zero point on all three curves (`0² ≠ 0³ + b`). Any contract that adds or scales caller-supplied points must gate the RESULT:
+>
+> ```ts
+> const r = ecAdd(a, b);
+> assert(ecOnCurve(r));   // rejects O, and rejects an off-curve result
+> ```
+>
+> This is also why `ecAdd(P, -P)` returns `O` rather than the tangent's `2P`: the answer must agree with the `ec-mulgen-linear` optimizer rewrite, which turns `ecAdd(ecMulGen(k1), ecMulGen(k2))` with `k1 + k2 ≡ 0 (mod n)` into `ecMulGen(0)` — the all-zero point. The same source must not compile to two different answers depending on whether the optimizer fired.
 
 > **Note on `ecOnCurve` / `p256OnCurve` / `p384OnCurve`:** these also reject **non-canonical** coordinates (`x >= p` or `y >= p`). Coordinates decode as unsigned integers and the field arithmetic reduces mod `p`, so `(x + p)‖y` would otherwise be a second accepted encoding of the same point — and `ecAdd` / `pNNNAdd` detect doubling by comparing the *raw* x-coordinates, so two accepted encodings of one point take the chord path and return an off-curve result. Gate every untrusted `Point` on the on-curve check before doing arithmetic with it.
 

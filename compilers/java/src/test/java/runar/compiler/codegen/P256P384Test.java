@@ -33,12 +33,20 @@ class P256P384Test {
     // P-256
     // --------------------------------------------------------------
 
+    /**
+     * +21 ops / +21 bytes over the pre-P==-Q-fix shape — the same delta
+     * {@code ecAdd} and {@code p384Add} take, since all three share the affine-add
+     * structure: a second OP_NUMEQUAL on y, the OP_BOOLAND folding it into
+     * {@code cond}, OP_SUB/OP_NOT for {@code notinf}, two OP_MULs masking rx/ry,
+     * plus the picks/rolls feeding them. Every one of those is a 1-byte op, so the
+     * op count and the byte count move by the same amount.
+     */
     @Test
     void p256AddParity() {
         assertParity("p256Add",
             P256P384::emitP256Add,
-            6642, 19885,
-            "d7c5d987ba1b857ae5138c692cf199b4fe98489af91cc7aa84e122eb8a7acd81");
+            6663, 19906,
+            "589550be7906bc2326968d6d2efc48dad59702510b0fd881ea9ee81e5f2fc41e");
     }
 
     @Test
@@ -81,24 +89,49 @@ class P256P384Test {
             "a4481881396c90da361f987c4adc581125b09103bfb6bd11f3d5acc5be1635d1");
     }
 
+    /**
+     * +85 ops / +151 bytes for the {@code _dk_valid} pubkey-validity gate, which
+     * decomposes exactly:
+     *
+     * <ul>
+     *   <li><b>52 curve-independent ops</b> (1 byte each) — 21 for the affine-add
+     *       P == -Q mask (see {@link #p256AddParity()}), the rest for the residue +
+     *       canonicity check in {@code cDecompressPubKey}, its altstack stash, and
+     *       the closing OP_BOOLAND in {@code cEmitVerifyECDSA}. P-384 pays the same
+     *       52, which is what makes it curve-independent.</li>
+     *   <li><b>+1 op / +1 byte per set bit of the sqrt exponent</b> — 33 here, 287 on
+     *       P-384. {@code _dk_y2_keep} now sits under {@code _dk_y2} for the whole of
+     *       {@code cFieldPow}, so the loop's {@code copyToTop(base)} moves from depth
+     *       1 (OP_OVER) to depth 2 (OP_2 + OP_PICK). {@code (p+1)/4} has 34 set bits
+     *       on P-256 and 288 on P-384; the MSB is the loop's seed, not a step.</li>
+     *   <li><b>+66 bytes</b> beyond the op count — the two full-width pushes of p the
+     *       check adds (one inside {@code cFieldSqr}'s reduce, one for the
+     *       OP_LESSTHAN). p is 32 bytes, so each push is 34 bytes on the wire against
+     *       the 1 byte the op count sees: 33 extra x2. On P-384 p is 48 bytes, so it
+     *       is 49 extra x2 = 98.</li>
+     * </ul>
+     *
+     * 52 + 33 = 85 ops, 85 + 66 = 151 bytes. Both match the TypeScript reference.
+     */
     @Test
     void verifyEcdsaP256Parity() {
         assertParity("verifyECDSA_P256",
             P256P384::emitVerifyECDSA_P256,
-            297188, 973648,
-            "fe6de26a521351ca374521aeb8d741cc87f2ef1870888c5f306015e9ce716642");
+            297273, 973799,
+            "e7601f63c10703b41a5f05d8e691f8593444200590c49b99038bc52bd3a69094");
     }
 
     // --------------------------------------------------------------
     // P-384
     // --------------------------------------------------------------
 
+    /** Same +21 op / +21 byte affine-add delta as {@code p256Add} — see there. */
     @Test
     void p384AddParity() {
         assertParity("p384Add",
             P256P384::emitP384Add,
-            11448, 46689,
-            "e4a7b0993055924a891d69401784b9ba416f26370bb57d3e4b802cfc4bc75f84");
+            11469, 46710,
+            "744c9376b1c89f0152ff83c0a0ad8940b1b963e489f4e95ecbf3582057c4266c");
     }
 
     @Test
@@ -141,12 +174,18 @@ class P256P384Test {
             "e32d98f40a17d26f70ce433663a01e3c476073419ab6109964d00cfbb57d6eae");
     }
 
+    /**
+     * +339 ops / +437 bytes for the same {@code _dk_valid} gate as
+     * {@link #verifyEcdsaP256Parity()}: 52 + 287 = 339 ops, 339 + 2*49 = 437 bytes.
+     * The 254-op gap to P-256 is exactly the gap in set-bit counts of {@code (p+1)/4}
+     * (287 vs 33) — see there for the full decomposition.
+     */
     @Test
     void verifyEcdsaP384Parity() {
         assertParity("verifyECDSA_P384",
             P256P384::emitVerifyECDSA_P384,
-            452910, 1986651,
-            "b5797efd8692bf9d8ae28e4d0dc1a89a590f5ed43087d83cf550d207807d243c");
+            453249, 1987088,
+            "d3398be003e870e7ab41012dc945cc07003099b0f0bc04f25b1a9268bbec1f02");
     }
 
     // --------------------------------------------------------------

@@ -98,8 +98,13 @@ def ec_point_y(p: bytes) -> int:
 def ec_on_curve(p: bytes) -> bool:
     """Check if point is on secp256k1 curve."""
     x, y = _decode_point(p)
-    if x == 0 and y == 0:
-        return True  # Point at infinity
+    # The all-zero blob is this codegen's encoding of the point at infinity,
+    # and it is NOT on the curve: the emitted ecOnCurve is exactly
+    # x < p AND y < p AND y^2 == x^3 + 7, and 0 != 7. Returning True here
+    # (the projective convention) made this mock disagree with the script it
+    # stands in for, so `assert(ec_on_curve(r))` passed off-chain and failed
+    # on-chain for r = O -- an unspendable output found only after deploy.
+    # O is now reachable from ec_add(P, -P), so this matters in practice.
     lhs = (y * y) % EC_P
     rhs = (x * x * x + 7) % EC_P
     return lhs == rhs

@@ -50,7 +50,7 @@ def _count_op_tree(ops: list[StackOp]) -> int:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("ecAdd",              emit_ec_add,               8202),
+    ("ecAdd",              emit_ec_add,               8223),
     ("ecMul",              emit_ec_mul,             130515),
     ("ecMulGen",           emit_ec_mul_gen,         130517),
     ("ecNegate",           emit_ec_negate,             945),

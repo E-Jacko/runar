@@ -1753,6 +1753,14 @@ function ecPointAddCoords(
   x1: bigint, y1: bigint, x2: bigint, y2: bigint,
 ): [bigint, bigint] {
   const p = EC_P;
+  // P + (-P) = O. Affine x||y cannot encode O, so both this interpreter and
+  // `affineAdd` in ec-codegen.ts represent it as the ALL-ZERO point — the same
+  // encoding `ecMul(P, 0n)` already yields. The two MUST agree: the differential
+  // oracle in conformance/witnesses/real-crypto-execution.test.ts asserts
+  // `interpreterAccepted === vmAccepted`, so a divergence here is a conformance
+  // failure, and "make the interpreter match the script" would be the wrong
+  // repair if the script were the one that had drifted.
+  if (x1 === x2 && y1 !== y2) return [0n, 0n];
   if (x1 === x2 && y1 === y2) {
     // Point doubling
     const s = ecMod(3n * x1 * x1 * ecModInv(2n * y1, p), p);
@@ -1933,6 +1941,9 @@ function nistPointAddCoords(
   c: NistCurve, x1: bigint, y1: bigint, x2: bigint, y2: bigint,
 ): [bigint, bigint] {
   const p = c.p;
+  // See ecPointAddCoords: P + (-P) = O, encoded as the all-zero point, exactly
+  // as cAffineAdd in p256-p384-codegen.ts does.
+  if (x1 === x2 && y1 !== y2) return [0n, 0n];
   const s = (x1 === x2 && y1 === y2)
     ? ecMod((3n * x1 * x1 - 3n) * ecModInv(2n * y1, p), p)   // tangent, a = -3
     : ecMod((y2 - y1) * ecModInv(x2 - x1, p), p);            // chord

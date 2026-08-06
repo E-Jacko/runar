@@ -420,10 +420,56 @@ public final class P256P384 {
     }
 
     private static void cAffineAdd(ECTracker t, BigInteger fieldP, BigInteger pMinus2) {
+        // The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+        // denominator is zero and the correct slope is the TANGENT,
+        // (3px^2 - 3) / (2py). Both cases are the same shape, `s = num / den`, so
+        // only the NUMERATOR and DENOMINATOR are selected; the single expensive
+        // cFieldInv still runs once.
+        //
+        //   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+        //   num    = cond ? 3*px^2 - 3 : (qy - py)
+        //   den    = cond ? 2*py       : (qx - px)
+        //
+        // selected as `b + cond*(a - b)` over the field, which needs no branch and
+        // so keeps the emitted op sequence — and the tracker's static stack model —
+        // identical on both paths.
+        //
+        // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+        // sends it down the tangent path and returns 2P — an on-curve, entirely
+        // plausible, WRONG point, which is strictly worse than the pre-fix chord
+        // path: that one divided by zero (cFieldInv is Fermat, inv(0) = 0) and
+        // produced an OFF-curve blob, so `assert(pNNNOnCurve(pNNNAdd(a, b)))` — the
+        // idiom examples/ts/p384-primitives writes verbatim — rejected it.
+        //
+        // P + (-P) is the point at infinity, which affine x||y cannot represent.
+        // This codegen already has a representation for O: the ALL-ZERO blob, which
+        // is what `pNNNMul(P, 0n)` returns. So return that, by masking the result
+        // with `notinf = NOT(px == qx AND NOT cond)`. O is not on the curve
+        // (0^2 != b), so the on-curve gate rejects it and the idiom works again; and
+        // it adds no failure channel to a pure value-producing expression, the same
+        // reason cEmitScalarReduce reduces instead of rejecting.
+        //
+        // The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+        // and notinf is 0 or 1, so the product is canonical either way.
         t.copyToTop("px", "_px_eq");
         t.copyToTop("qx", "_qx_eq");
-        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_cond",
+        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_xeq",
                 e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("py", "_py_eq");
+        t.copyToTop("qy", "_qy_eq");
+        t.rawBlock(List.of("_py_eq", "_qy_eq"), "_yeq",
+                e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("_xeq", "_xeq_c");
+        t.toTop("_yeq");
+        t.rawBlock(List.of("_xeq_c", "_yeq"), "_cond",
+                e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        // notinf = NOT(xeq - cond): 1 exactly when px == qx and the points differ.
+        t.toTop("_xeq");
+        t.copyToTop("_cond", "_cond_c");
+        t.rawBlock(List.of("_xeq", "_cond_c"), "_notinf", e -> {
+            e.accept(new OpcodeOp("OP_SUB"));
+            e.accept(new OpcodeOp("OP_NOT"));
+        });
 
         // chord numerator / denominator
         t.copyToTop("qy", "_qy1");
@@ -482,6 +528,16 @@ public final class P256P384 {
         t.toTop("py"); t.drop();
         t.toTop("qx"); t.drop();
         t.toTop("qy"); t.drop();
+
+        // P == -Q -> force the all-zero point (see the header comment).
+        t.toTop("rx");
+        t.copyToTop("_notinf", "_notinf_x");
+        t.rawBlock(List.of("rx", "_notinf_x"), "rx",
+                e -> e.accept(new OpcodeOp("OP_MUL")));
+        t.toTop("ry");
+        t.toTop("_notinf");
+        t.rawBlock(List.of("ry", "_notinf"), "ry",
+                e -> e.accept(new OpcodeOp("OP_MUL")));
     }
 
     // ===================================================================
@@ -690,12 +746,30 @@ public final class P256P384 {
      *              cannot represent; it stays the all-zero point, as before.
      * </pre>
      *
+     * <p>At i &gt;= 1, c_i lies in [3n&gt;&gt;i, (4n-1)&gt;&gt;i] — the lower bound is 3n,
+     * not 3n+1, because the reduce puts k = 0 in the domain.
+     *
      * <p>Handling H == 0 at every step would cost ~75% more script bytes — on P-384 that
      * is another 600 KB; handling it here costs ~0.2%. The operand P is caller-supplied
      * but cannot move the exception, because the condition depends only on
      * c_i mod ord(P) and ord(P) = n for every point on these curves. Points that are NOT
      * on the curve carry no such guarantee — gate untrusted input on
-     * {@code p256OnCurve} / {@code p384OnCurve} first.
+     * {@code p256OnCurve} / {@code p384OnCurve} first. {@code cDecompressPubKey} now
+     * enforces that itself for the one in-tree caller that takes a pubkey as input.
+     *
+     * <p>THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true because
+     * {@code cEmitMul} reduces k mod n before adding 3n. That reduce landed one commit
+     * AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS UNSOUND: a
+     * last-step-only select while the scalar is still unbounded leaves c_i free to hit
+     * 0, 1 or 2 (mod n) at other steps. The two commits must land together and must never
+     * be bisected, cherry-picked or reverted apart.
+     *
+     * <p>The interval argument does 100% of the work; there is no defence in depth here.
+     * In particular c_i == 1 (mod n) — a pre-add accumulator of O — is UNREACHABLE, not
+     * handled: were it reachable the select would still take the ADD path, because O is
+     * carried as Z1 = 0, which makes U2 = 0 and H = -X1 != 0. Anything that changes the
+     * +3n offset, the iteration count or the reduce must redo the interval check, not
+     * assume this still holds.
      *
      * <p>Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
      */
@@ -858,6 +932,36 @@ public final class P256P384 {
     // Pubkey decompression (prefix byte + x → (x, y))
     // ===================================================================
 
+    /**
+     * Decompress a compressed pubkey: [prefix||x] → (x_num, y_num, valid).
+     *
+     * <p>For P-256/P-384 where a = -3:
+     * <pre>
+     *   y^2 = x^3 - 3x + b mod p
+     *   y   = (y^2)^((p+1)/4) mod p
+     * </pre>
+     * then select y or p-y based on prefix parity.
+     *
+     * <p>{@code (y^2)^((p+1)/4)} is a square root ONLY when y^2 is a quadratic
+     * residue; both primes are == 3 (mod 4), so for a non-residue it returns a square
+     * root of -y^2 instead and the recovered point is NOT on the curve. Nor is x
+     * checked against p: the BIN2NUM decode accepts any width-fitting value and every
+     * field op silently reduces it, so a non-canonical x decompresses happily too.
+     *
+     * <p>Both matter because the only consumer is {@code cEmitVerifyECDSA}, which feeds
+     * the result straight into {@code cEmitMul}. That ladder's exception analysis (see
+     * {@code cBuildJacobianAddOrDoubleInline}) is stated for points ON the curve, where
+     * cofactor 1 pins ord(P) = n; an off-curve point lands on the twist, whose order is
+     * composite, so the degenerate steps the interval argument rules out become
+     * reachable. The pubkey is a caller-supplied unlock argument.
+     *
+     * <p>So this emits a third output, {@code _dk_valid} = (x &lt; p) AND
+     * (y_cand^2 == y^2), which the caller ANDs into the verifier's boolean result. A
+     * flag, not an OP_VERIFY: {@code verifyECDSA_*} is a total boolean-valued builtin
+     * and turning attacker-chosen bytes into a script abort would be a liveness
+     * regression — the same argument {@code cEmitScalarReduce} makes for reducing
+     * rather than rejecting.
+     */
     private static void cDecompressPubKey(ECTracker t, String pkName, String qxName,
                                            String qyName, int coordBytes,
                                            ReverseBytesFn revFn, BigInteger fieldP,
@@ -907,7 +1011,11 @@ public final class P256P384 {
         t.pushBigInt("_dk_b", curveB);
         cFieldAdd(t, "_dk_x3m3x", "_dk_b", "_dk_y2", fieldP);
 
-        // y = (y^2)^sqrtExp mod p
+        // y = (y^2)^sqrtExp mod p. cFieldPow CONSUMES its base, so keep a copy of
+        // y^2 for the residue check at the end. It has to sit BELOW _dk_y_cand: the
+        // parity select below is an OP_IF whose branches are a bare drop / nip, so
+        // nothing may come between _dk_y_cand and the negated candidate.
+        t.copyToTop("_dk_y2", "_dk_y2_keep");
         cFieldPow(t, "_dk_y2", sqrtExp, "_dk_y_cand", fieldP, pMinus2);
 
         // Check candidate y parity
@@ -962,6 +1070,26 @@ public final class P256P384 {
                 break;
             }
         }
+
+        // valid = (qy^2 == y^2) AND (qx < p).
+        // The selected qy is y_cand or p - y_cand, so squaring it tests the same
+        // residue property either way. The first conjunct rejects an x whose RHS is
+        // a quadratic non-residue — the recovered point is then off the curve; the
+        // second rejects a non-canonical encoding of an otherwise fine x.
+        t.copyToTop(qyName, "_dk_y_sq_in");
+        cFieldSqr(t, "_dk_y_sq_in", "_dk_y_sq", fieldP);
+        t.toTop("_dk_y_sq");
+        t.toTop("_dk_y2_keep");
+        t.rawBlock(List.of("_dk_y_sq", "_dk_y2_keep"), "_dk_res_ok",
+            e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop(qxName, "_dk_x_lt");
+        cPushFieldP(t, "_dk_p_lt", fieldP);
+        t.rawBlock(List.of("_dk_x_lt", "_dk_p_lt"), "_dk_x_ok",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.toTop("_dk_res_ok");
+        t.toTop("_dk_x_ok");
+        t.rawBlock(List.of("_dk_res_ok", "_dk_x_ok"), "_dk_valid",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     // ===================================================================
@@ -1012,7 +1140,9 @@ public final class P256P384 {
             e.accept(new OpcodeOp("OP_BIN2NUM"));
         });
 
-        // Step 3: Decompress pubkey
+        // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
+        // bytes do not decompress to a canonical on-curve point, which is ANDed into
+        // the result below so such a key can never verify.
         cDecompressPubKey(t, "_pk", "_qx", "_qy",
             coordBytes, revFn, fieldP, pMinus2, curveB, sqrtExp);
 
@@ -1035,7 +1165,9 @@ public final class P256P384 {
         t.pushBytes("_G", gPointData);
         t.toTop("_u1");
 
-        // Stash items on altstack
+        // Stash items on altstack. _dk_valid goes DEEPEST — the altstack is LIFO
+        // and it is popped last.
+        t.toTop("_dk_valid"); t.toAlt();
         t.toTop("_r_save"); t.toAlt();
         t.toTop("_u2");     t.toAlt();
         t.toTop("_qy");     t.toAlt();
@@ -1100,14 +1232,22 @@ public final class P256P384 {
 
         cGroupMod(t, "rx", "_rx_mod_n", curveN);
 
-        // Restore r
+        // Restore r, then the decompression verdict beneath it
         t.fromAlt("_r_save");
+        t.fromAlt("_dk_valid");
 
         // Compare
         t.toTop("_rx_mod_n");
         t.toTop("_r_save");
-        t.rawBlock(List.of("_rx_mod_n", "_r_save"), "_result",
+        t.rawBlock(List.of("_rx_mod_n", "_r_save"), "_sig_ok",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
+
+        // A pubkey that did not decompress to a canonical on-curve point can never
+        // verify, whatever the ladder made of it.
+        t.toTop("_dk_valid");
+        t.toTop("_sig_ok");
+        t.rawBlock(List.of("_dk_valid", "_sig_ok"), "_result",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     // ===================================================================

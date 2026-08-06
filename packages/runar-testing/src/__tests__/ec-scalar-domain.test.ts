@@ -3,7 +3,7 @@ import { createECDH } from 'node:crypto';
 import { Point as BsvPoint, BigNumber } from '@bsv/sdk';
 import {
   emitMethod,
-  emitEcMul, emitEcMulGen,
+  emitEcAdd, emitEcMul, emitEcMulGen,
   emitP256Mul, emitP256MulGen,
   emitP384Mul, emitP384MulGen,
 } from 'runar-compiler';
@@ -247,3 +247,62 @@ for (const [name, c] of Object.entries(CURVES) as Array<[string, Curve]>) {
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// The `ec-mulgen-linear` optimizer rule rides on this reduce
+// ---------------------------------------------------------------------------
+//
+// optimizer/ec-rules.json rewrites ecAdd(ecMulGen(k1), ecMulGen(k2)) into
+// ecMulGen(k1 + k2). For CONSTANT operands the sum is folded mod n at rewrite
+// time; for runtime operands the Go rule engine (the only tier that fires this
+// rule on non-constants — see buildOpHelper in compilers/go/frontend/
+// ec_rules_engine.go) emits a plain `bin_op "+"` with NO mod-n. So the
+// rewritten spelling is correct only because the reduce above puts k1 + k2 back
+// into [0, n−1] inside the ladder. Before that reduce existed this rule was a
+// live miscompilation for every k1 + k2 ≥ n.
+//
+// Both spellings are pinned here, at the two scalars where they could differ,
+// so that removing the reduce as "redundant" fails loudly.
+
+describe('ec-mulgen-linear depends on the scalar reduce', () => {
+  const c = CURVES.secp256k1;
+  const A = makeArith(c);
+  const w = c.bytes * 2;
+  const G: NonNullable<Aff> = { x: c.gx, y: c.gy };
+  const G_HEX = c.gx.toString(16).padStart(w, '0') + c.gy.toString(16).padStart(w, '0');
+  const hexOf = (pt: NonNullable<Aff>) =>
+    pt.x.toString(16).padStart(w, '0') + pt.y.toString(16).padStart(w, '0');
+  const ZERO = '00'.repeat(c.bytes * 2);
+
+  function ecAdd(aHex: string, bHex: string): string {
+    const ops: StackOp[] = [
+      { op: 'push', value: blob(aHex) } as StackOp,
+      { op: 'push', value: blob(bHex) } as StackOp,
+    ];
+    emitEcAdd((o: StackOp) => ops.push(o));
+    return exec(ops);
+  }
+
+  // k1 = n − 1, k2 = 5. The rewritten sum is n + 4, which is ≥ n and therefore
+  // outside the ladder's domain without the reduce.
+  it('rewritten: MulGen((n − 1) + 5) === 4·G', () => {
+    expect(curveMulGen(c, c.n - 1n + 5n)).toBe(hexOf(A.mul(4n, G)!));
+  });
+
+  it('unrewritten: Add(MulGen(n − 1), MulGen(5)) === 4·G', () => {
+    const negG = curveMulGen(c, c.n - 1n);
+    const fiveG = curveMulGen(c, 5n);
+    expect(ecAdd(negG, fiveG)).toBe(hexOf(A.mul(4n, G)!));
+  });
+
+  // k1 + k2 ≡ 0 (mod n): the rewrite yields ecMulGen(0) — the all-zero point —
+  // while the unrewritten spelling is ecAdd(P, −P). Those agree only because
+  // affineAdd was taught to return the all-zero point for P == −Q; selecting
+  // the tangent on px == qx alone made the unrewritten spelling return 2·k1·G,
+  // i.e. the same source compiling to two different answers depending on
+  // whether the optimizer fired.
+  it('k1 + k2 ≡ 0 (mod n): both spellings give the all-zero point', () => {
+    expect(curveMulGen(c, 3n + (c.n - 3n))).toBe(ZERO);
+    expect(ecAdd(curveMulGen(c, 3n), curveMulGen(c, c.n - 3n))).toBe(ZERO);
+  });
+});

@@ -36,12 +36,18 @@ import { ScriptVM } from '../index.js';
  * field elements. Every Rúnar result here is produced by running the emitted
  * script through the real @bsv/sdk interpreter.
  *
- * NOTE on the y half of the guard: it is emitted (mirroring secp256k1) but
- * cannot be exercised the same way. (x + p) has to fit the coordinate width,
- * which needs x < 2^(8·w) − p — about 2^224 for P-256, 2^128 for P-384 and
- * 2^32 for secp256k1 — and a curve point with such a small *x* is found by
- * trying x = 1, 2, 3, …, while one with such a small *y* is a 2^-32 / 2^-256
- * event. So only the x half has a constructible witness.
+ * NOTE on the y half of the guard. An earlier version of this comment claimed
+ * it had "no constructible witness". That was wrong, and wrong in the direction
+ * that matters. A non-canonical y needs y < 2^(8·w) − p — about 2^224 for
+ * P-256, 2^128 for P-384, 2^32 for secp256k1 — and by RANDOM search that is a
+ * 2^-32 / 2^-256 / 2^-224 event, so P-256 alone is already only ~4·10⁹ trials,
+ * hours on a GPU, not "infeasible".
+ *
+ * But nobody has to search at all. Fix y and the curve equation becomes a
+ * CUBIC in x, x³ + a·x + (b − y²) ≡ 0 (mod p), whose roots are found in
+ * milliseconds by gcd(x^p − x, f) over F_p. So a small-y witness exists for
+ * ALL THREE curves and is computed below (`smallYPoint`) rather than assumed
+ * away — which is the strongest argument for keeping the y half of the guard.
  */
 
 const CURVES = {
@@ -123,6 +129,114 @@ function smallXPoint(c: Curve): { x: bigint; y: bigint } {
     if (y !== null) return { x, y };
   }
   throw new Error(`no small-x point found for ${c.openssl}`);
+}
+
+// --- root-finding for the y-side witness ------------------------------------
+//
+// Polynomials over F_p as little-endian coefficient arrays. Only enough to run
+// gcd(x^p − x, f) for a cubic f, which yields f's distinct roots.
+
+type Poly = bigint[];
+
+function polyTrim(a: Poly, p: bigint): Poly {
+  const r = a.map((v) => mod(v, p));
+  while (r.length > 0 && r[r.length - 1] === 0n) r.pop();
+  return r;
+}
+
+function polyMul(a: Poly, b: Poly, p: bigint): Poly {
+  if (a.length === 0 || b.length === 0) return [];
+  const out = new Array<bigint>(a.length + b.length - 1).fill(0n);
+  for (let i = 0; i < a.length; i++)
+    for (let j = 0; j < b.length; j++)
+      out[i + j] = mod(out[i + j]! + a[i]! * b[j]!, p);
+  return polyTrim(out, p);
+}
+
+/** Remainder of `a` divided by monic-izable `b`. */
+function polyMod(a: Poly, b: Poly, p: bigint): Poly {
+  const r = polyTrim([...a], p);
+  const d = polyTrim([...b], p);
+  if (d.length === 0) throw new Error('divide by zero polynomial');
+  const invLead = powm(d[d.length - 1]!, p - 2n, p);
+  while (r.length >= d.length) {
+    const shift = r.length - d.length;
+    const f = mod(r[r.length - 1]! * invLead, p);
+    for (let i = 0; i < d.length; i++)
+      r[shift + i] = mod(r[shift + i]! - f * d[i]!, p);
+    while (r.length > 0 && mod(r[r.length - 1]!, p) === 0n) r.pop();
+  }
+  return polyTrim(r, p);
+}
+
+function polySub(a: Poly, b: Poly, p: bigint): Poly {
+  const out: Poly = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++)
+    out.push(mod((a[i] ?? 0n) - (b[i] ?? 0n), p));
+  return polyTrim(out, p);
+}
+
+/** base^e mod m, over F_p[X]. */
+function polyPowMod(base: Poly, e: bigint, m: Poly, p: bigint): Poly {
+  let acc: Poly = [1n];
+  let b = polyMod(base, m, p);
+  let k = e;
+  while (k > 0n) {
+    if (k & 1n) acc = polyMod(polyMul(acc, b, p), m, p);
+    b = polyMod(polyMul(b, b, p), m, p);
+    k >>= 1n;
+  }
+  return acc;
+}
+
+function polyGcd(a: Poly, b: Poly, p: bigint): Poly {
+  let u = polyTrim([...a], p);
+  let v = polyTrim([...b], p);
+  while (v.length > 0) {
+    const t = polyMod(u, v, p);
+    u = v;
+    v = t;
+  }
+  // normalise to monic
+  if (u.length === 0) return u;
+  const inv = powm(u[u.length - 1]!, p - 2n, p);
+  return u.map((v2) => mod(v2 * inv, p));
+}
+
+/**
+ * One root of `f` in F_p, or null. gcd(X^p − X, f) is the product of f's
+ * distinct linear factors; Cantor–Zassenhaus then splits that down to a single
+ * factor when there is more than one root (which is the usual case on
+ * secp256k1, where p ≡ 1 mod 3 makes the cubic X³ − (y² − b) have either three
+ * roots or none).
+ */
+function anyRoot(f: Poly, p: bigint): bigint | null {
+  let g = polyGcd(f, polySub(polyPowMod([0n, 1n], p, f, p), [0n, 1n], p), p);
+  if (g.length < 2) return null;
+  for (let guard = 0; g.length > 2 && guard < 64; guard++) {
+    for (let d = 1n; d < 64n; d++) {
+      const h = polyGcd(g, polySub(polyPowMod([d, 1n], (p - 1n) / 2n, g, p), [1n], p), p);
+      if (h.length >= 2 && h.length < g.length) { g = h; break; }
+    }
+  }
+  return g.length === 2 ? mod(-g[0]!, p) : null;
+}
+
+/**
+ * A curve point with a SMALL y — the witness the old comment declared
+ * unconstructible. Fix y, and x is a root of the cubic
+ * f(X) = X³ + a·X + (b − y²) over F_p, found algebraically in milliseconds.
+ * No 2^32 search, on any of the three curves.
+ */
+function smallYPoint(c: Curve): { x: bigint; y: bigint } {
+  const limit = 1n << BigInt(c.bytes * 8);
+  for (let y = 1n; y < 200n; y++) {
+    if (y + c.p >= limit) break;
+    const f: Poly = polyTrim([mod(c.b - y * y, c.p), mod(c.a, c.p), 0n, 1n], c.p);
+    const x = anyRoot(f, c.p);
+    if (x !== null && isOnCurve(c, x, y)) return { x, y };
+  }
+  throw new Error(`no small-y point found for ${c.openssl}`);
 }
 
 // --- harness ----------------------------------------------------------------
@@ -223,5 +337,28 @@ for (const [name, c] of Object.entries(CURVES) as Array<[string, Curve]>) {
         expect(c.alreadyGuarded).toBe(true);
       });
     }
+  });
+
+  // The y half of the guard, with a real witness rather than an assumption.
+  describe(`${name} on-curve canonicity — the y half`, () => {
+    const Q = smallYPoint(c);
+    const canonicalY = hx(Q.x) + hx(Q.y);
+    const nonCanonicalY = hx(Q.x) + hx(Q.y + c.p);
+
+    it('a small-y curve point exists and its y ≥ p encoding fits the width', () => {
+      expect(isOnCurve(c, Q.x, Q.y)).toBe(true);
+      expect(Q.y + c.p).toBeLessThan(1n << BigInt(c.bytes * 8));
+      expect(mod(Q.y + c.p, c.p)).toBe(Q.y);
+    });
+
+    it('oracle: OpenSSL accepts the canonical encoding and rejects y ≥ p', () => {
+      expect(opensslAcceptsPoint(c, canonicalY)).toBe(true);
+      expect(opensslAcceptsPoint(c, nonCanonicalY)).toBe(false);
+    });
+
+    it('accepts the canonical point, rejects y ≥ p — agreeing with OpenSSL', () => {
+      expect(onCurve(c, canonicalY)).toBe(true);
+      expect(onCurve(c, nonCanonicalY)).toBe(false);
+    });
   });
 }

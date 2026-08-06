@@ -431,19 +431,58 @@ public final class Ec {
         // are selected and the single expensive fieldInv still runs once.
         // rx and ry below are already correct for doubling.
         //
-        //   cond = (px == qx)
-        //   num  = cond ? 3*px^2 : (qy - py)
-        //   den  = cond ? 2*py   : (qx - px)
+        //   cond   = (px == qx) AND (py == qy)   1 when doubling, else 0
+        //   num    = cond ? 3*px^2 : (qy - py)
+        //   den    = cond ? 2*py   : (qx - px)
         //
         // selected as `b + cond*(a - b)`, which needs no branch and keeps the
         // emitted op sequence identical on both paths.
         //
-        // NOT handled: P == -Q, whose true result is the point at infinity,
-        // which affine coordinates cannot represent.
+        // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx
+        // ALONE sends it down the tangent path and returns 2P — an on-curve,
+        // entirely plausible, WRONG point. Before the doubling fix the chord
+        // path ran there, divided by zero (fieldInv is Fermat, inv(0) = 0) and
+        // produced an OFF-curve blob, so `assert(ecOnCurve(ecAdd(a, b)))` —
+        // the idiom this codegen tells authors to write — happened to reject
+        // it. Selecting on px alone would have silently disarmed that.
+        //
+        // P + (-P) is the point at infinity, which affine x||y cannot
+        // represent. This codegen already has a representation for O: the
+        // ALL-ZERO blob, which is what `ecMul(P, 0n)` returns and what the
+        // `ec-mulgen-linear` rewrite in optimizer/ec-rules.json produces for
+        // k1 + k2 == 0 (mod n). So return that, by masking the result with
+        // `notinf = NOT(px == qx AND NOT cond)`:
+        //
+        //   - it agrees with the rewrite, so the same source cannot give two
+        //     answers depending on whether the optimizer fired;
+        //   - O is not on the curve (0^2 != 0^3 + 7), so the on-curve gate
+        //     rejects it and the idiom above works again;
+        //   - it adds no failure channel to what is a pure value-producing
+        //     expression, the same reason emitScalarReduce reduces instead of
+        //     rejecting.
+        //
+        // The mask is a bare OP_MUL with no reduction: rx, ry are already in
+        // [0, p) and notinf is 0 or 1, so the product is canonical either way.
         t.copyToTop("px", "_px_eq");
         t.copyToTop("qx", "_qx_eq");
-        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_cond",
+        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_xeq",
             e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("py", "_py_eq");
+        t.copyToTop("qy", "_qy_eq");
+        t.rawBlock(List.of("_py_eq", "_qy_eq"), "_yeq",
+            e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("_xeq", "_xeq_c");
+        t.toTop("_yeq");
+        t.rawBlock(List.of("_xeq_c", "_yeq"), "_cond",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        // notinf = NOT(xeq - cond): xeq - cond is 1 exactly when px == qx and
+        // the points are not equal, i.e. exactly the P == -Q case.
+        t.toTop("_xeq");
+        t.copyToTop("_cond", "_cond_c");
+        t.rawBlock(List.of("_xeq", "_cond_c"), "_notinf", e -> {
+            e.accept(new OpcodeOp("OP_SUB"));
+            e.accept(new OpcodeOp("OP_NOT"));
+        });
 
         // chord numerator / denominator
         t.copyToTop("qy", "_qy1");
@@ -500,6 +539,16 @@ public final class Ec {
         t.toTop("py"); t.drop();
         t.toTop("qx"); t.drop();
         t.toTop("qy"); t.drop();
+
+        // P == -Q -> force the all-zero point (see the header comment).
+        t.toTop("rx");
+        t.copyToTop("_notinf", "_notinf_x");
+        t.rawBlock(List.of("rx", "_notinf_x"), "rx",
+            e -> e.accept(new OpcodeOp("OP_MUL")));
+        t.toTop("ry");
+        t.toTop("_notinf");
+        t.rawBlock(List.of("ry", "_notinf"), "ry",
+            e -> e.accept(new OpcodeOp("OP_MUL")));
     }
 
     // ==================================================================
@@ -704,11 +753,28 @@ public final class Ec {
      *              cannot represent; it stays the all-zero point, as before.
      * </pre>
      *
-     * <p>Handling H == 0 at every one of the 257 steps would cost ~70% more script bytes;
+     * <p>At i &gt;= 1, c_i lies in [3n&gt;&gt;i, (4n-1)&gt;&gt;i] — the lower bound is 3n,
+     * not 3n+1, because the reduce puts k = 0 in the domain — and that interval contains
+     * no value == 0, 1 or 2 (mod n) that is also odd; c_256 = 2 is even, so no add runs.
+     * Handling H == 0 at every one of the 257 steps would cost ~70% more script bytes;
      * handling it here costs 0.26%. The operand P is caller-supplied but cannot move the
      * exception, because the condition depends only on c_i mod ord(P) and ord(P) = n for
      * every point on the curve. Points that are NOT on the curve carry no such guarantee —
      * gate untrusted input on {@code ecOnCurve} first.
+     *
+     * <p>THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true because
+     * {@code emitEcMul} reduces k mod n before adding 3n. That reduce landed one commit
+     * AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS UNSOUND: a
+     * last-step-only select while the scalar is still unbounded leaves c_i free to hit
+     * 0, 1 or 2 (mod n) at other steps. The two commits must land together and must never
+     * be bisected, cherry-picked or reverted apart.
+     *
+     * <p>The interval argument does 100% of the work; there is no defence in depth here.
+     * In particular c_i == 1 (mod n) — a pre-add accumulator of O — is UNREACHABLE, not
+     * handled: were it reachable the select would still take the ADD path, because O is
+     * carried as Z1 = 0, which makes U2 = 0 and H = -X1 != 0. Anything that changes the
+     * +3n offset, the iteration count or the reduce must redo the interval check, not
+     * assume this still holds.
      *
      * <p>Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
      */

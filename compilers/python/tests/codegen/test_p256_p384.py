@@ -41,13 +41,13 @@ def _count_op_tree(ops: list[StackOp]) -> int:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("p256Add",              emit_p256_add,               6642),
+    ("p256Add",              emit_p256_add,               6663),
     ("p256Mul",              emit_p256_mul,             140036),
     ("p256MulGen",           emit_p256_mul_gen,         140038),
     ("p256Negate",           emit_p256_negate,             945),
     ("p256OnCurve",          emit_p256_on_curve,           559),
     ("p256EncodeCompressed", emit_p256_encode_compressed,   16),
-    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    297188),
+    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    297273),
 ])
 def test_p256_op_count(name, fn, expected):
     ops: list[StackOp] = []
@@ -61,7 +61,7 @@ def test_p256_op_count(name, fn, expected):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("p384Add",              emit_p384_add,              11448),
+    ("p384Add",              emit_p384_add,              11469),
     ("p384Mul",              emit_p384_mul,             211178),
     ("p384MulGen",           emit_p384_mul_gen,         211180),
     ("p384Negate",           emit_p384_negate,            1393),

@@ -102,8 +102,13 @@ module Runar
       # Check if point is on the secp256k1 curve.
       def ec_on_curve(p)
         x, y = decode_point(p)
-        return true if x == 0 && y == 0 # Point at infinity
-
+        # The all-zero blob is this codegen's encoding of the point at infinity,
+        # and it is NOT on the curve: the emitted ec_on_curve is exactly
+        # x < p AND y < p AND y^2 == x^3 + 7, and 0 != 7. Returning true here
+        # (the projective convention) made this mock disagree with the script it
+        # stands in for, so `assert(ec_on_curve(r))` passed off-chain and failed
+        # on-chain for r = O -- an unspendable output found only after deploy.
+        # O is now reachable from ec_add(P, -P), so this matters in practice.
         lhs = (y * y) % EC_P
         rhs = (x * x * x + 7) % EC_P
         lhs == rhs

@@ -705,28 +705,6 @@ fn groupInv(t: *NistTracker, a_name: []const u8, exp_be: []const u8, n_be: []con
 // Affine point addition (for use in ECDSA and addition operations)
 // ===========================================================================
 
-/// Affine point addition.
-///
-/// The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
-/// denominator is zero and the correct slope is the TANGENT, (3px^2 + a)/(2py)
-/// — and a = -3 on both NIST curves, so the numerator is 3px^2 - 3. The
-/// secp256k1 fix (a = 0) was never ported here, so p256Add(P, P) and
-/// p384Add(P, P) produced a wrong point and every contract that doubled
-/// deployed an unspendable script.
-///
-/// Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
-/// selected and the single expensive fieldInv still runs exactly once.
-/// rx and ry below are already correct for doubling.
-///
-///   cond = (px == qx)
-///   num  = cond ? 3*px^2 - 3 : (qy - py)
-///   den  = cond ? 2*py       : (qx - px)
-///
-/// selected as `b + cond*(a - b)`, which needs no branch and keeps the emitted
-/// op sequence identical on both paths.
-///
-/// NOT handled: P == -Q, whose true result is the point at infinity, which
-/// affine coordinates cannot represent.
 /// GAP-301: coordinate canonicity, leaving "_canon" on the tracker.
 ///
 /// decomposePoint BIN2NUMs each coordinate as an unsigned value that may be
@@ -755,12 +733,69 @@ fn emitCanonicityGuard(t: *NistTracker, x_name: []const u8, y_name: []const u8, 
     try t.names.append(t.allocator, "_canon");
 }
 
+/// Affine point addition.
+///
+/// The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+/// denominator is zero and the correct slope is the TANGENT, (3px^2 + a)/(2py)
+/// — and a = -3 on both NIST curves, so the numerator is 3px^2 - 3. The
+/// secp256k1 fix (a = 0) was never ported here, so p256Add(P, P) and
+/// p384Add(P, P) produced a wrong point and every contract that doubled
+/// deployed an unspendable script.
+///
+/// Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
+/// selected and the single expensive fieldInv still runs exactly once.
+/// rx and ry below are already correct for doubling.
+///
+///   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+///   num    = cond ? 3*px^2 - 3 : (qy - py)
+///   den    = cond ? 2*py       : (qx - px)
+///
+/// selected as `b + cond*(a - b)`, which needs no branch and keeps the emitted
+/// op sequence identical on both paths.
+///
+/// THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+/// sends it down the tangent path and returns 2P — an on-curve, entirely
+/// plausible, WRONG point, which is strictly worse than the pre-fix chord
+/// path: that one divided by zero (fieldInv is Fermat, inv(0) = 0) and
+/// produced an OFF-curve blob, so `assert(pNNNOnCurve(pNNNAdd(a, b)))` — the
+/// idiom examples/ts/p384-primitives writes verbatim — rejected it.
+///
+/// P + (-P) is the point at infinity, which affine x||y cannot represent. This
+/// codegen already has a representation for O: the ALL-ZERO blob, which is
+/// what `pNNNMul(P, 0n)` returns. So return that, by masking the result with
+/// `notinf = NOT(px == qx AND NOT cond)`. O is not on the curve (0^2 != b),
+/// so the on-curve gate rejects it and the idiom works again; and it adds no
+/// failure channel to a pure value-producing expression, the same reason the
+/// scalar reduce in emitScalarMulOnTracker reduces instead of rejecting.
+///
+/// The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+/// and notinf is 0 or 1, so the product is canonical either way.
 fn affineAdd(t: *NistTracker, p_be: []const u8) !void {
     try t.copyToTop("px", "_px_eq");
     try t.copyToTop("qx", "_qx_eq");
     t.popNames(2);
     try t.emitOpcode("OP_NUMEQUAL");
+    try t.names.append(t.allocator, "_xeq");
+
+    try t.copyToTop("py", "_py_eq");
+    try t.copyToTop("qy", "_qy_eq");
+    t.popNames(2);
+    try t.emitOpcode("OP_NUMEQUAL");
+    try t.names.append(t.allocator, "_yeq");
+
+    try t.copyToTop("_xeq", "_xeq_c");
+    try t.toTop("_yeq");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
     try t.names.append(t.allocator, "_cond");
+
+    // notinf = NOT(xeq - cond): 1 exactly when px == qx and the points differ.
+    try t.toTop("_xeq");
+    try t.copyToTop("_cond", "_cond_c");
+    t.popNames(2);
+    try t.emitOpcode("OP_SUB");
+    try t.emitOpcode("OP_NOT");
+    try t.names.append(t.allocator, "_notinf");
 
     // chord numerator / denominator
     try t.copyToTop("qy", "_qy1");
@@ -819,6 +854,18 @@ fn affineAdd(t: *NistTracker, p_be: []const u8) !void {
     try t.drop();
     try t.toTop("qy");
     try t.drop();
+
+    // P == -Q -> force the all-zero point (see the header comment).
+    try t.toTop("rx");
+    try t.copyToTop("_notinf", "_notinf_x");
+    t.popNames(2);
+    try t.emitOpcode("OP_MUL");
+    try t.names.append(t.allocator, "rx");
+    try t.toTop("ry");
+    try t.toTop("_notinf");
+    t.popNames(2);
+    try t.emitOpcode("OP_MUL");
+    try t.names.append(t.allocator, "ry");
 }
 
 // ===========================================================================
@@ -1037,12 +1084,31 @@ fn selectCoord(
 ///              true result the point at infinity, which affine coordinates
 ///              cannot represent; it stays the all-zero point, as before.
 ///
+/// At i >= 1, c_i lies in [3n>>i, (4n-1)>>i] — the lower bound is 3n, not 3n+1,
+/// because the reduce puts k = 0 in the domain.
+///
 /// Handling H == 0 at every step would cost ~75% more script bytes — on P-384
 /// that is another 600 KB; handling it here costs ~0.2%. The operand P is
 /// caller-supplied but cannot move the exception, because the condition depends
 /// only on c_i mod ord(P) and ord(P) = n for every point on these curves.
 /// Points that are NOT on the curve carry no such guarantee — gate untrusted
-/// input on p256OnCurve / p384OnCurve first.
+/// input on p256OnCurve / p384OnCurve first. decompressPubKey now enforces that
+/// itself for the one in-tree caller that takes a pubkey as input.
+///
+/// THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true
+/// because emitScalarMulOnTracker reduces k mod n before adding 3n. That reduce
+/// landed one commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON
+/// ITS OWN IS UNSOUND: a last-step-only select while the scalar is still
+/// unbounded leaves c_i free to hit 0, 1 or 2 (mod n) at other steps. The two
+/// commits must land together and must never be bisected, cherry-picked or
+/// reverted apart.
+///
+/// The interval argument does 100% of the work; there is no defence in depth
+/// here. In particular c_i == 1 (mod n) — a pre-add accumulator of O — is
+/// UNREACHABLE, not handled: were it reachable the select would still take the
+/// ADD path, because O is carried as Z1 = 0, which makes U2 = 0 and
+/// H = -X1 != 0. Anything that changes the +3n offset, the iteration count or
+/// the reduce must redo the interval check, not assume this still holds.
 ///
 /// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
 fn buildJacobianAddOrDoubleInline(allocator: Allocator, base_names: []const ?[]const u8, params: *const NistCurveParams) !EcOpBundle {
@@ -1267,6 +1333,33 @@ fn fieldPow(t: *NistTracker, base_name: []const u8, exp_be: []const u8, p_be: []
 // Public key decompression: (prefix_byte || x_bytes) -> (x, y)
 // ===========================================================================
 
+/// Decompress a compressed pubkey: [prefix||x] -> (x_num, y_num, valid).
+///
+/// For P-256/P-384 where a = -3:
+///   y^2 = x^3 - 3x + b mod p
+///   y = (y^2)^((p+1)/4) mod p
+///   Select y or p-y based on prefix parity.
+///
+/// `(y^2)^((p+1)/4)` is a square root ONLY when y^2 is a quadratic residue; both
+/// primes are == 3 (mod 4), so for a non-residue it returns a square root of
+/// -y^2 instead and the recovered point is NOT on the curve. Nor is x checked
+/// against p: decomposePoint-style BIN2NUM accepts any width-fitting value and
+/// every field op silently reduces it, so a non-canonical x decompresses
+/// happily too.
+///
+/// Both matter because the only consumer is emitVerifyECDSA, which feeds the
+/// result straight into the scalar-mul ladder. That ladder's exception analysis
+/// (see buildJacobianAddOrDoubleInline) is stated for points ON the curve,
+/// where cofactor 1 pins ord(P) = n; an off-curve point lands on the twist,
+/// whose order is composite, so the degenerate steps the interval argument
+/// rules out become reachable. The pubkey is a caller-supplied unlock argument.
+///
+/// So this emits a third output, `_dk_valid` = (x < p) AND (y_cand^2 == y^2),
+/// which the caller ANDs into the verifier's boolean result. A flag, not an
+/// OP_VERIFY: `verifyECDSA_*` is a total boolean-valued builtin and turning
+/// attacker-chosen bytes into a script abort would be a liveness regression —
+/// the same argument the scalar reduce makes for reducing rather than
+/// rejecting.
 fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, qy_name: []const u8) !void {
     const c = t.params;
     const p_be = c.field_p_be;
@@ -1314,7 +1407,11 @@ fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, q
     try t.pushBigIntBE("_dk_b", c.curve_b_be);
     try fieldAdd(t, "_dk_x3m3x", "_dk_b", p_be, "_dk_y2");
 
-    // y = (y^2)^sqrtExp mod p
+    // y = (y^2)^sqrtExp mod p. fieldPow CONSUMES its base, so keep a copy of
+    // y^2 for the residue check at the end. It has to sit BELOW _dk_y_cand: the
+    // parity select below is an OP_IF whose branches are a bare drop / nip, so
+    // nothing may come between _dk_y_cand and the negated candidate.
+    try t.copyToTop("_dk_y2", "_dk_y2_keep");
     try fieldPow(t, "_dk_y2", c.sqrt_exp_be, p_be, "_dk_y_cand");
 
     // Check if candidate y has the right parity
@@ -1395,6 +1492,31 @@ fn decompressPubKey(t: *NistTracker, pk_name: []const u8, qx_name: []const u8, q
             }
         }
     }
+
+    // valid = (qy^2 == y^2) AND (qx < p).
+    // The selected qy is y_cand or p - y_cand, so squaring it tests the same
+    // residue property either way. The first conjunct rejects an x whose RHS is
+    // a quadratic non-residue — the recovered point is then off the curve; the
+    // second rejects a non-canonical encoding of an otherwise fine x.
+    try t.copyToTop(qy_name, "_dk_y_sq_in");
+    try fieldSqr(t, "_dk_y_sq_in", p_be, "_dk_y_sq");
+    try t.toTop("_dk_y_sq");
+    try t.toTop("_dk_y2_keep");
+    t.popNames(2);
+    try t.emitOpcode("OP_NUMEQUAL");
+    try t.names.append(t.allocator, "_dk_res_ok");
+
+    try t.copyToTop(qx_name, "_dk_x_lt");
+    try t.pushBigIntBE("_dk_p_lt", p_be);
+    t.popNames(2);
+    try t.emitOpcode("OP_LESSTHAN");
+    try t.names.append(t.allocator, "_dk_x_ok");
+
+    try t.toTop("_dk_res_ok");
+    try t.toTop("_dk_x_ok");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_dk_valid");
 }
 
 // ===========================================================================
@@ -1439,7 +1561,9 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
     try emitBytesToUnsignedNum(t, cb);
     try t.names.append(t.allocator, "_s");
 
-    // Step 3: Decompress pubkey
+    // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
+    // bytes do not decompress to a canonical on-curve point, which is ANDed into
+    // the result below so such a key can never verify.
     try decompressPubKey(t, "_pk", "_qx", "_qy");
 
     // Step 4: w = s^{-1} mod n
@@ -1462,7 +1586,10 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
     try t.pushOwnedBytes("_G", g_point);
     try t.toTop("_u1");
 
-    // Stash items on altstack (pushed in reverse retrieval order)
+    // Stash items on altstack (pushed in reverse retrieval order).
+    // _dk_valid goes DEEPEST — the altstack is LIFO and it is popped last.
+    try t.toTop("_dk_valid");
+    try t.toAlt();
     try t.toTop("_r_save");
     try t.toAlt();
     try t.toTop("_u2");
@@ -1518,16 +1645,24 @@ fn emitVerifyECDSA(t: *NistTracker) !void {
 
     try groupMod(t, "rx", n_be, "_rx_mod_n");
 
-    // Restore r
+    // Restore r, then the decompression verdict beneath it
     try t.fromAlt("_r_save");
+    try t.fromAlt("_dk_valid");
 
     // Compare
     try t.toTop("_rx_mod_n");
     try t.toTop("_r_save");
     t.popNames(2);
     try t.emitOpcode("OP_EQUAL");
-    try t.names.append(t.allocator, "_result");
+    try t.names.append(t.allocator, "_sig_ok");
 
+    // A pubkey that did not decompress to a canonical on-curve point can never
+    // verify, whatever the ladder made of it.
+    try t.toTop("_dk_valid");
+    try t.toTop("_sig_ok");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_result");
 }
 
 // ===========================================================================
@@ -1805,14 +1940,26 @@ fn countOpTree(ops: []const StackOp) usize {
 }
 
 test "nist_ec helper op-count goldens" {
+    // p256Add 6623 -> 6639 and p384Add 11429 -> 11445 (+16 each): affineAdd now
+    // detects P == -Q (px == qx but py != qy) and masks the result to the
+    // all-zero point instead of taking the tangent and returning a plausible,
+    // WRONG 2P. Curve-independent, as it must be — the added ops are the same
+    // sequence for both curves; only the push widths differ, and those are
+    // bytes, not ops. +21 script BYTES on each. See the same note in
+    // ec_emitters.zig for why the TS/Go/Rust/Python/Ruby/Java peers book this
+    // as +21 OPS: they count a deep pick/roll as two ops, this tracker as one.
+    //
+    // verifyECDSA_P256 / _P384 also moved (decompressPubKey's `_dk_valid`
+    // residue + canonicity guard, +148 / +434 bytes) but carry no op-count
+    // golden here — the conformance hex is their gate.
     const cases = .{
-        .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6623) },
+        .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6639) },
         .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 129192) },
         .{ registry.CryptoBuiltin.p256_mul_gen, "p256MulGen", @as(usize, 129194) },
         .{ registry.CryptoBuiltin.p256_negate, "p256Negate", @as(usize, 945) },
         .{ registry.CryptoBuiltin.p256_on_curve, "p256OnCurve", @as(usize, 555) },
         .{ registry.CryptoBuiltin.p256_encode_compressed, "p256EncodeCompressed", @as(usize, 16) },
-        .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11429) },
+        .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11445) },
         .{ registry.CryptoBuiltin.p384_mul, "p384Mul", @as(usize, 194958) },
         .{ registry.CryptoBuiltin.p384_mul_gen, "p384MulGen", @as(usize, 194960) },
         .{ registry.CryptoBuiltin.p384_negate, "p384Negate", @as(usize, 1393) },

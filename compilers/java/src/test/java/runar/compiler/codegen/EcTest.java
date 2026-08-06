@@ -42,10 +42,15 @@ class EcTest {
     void ecAddShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcAdd(ops::add);
-        assertEquals(8202, countOpTree(ops), "ecAdd op count drift");
+        // +21 ops / +21 bytes over the pre-P==-Q-fix shape: the second
+        // OP_NUMEQUAL on y, the OP_BOOLAND that ANDs it into `cond`, the
+        // OP_SUB/OP_NOT that build `notinf`, the two OP_MULs that mask rx/ry,
+        // and the picks/rolls that feed them. All 1-byte ops, hence op count
+        // and byte count move together.
+        assertEquals(8223, countOpTree(ops), "ecAdd op count drift");
 
         String hex = emitHex(ops);
-        assertEquals(25405, hex.length() / 2, "ecAdd hex byte count drift");
+        assertEquals(25426, hex.length() / 2, "ecAdd hex byte count drift");
     }
 
     @Test

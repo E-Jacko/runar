@@ -453,132 +453,108 @@
     },
     {
       "path": "conformance/tests/convergence-proof/expected-script.hex",
-      "sha256": "ccc59a1ea7032b77b3d9f7bd4eaa1fef78f110e89eb53bf33524e0b2e5a2e866",
-      "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
-      "reviewer": "gh:icellan"
-    },
-    {
-      "path": "conformance/tests/ec-demo/expected-script.hex",
-      "sha256": "cf7dac2c75d649b28d0ba7c29b719d96458b9e045a03aed291a96895a4703b90",
-      "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
-      "reviewer": "gh:icellan"
-    },
-    {
-      "path": "conformance/tests/ec-primitives/expected-script.hex",
-      "sha256": "84f7c121db70927932f7313bd9bca9f7a2d69c9f2987ac7ef03d65748a61a97b",
-      "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
-      "reviewer": "gh:icellan"
-    },
-    {
-      "path": "conformance/tests/ec-unit/expected-script.hex",
-      "sha256": "d543af1444b1cacbb763420a28108a63fd70f9db2bddb8da925a20ff168f9182",
-      "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
-      "reviewer": "gh:icellan"
-    },
-    {
-      "path": "conformance/tests/schnorr-zkp/expected-script.hex",
-      "sha256": "7c7501b30f34e2dc256dfd4f59f6a47a718abdbd18b54ef03a670f0c3cba65b7",
-      "verified-against": "differential-oracle",
-      "reason": "ecAdd could not DOUBLE a point: the affine chord slope (qy-py)/(qx-px) divides by zero when P==Q, so ecAdd(P,P) produced a wrong point and any contract that doubled deployed an UNSPENDABLE script — byte-identically across all seven tiers. affineAdd now selects the tangent numerator and denominator before the single fieldInv. These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: the emitted script is executed against the real @bsv/sdk interpreter in packages/runar-testing/src/__tests__/ec-add-doubling.test.ts and checked against the known secp256k1 group elements — ecAdd(G,2G)==3G (chord path unchanged), ecAdd(G,G)==2G and ecAdd(2G,2G)==4G (doubling fixed), with ecMulGen(3)==3G as a control. The original defect was first observed as a real regtest-node rejection of the ec-unit fixture. Cross-tier: conformance 65/65 with no tier-vs-tier divergence; Zig and Go verified byte-identical on the same ecAdd ANF.",
-      "reviewer": "gh:icellan"
-    },
-    {
-      "path": "conformance/script-size-baseline.json",
-      "sha256": "d0ba1a09307b2c61b4d3e2370c9519a641b05444e587ee86dc9ab8dac2c1d894",
-      "verified-against": "intentional-spec-change",
-      "reason": "Re-stamped after the ecAdd doubling fix. Only the five EC fixtures moved, by +0.05%..+0.09% (convergence-proof, ec-demo, ec-primitives, ec-unit, schnorr-zkp) — the tangent-slope selection adds 124 ops and reuses the single existing fieldInv. All 60 other fixtures are byte-unchanged.",
-      "reviewer": "gh:icellan"
-    },
-    {
-      "path": "conformance/tests/ec-unit/expected-script.hex",
-      "sha256": "888ce0a32e6109dd76e558c9ce76363fdd0f9832fe00b1a8ceb03d996b245f75",
+      "sha256": "e009a9e781731c6b7e7f4dfee78756c2b7f3cb04ba6bc3189641c84489a05aeb",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +42 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +21 bytes: affineAdd / cAffineAdd now detect P == -Q (px == qx but py != qy) and force the ALL-ZERO point — this codegen's encoding of the point at infinity, the same value ecMul(P, 0n) already returns and the same value the ec-mulgen-linear rewrite in optimizer/ec-rules.json produces for k1 + k2 = 0 (mod n). Selecting the tangent on px == qx ALONE (03f50d48) answered P + (-P) with 2P: on-curve, plausible, wrong, and accepted by the assert(ecOnCurve(ecAdd(a,b))) idiom the codegen documents. +21 bytes per affine-add call site. Graded against a from-scratch affine adder written from the curve parameters alone plus OpenSSL's point validation (ECDH.convertKey), replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-degenerate-add.test.ts, and pinned cross-tier by the verifyAdd(G, -G) reject spends in conformance/witnesses/real-crypto/{p256,p384}-primitives.json. The ANF interpreter was changed in the same commit so the differential oracle still agrees. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/ec-demo/expected-script.hex",
-      "sha256": "cfa6088e8b1e2b6f3a3032c7172c733ff70ab3a1e94dcc523571a360b5a49758",
+      "sha256": "64a4caa37afd45263ff8a8e6231732f8458f1a611d3430698d4ae201aa0758f0",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +126 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +42 bytes: affineAdd / cAffineAdd now detect P == -Q (px == qx but py != qy) and force the ALL-ZERO point — this codegen's encoding of the point at infinity, the same value ecMul(P, 0n) already returns and the same value the ec-mulgen-linear rewrite in optimizer/ec-rules.json produces for k1 + k2 = 0 (mod n). Selecting the tangent on px == qx ALONE (03f50d48) answered P + (-P) with 2P: on-curve, plausible, wrong, and accepted by the assert(ecOnCurve(ecAdd(a,b))) idiom the codegen documents. +21 bytes per affine-add call site. Graded against a from-scratch affine adder written from the curve parameters alone plus OpenSSL's point validation (ECDH.convertKey), replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-degenerate-add.test.ts, and pinned cross-tier by the verifyAdd(G, -G) reject spends in conformance/witnesses/real-crypto/{p256,p384}-primitives.json. The ANF interpreter was changed in the same commit so the differential oracle still agrees. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/ec-primitives/expected-script.hex",
-      "sha256": "4464495425036024c2a48b90225c2c658354cb20c499710ec8c56352da9360f0",
+      "sha256": "cc730ecff81cdeae61b1f41f56a222d137d95b75c2979a28575652748e9ef239",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +126 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +42 bytes: affineAdd / cAffineAdd now detect P == -Q (px == qx but py != qy) and force the ALL-ZERO point — this codegen's encoding of the point at infinity, the same value ecMul(P, 0n) already returns and the same value the ec-mulgen-linear rewrite in optimizer/ec-rules.json produces for k1 + k2 = 0 (mod n). Selecting the tangent on px == qx ALONE (03f50d48) answered P + (-P) with 2P: on-curve, plausible, wrong, and accepted by the assert(ecOnCurve(ecAdd(a,b))) idiom the codegen documents. +21 bytes per affine-add call site. Graded against a from-scratch affine adder written from the curve parameters alone plus OpenSSL's point validation (ECDH.convertKey), replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-degenerate-add.test.ts, and pinned cross-tier by the verifyAdd(G, -G) reject spends in conformance/witnesses/real-crypto/{p256,p384}-primitives.json. The ANF interpreter was changed in the same commit so the differential oracle still agrees. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
-      "path": "conformance/tests/schnorr-zkp/expected-script.hex",
-      "sha256": "9f23e983c2b451019e52480282132599be6d7b6e32da570bf822c99a7434f8ad",
+      "path": "conformance/tests/ec-unit/expected-script.hex",
+      "sha256": "dbeaa4a6d259ed63024d3b76e03e0b2a4932c2cd43cc8ae2bcf466a8e34a82a5",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +84 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
-      "reviewer": "unreviewed:generated-by-agent",
-      "date": "2026-08-06",
-      "review-status": "unreviewed"
-    },
-    {
-      "path": "conformance/tests/convergence-proof/expected-script.hex",
-      "sha256": "1b6bb5843a88e495c23d3a6cace532280fb179a46fba6d0eb0c06006bc70b128",
-      "verified-against": "second-implementation",
-      "reason": "Codegen change, +42 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change plus a fixture-source change, +25149 bytes. Codegen: the affine-add P == -Q fix (+21 bytes per call site, see the other entries). Source: ECUnit.testOps() gained `const infPt = ecAdd(g, neg); assert(!ecOnCurve(infPt));` in all nine formats, so the point at infinity — which affine x||y cannot encode, and which every tier therefore returns as the all-zero blob from a SUCCESSFUL script — is now proven detectable by ecOnCurve on the real @bsv/sdk Spend engine, in every tier and every format. ecAdd(g, neg) rather than ecMul(g, 0n): identical result, ~26 KB of script instead of ~429 KB, which would have grown this fixture 94% for no additional property. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p256-primitives/expected-script.hex",
-      "sha256": "65987946eba03590eb1c8116e05a5ba4047d502bc238844ca845209203265bf2",
+      "sha256": "fed37a14ee298d78af213b1787c89166bcac53338cd97fb717b10810483c8ecd",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +318 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +21 bytes: affineAdd / cAffineAdd now detect P == -Q (px == qx but py != qy) and force the ALL-ZERO point — this codegen's encoding of the point at infinity, the same value ecMul(P, 0n) already returns and the same value the ec-mulgen-linear rewrite in optimizer/ec-rules.json produces for k1 + k2 = 0 (mod n). Selecting the tangent on px == qx ALONE (03f50d48) answered P + (-P) with 2P: on-curve, plausible, wrong, and accepted by the assert(ecOnCurve(ecAdd(a,b))) idiom the codegen documents. +21 bytes per affine-add call site. Graded against a from-scratch affine adder written from the curve parameters alone plus OpenSSL's point validation (ECDH.convertKey), replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-degenerate-add.test.ts, and pinned cross-tier by the verifyAdd(G, -G) reject spends in conformance/witnesses/real-crypto/{p256,p384}-primitives.json. The ANF interpreter was changed in the same commit so the differential oracle still agrees. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p256-wallet/expected-script.hex",
-      "sha256": "fad9112bc4e6144ae52ebc1c4eeb728dbb6df330bab7e268a0a3c830eed7af47",
+      "sha256": "912de7c9253bfe6cba8abc9607a7e98ec1d14d07629ee027562045f2f9a0b939",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +84 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +148 bytes: the affine-add P == -Q fix (+21 bytes per call site, see the other entries) plus decompressPubKey's new validity flag. decompressPubKey computed y = (x^3 - 3x + b)^((p+1)/4) and never checked y^2 == x^3 - 3x + b, nor x < p, so a pubkey whose x is a quadratic non-residue decompressed to an OFF-CURVE point that went straight into the scalar-mul ladder — whose exception analysis is stated only for points ON the curve, where cofactor 1 pins ord(P) = n. It now emits valid = (x < p) AND (y^2 == rhs), ANDed into the verifier's boolean result (a flag, not an OP_VERIFY: verifyECDSA_* is a total boolean builtin). Graded against OpenSSL: a genuine P-256 / P-384 keypair and signature from node:crypto must still verify TRUE through the real @bsv/sdk Spend interpreter, and non-residue / x >= p pubkeys must return FALSE (packages/runar-testing/src/__tests__/p256-p384-ecdsa-verify.test.ts — the first execution of either verifier by anything in this repo). All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p384-primitives/expected-script.hex",
-      "sha256": "724287cbdb689748b19f00518be145c37884dbcf60d5e9b541593bc6bd6b0203",
+      "sha256": "a0439ba637654025d9abdf758e6763915ab2527e2d53652b282f0e709b2d5a3b",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +446 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +21 bytes: affineAdd / cAffineAdd now detect P == -Q (px == qx but py != qy) and force the ALL-ZERO point — this codegen's encoding of the point at infinity, the same value ecMul(P, 0n) already returns and the same value the ec-mulgen-linear rewrite in optimizer/ec-rules.json produces for k1 + k2 = 0 (mod n). Selecting the tangent on px == qx ALONE (03f50d48) answered P + (-P) with 2P: on-curve, plausible, wrong, and accepted by the assert(ecOnCurve(ecAdd(a,b))) idiom the codegen documents. +21 bytes per affine-add call site. Graded against a from-scratch affine adder written from the curve parameters alone plus OpenSSL's point validation (ECDH.convertKey), replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-degenerate-add.test.ts, and pinned cross-tier by the verifyAdd(G, -G) reject spends in conformance/witnesses/real-crypto/{p256,p384}-primitives.json. The ANF interpreter was changed in the same commit so the differential oracle still agrees. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p384-wallet/expected-script.hex",
-      "sha256": "90405dc1ef21d3e5301dfa733ad814616eea0928a52903d0ee0414225015b9ca",
+      "sha256": "9c87924e603598f90f30d20ea633da75f14f1130e00587973572d71ee8ca42ef",
       "verified-against": "second-implementation",
-      "reason": "Codegen change, +116 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reason": "Codegen change, +434 bytes: the affine-add P == -Q fix (+21 bytes per call site, see the other entries) plus decompressPubKey's new validity flag. decompressPubKey computed y = (x^3 - 3x + b)^((p+1)/4) and never checked y^2 == x^3 - 3x + b, nor x < p, so a pubkey whose x is a quadratic non-residue decompressed to an OFF-CURVE point that went straight into the scalar-mul ladder — whose exception analysis is stated only for points ON the curve, where cofactor 1 pins ord(P) = n. It now emits valid = (x < p) AND (y^2 == rhs), ANDed into the verifier's boolean result (a flag, not an OP_VERIFY: verifyECDSA_* is a total boolean builtin). Graded against OpenSSL: a genuine P-256 / P-384 keypair and signature from node:crypto must still verify TRUE through the real @bsv/sdk Spend interpreter, and non-residue / x >= p pubkeys must return FALSE (packages/runar-testing/src/__tests__/p256-p384-ecdsa-verify.test.ts — the first execution of either verifier by anything in this repo). All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
+    },
+    {
+      "path": "conformance/tests/schnorr-zkp/expected-script.hex",
+      "sha256": "da32369778973ca691fd02a5df3363dc658bbfc5deeb10b6c8ea7ece825988f7",
+      "verified-against": "second-implementation",
+      "reason": "Codegen change, +21 bytes: affineAdd / cAffineAdd now detect P == -Q (px == qx but py != qy) and force the ALL-ZERO point — this codegen's encoding of the point at infinity, the same value ecMul(P, 0n) already returns and the same value the ec-mulgen-linear rewrite in optimizer/ec-rules.json produces for k1 + k2 = 0 (mod n). Selecting the tangent on px == qx ALONE (03f50d48) answered P + (-P) with 2P: on-curve, plausible, wrong, and accepted by the assert(ecOnCurve(ecAdd(a,b))) idiom the codegen documents. +21 bytes per affine-add call site. Graded against a from-scratch affine adder written from the curve parameters alone plus OpenSSL's point validation (ECDH.convertKey), replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-degenerate-add.test.ts, and pinned cross-tier by the verifyAdd(G, -G) reject spends in conformance/witnesses/real-crypto/{p256,p384}-primitives.json. The ANF interpreter was changed in the same commit so the differential oracle still agrees. All 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"
     },
     {
       "path": "conformance/script-size-baseline.json",
-      "sha256": "cc2348d9fbd1c99526e906508b421edbfa85de12a6e17f9e8ae96d552d3aab86",
-      "verified-against": "intentional-spec-change",
-      "reason": "Re-stamp after the GAP-301 canonicity guard and the ecMul / pNNNMul scalar reduction. Nine fixtures grew: convergence-proof +42, ec-unit +42, schnorr-zkp +84, p256-wallet +84, p384-wallet +116, ec-demo +126, ec-primitives +126, p256-primitives +318, p384-primitives +446 bytes (+0.01%..+0.03% each, all far inside the +10% tolerance). Every added byte is a coordinate range-check or a mod-n reduction that makes a previously unspecified input well defined; no fixture shrank.",
+      "sha256": "e5b61635c5bd38a747f091aa997a7e279fcae79fd6188aa30822563a8a2984b6",
+      "verified-against": "second-implementation",
+      "reason": "Re-stamp after the affine-add P == -Q fix and the decompressPubKey validity flag. convergence-proof +21, ec-demo +42, ec-primitives +42, ec-unit +25149, p256-primitives +21, p256-wallet +148, p384-primitives +21, p384-wallet +434, schnorr-zkp +21 bytes. Every added byte either turns an on-curve WRONG answer for P + (-P) into the point at infinity, or rejects a pubkey that does not decompress to a canonical on-curve point; ec-unit additionally gained one ecAdd + ecOnCurve of fixture source that proves the infinity encoding is detectable. No fixture shrank; every growth is far inside the +10% tolerance.",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
+    },
+    {
+      "path": "conformance/analyzer/ec-demo/expected-analyzer-report.json",
+      "sha256": "c417490740fb18b19b2e411188b50036ec48b222b179381c4486afac26f4192e",
+      "verified-against": "second-implementation",
+      "reason": "Analyzer report regenerated after the affine-add P == -Q fix. The analyzer reads conformance/tests/<fixture>/expected-script.hex verbatim, so these two reports move whenever the EC codegen moves: ec-demo grew 42 bytes (two ecAdd call sites x +21) and schnorr-zkp 21 (one). No analyzer logic changed; the reports are a pure function of the hex, which is itself byte-identical across all 7 tiers (conformance multi-format, 594/594 in both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
+    },
+    {
+      "path": "conformance/analyzer/schnorr-zkp/expected-analyzer-report.json",
+      "sha256": "afc68dbb7795661aa5e7e41c61066611fb3deeb04baa289a918385a2938aeca9",
+      "verified-against": "second-implementation",
+      "reason": "Analyzer report regenerated after the affine-add P == -Q fix. The analyzer reads conformance/tests/<fixture>/expected-script.hex verbatim, so these two reports move whenever the EC codegen moves: ec-demo grew 42 bytes (two ecAdd call sites x +21) and schnorr-zkp 21 (one). No analyzer logic changed; the reports are a pure function of the hex, which is itself byte-identical across all 7 tiers (conformance multi-format, 594/594 in both fold modes).",
       "reviewer": "unreviewed:generated-by-agent",
       "date": "2026-08-06",
       "review-status": "unreviewed"

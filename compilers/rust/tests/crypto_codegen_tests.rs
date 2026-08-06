@@ -335,7 +335,12 @@ fn test_blake3_hash_op_count_golden() {
 #[test]
 fn test_p256_add_op_count_golden() {
     let ops = collect(|s| emit_p256_add(s));
-    assert_eq!(count_op_tree(&ops), 6642, "p256_add op count drift");
+    // 6642 -> 6663 (+21 ops / +21 bytes) — the same delta ecAdd and p384Add
+    // take, since all three share the affine-add structure: a second
+    // OP_NUMEQUAL on y, the OP_BOOLAND folding it into `cond`, OP_SUB/OP_NOT
+    // for `notinf`, two OP_MULs masking rx/ry, plus the picks/rolls feeding
+    // them. Every one is a 1-byte op, so op count and byte count move together.
+    assert_eq!(count_op_tree(&ops), 6663, "p256_add op count drift");
 }
 
 #[test]
@@ -377,7 +382,23 @@ fn test_verify_ecdsa_p256_op_count_golden() {
     let ops = collect(|s| emit_verify_ecdsa_p256(s));
     // Rust emits 8 fewer raw StackOps than Python/Java peers (a verify
     // computes two mul/mul_gen invocations × the 4-op divergence).
-    assert_eq!(count_op_tree(&ops), 297180, "verify_ecdsa_p256 op count drift");
+    //
+    // 297180 -> 297265 (+85 ops / +151 script bytes) for the `_dk_valid`
+    // pubkey-validity gate, which decomposes as:
+    //   * 52 curve-independent 1-byte ops — 21 for the affine-add P == -Q mask
+    //     (see test_p256_add_op_count_golden), the rest for the residue +
+    //     canonicity check in c_decompress_pub_key, its altstack stash, and the
+    //     closing OP_BOOLAND in c_emit_verify_ecdsa. P-384 pays the same 52.
+    //   * +1 op per set bit of the sqrt exponent — 33 here, 287 on P-384.
+    //     `_dk_y2_keep` now sits under `_dk_y2` for the whole of c_field_pow, so
+    //     the loop's copy_to_top(base) moves from depth 1 (OP_OVER) to depth 2
+    //     (OP_2 + OP_PICK). (p+1)/4 has 34 set bits on P-256, 288 on P-384; the
+    //     MSB is the loop's seed, not a step.
+    //   * +66 bytes beyond the op count — the two full-width pushes of p the
+    //     check adds (one in c_field_sqr's reduce, one for the OP_LESSTHAN):
+    //     33 extra bytes each on P-256, 49 each on P-384.
+    // 52 + 33 = 85 ops; 85 + 66 = 151 bytes. Both match the TS reference.
+    assert_eq!(count_op_tree(&ops), 297265, "verify_ecdsa_p256 op count drift");
 }
 
 // -- P-384 -----------------------------------------------------------------
@@ -385,7 +406,9 @@ fn test_verify_ecdsa_p256_op_count_golden() {
 #[test]
 fn test_p384_add_op_count_golden() {
     let ops = collect(|s| emit_p384_add(s));
-    assert_eq!(count_op_tree(&ops), 11448, "p384_add op count drift");
+    // 11448 -> 11469 (+21 ops / +21 bytes): same affine-add P == -Q -> O mask
+    // as ecAdd / p256Add, see test_p256_add_op_count_golden.
+    assert_eq!(count_op_tree(&ops), 11469, "p384_add op count drift");
 }
 
 #[test]

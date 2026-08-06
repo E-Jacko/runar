@@ -53,7 +53,8 @@
   {
     "name": "ec-mulgen-linear",
     "match": { "func": "ecAdd", "args": [{ "func": "ecMulGen", "args": ["$k1"] }, { "func": "ecMulGen", "args": ["$k2"] }] },
-    "replace": { "func": "ecMulGen", "args": [{ "op": "+", "args": ["$k1", "$k2"] }] }
+    "replace": { "func": "ecMulGen", "args": [{ "op": "+", "args": ["$k1", "$k2"] }] },
+    "note": "LOAD-BEARING DEPENDENCY: for runtime (non-constant) scalars the rule engine emits a plain bin_op '+' with NO mod-n, so this rewrite is only sound because emitEcMulGen/emitEcMul reduce the scalar mod n before the ladder (emitScalarReduce, ec-codegen.ts). Delete or weaken that reduce and this rule silently miscompiles every k1 + k2 >= n. Constant operands are folded mod n at rewrite time instead. The k1 + k2 = 0 (mod n) case agrees with the unrewritten spelling only because affineAdd returns the all-zero point for P + (-P); see the P == -Q comment in ec-codegen.ts. Pinned by ec-scalar-domain.test.ts ('ec-mulgen-linear depends on the scalar reduce') and by TestECOptimizer_MulGenLinearRuntimeSumIsUnreduced in compilers/go/frontend."
   },
   {
     "name": "ec-mul-distributive",
