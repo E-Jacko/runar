@@ -1769,7 +1769,12 @@ function ecPointAddCoords(
 function ecScalarMul(x: bigint, y: bigint, k: bigint): [bigint, bigint] {
   const n = EC_N;
   k = ecMod(k, n);
-  if (k === 0n) throw new Error('ecMul: scalar is 0');
+  // k ≡ 0 (mod n) is the point at infinity. Affine x‖y cannot encode it, and
+  // the emitted script yields the all-zero point there (fieldInv is Fermat, so
+  // inv(0) = 0). Return the same thing rather than throwing: the interpreter is
+  // a differential oracle for that script, so a throw here would be a
+  // divergence the oracle can never report.
+  if (k === 0n) return [0n, 0n];
   let rx = x;
   let ry = y;
   let started = false;
@@ -1859,12 +1864,10 @@ function ecPointYImpl(pt: Uint8Array): bigint {
 // constant zero point (and an unconditional `true` from the on-curve check),
 // which made the source-vs-script differential oracle vacuous for both curves.
 //
-// Deliberately NOT mirrored from `ecOnCurveImpl`: the canonicity guard that
-// rejects x >= p / y >= p. `emitP256OnCurve` / `emitP384OnCurve` check only the
-// curve equation, so adding the guard here would make the interpreter disagree
-// with the script it is supposed to be a differential oracle for. That
-// asymmetry with secp256k1's hardened `ecOnCurve` (GAP-301) is a real, separate
-// gap in the NIST codegen — reported, not silently papered over here.
+// `nistOnCurveImpl` carries the same GAP-301 canonicity guard as
+// `ecOnCurveImpl`, because `emitP256OnCurve` / `emitP384OnCurve` now emit it
+// too. The two must move together: a differential oracle that accepts an input
+// the script rejects is not an oracle.
 
 type NistCurve = {
   p: bigint;
@@ -1939,7 +1942,9 @@ function nistPointAddCoords(
 
 function nistScalarMul(c: NistCurve, x: bigint, y: bigint, k: bigint): [bigint, bigint] {
   const kk = ecMod(k, c.n);
-  if (kk === 0n) throw new Error(`${c.name} scalar mul: scalar is 0`);
+  // See ecScalarMul: k ≡ 0 (mod n) is O, which the emitted script yields as the
+  // all-zero point. Match it instead of throwing.
+  if (kk === 0n) return [0n, 0n];
   let rx = x;
   let ry = y;
   let started = false;
@@ -1983,6 +1988,10 @@ function nistNegateImpl(c: NistCurve, pt: Uint8Array): Uint8Array {
 
 function nistOnCurveImpl(c: NistCurve, pt: Uint8Array): boolean {
   const [x, y] = nistDecodePoint(c, pt);
+  // GAP-301: reject non-canonical coordinate encodings (x >= p or y >= p) to
+  // match the compiled script, which range-checks the coordinates before the
+  // field arithmetic reduces them mod p.
+  if (x >= c.p || y >= c.p) return false;
   return ecMod(y * y, c.p) === ecMod(x * x * x - 3n * x + c.b, c.p);
 }
 

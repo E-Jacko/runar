@@ -465,7 +465,7 @@ All EC operations are built on secp256k1 field arithmetic over `F_p` where `p = 
 | `ecMul(p, k)` | 256-iteration double-and-add loop (Jacobian coordinates) | ~50-100 KB |
 | `ecMulGen(k)` | Same as `ecMul` but with hardcoded generator G | ~50-100 KB |
 | `ecNegate(p)` | `OP_SPLIT` (extract y), `PUSH p`, `OP_SWAP`, `OP_SUB` | ~100 B |
-| `ecOnCurve(p)` | Compute `y^2` and `x^3 + 7`, compare mod p | ~500 B |
+| `ecOnCurve(p)` | Range-check `x < p`, `y < p`, then compute `y^2` and `x^3 + 7` and compare mod p | ~730 B |
 | `ecModReduce(v, m)` | `OP_MOD` with negative correction | ~20 B |
 | `ecEncodeCompressed(p)` | Extract x, compute parity of y, prefix with 02/03 | ~200 B |
 | `ecMakePoint(x, y)` | `OP_NUM2BIN` (32 bytes each), `OP_CAT` | ~50 B |

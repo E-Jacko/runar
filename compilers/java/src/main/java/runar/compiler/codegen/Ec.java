@@ -772,14 +772,46 @@ public final class Ec {
         composePoint(t, "rx", "ry", "_result");
     }
 
+    /**
+     * Reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+     *
+     * <p>OP_MOD takes the sign of the DIVIDEND, so {@code k mod n} alone lands in
+     * (-n, n); the {@code + n, mod n} normalises the negative half. One push of n
+     * covers both reductions — the same shape as {@code emitEcModReduce}.
+     *
+     * <p>Without it, {@link #emitEcMul}'s ladder is only correct while
+     * 2^257 &lt;= k + 3n &lt; 2^258: a scalar &gt;= ~n sets bit 258, the
+     * 257-iteration loop never sees it, and the ladder returns a DIFFERENT
+     * multiple of P rather than failing. Scalars are contract input, so that is
+     * attacker-chosen. Reducing costs 1 push + 8 opcodes (42 bytes) against a
+     * ~429 KB script, and makes k &gt;= n, k &lt; 0 and k = 0 all well defined.
+     */
+    private static void emitScalarReduce(ECTracker t, String kName, String resultName) {
+        t.pushBigInt("_n_red", EC_CURVE_N);
+        t.rawBlock(List.of(kName, "_n_red"), resultName, e -> {
+            e.accept(new OpcodeOp("OP_2DUP"));
+            e.accept(new OpcodeOp("OP_MOD"));
+            e.accept(new RotOp());
+            e.accept(new DropOp());
+            e.accept(new OverOp());
+            e.accept(new OpcodeOp("OP_ADD"));
+            e.accept(new SwapOp());
+            e.accept(new OpcodeOp("OP_MOD"));
+        });
+    }
+
     public static void emitEcMul(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt", "_k"), emit);
         decomposePoint(t, "_pt", "ax", "ay");
 
         // k' = k + 3n
+        //
+        // "k in [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar
+        // is usually an unlock argument — so reduce it first.
         t.toTop("_k");
+        emitScalarReduce(t, "_k", "_kr");
         t.pushBigInt("_n", EC_CURVE_N);
-        t.rawBlock(List.of("_k", "_n"), "_kn", e -> e.accept(new OpcodeOp("OP_ADD")));
+        t.rawBlock(List.of("_kr", "_n"), "_kn", e -> e.accept(new OpcodeOp("OP_ADD")));
         t.pushBigInt("_n2", EC_CURVE_N);
         t.rawBlock(List.of("_kn", "_n2"), "_kn2", e -> e.accept(new OpcodeOp("OP_ADD")));
         t.pushBigInt("_n3", EC_CURVE_N);

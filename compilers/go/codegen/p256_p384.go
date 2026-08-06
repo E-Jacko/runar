@@ -5,8 +5,9 @@
 // and generator points.
 //
 // Point representation:
-//   P-256: 64 bytes (x[32] || y[32], big-endian unsigned)
-//   P-384: 96 bytes (x[48] || y[48], big-endian unsigned)
+//
+//	P-256: 64 bytes (x[32] || y[32], big-endian unsigned)
+//	P-384: 96 bytes (x[48] || y[48], big-endian unsigned)
 //
 // Key difference from secp256k1: curve parameter a = -3 (not 0), which gives
 // an optimized Jacobian doubling formula.
@@ -21,14 +22,14 @@ import (
 // ===========================================================================
 
 var (
-	p256P        *big.Int
-	p256PMinus2  *big.Int
-	p256B        *big.Int
-	p256N        *big.Int
-	p256NMinus2  *big.Int
-	p256GX       *big.Int
-	p256GY       *big.Int
-	p256SqrtExp  *big.Int
+	p256P       *big.Int
+	p256PMinus2 *big.Int
+	p256B       *big.Int
+	p256N       *big.Int
+	p256NMinus2 *big.Int
+	p256GX      *big.Int
+	p256GY      *big.Int
+	p256SqrtExp *big.Int
 )
 
 // ===========================================================================
@@ -36,14 +37,14 @@ var (
 // ===========================================================================
 
 var (
-	p384P        *big.Int
-	p384PMinus2  *big.Int
-	p384B        *big.Int
-	p384N        *big.Int
-	p384NMinus2  *big.Int
-	p384GX       *big.Int
-	p384GY       *big.Int
-	p384SqrtExp  *big.Int
+	p384P       *big.Int
+	p384PMinus2 *big.Int
+	p384B       *big.Int
+	p384N       *big.Int
+	p384NMinus2 *big.Int
+	p384GX      *big.Int
+	p384GY      *big.Int
+	p384SqrtExp *big.Int
 )
 
 func init() {
@@ -268,6 +269,32 @@ func cGroupMod(t *ECTracker, aName, resultName string, g *nistGroupParams) {
 	})
 }
 
+// cEmitScalarReduce reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+//
+// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+// the `+ n, mod n` normalises the negative half. One push of n covers both
+// reductions — the same shape as EmitEcModReduce.
+//
+// Without it, cEmitMul's ladder is only correct while 2^b <= k + 3n < 2^(b+1)
+// for the fixed b it unrolls: a scalar >= ~n sets a bit above the loop's top,
+// the loop never sees it, and the ladder returns a DIFFERENT multiple of P
+// rather than failing. Scalars are contract input, so that is attacker-chosen.
+// Reducing costs 1 push + 8 opcodes (42 / 58 bytes) against a ~460 KB / 1.6 MB
+// script, and makes k >= n, k < 0 and k = 0 all well defined.
+func cEmitScalarReduce(t *ECTracker, kName, resultName string, g *nistGroupParams) {
+	cPushGroupN(t, "_n_red", g)
+	t.rawBlock([]string{kName, "_n_red"}, resultName, func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+		e(StackOp{Op: "rot"})
+		e(StackOp{Op: "drop"})
+		e(StackOp{Op: "over"})
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+		e(StackOp{Op: "swap"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+	})
+}
+
 func cGroupMul(t *ECTracker, aName, bName, resultName string, g *nistGroupParams) {
 	t.toTop(aName)
 	t.toTop(bName)
@@ -372,6 +399,35 @@ func cComposePoint(t *ECTracker, xName, yName, resultName string, c *nistCurvePa
 // ===========================================================================
 // Affine point addition
 // ===========================================================================
+
+// cEmitCanonicityGuard emits the GAP-301 coordinate-canonicity check, leaving
+// "_canon" on the tracker.
+//
+// cDecomposePoint BIN2NUMs each coordinate as an unsigned value that may be
+// >= p; the curve equation reduces it mod p, so (x + p)||y would pass as a
+// point it is not the canonical encoding of. Reject it: require x < p AND
+// y < p (coordinates are unsigned, so the 0 <= bound holds by construction).
+// The caller ANDs "_canon" into its result so the check still returns a
+// boolean. This mirrors secp256k1's EmitEcOnCurve, whose guard the a = -3
+// curves never received — leaving pNNNOnCurve accepting inputs ecOnCurve
+// rejects even though both are documented as THE gate for untrusted points.
+func cEmitCanonicityGuard(t *ECTracker, xName, yName string, c *nistCurveParams) {
+	t.copyToTop(xName, "_x_lt")
+	cPushFieldP(t, "_p_for_x", c)
+	t.rawBlock([]string{"_x_lt", "_p_for_x"}, "_x_canon", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_LESSTHAN"})
+	})
+	t.copyToTop(yName, "_y_lt")
+	cPushFieldP(t, "_p_for_y", c)
+	t.rawBlock([]string{"_y_lt", "_p_for_y"}, "_y_canon", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_LESSTHAN"})
+	})
+	t.toTop("_x_canon")
+	t.toTop("_y_canon")
+	t.rawBlock([]string{"_x_canon", "_y_canon"}, "_canon", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
+	})
+}
 
 func cAffineAdd(t *ECTracker, c *nistCurveParams) {
 	// The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
@@ -756,9 +812,13 @@ func cEmitMul(emit func(StackOp), c *nistCurveParams, g *nistGroupParams) {
 	cDecomposePoint(t, "_pt", "ax", "ay", c)
 
 	// k' = k + 3n
+	//
+	// The "k ∈ [1, n-1]" precondition is one the caller cannot enforce — the
+	// scalar is usually an unlock argument — so reduce it first.
 	t.toTop("_k")
+	cEmitScalarReduce(t, "_k", "_kr", g)
 	t.pushBigInt("_n", g.n)
-	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
+	t.rawBlock([]string{"_kr", "_n"}, "_kn", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_ADD"})
 	})
 	t.pushBigInt("_n2", g.n)
@@ -951,8 +1011,8 @@ func cDecompressPubKey(
 	t.toTop("_dk_match")
 	t.nm = t.nm[:len(t.nm)-1] // condition consumed by IF
 
-	thenOps := []StackOp{{Op: "drop"}}  // remove neg_y, leaving y_cand
-	elseOps := []StackOp{{Op: "nip"}}   // remove y_cand, leaving neg_y
+	thenOps := []StackOp{{Op: "drop"}} // remove neg_y, leaving y_cand
+	elseOps := []StackOp{{Op: "nip"}}  // remove y_cand, leaving neg_y
 	t.e(StackOp{Op: "if", Then: thenOps, Else: elseOps})
 
 	// Remove one from tracker and rename the surviving item
@@ -1198,6 +1258,7 @@ func EmitP256Negate(emit func(StackOp)) {
 func EmitP256OnCurve(emit func(StackOp)) {
 	t := NewECTracker([]string{"_pt"}, emit)
 	cDecomposePoint(t, "_pt", "_x", "_y", p256CurveParams)
+	cEmitCanonicityGuard(t, "_x", "_y", p256CurveParams)
 
 	// lhs = y^2
 	cFieldSqr(t, "_y", "_y2", p256CurveParams)
@@ -1215,8 +1276,15 @@ func EmitP256OnCurve(emit func(StackOp)) {
 	// Compare
 	t.toTop("_y2")
 	t.toTop("_rhs")
-	t.rawBlock([]string{"_y2", "_rhs"}, "_result", func(e func(StackOp)) {
+	t.rawBlock([]string{"_y2", "_rhs"}, "_curve_eq", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_EQUAL"})
+	})
+
+	// on-curve = canonical AND curve-equation
+	t.toTop("_canon")
+	t.toTop("_curve_eq")
+	t.rawBlock([]string{"_canon", "_curve_eq"}, "_result", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
 	})
 }
 
@@ -1293,6 +1361,7 @@ func EmitP384Negate(emit func(StackOp)) {
 func EmitP384OnCurve(emit func(StackOp)) {
 	t := NewECTracker([]string{"_pt"}, emit)
 	cDecomposePoint(t, "_pt", "_x", "_y", p384CurveParams)
+	cEmitCanonicityGuard(t, "_x", "_y", p384CurveParams)
 
 	// lhs = y^2
 	cFieldSqr(t, "_y", "_y2", p384CurveParams)
@@ -1310,8 +1379,15 @@ func EmitP384OnCurve(emit func(StackOp)) {
 	// Compare
 	t.toTop("_y2")
 	t.toTop("_rhs")
-	t.rawBlock([]string{"_y2", "_rhs"}, "_result", func(e func(StackOp)) {
+	t.rawBlock([]string{"_y2", "_rhs"}, "_curve_eq", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_EQUAL"})
+	})
+
+	// on-curve = canonical AND curve-equation
+	t.toTop("_canon")
+	t.toTop("_curve_eq")
+	t.rawBlock([]string{"_canon", "_curve_eq"}, "_result", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
 	})
 }
 

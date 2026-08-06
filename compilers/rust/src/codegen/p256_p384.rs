@@ -417,6 +417,33 @@ fn c_group_mod(t: &mut ECTracker, a_name: &str, result_name: &str, g: &NistGroup
     });
 }
 
+/// Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+///
+/// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+/// the `+ n, mod n` normalises the negative half. One push of n covers both
+/// reductions — the same shape as `emit_ec_mod_reduce`.
+///
+/// Without it, `c_emit_mul`'s ladder is only correct while
+/// 2^b <= k + 3n < 2^(b+1) for the fixed b it unrolls: a scalar >= ~n sets a bit
+/// above the loop's top, the loop never sees it, and the ladder returns a
+/// DIFFERENT multiple of P rather than failing. Scalars are contract input, so
+/// that is attacker-chosen. Reducing costs 1 push + 8 opcodes (42 / 58 bytes)
+/// against a ~460 KB / 1.6 MB script, and makes k >= n, k < 0 and k = 0 all
+/// well defined.
+fn c_emit_scalar_reduce(t: &mut ECTracker, k_name: &str, result_name: &str, g: &NistGroupParams) {
+    c_push_group_n(t, "_n_red", g);
+    t.raw_block(&[k_name, "_n_red"], Some(result_name), |e| {
+        e(StackOp::Opcode("OP_2DUP".into()));
+        e(StackOp::Opcode("OP_MOD".into()));
+        e(StackOp::Rot);
+        e(StackOp::Drop);
+        e(StackOp::Over);
+        e(StackOp::Opcode("OP_ADD".into()));
+        e(StackOp::Swap);
+        e(StackOp::Opcode("OP_MOD".into()));
+    });
+}
+
 fn c_group_mul(t: &mut ECTracker, a_name: &str, b_name: &str, result_name: &str, g: &NistGroupParams) {
     t.to_top(a_name);
     t.to_top(b_name);
@@ -523,6 +550,34 @@ fn c_compose_point(t: &mut ECTracker, x_name: &str, y_name: &str, result_name: &
 // ===========================================================================
 // Affine point addition
 // ===========================================================================
+
+/// GAP-301: coordinate canonicity, leaving `_canon` on the tracker.
+///
+/// `c_decompose_point` BIN2NUMs each coordinate as an unsigned value that may
+/// be >= p; the curve equation reduces it mod p, so (x + p)||y would pass as a
+/// point it is not the canonical encoding of. Reject it: require x < p AND
+/// y < p (coordinates are unsigned, so the 0 <= bound holds by construction).
+/// The caller ANDs `_canon` into its result so the check still returns a
+/// boolean. This mirrors secp256k1's `emit_ec_on_curve`, whose guard the a = -3
+/// curves never received — leaving `pNNNOnCurve` accepting inputs `ecOnCurve`
+/// rejects even though both are documented as THE gate for untrusted points.
+fn c_emit_canonicity_guard(t: &mut ECTracker, x_name: &str, y_name: &str, c: &NistCurveParams) {
+    t.copy_to_top(x_name, "_x_lt");
+    c_push_field_p(t, "_p_for_x", c);
+    t.raw_block(&["_x_lt", "_p_for_x"], Some("_x_canon"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.copy_to_top(y_name, "_y_lt");
+    c_push_field_p(t, "_p_for_y", c);
+    t.raw_block(&["_y_lt", "_p_for_y"], Some("_y_canon"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.to_top("_x_canon");
+    t.to_top("_y_canon");
+    t.raw_block(&["_x_canon", "_y_canon"], Some("_canon"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+}
 
 fn c_affine_add(t: &mut ECTracker, c: &NistCurveParams) {
     // The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
@@ -885,10 +940,14 @@ fn c_emit_mul(emit: &mut dyn FnMut(StackOp), c: &NistCurveParams, g: &NistGroupP
     c_decompose_point(&mut t, "_pt", "ax", "ay", c);
 
     // k' = k + 3n (pre-compute 3n to match Go peephole optimizer output)
+    //
+    // The "k ∈ [1, n-1]" precondition is one the caller cannot enforce — the
+    // scalar is usually an unlock argument — so reduce it first.
     t.to_top("_k");
+    c_emit_scalar_reduce(&mut t, "_k", "_kr", g);
     let three_n = &**g.n * 3;
     t.push_big_int("_3n", &three_n);
-    t.raw_block(&["_k", "_3n"], Some("_kn3"), |e| {
+    t.raw_block(&["_kr", "_3n"], Some("_kn3"), |e| {
         e(StackOp::Opcode("OP_ADD".into()));
     });
     t.rename("_k");
@@ -1281,6 +1340,7 @@ pub fn emit_p256_negate(emit: &mut dyn FnMut(StackOp)) {
 pub fn emit_p256_on_curve(emit: &mut dyn FnMut(StackOp)) {
     let mut t = ECTracker::new(&["_pt"], emit);
     c_decompose_point(&mut t, "_pt", "_x", "_y", &P256_CURVE);
+    c_emit_canonicity_guard(&mut t, "_x", "_y", &P256_CURVE);
 
     // lhs = y^2
     c_field_sqr(&mut t, "_y", "_y2", &P256_CURVE);
@@ -1298,8 +1358,15 @@ pub fn emit_p256_on_curve(emit: &mut dyn FnMut(StackOp)) {
     // Compare
     t.to_top("_y2");
     t.to_top("_rhs");
-    t.raw_block(&["_y2", "_rhs"], Some("_result"), |e| {
+    t.raw_block(&["_y2", "_rhs"], Some("_curve_eq"), |e| {
         e(StackOp::Opcode("OP_EQUAL".into()));
+    });
+
+    // on-curve = canonical AND curve-equation
+    t.to_top("_canon");
+    t.to_top("_curve_eq");
+    t.raw_block(&["_canon", "_curve_eq"], Some("_result"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
 
@@ -1376,6 +1443,7 @@ pub fn emit_p384_negate(emit: &mut dyn FnMut(StackOp)) {
 pub fn emit_p384_on_curve(emit: &mut dyn FnMut(StackOp)) {
     let mut t = ECTracker::new(&["_pt"], emit);
     c_decompose_point(&mut t, "_pt", "_x", "_y", &P384_CURVE);
+    c_emit_canonicity_guard(&mut t, "_x", "_y", &P384_CURVE);
 
     // lhs = y^2
     c_field_sqr(&mut t, "_y", "_y2", &P384_CURVE);
@@ -1393,8 +1461,15 @@ pub fn emit_p384_on_curve(emit: &mut dyn FnMut(StackOp)) {
     // Compare
     t.to_top("_y2");
     t.to_top("_rhs");
-    t.raw_block(&["_y2", "_rhs"], Some("_result"), |e| {
+    t.raw_block(&["_y2", "_rhs"], Some("_curve_eq"), |e| {
         e(StackOp::Opcode("OP_EQUAL".into()));
+    });
+
+    // on-curve = canonical AND curve-equation
+    t.to_top("_canon");
+    t.to_top("_curve_eq");
+    t.raw_block(&["_canon", "_curve_eq"], Some("_result"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
 

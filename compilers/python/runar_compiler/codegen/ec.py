@@ -826,6 +826,35 @@ def emit_ec_add(emit: Callable) -> None:
     _ec_compose_point(t, "rx", "ry", "_result")
 
 
+def _ec_emit_scalar_reduce(t: ECTracker, k_name: str, result_name: str, curve_n: int) -> None:
+    """Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+
+    OP_MOD takes the sign of the DIVIDEND, so ``k mod n`` alone lands in
+    (-n, n); the ``+ n, mod n`` normalises the negative half. One push of n
+    covers both reductions -- the same shape as ``emit_ec_mod_reduce``.
+
+    Without it, ``emit_ec_mul``'s ladder is only correct while
+    2^257 <= k + 3n < 2^258: a scalar >= ~n sets bit 258, the 257-iteration
+    loop never sees it, and the ladder returns a DIFFERENT multiple of P rather
+    than failing. Scalars are contract input, so that is attacker-chosen.
+    Reducing costs 1 push + 8 opcodes (42 bytes) against a ~429 KB script, and
+    makes k >= n, k < 0 and k = 0 all well defined.
+    """
+    t.push_big_int("_n_red", curve_n)
+
+    def _body(e: Callable) -> None:
+        e(_make_stack_op(op="opcode", code="OP_2DUP"))
+        e(_make_stack_op(op="opcode", code="OP_MOD"))
+        e(_make_stack_op(op="rot"))
+        e(_make_stack_op(op="drop"))
+        e(_make_stack_op(op="over"))
+        e(_make_stack_op(op="opcode", code="OP_ADD"))
+        e(_make_stack_op(op="swap"))
+        e(_make_stack_op(op="opcode", code="OP_MOD"))
+
+    t.raw_block([k_name, "_n_red"], result_name, _body)
+
+
 def emit_ec_mul(emit: Callable) -> None:
     """Perform scalar multiplication P * k.
 
@@ -841,10 +870,14 @@ def emit_ec_mul(emit: Callable) -> None:
     # k' = k + 3n: guarantees bit 257 is set.
     # k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
     # is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
+    #
+    # "k in [1, n-1]" is a PRECONDITION the caller cannot enforce -- the scalar
+    # is usually an unlock argument -- so reduce it first.
     curve_n = int("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
     t.to_top("_k")
+    _ec_emit_scalar_reduce(t, "_k", "_kr", curve_n)
     t.push_big_int("_n", curve_n)
-    t.raw_block(["_k", "_n"], "_kn", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
+    t.raw_block(["_kr", "_n"], "_kn", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
     t.push_big_int("_n2", curve_n)
     t.raw_block(["_kn", "_n2"], "_kn2", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
     t.push_big_int("_n3", curve_n)

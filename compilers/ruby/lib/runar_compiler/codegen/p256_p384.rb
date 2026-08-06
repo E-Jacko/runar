@@ -243,6 +243,33 @@ module RunarCompiler
         t.raw_block([a_name, "_gmod_n"], result_name, fn)
       end
 
+      # Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+      #
+      # OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in
+      # (-n, n); the `+ n, mod n` normalises the negative half. One push of n
+      # covers both reductions -- the same shape as `emit_ec_mod_reduce`.
+      #
+      # Without it, `c_emit_mul`'s ladder is only correct while
+      # 2^b <= k + 3n < 2^(b+1) for the fixed b it unrolls: a scalar >= ~n sets
+      # a bit above the loop's top, the loop never sees it, and the ladder
+      # returns a DIFFERENT multiple of P rather than failing. Scalars are
+      # contract input, so that is attacker-chosen. Reducing costs 1 push + 8
+      # opcodes (42 / 58 bytes) against a ~460 KB / 1.6 MB script, and makes
+      # k >= n, k < 0 and k = 0 all well defined.
+      def self.c_emit_scalar_reduce(t, k_name, result_name, g)
+        c_push_group_n(t, "_n_red", g)
+        t.raw_block([k_name, "_n_red"], result_name, lambda { |e|
+          e.call(make_stack_op(op: "opcode", code: "OP_2DUP"))
+          e.call(make_stack_op(op: "opcode", code: "OP_MOD"))
+          e.call(make_stack_op(op: "rot"))
+          e.call(make_stack_op(op: "drop"))
+          e.call(make_stack_op(op: "over"))
+          e.call(make_stack_op(op: "opcode", code: "OP_ADD"))
+          e.call(make_stack_op(op: "swap"))
+          e.call(make_stack_op(op: "opcode", code: "OP_MOD"))
+        })
+      end
+
       def self.c_group_mul(t, a_name, b_name, result_name, g)
         t.to_top(a_name)
         t.to_top(b_name)
@@ -368,6 +395,29 @@ module RunarCompiler
       #
       # NOT handled: P == -Q, whose true result is the point at infinity, which
       # affine coordinates cannot represent.
+      # GAP-301: coordinate canonicity, leaving "_canon" on the tracker.
+      #
+      # `c_decompose_point` BIN2NUMs each coordinate as an unsigned value that
+      # may be >= p; the curve equation reduces it mod p, so (x + p)||y would
+      # pass as a point it is not the canonical encoding of. Reject it: require
+      # x < p AND y < p (coordinates are unsigned, so the 0 <= bound holds by
+      # construction). The caller ANDs "_canon" into its result so the check
+      # still returns a boolean. This mirrors secp256k1's `emit_ec_on_curve`,
+      # whose guard the a = -3 curves never received -- leaving `pNNNOnCurve`
+      # accepting inputs `ecOnCurve` rejects even though both are documented as
+      # THE gate for untrusted points.
+      def self.c_emit_canonicity_guard(t, x_name, y_name, c)
+        t.copy_to_top(x_name, "_x_lt")
+        c_push_field_p(t, "_p_for_x", c)
+        t.raw_block(["_x_lt", "_p_for_x"], "_x_canon", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_LESSTHAN")) })
+        t.copy_to_top(y_name, "_y_lt")
+        c_push_field_p(t, "_p_for_y", c)
+        t.raw_block(["_y_lt", "_p_for_y"], "_y_canon", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_LESSTHAN")) })
+        t.to_top("_x_canon")
+        t.to_top("_y_canon")
+        t.raw_block(["_x_canon", "_y_canon"], "_canon", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_BOOLAND")) })
+      end
+
       def self.c_affine_add(t, c)
         t.copy_to_top("px", "_px_eq")
         t.copy_to_top("qx", "_qx_eq")
@@ -700,9 +750,13 @@ module RunarCompiler
         c_decompose_point(t, "_pt", "ax", "ay", c)
 
         # k' = k + 3n
+        #
+        # The "k in [1, n-1]" precondition is one the caller cannot enforce --
+        # the scalar is usually an unlock argument -- so reduce it first.
         t.to_top("_k")
+        c_emit_scalar_reduce(t, "_k", "_kr", g)
         t.push_big_int("_n", g.n)
-        t.raw_block(["_k", "_n"], "_kn", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
+        t.raw_block(["_kr", "_n"], "_kn", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
         t.push_big_int("_n2", g.n)
         t.raw_block(["_kn", "_n2"], "_kn2", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
         t.push_big_int("_n3", g.n)
@@ -1058,6 +1112,7 @@ module RunarCompiler
       def self.emit_p256_on_curve(emit)
         t = EC::ECTracker.new(["_pt"], emit)
         c_decompose_point(t, "_pt", "_x", "_y", P256_CURVE)
+        c_emit_canonicity_guard(t, "_x", "_y", P256_CURVE)
 
         c_field_sqr(t, "_y", "_y2", P256_CURVE)
 
@@ -1072,7 +1127,12 @@ module RunarCompiler
 
         t.to_top("_y2")
         t.to_top("_rhs")
-        t.raw_block(["_y2", "_rhs"], "_result", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_EQUAL")) })
+        t.raw_block(["_y2", "_rhs"], "_curve_eq", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_EQUAL")) })
+
+        # on-curve = canonical AND curve-equation
+        t.to_top("_canon")
+        t.to_top("_curve_eq")
+        t.raw_block(["_canon", "_curve_eq"], "_result", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_BOOLAND")) })
       end
 
       def self.emit_p256_encode_compressed(emit)
@@ -1134,6 +1194,7 @@ module RunarCompiler
       def self.emit_p384_on_curve(emit)
         t = EC::ECTracker.new(["_pt"], emit)
         c_decompose_point(t, "_pt", "_x", "_y", P384_CURVE)
+        c_emit_canonicity_guard(t, "_x", "_y", P384_CURVE)
 
         c_field_sqr(t, "_y", "_y2", P384_CURVE)
 
@@ -1148,7 +1209,12 @@ module RunarCompiler
 
         t.to_top("_y2")
         t.to_top("_rhs")
-        t.raw_block(["_y2", "_rhs"], "_result", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_EQUAL")) })
+        t.raw_block(["_y2", "_rhs"], "_curve_eq", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_EQUAL")) })
+
+        # on-curve = canonical AND curve-equation
+        t.to_top("_canon")
+        t.to_top("_curve_eq")
+        t.raw_block(["_canon", "_curve_eq"], "_result", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_BOOLAND")) })
       end
 
       def self.emit_p384_encode_compressed(emit)

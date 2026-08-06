@@ -391,6 +391,8 @@ Goldens are **self-produced** by the very implementation under test — `pnpm ru
 
   The entry is **content-pinned**: `sha256` must equal the current bytes of the golden. Because the pin is content-addressed, an entry can only ever justify the *one* value it was reviewed for — a later, *different* regeneration of the same file fails the gate again and forces a fresh, re-reviewed entry. This is what prevents a stale exemption from silently authorizing future silent regenerations. `verified-against` records the class of independent oracle; `reason` and `reviewer` make the sign-off explicit and reviewable in the allowlist diff.
 
+  **`reviewer` must be true, not conventional.** The gate only checks that the field is non-empty, so a pre-filled or invented handle passes it — and a provenance record whose sign-off is fabricated is worse than no record, because it launders exactly the self-regeneration the gate exists to catch. If a tool or an agent produced the entry and no human has checked it yet, say so: set `"reviewer": "unreviewed:<producer>"` **and** `"review-status": "unreviewed"`, and let the reviewer replace both when they actually sign off.
+
 **Running it.**
 
 ```bash

@@ -537,13 +537,13 @@ All intermediate arithmetic in EC operations uses modular arithmetic over `F_p`:
     ──────────────────────────────────────────────────────────────
     <ecAdd(a, a), env, sigma>  -->  VBytes(encode_point(rx, ry))    /* point doubling */
 
-    Point(x, y) = decode_point(p)    k = VInt(scalar)
-    result = double_and_add(x, y, scalar, 256 iterations)
+    Point(x, y) = decode_point(p)    k = ((VInt(scalar) % n) + n) % n
+    result = double_and_add(x, y, k, 256 iterations)
     ──────────────────────────────────────────────────────────────
     <ecMul(p, k), env, sigma>  -->  VBytes(encode_point(result))
 
-    k = VInt(scalar)
-    result = double_and_add(Gx, Gy, scalar, 256 iterations)
+    k = ((VInt(scalar) % n) + n) % n
+    result = double_and_add(Gx, Gy, k, 256 iterations)
     ──────────────────────────────────────────────────────────────
     <ecMulGen(k), env, sigma>  -->  VBytes(encode_point(result))
 
@@ -552,9 +552,10 @@ All intermediate arithmetic in EC operations uses modular arithmetic over `F_p`:
     <ecNegate(p), env, sigma>  -->  VBytes(encode_point(x, p - y))
 
     Point(x, y) = decode_point(p)
+    canonical = (x < p_field) AND (y < p_field)
     lhs = field_mul(y, y)    rhs = field_add(field_mul(x, field_mul(x, x)), 7)
     ──────────────────────────────────────────────────
-    <ecOnCurve(p), env, sigma>  -->  VBool(lhs == rhs)
+    <ecOnCurve(p), env, sigma>  -->  VBool(canonical AND lhs == rhs)
 
     v = VInt(value)    m = VInt(mod)
     ──────────────────────────────────────────────────
@@ -566,6 +567,15 @@ All intermediate arithmetic in EC operations uses modular arithmetic over `F_p`:
 The `ecMul` and `ecMulGen` implementations use Jacobian projective coordinates `(X, Y, Z)` internally, where the affine point `(x, y)` corresponds to `(X/Z^2, Y/Z^3)`. This avoids expensive modular inversions during the 256-iteration double-and-add loop. A single conversion from Jacobian to affine (requiring one modular inverse) is performed at the end.
 
 The double-and-add algorithm iterates over the 256 bits of the scalar from most significant to least significant. For each bit: double the accumulator; if the bit is 1, add the base point. This produces a fixed 256-iteration loop regardless of the scalar value.
+
+### 8.6 Scalar domain and coordinate canonicity
+
+`ecMul` / `ecMulGen` — and their NIST peers `p256Mul` / `p384Mul` / `pNNNMulGen` — reduce the scalar to `[0, n-1]` before the ladder runs. The ladder itself is only correct while the fixed high bit it relies on is the top set bit of `k + 3n`, which holds exactly on that interval; without the reduction a scalar at or above `n` silently produced a *different* multiple of `P` rather than an error. Consequences of the reduction:
+
+- `k >= n` behaves as `k mod n`, and a negative `k` as `((k mod n) + n) mod n` (so `ecMul(P, -1)` is `-P`).
+- `k ≡ 0 (mod n)` denotes the point at infinity, which the affine `x‖y` encoding cannot represent. It evaluates to the **all-zero point**; a contract that can be handed an untrusted scalar must treat the all-zero result as a rejection.
+
+`ecOnCurve` / `p256OnCurve` / `p384OnCurve` additionally require both coordinates to be **canonical** — `x < p` and `y < p`. Coordinates are decoded as unsigned integers and every field operation reduces mod `p`, so `(x + p)‖y` satisfies the curve equation exactly as `x‖y` does; without the range check a point would have more than one accepted encoding, and `ecAdd` / `pNNNAdd` — which detect doubling by comparing the *raw* x-coordinates — would take the chord path on two encodings of the same point and return an off-curve result. This makes the three curves agree: `ecOnCurve` has carried the check since GAP-301, and the NIST pair now does too.
 
 ---
 

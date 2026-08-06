@@ -42,7 +42,7 @@ class EcTest {
     void ecAddShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcAdd(ops::add);
-        assertEquals(8202, ops.size(), "ecAdd op count drift");
+        assertEquals(8202, countOpTree(ops), "ecAdd op count drift");
 
         String hex = emitHex(ops);
         assertEquals(25405, hex.length() / 2, "ecAdd hex byte count drift");
@@ -52,23 +52,23 @@ class EcTest {
     void ecMulShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMul(ops::add);
-        assertEquals(63828, ops.size(), "ecMul op count drift");
-        assertEquals(428634, emitHex(ops).length() / 2);
+        assertEquals(130515, countOpTree(ops), "ecMul op count drift");
+        assertEquals(428676, emitHex(ops).length() / 2);
     }
 
     @Test
     void ecMulGenShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMulGen(ops::add);
-        assertEquals(63830, ops.size(), "ecMulGen op count drift");
-        assertEquals(428700, emitHex(ops).length() / 2);
+        assertEquals(130517, countOpTree(ops), "ecMulGen op count drift");
+        assertEquals(428742, emitHex(ops).length() / 2);
     }
 
     @Test
     void ecNegateShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcNegate(ops::add);
-        assertEquals(945, ops.size());
+        assertEquals(945, countOpTree(ops));
         assertEquals(1018, emitHex(ops).length() / 2);
     }
 
@@ -76,7 +76,7 @@ class EcTest {
     void ecOnCurveShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcOnCurve(ops::add);
-        assertEquals(533, ops.size());
+        assertEquals(533, countOpTree(ops));
         assertEquals(734, emitHex(ops).length() / 2);
     }
 
@@ -84,7 +84,7 @@ class EcTest {
     void ecModReduceIsExactEightOps() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcModReduce(ops::add);
-        assertEquals(8, ops.size());
+        assertEquals(8, countOpTree(ops));
         // OP_2DUP, OP_MOD, OP_ROT, OP_DROP, OP_OVER, OP_ADD, OP_SWAP, OP_MOD
         assertTrue(ops.get(0) instanceof OpcodeOp
             && "OP_2DUP".equals(((OpcodeOp) ops.get(0)).code()));
@@ -104,7 +104,7 @@ class EcTest {
     void ecEncodeCompressedShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcEncodeCompressed(ops::add);
-        assertEquals(14, ops.size());
+        assertEquals(16, countOpTree(ops));
         assertEquals(19, emitHex(ops).length() / 2);
     }
 
@@ -112,7 +112,7 @@ class EcTest {
     void ecMakePointShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMakePoint(ops::add);
-        assertEquals(467, ops.size());
+        assertEquals(467, countOpTree(ops));
         assertEquals(471, emitHex(ops).length() / 2);
     }
 
@@ -120,7 +120,7 @@ class EcTest {
     void ecPointXShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcPointX(ops::add);
-        assertEquals(233, ops.size());
+        assertEquals(233, countOpTree(ops));
         assertEquals(235, emitHex(ops).length() / 2);
     }
 
@@ -128,7 +128,7 @@ class EcTest {
     void ecPointYShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcPointY(ops::add);
-        assertEquals(234, ops.size());
+        assertEquals(234, countOpTree(ops));
         assertEquals(236, emitHex(ops).length() / 2);
     }
 
@@ -166,6 +166,27 @@ class EcTest {
     }
 
     // ---- helpers ----
+
+    /**
+     * Total number of {@link StackOp}s in {@code ops}, INCLUDING the bodies of
+     * {@code if} ops.
+     *
+     * <p>A flat {@code ops.size()} cannot see inside a branch, so any emitter
+     * whose work sits in an {@code if} body — the ladder emits 257 conditional
+     * additions — reports a count that barely moves no matter what the branch
+     * contains. Recursing is what makes the golden a gate.
+     */
+    private static int countOpTree(List<StackOp> ops) {
+        int total = 0;
+        for (StackOp op : ops) {
+            total++;
+            if (op instanceof IfOp ifOp) {
+                if (ifOp.thenBranch() != null) total += countOpTree(ifOp.thenBranch());
+                if (ifOp.elseBranch() != null) total += countOpTree(ifOp.elseBranch());
+            }
+        }
+        return total;
+    }
 
     private static String emitHex(List<StackOp> ops) {
         StackProgram prog = new StackProgram("Test",

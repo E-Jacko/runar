@@ -889,10 +889,31 @@ fn emitEcAdd(t: *ECTracker) !void {
     try composePoint(t, "rx", "ry", "_result");
 }
 
+/// Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+///
+/// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+/// the `+ n, mod n` normalises the negative half. One push of n covers both
+/// reductions — the same shape as fieldMod / ecModReduce.
+///
+/// Without it, emitEcMul's ladder is only correct while 2^257 <= k + 3n < 2^258:
+/// a scalar >= ~n sets bit 258, the 257-iteration loop never sees it, and the
+/// ladder returns a DIFFERENT multiple of P rather than failing. Scalars are
+/// contract input, so that is attacker-chosen. Reducing costs 1 push + 8 opcodes
+/// (42 bytes) against a ~429 KB script, and makes k >= n, k < 0 and k = 0 all
+/// well defined.
+fn emitScalarReduce(t: *ECTracker, k_name: []const u8, result_name: []const u8) !void {
+    try t.toTop(k_name);
+    try pushCurveNNum(t, "_n_red");
+    try t.rawBlock(2, result_name, emitFieldModSequence);
+}
+
 fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !void {
     try decomposePoint(t, point_name, "ax", "ay");
 
+    // "k in [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar is
+    // usually an unlock argument — so reduce it first. See emitScalarReduce.
     try t.toTop(scalar_name);
+    try emitScalarReduce(t, scalar_name, "_kr");
     try t.pushStaticBytes("_3n", curve_3n_script_num_le[0..]);
     try t.rawBlock(2, "_kn3", emitAddOpcode);
     t.renameTop("_k");
@@ -1048,31 +1069,53 @@ test "ec add helper emits affine split and compose flow" {
 // regression in `buildBuiltinOps` surfaces here as a localized failure
 // rather than only as a cross-tier hex mismatch from the golden harness.
 //
-// The counts diverge from the Python/Java peers because the Zig tier
-// represents control flow at the helper level as a single `.@"if"` op
-// (containing nested `.then` / `.else` slices), whereas Python/Java
-// flatten if-bodies into separate ops. Final compiled hex is byte-
-// identical (enforced by the conformance harness).
+// The counts are op-TREE sizes (if bodies included, see countOpTree) and
+// still diverge slightly from the Python/Java peers because the Zig tier
+// bundles some sequences differently at the helper level. Final compiled hex
+// is byte-identical (enforced by the conformance harness).
 // ---------------------------------------------------------------------------
+
+/// Total number of StackOps in `ops`, INCLUDING the bodies of `.@"if"` ops.
+///
+/// A flat `ops.len` cannot see inside a branch, so any emitter whose work sits
+/// in an if body — the scalar ladders emit 257 / 385 conditional additions —
+/// reports a count that barely moves no matter what the branch contains.
+/// Adding +1.3 KB of script inside the ladder's last step left the p256Mul /
+/// p384Mul goldens byte-identical. Recursing is what makes the golden a gate.
+fn countOpTree(ops: []const StackOp) usize {
+    var total: usize = 0;
+    for (ops) |op| {
+        total += 1;
+        switch (op) {
+            .@"if" => |stack_if| {
+                total += countOpTree(stack_if.then);
+                if (stack_if.@"else") |else_ops| total += countOpTree(else_ops);
+            },
+            else => {},
+        }
+    }
+    return total;
+}
 
 test "ec helper op-count goldens" {
     const cases = .{
         .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8183) },
-        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 59707) },
-        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 59709) },
+        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 119671) },
+        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 119673) },
         .{ registry.CryptoBuiltin.ec_negate, "ecNegate", @as(usize, 945) },
         .{ registry.CryptoBuiltin.ec_on_curve, "ecOnCurve", @as(usize, 530) },
     };
     inline for (cases) |c| {
         var bundle = try buildBuiltinOps(std.testing.allocator, c[0]);
         defer bundle.deinit();
-        if (bundle.ops.len != c[2]) {
+        const got = countOpTree(bundle.ops);
+        if (got != c[2]) {
             std.debug.print(
                 "{s}: op-count drift — got {d}, want {d}\n",
-                .{ c[1], bundle.ops.len, c[2] },
+                .{ c[1], got, c[2] },
             );
         }
-        try std.testing.expectEqual(c[2], bundle.ops.len);
+        try std.testing.expectEqual(c[2], got);
     }
 }
 

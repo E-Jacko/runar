@@ -229,6 +229,35 @@ public final class P256P384 {
         });
     }
 
+    /**
+     * Reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+     *
+     * <p>OP_MOD takes the sign of the DIVIDEND, so {@code k mod n} alone lands in
+     * (-n, n); the {@code + n, mod n} normalises the negative half. One push of n
+     * covers both reductions — the same shape as {@code emitEcModReduce}.
+     *
+     * <p>Without it, {@code cEmitMul}'s ladder is only correct while
+     * 2^b &lt;= k + 3n &lt; 2^(b+1) for the fixed b it unrolls: a scalar &gt;= ~n
+     * sets a bit above the loop's top, the loop never sees it, and the ladder
+     * returns a DIFFERENT multiple of P rather than failing. Scalars are contract
+     * input, so that is attacker-chosen. Reducing costs 1 push + 8 opcodes
+     * (42 / 58 bytes) against a ~460 KB / 1.6 MB script, and makes k &gt;= n,
+     * k &lt; 0 and k = 0 all well defined.
+     */
+    private static void cEmitScalarReduce(ECTracker t, String kName, String resultName, BigInteger n) {
+        cPushGroupN(t, "_n_red", n);
+        t.rawBlock(List.of(kName, "_n_red"), resultName, e -> {
+            e.accept(new OpcodeOp("OP_2DUP"));
+            e.accept(new OpcodeOp("OP_MOD"));
+            e.accept(new RotOp());
+            e.accept(new DropOp());
+            e.accept(new OverOp());
+            e.accept(new OpcodeOp("OP_ADD"));
+            e.accept(new SwapOp());
+            e.accept(new OpcodeOp("OP_MOD"));
+        });
+    }
+
     private static void cGroupMul(ECTracker t, String aName, String bName, String resultName, BigInteger n) {
         t.toTop(aName);
         t.toTop(bName);
@@ -362,6 +391,34 @@ public final class P256P384 {
      * <p>NOT handled: P == -Q, whose true result is the point at infinity, which affine
      * coordinates cannot represent.
      */
+    /**
+     * GAP-301: coordinate canonicity, leaving {@code _canon} on the tracker.
+     *
+     * <p>{@code cDecomposePoint} BIN2NUMs each coordinate as an unsigned value
+     * that may be &gt;= p; the curve equation reduces it mod p, so (x + p)||y
+     * would pass as a point it is not the canonical encoding of. Reject it:
+     * require x &lt; p AND y &lt; p (coordinates are unsigned, so the 0 &lt;=
+     * bound holds by construction). The caller ANDs {@code _canon} into its
+     * result so the check still returns a boolean. This mirrors secp256k1's
+     * {@code emitEcOnCurve}, whose guard the a = -3 curves never received —
+     * leaving {@code pNNNOnCurve} accepting inputs {@code ecOnCurve} rejects
+     * even though both are documented as THE gate for untrusted points.
+     */
+    private static void cEmitCanonicityGuard(ECTracker t, String xName, String yName, BigInteger fieldP) {
+        t.copyToTop(xName, "_x_lt");
+        cPushFieldP(t, "_p_for_x", fieldP);
+        t.rawBlock(List.of("_x_lt", "_p_for_x"), "_x_canon",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.copyToTop(yName, "_y_lt");
+        cPushFieldP(t, "_p_for_y", fieldP);
+        t.rawBlock(List.of("_y_lt", "_p_for_y"), "_y_canon",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.toTop("_x_canon");
+        t.toTop("_y_canon");
+        t.rawBlock(List.of("_x_canon", "_y_canon"), "_canon",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+    }
+
     private static void cAffineAdd(ECTracker t, BigInteger fieldP, BigInteger pMinus2) {
         t.copyToTop("px", "_px_eq");
         t.copyToTop("qx", "_qx_eq");
@@ -702,9 +759,13 @@ public final class P256P384 {
         cDecomposePoint(t, "_pt", "ax", "ay", coordBytes, revFn);
 
         // k' = k + 3n (three separate adds, matches Go reference)
+        //
+        // The "k in [1, n-1]" precondition is one the caller cannot enforce — the
+        // scalar is usually an unlock argument — so reduce it first.
         t.toTop("_k");
+        cEmitScalarReduce(t, "_k", "_kr", curveN);
         t.pushBigInt("_n", curveN);
-        t.rawBlock(List.of("_k", "_n"), "_kn",
+        t.rawBlock(List.of("_kr", "_n"), "_kn",
             e -> e.accept(new OpcodeOp("OP_ADD")));
         t.pushBigInt("_n2", curveN);
         t.rawBlock(List.of("_kn", "_n2"), "_kn2",
@@ -1085,6 +1146,7 @@ public final class P256P384 {
     public static void emitP256OnCurve(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt"), emit);
         cDecomposePoint(t, "_pt", "_x", "_y", 32, REV32);
+        cEmitCanonicityGuard(t, "_x", "_y", P256_P);
 
         // lhs = y^2
         cFieldSqr(t, "_y", "_y2", P256_P);
@@ -1101,8 +1163,14 @@ public final class P256P384 {
 
         t.toTop("_y2");
         t.toTop("_rhs");
-        t.rawBlock(List.of("_y2", "_rhs"), "_result",
+        t.rawBlock(List.of("_y2", "_rhs"), "_curve_eq",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
+
+        // on-curve = canonical AND curve-equation
+        t.toTop("_canon");
+        t.toTop("_curve_eq");
+        t.rawBlock(List.of("_canon", "_curve_eq"), "_result",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     public static void emitP256EncodeCompressed(Consumer<StackOp> emit) {
@@ -1171,6 +1239,7 @@ public final class P256P384 {
     public static void emitP384OnCurve(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt"), emit);
         cDecomposePoint(t, "_pt", "_x", "_y", 48, REV48);
+        cEmitCanonicityGuard(t, "_x", "_y", P384_P);
 
         cFieldSqr(t, "_y", "_y2", P384_P);
 
@@ -1185,8 +1254,14 @@ public final class P256P384 {
 
         t.toTop("_y2");
         t.toTop("_rhs");
-        t.rawBlock(List.of("_y2", "_rhs"), "_result",
+        t.rawBlock(List.of("_y2", "_rhs"), "_curve_eq",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
+
+        // on-curve = canonical AND curve-equation
+        t.toTop("_canon");
+        t.toTop("_curve_eq");
+        t.rawBlock(List.of("_canon", "_curve_eq"), "_result",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     public static void emitP384EncodeCompressed(Consumer<StackOp> emit) {

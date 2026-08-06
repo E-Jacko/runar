@@ -26,6 +26,27 @@ fn collect<F: FnOnce(&mut dyn FnMut(StackOp))>(f: F) -> Vec<StackOp> {
     ops
 }
 
+/// Total number of `StackOp`s in `ops`, INCLUDING the bodies of `if` ops.
+///
+/// A flat `ops.len()` cannot see inside a branch, so any emitter whose work
+/// sits in an `if` body — the scalar ladders emit 257 / 385 conditional
+/// additions, WOTS+ and SLH-DSA are almost entirely conditional — reports a
+/// count that barely moves no matter what the branch contains. Adding +1.3 KB
+/// of script inside the ladder's last step left the `p256_mul` / `p384_mul`
+/// goldens byte-identical. Recursing is what makes the golden a gate.
+fn count_op_tree(ops: &[StackOp]) -> usize {
+    let mut total = 0usize;
+    for op in ops {
+        total += 1;
+        if let StackOp::If { then_ops, else_ops } = op {
+            total += count_op_tree(then_ops);
+            total += count_op_tree(else_ops);
+        }
+    }
+    total
+}
+
+
 // ---------------------------------------------------------------------------
 // Blake3 codegen
 // ---------------------------------------------------------------------------
@@ -300,13 +321,13 @@ fn test_emit_verify_slh_dsa_all_param_sets() {
 #[test]
 fn test_blake3_compress_op_count_golden() {
     let ops = collect(|s| emit_blake3_compress(s));
-    assert_eq!(ops.len(), 10373, "blake3_compress op count drift");
+    assert_eq!(count_op_tree(&ops), 10373, "blake3_compress op count drift");
 }
 
 #[test]
 fn test_blake3_hash_op_count_golden() {
     let ops = collect(|s| emit_blake3_hash(s));
-    assert_eq!(ops.len(), 10387, "blake3_hash op count drift");
+    assert_eq!(count_op_tree(&ops), 10387, "blake3_hash op count drift");
 }
 
 // -- P-256 -----------------------------------------------------------------
@@ -314,7 +335,7 @@ fn test_blake3_hash_op_count_golden() {
 #[test]
 fn test_p256_add_op_count_golden() {
     let ops = collect(|s| emit_p256_add(s));
-    assert_eq!(ops.len(), 6642, "p256_add op count drift");
+    assert_eq!(count_op_tree(&ops), 6642, "p256_add op count drift");
 }
 
 #[test]
@@ -323,32 +344,32 @@ fn test_p256_mul_op_count_golden() {
     // Rust emits 4 fewer raw StackOps than Python/Java peers; same pattern
     // as ecMul (see ec_codegen_tests.rs module comment). Final hex is
     // byte-identical (enforced by the conformance harness).
-    assert_eq!(ops.len(), 73302, "p256_mul op count drift");
+    assert_eq!(count_op_tree(&ops), 140032, "p256_mul op count drift");
 }
 
 #[test]
 fn test_p256_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_p256_mul_gen(s));
     // See p256_mul_op_count_golden comment.
-    assert_eq!(ops.len(), 73304, "p256_mul_gen op count drift");
+    assert_eq!(count_op_tree(&ops), 140034, "p256_mul_gen op count drift");
 }
 
 #[test]
 fn test_p256_negate_op_count_golden() {
     let ops = collect(|s| emit_p256_negate(s));
-    assert_eq!(ops.len(), 945, "p256_negate op count drift");
+    assert_eq!(count_op_tree(&ops), 945, "p256_negate op count drift");
 }
 
 #[test]
 fn test_p256_on_curve_op_count_golden() {
     let ops = collect(|s| emit_p256_on_curve(s));
-    assert_eq!(ops.len(), 546, "p256_on_curve op count drift");
+    assert_eq!(count_op_tree(&ops), 559, "p256_on_curve op count drift");
 }
 
 #[test]
 fn test_p256_encode_compressed_op_count_golden() {
     let ops = collect(|s| emit_p256_encode_compressed(s));
-    assert_eq!(ops.len(), 14, "p256_encode_compressed op count drift");
+    assert_eq!(count_op_tree(&ops), 16, "p256_encode_compressed op count drift");
 }
 
 #[test]
@@ -356,7 +377,7 @@ fn test_verify_ecdsa_p256_op_count_golden() {
     let ops = collect(|s| emit_verify_ecdsa_p256(s));
     // Rust emits 8 fewer raw StackOps than Python/Java peers (a verify
     // computes two mul/mul_gen invocations × the 4-op divergence).
-    assert_eq!(ops.len(), 163718, "verify_ecdsa_p256 op count drift");
+    assert_eq!(count_op_tree(&ops), 297180, "verify_ecdsa_p256 op count drift");
 }
 
 // -- P-384 -----------------------------------------------------------------
@@ -364,25 +385,25 @@ fn test_verify_ecdsa_p256_op_count_golden() {
 #[test]
 fn test_p384_add_op_count_golden() {
     let ops = collect(|s| emit_p384_add(s));
-    assert_eq!(ops.len(), 11448, "p384_add op count drift");
+    assert_eq!(count_op_tree(&ops), 11448, "p384_add op count drift");
 }
 
 #[test]
 fn test_p384_mul_op_count_golden() {
     let ops = collect(|s| emit_p384_mul(s));
     // See ec_codegen_tests.rs module comment for the 4-op divergence pattern.
-    assert_eq!(ops.len(), 111420, "p384_mul op count drift");
+    assert_eq!(count_op_tree(&ops), 211174, "p384_mul op count drift");
 }
 
 #[test]
 fn test_p384_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_p384_mul_gen(s));
     // See p384_mul_op_count_golden comment.
-    assert_eq!(ops.len(), 111422, "p384_mul_gen op count drift");
+    assert_eq!(count_op_tree(&ops), 211176, "p384_mul_gen op count drift");
 }
 
 #[test]
 fn test_p384_negate_op_count_golden() {
     let ops = collect(|s| emit_p384_negate(s));
-    assert_eq!(ops.len(), 1393, "p384_negate op count drift");
+    assert_eq!(count_op_tree(&ops), 1393, "p384_negate op count drift");
 }

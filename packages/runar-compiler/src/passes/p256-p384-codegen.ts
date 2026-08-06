@@ -248,6 +248,34 @@ function cGroupMod(t: ECTracker, aName: string, resultName: string, g: GroupPara
   });
 }
 
+/**
+ * Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+ *
+ * OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+ * the `+ n, mod n` normalises the negative half. One push of n covers both
+ * reductions — the same shape as `emitEcModReduce`.
+ *
+ * Without it, `cEmitMul`'s ladder is only correct while 2^b <= k + 3n < 2^(b+1)
+ * for the fixed b it unrolls: a scalar >= ~n sets a bit above the loop's top,
+ * the loop never sees it, and the ladder returns a DIFFERENT multiple of P
+ * rather than failing. Scalars are contract input, so that is attacker-chosen.
+ * Reducing costs 1 push + 7 opcodes (41 / 57 bytes) against a ~460 KB / 1.6 MB
+ * script, and makes k >= n, k < 0 and k = 0 all well defined.
+ */
+function cEmitScalarReduce(t: ECTracker, kName: string, resultName: string, g: GroupParams): void {
+  pushGroupN(t, '_n_red', g);
+  t.rawBlock([kName, '_n_red'], resultName, (e) => {
+    e({ op: 'opcode', code: 'OP_2DUP' });
+    e({ op: 'opcode', code: 'OP_MOD' });
+    e({ op: 'rot' });
+    e({ op: 'drop' });
+    e({ op: 'over' });
+    e({ op: 'opcode', code: 'OP_ADD' });
+    e({ op: 'swap' });
+    e({ op: 'opcode', code: 'OP_MOD' });
+  });
+}
+
 function cGroupMul(t: ECTracker, aName: string, bName: string, resultName: string, g: GroupParams): void {
   t.toTop(aName);
   t.toTop(bName);
@@ -354,6 +382,36 @@ function cComposePoint(t: ECTracker, xName: string, yName: string, resultName: s
   t.toTop('_cp_yb');
   t.rawBlock(['_cp_xb', '_cp_yb'], resultName, (e) => {
     e({ op: 'opcode', code: 'OP_CAT' });
+  });
+}
+
+/**
+ * GAP-301: coordinate canonicity, leaving `_canon` on the tracker.
+ *
+ * `cDecomposePoint` BIN2NUMs each coordinate as an unsigned value that may be
+ * >= p; the curve equation reduces it mod p, so (x + p)‖y would pass as a
+ * point it is not the canonical encoding of. Reject it: require x < p AND
+ * y < p (coordinates are unsigned, so the 0 <= bound holds by construction).
+ * The caller ANDs `_canon` into its result so the check still returns a
+ * boolean. This mirrors secp256k1's `emitEcOnCurve`, whose guard the a = -3
+ * curves never received — leaving `pNNNOnCurve` accepting inputs `ecOnCurve`
+ * rejects even though both are documented as THE gate for untrusted points.
+ */
+function cEmitCanonicityGuard(t: ECTracker, xName: string, yName: string, c: CurveParams): void {
+  t.copyToTop(xName, '_x_lt');
+  pushFieldP(t, '_p_for_x', c);
+  t.rawBlock(['_x_lt', '_p_for_x'], '_x_canon', (e) => {
+    e({ op: 'opcode', code: 'OP_LESSTHAN' });
+  });
+  t.copyToTop(yName, '_y_lt');
+  pushFieldP(t, '_p_for_y', c);
+  t.rawBlock(['_y_lt', '_p_for_y'], '_y_canon', (e) => {
+    e({ op: 'opcode', code: 'OP_LESSTHAN' });
+  });
+  t.toTop('_x_canon');
+  t.toTop('_y_canon');
+  t.rawBlock(['_x_canon', '_y_canon'], '_canon', (e) => {
+    e({ op: 'opcode', code: 'OP_BOOLAND' });
   });
 }
 
@@ -752,9 +810,13 @@ function cEmitMul(
   //   Run 258 iterations (bit 257 down to 0).
   // For P-384: k ∈ [1, n-1], k+3n ∈ [3n+1, 4n-1], 3n > 2^384, so bit 385 is set.
   //   Run 386 iterations (bit 385 down to 0).
+  //
+  // That "k ∈ [1, n-1]" is a PRECONDITION the caller cannot enforce: the
+  // scalar is usually an unlock argument. Reduce it here — see cEmitScalarReduce.
   t.toTop('_k');
+  cEmitScalarReduce(t, '_k', '_kr', g);
   t.pushInt('_n', g.n);
-  t.rawBlock(['_k', '_n'], '_kn', (e) => {
+  t.rawBlock(['_kr', '_n'], '_kn', (e) => {
     e({ op: 'opcode', code: 'OP_ADD' });
   });
   t.pushInt('_n2', g.n);
@@ -1209,6 +1271,7 @@ export function emitP256Negate(emit: (op: StackOp) => void): void {
 export function emitP256OnCurve(emit: (op: StackOp) => void): void {
   const t = new ECTracker(['_pt'], emit);
   cDecomposePoint(t, '_pt', '_x', '_y', P256_PARAMS);
+  cEmitCanonicityGuard(t, '_x', '_y', P256_PARAMS);
 
   // lhs = y^2
   cFieldSqr(t, '_y', '_y2', P256_PARAMS);
@@ -1226,8 +1289,15 @@ export function emitP256OnCurve(emit: (op: StackOp) => void): void {
   // Compare
   t.toTop('_y2');
   t.toTop('_rhs');
-  t.rawBlock(['_y2', '_rhs'], '_result', (e) => {
+  t.rawBlock(['_y2', '_rhs'], '_curve_eq', (e) => {
     e({ op: 'opcode', code: 'OP_EQUAL' });
+  });
+
+  // on-curve = canonical AND curve-equation
+  t.toTop('_canon');
+  t.toTop('_curve_eq');
+  t.rawBlock(['_canon', '_curve_eq'], '_result', (e) => {
+    e({ op: 'opcode', code: 'OP_BOOLAND' });
   });
 }
 
@@ -1332,6 +1402,7 @@ export function emitP384Negate(emit: (op: StackOp) => void): void {
 export function emitP384OnCurve(emit: (op: StackOp) => void): void {
   const t = new ECTracker(['_pt'], emit);
   cDecomposePoint(t, '_pt', '_x', '_y', P384_PARAMS);
+  cEmitCanonicityGuard(t, '_x', '_y', P384_PARAMS);
 
   // lhs = y^2
   cFieldSqr(t, '_y', '_y2', P384_PARAMS);
@@ -1349,8 +1420,15 @@ export function emitP384OnCurve(emit: (op: StackOp) => void): void {
   // Compare
   t.toTop('_y2');
   t.toTop('_rhs');
-  t.rawBlock(['_y2', '_rhs'], '_result', (e) => {
+  t.rawBlock(['_y2', '_rhs'], '_curve_eq', (e) => {
     e({ op: 'opcode', code: 'OP_EQUAL' });
+  });
+
+  // on-curve = canonical AND curve-equation
+  t.toTop('_canon');
+  t.toTop('_curve_eq');
+  t.rawBlock(['_canon', '_curve_eq'], '_result', (e) => {
+    e({ op: 'opcode', code: 'OP_BOOLAND' });
   });
 }
 

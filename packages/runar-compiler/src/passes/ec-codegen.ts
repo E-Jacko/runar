@@ -151,6 +151,34 @@ function pushFieldP(t: ECTracker, name: string): void {
 }
 
 /**
+ * Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+ *
+ * OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+ * the `+ n, mod n` normalises the negative half. One push of n covers both
+ * reductions — the same shape as `emitEcModReduce`.
+ *
+ * Without it, `emitEcMul`'s ladder is only correct while 2^257 <= k + 3n < 2^258:
+ * a scalar >= ~n sets bit 258, the 257-iteration loop never sees it, and the
+ * ladder returns a DIFFERENT multiple of P rather than failing. Scalars are
+ * contract input, so that is attacker-chosen. Reducing costs 1 push + 7 opcodes
+ * (41 bytes) against a ~429 KB script, and makes k >= n, k < 0 and k = 0 all
+ * well defined.
+ */
+function emitScalarReduce(t: ECTracker, kName: string, resultName: string): void {
+  t.pushInt('_n_red', CURVE_N);
+  t.rawBlock([kName, '_n_red'], resultName, (e) => {
+    e({ op: 'opcode', code: 'OP_2DUP' });
+    e({ op: 'opcode', code: 'OP_MOD' });
+    e({ op: 'rot' });
+    e({ op: 'drop' });
+    e({ op: 'over' });
+    e({ op: 'opcode', code: 'OP_ADD' });
+    e({ op: 'swap' });
+    e({ op: 'opcode', code: 'OP_MOD' });
+  });
+}
+
+/**
  * fieldMod: reduce TOS mod p, ensure non-negative.
  * Expects 'aName' to be on the tracker stack.
  */
@@ -772,9 +800,13 @@ export function emitEcMul(emit: (op: StackOp) => void): void {
   // k' = k + 3n: guarantees bit 257 is set for MSB-first double-and-add.
   // k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
   // is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
+  //
+  // "k ∈ [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar is
+  // usually an unlock argument — so reduce it first. See emitScalarReduce.
   t.toTop('_k');
+  emitScalarReduce(t, '_k', '_kr');
   t.pushInt('_n', CURVE_N);
-  t.rawBlock(['_k', '_n'], '_kn', (e) => {
+  t.rawBlock(['_kr', '_n'], '_kn', (e) => {
     e({ op: 'opcode', code: 'OP_ADD' });
   });
   t.pushInt('_n2', CURVE_N);

@@ -206,6 +206,36 @@ def _c_group_mod(t: ECTracker, a_name: str, result_name: str, curve_n: int) -> N
     t.raw_block([a_name, "_gmod_n"], result_name, _fn)
 
 
+def _c_emit_scalar_reduce(t: ECTracker, k_name: str, result_name: str, curve_n: int) -> None:
+    """Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+
+    OP_MOD takes the sign of the DIVIDEND, so ``k mod n`` alone lands in
+    (-n, n); the ``+ n, mod n`` normalises the negative half. One push of n
+    covers both reductions -- the same shape as ``emit_ec_mod_reduce``.
+
+    Without it, ``_c_emit_mul``'s ladder is only correct while
+    2^b <= k + 3n < 2^(b+1) for the fixed b it unrolls: a scalar >= ~n sets a
+    bit above the loop's top, the loop never sees it, and the ladder returns a
+    DIFFERENT multiple of P rather than failing. Scalars are contract input, so
+    that is attacker-chosen. Reducing costs 1 push + 8 opcodes (42 / 58 bytes)
+    against a ~460 KB / 1.6 MB script, and makes k >= n, k < 0 and k = 0 all
+    well defined.
+    """
+    _c_push_group_n(t, "_n_red", curve_n)
+
+    def _body(e: Callable) -> None:
+        e(_make_stack_op(op="opcode", code="OP_2DUP"))
+        e(_make_stack_op(op="opcode", code="OP_MOD"))
+        e(_make_stack_op(op="rot"))
+        e(_make_stack_op(op="drop"))
+        e(_make_stack_op(op="over"))
+        e(_make_stack_op(op="opcode", code="OP_ADD"))
+        e(_make_stack_op(op="swap"))
+        e(_make_stack_op(op="opcode", code="OP_MOD"))
+
+    t.raw_block([k_name, "_n_red"], result_name, _body)
+
+
 def _c_group_mul(t: ECTracker, a_name: str, b_name: str, result_name: str, curve_n: int) -> None:
     t.to_top(a_name)
     t.to_top(b_name)
@@ -321,6 +351,30 @@ def _c_compose_point(
 # ===========================================================================
 # Affine point addition (parameterised by curve)
 # ===========================================================================
+
+def _c_emit_canonicity_guard(t: ECTracker, x_name: str, y_name: str, field_p: int) -> None:
+    """GAP-301: coordinate canonicity, leaving ``_canon`` on the tracker.
+
+    ``_c_decompose_point`` BIN2NUMs each coordinate as an unsigned value that
+    may be >= p; the curve equation reduces it mod p, so (x + p)||y would pass
+    as a point it is not the canonical encoding of. Reject it: require x < p
+    AND y < p (coordinates are unsigned, so the 0 <= bound holds by
+    construction). The caller ANDs ``_canon`` into its result so the check
+    still returns a boolean. This mirrors secp256k1's ``emit_ec_on_curve``,
+    whose guard the a = -3 curves never received -- leaving ``pNNNOnCurve``
+    accepting inputs ``ecOnCurve`` rejects even though both are documented as
+    THE gate for untrusted points.
+    """
+    t.copy_to_top(x_name, "_x_lt")
+    _c_push_field_p(t, "_p_for_x", field_p)
+    t.raw_block(["_x_lt", "_p_for_x"], "_x_canon", lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.copy_to_top(y_name, "_y_lt")
+    _c_push_field_p(t, "_p_for_y", field_p)
+    t.raw_block(["_y_lt", "_p_for_y"], "_y_canon", lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.to_top("_x_canon")
+    t.to_top("_y_canon")
+    t.raw_block(["_x_canon", "_y_canon"], "_canon", lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
 
 def _c_affine_add(t: ECTracker, field_p: int, p_minus_2: int) -> None:
     """Perform affine point addition.
@@ -722,9 +776,13 @@ def _c_emit_mul(
     _c_decompose_point(t, "_pt", "ax", "ay", coord_bytes, reverse_bytes_fn)
 
     # k' = k + 3n
+    #
+    # The "k in [1, n-1]" precondition is one the caller cannot enforce -- the
+    # scalar is usually an unlock argument -- so reduce it first.
     t.to_top("_k")
+    _c_emit_scalar_reduce(t, "_k", "_kr", curve_n)
     t.push_big_int("_n", curve_n)
-    t.raw_block(["_k", "_n"], "_kn", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
+    t.raw_block(["_kr", "_n"], "_kn", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
     t.push_big_int("_n2", curve_n)
     t.raw_block(["_kn", "_n2"], "_kn2", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
     t.push_big_int("_n3", curve_n)
@@ -1122,6 +1180,7 @@ def emit_p256_on_curve(emit: Callable) -> None:
     """Check if a P-256 point is on the curve (y^2 = x^3 - 3x + b mod p)."""
     t = ECTracker(["_pt"], emit)
     _c_decompose_point(t, "_pt", "_x", "_y", 32, _emit_reverse32)
+    _c_emit_canonicity_guard(t, "_x", "_y", P256_P)
 
     _c_field_sqr(t, "_y", "_y2", P256_P)
 
@@ -1136,7 +1195,12 @@ def emit_p256_on_curve(emit: Callable) -> None:
 
     t.to_top("_y2")
     t.to_top("_rhs")
-    t.raw_block(["_y2", "_rhs"], "_result", lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")))
+    t.raw_block(["_y2", "_rhs"], "_curve_eq", lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")))
+
+    # on-curve = canonical AND curve-equation
+    t.to_top("_canon")
+    t.to_top("_curve_eq")
+    t.raw_block(["_canon", "_curve_eq"], "_result", lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
 
 def emit_p256_encode_compressed(emit: Callable) -> None:
@@ -1221,6 +1285,7 @@ def emit_p384_on_curve(emit: Callable) -> None:
     """Check if a P-384 point is on the curve (y^2 = x^3 - 3x + b mod p)."""
     t = ECTracker(["_pt"], emit)
     _c_decompose_point(t, "_pt", "_x", "_y", 48, _emit_reverse48)
+    _c_emit_canonicity_guard(t, "_x", "_y", P384_P)
 
     _c_field_sqr(t, "_y", "_y2", P384_P)
 
@@ -1235,7 +1300,12 @@ def emit_p384_on_curve(emit: Callable) -> None:
 
     t.to_top("_y2")
     t.to_top("_rhs")
-    t.raw_block(["_y2", "_rhs"], "_result", lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")))
+    t.raw_block(["_y2", "_rhs"], "_curve_eq", lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")))
+
+    # on-curve = canonical AND curve-equation
+    t.to_top("_canon")
+    t.to_top("_curve_eq")
+    t.raw_block(["_canon", "_curve_eq"], "_result", lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
 
 def emit_p384_encode_compressed(emit: Callable) -> None:

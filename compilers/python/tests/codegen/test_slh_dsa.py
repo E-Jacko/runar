@@ -13,6 +13,24 @@ from runar_compiler.codegen.slh_dsa import emit_verify_slh_dsa, SLH_PARAMS
 from runar_compiler.codegen.stack import StackOp
 
 
+def _count_op_tree(ops: list[StackOp]) -> int:
+    """Total StackOps in ``ops``, INCLUDING the bodies of ``if`` ops.
+
+    A flat ``len(ops)`` cannot see inside a branch, and SLH-DSA verification is
+    almost entirely conditional: 85,765 top-level ops for SHA2-128f hide
+    514,147 in total. A golden over the flat count barely moves no matter what
+    the branches contain. Recursing is what makes the golden a gate.
+    """
+    total = 0
+    for op in ops:
+        total += 1
+        if op.op == "if":
+            total += _count_op_tree(op.then)
+            total += _count_op_tree(op.else_ops)
+    return total
+
+
+
 SUPPORTED_KEYS = [
     "SHA2_128s", "SHA2_128f",
     "SHA2_192s", "SHA2_192f",
@@ -22,6 +40,7 @@ SUPPORTED_KEYS = [
 
 # ---------------------------------------------------------------------------
 # Op counts (golden values captured from the Python reference).
+# Op-TREE sizes: `if` bodies included, see `_count_op_tree`.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("key,expected", [
@@ -34,18 +53,19 @@ SUPPORTED_KEYS = [
     # 128s), and (2) the FORS index extraction now reads a 3-byte window when an
     # a-bit field straddles it (a=14 sets 192s/256s), adding ops there. New
     # counts match byte-for-byte against the regenerated goldens.
-    ("SHA2_128s",  29564),
-    ("SHA2_128f",  85765),
-    ("SHA2_192s",  41951),
-    ("SHA2_192f", 121712),
-    ("SHA2_256s",  61193),
-    ("SHA2_256f", 122997),
+    ("SHA2_128s", 179246),
+    ("SHA2_128f", 514147),
+    ("SHA2_192s", 256935),
+    ("SHA2_192f", 741024),
+    ("SHA2_256s", 350397),
+    ("SHA2_256f", 699553),
 ])
 def test_op_count(key, expected):
     ops: list[StackOp] = []
     emit_verify_slh_dsa(ops.append, key)
-    assert len(ops) == expected, (
-        f"SLH-DSA-{key} op count drift: got {len(ops)} want {expected}"
+    got = _count_op_tree(ops)
+    assert got == expected, (
+        f"SLH-DSA-{key} op count drift: got {got} want {expected}"
     )
 
 

@@ -727,6 +727,34 @@ fn groupInv(t: *NistTracker, a_name: []const u8, exp_be: []const u8, n_be: []con
 ///
 /// NOT handled: P == -Q, whose true result is the point at infinity, which
 /// affine coordinates cannot represent.
+/// GAP-301: coordinate canonicity, leaving "_canon" on the tracker.
+///
+/// decomposePoint BIN2NUMs each coordinate as an unsigned value that may be
+/// >= p; the curve equation reduces it mod p, so (x + p)||y would pass as a
+/// point it is not the canonical encoding of. Reject it: require x < p AND
+/// y < p (coordinates are unsigned, so the 0 <= bound holds by construction).
+/// The caller ANDs "_canon" into its result so the check still returns a
+/// boolean. This mirrors secp256k1's emitEcOnCurve, whose guard the a = -3
+/// curves never received — leaving pNNNOnCurve accepting inputs ecOnCurve
+/// rejects even though both are documented as THE gate for untrusted points.
+fn emitCanonicityGuard(t: *NistTracker, x_name: []const u8, y_name: []const u8, p_be: []const u8) !void {
+    try t.copyToTop(x_name, "_x_lt");
+    try t.pushBigIntBE("_p_for_x", p_be);
+    t.popNames(2);
+    try t.emitOpcode("OP_LESSTHAN");
+    try t.names.append(t.allocator, "_x_canon");
+    try t.copyToTop(y_name, "_y_lt");
+    try t.pushBigIntBE("_p_for_y", p_be);
+    t.popNames(2);
+    try t.emitOpcode("OP_LESSTHAN");
+    try t.names.append(t.allocator, "_y_canon");
+    try t.toTop("_x_canon");
+    try t.toTop("_y_canon");
+    t.popNames(2);
+    try t.emitOpcode("OP_BOOLAND");
+    try t.names.append(t.allocator, "_canon");
+}
+
 fn affineAdd(t: *NistTracker, p_be: []const u8) !void {
     try t.copyToTop("px", "_px_eq");
     try t.copyToTop("qx", "_qx_eq");
@@ -1106,7 +1134,12 @@ fn emitScalarMulOnTracker(t: *NistTracker) !void {
     try decomposePoint(t, "_pt", "ax", "ay");
 
     // k' = k + 3n (pre-compute 3n to match Go peephole optimizer output)
+    //
+    // The "k in [1, n-1]" precondition is one the caller cannot enforce — the
+    // scalar is usually an unlock argument — so reduce it to [0, n-1] first.
+    // groupMod IS ((k mod n) + n) mod n, which is exactly that.
     try t.toTop("_k");
+    try groupMod(t, "_k", c.group_n_be, "_kr");
     try t.pushBigIntBE("_3n", c.three_n_be);
     t.popNames(2);
     try t.emitOpcode("OP_ADD");
@@ -1548,6 +1581,7 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
             var t = try NistTracker.init(allocator, &.{"_pt"}, &p256_params);
             errdefer t.deinit();
             try decomposePoint(&t, "_pt", "_x", "_y");
+            try emitCanonicityGuard(&t, "_x", "_y", p256_field_p_be[0..]);
             try fieldSqr(&t, "_y", p256_field_p_be[0..], "_y2");
             try t.copyToTop("_x", "_x_copy");
             try t.copyToTop("_x", "_x_copy2");
@@ -1561,6 +1595,12 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
             try t.toTop("_rhs");
             t.popNames(2);
             try t.emitOpcode("OP_EQUAL");
+            try t.names.append(t.allocator, "_curve_eq");
+            // on-curve = canonical AND curve-equation
+            try t.toTop("_canon");
+            try t.toTop("_curve_eq");
+            t.popNames(2);
+            try t.emitOpcode("OP_BOOLAND");
             try t.names.append(t.allocator, "_result");
             return t.takeBundle();
         },
@@ -1654,6 +1694,7 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
             var t = try NistTracker.init(allocator, &.{"_pt"}, &p384_params);
             errdefer t.deinit();
             try decomposePoint(&t, "_pt", "_x", "_y");
+            try emitCanonicityGuard(&t, "_x", "_y", p384_field_p_be[0..]);
             try fieldSqr(&t, "_y", p384_field_p_be[0..], "_y2");
             try t.copyToTop("_x", "_x_copy");
             try t.copyToTop("_x", "_x_copy2");
@@ -1667,6 +1708,12 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
             try t.toTop("_rhs");
             t.popNames(2);
             try t.emitOpcode("OP_EQUAL");
+            try t.names.append(t.allocator, "_curve_eq");
+            // on-curve = canonical AND curve-equation
+            try t.toTop("_canon");
+            try t.toTop("_curve_eq");
+            t.popNames(2);
+            try t.emitOpcode("OP_BOOLAND");
             try t.names.append(t.allocator, "_result");
             return t.takeBundle();
         },
@@ -1728,36 +1775,59 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
 // The "emits ops" tests below only assert `ops.len > 0`. These goldens
 // pin the Zig helper's pre-stack-lowering bundle size so a regression in
 // `buildBuiltinOps` surfaces here as a localized failure rather than
-// only as a cross-tier hex mismatch from the golden harness. Counts
-// differ slightly from the Python/Java peers because the Zig tier
-// represents control flow at the helper level as a single `.@"if"` op
-// with nested then/else slices; final compiled hex is byte-identical
-// (enforced by the conformance harness).
+// only as a cross-tier hex mismatch from the golden harness. Counts are
+// op-TREE sizes (if bodies included, see countOpTree) and still differ
+// slightly from the Python/Java peers because the Zig tier bundles some
+// sequences differently at the helper level; final compiled hex is
+// byte-identical (enforced by the conformance harness).
 // ---------------------------------------------------------------------------
+
+/// Total number of StackOps in `ops`, INCLUDING the bodies of `.@"if"` ops.
+///
+/// A flat `ops.len` cannot see inside a branch, so any emitter whose work sits
+/// in an if body — the scalar ladders emit 257 / 385 conditional additions —
+/// reports a count that barely moves no matter what the branch contains.
+/// Adding +1.3 KB of script inside the ladder's last step left the p256Mul /
+/// p384Mul goldens byte-identical. Recursing is what makes the golden a gate.
+fn countOpTree(ops: []const StackOp) usize {
+    var total: usize = 0;
+    for (ops) |op| {
+        total += 1;
+        switch (op) {
+            .@"if" => |stack_if| {
+                total += countOpTree(stack_if.then);
+                if (stack_if.@"else") |else_ops| total += countOpTree(else_ops);
+            },
+            else => {},
+        }
+    }
+    return total;
+}
 
 test "nist_ec helper op-count goldens" {
     const cases = .{
         .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6623) },
-        .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 69185) },
-        .{ registry.CryptoBuiltin.p256_mul_gen, "p256MulGen", @as(usize, 69187) },
+        .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 129192) },
+        .{ registry.CryptoBuiltin.p256_mul_gen, "p256MulGen", @as(usize, 129194) },
         .{ registry.CryptoBuiltin.p256_negate, "p256Negate", @as(usize, 945) },
-        .{ registry.CryptoBuiltin.p256_on_curve, "p256OnCurve", @as(usize, 543) },
-        .{ registry.CryptoBuiltin.p256_encode_compressed, "p256EncodeCompressed", @as(usize, 14) },
+        .{ registry.CryptoBuiltin.p256_on_curve, "p256OnCurve", @as(usize, 555) },
+        .{ registry.CryptoBuiltin.p256_encode_compressed, "p256EncodeCompressed", @as(usize, 16) },
         .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11429) },
-        .{ registry.CryptoBuiltin.p384_mul, "p384Mul", @as(usize, 105255) },
-        .{ registry.CryptoBuiltin.p384_mul_gen, "p384MulGen", @as(usize, 105257) },
+        .{ registry.CryptoBuiltin.p384_mul, "p384Mul", @as(usize, 194958) },
+        .{ registry.CryptoBuiltin.p384_mul_gen, "p384MulGen", @as(usize, 194960) },
         .{ registry.CryptoBuiltin.p384_negate, "p384Negate", @as(usize, 1393) },
     };
     inline for (cases) |c| {
         var bundle = try buildBuiltinOps(std.testing.allocator, c[0]);
         defer bundle.deinit();
-        if (bundle.ops.len != c[2]) {
+        const got = countOpTree(bundle.ops);
+        if (got != c[2]) {
             std.debug.print(
                 "{s}: op-count drift — got {d}, want {d}\n",
-                .{ c[1], bundle.ops.len, c[2] },
+                .{ c[1], got, c[2] },
             );
         }
-        try std.testing.expectEqual(c[2], bundle.ops.len);
+        try std.testing.expectEqual(c[2], got);
     }
 }
 

@@ -17,7 +17,17 @@
     "                                       differential-oracle | intentional-spec-change",
     "  reason           (string, required)  human explanation of WHY the new bytes are correct",
     "                                       and against WHICH independent oracle they were checked",
-    "  reviewer         (string, required)  sign-off marker, e.g. a GitHub handle 'gh:alice'",
+    "  reviewer         (string, required)  who signed the entry off. A real reviewer is a GitHub",
+    "                                       handle ('gh:alice'). An entry produced by a tool or an agent",
+    "                                       and NOT yet reviewed by a human MUST say so: use",
+    "                                       'unreviewed:<producer>' and set review-status below. The gate",
+    "                                       only checks that the field is non-empty, so a fabricated",
+    "                                       handle would pass it — the honesty of this field is the whole",
+    "                                       point of the record, and pre-filling one by convention makes",
+    "                                       the record worse than having none.",
+    "  review-status    (enum,   optional)  'unreviewed' while no human has checked the entry; omit (or",
+    "                                       'reviewed') once one has. Entries added before this field",
+    "                                       existed do not carry it.",
     "  date             (string, optional)  ISO date the entry was added",
     "",
     "To compute the sha256 of a golden after you have regenerated it:",
@@ -485,83 +495,93 @@
     },
     {
       "path": "conformance/tests/ec-unit/expected-script.hex",
-      "sha256": "b5b8370b14a0a0e19ad4c7c4b4ce595a0d065c265ab6610676429040f3a78437",
+      "sha256": "888ce0a32e6109dd76e558c9ce76363fdd0f9832fe00b1a8ceb03d996b245f75",
       "verified-against": "second-implementation",
-      "reason": "ecMul / ecMulGen returned the ALL-ZERO point for the scalar k = 2 exactly. The Jacobian ladder adds the affine P to the accumulator; at the last step the accumulator is (k'-1)*P with k' = k + 3n, which for k = 2 IS P, and the mixed-add cannot double: H = U2 - X1 = 0 makes Z3 = Z1*H = 0 and fieldInv is Fermat, so fieldInv(0) = 0 and the Jacobian->affine conversion yields 64 zero bytes instead of 2P. Any contract multiplying by 2 deployed an UNSPENDABLE script, byte-identically across all seven tiers. The last step now computes both the mixed-add and the doubling of the saved accumulator and branchlessly selects on (H == 0 AND R == 0). Only the last step needs it: c_i = k' >> i ranges over a contiguous interval fixed by i, so exhaustive interval arithmetic over the whole domain k in [0, n-1] shows the only reachable exceptional steps are i = 0 for k = 2 (accumulator == P, the bug) and i = 0 for k = 0 (accumulator == -P, result infinity, unchanged). These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/ec-mul-k2.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against @bsv/sdk's OWN secp256k1 implementation (Point.mul) for k = 1,2,3,4,5,7,12345, n-1, n/2 and pseudorandom scalars, plus a from-scratch double-and-add written from the curve parameters alone that is cross-checked against @bsv/sdk. ecMul(3G,2)==6G pins that the exception is not generator-specific. ec-add-doubling.test.ts still passes unchanged. Cross-tier: all 7 tiers (ts/go/rust/python/zig/ruby/java) produce byte-identical hex for this fixture in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +42 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/ec-demo/expected-script.hex",
-      "sha256": "e9c427d2db17460705a6e676a78158da373a6b54753a58694f4753387e9b768e",
+      "sha256": "cfa6088e8b1e2b6f3a3032c7172c733ff70ab3a1e94dcc523571a360b5a49758",
       "verified-against": "second-implementation",
-      "reason": "ecMul / ecMulGen returned the ALL-ZERO point for the scalar k = 2 exactly. The Jacobian ladder adds the affine P to the accumulator; at the last step the accumulator is (k'-1)*P with k' = k + 3n, which for k = 2 IS P, and the mixed-add cannot double: H = U2 - X1 = 0 makes Z3 = Z1*H = 0 and fieldInv is Fermat, so fieldInv(0) = 0 and the Jacobian->affine conversion yields 64 zero bytes instead of 2P. Any contract multiplying by 2 deployed an UNSPENDABLE script, byte-identically across all seven tiers. The last step now computes both the mixed-add and the doubling of the saved accumulator and branchlessly selects on (H == 0 AND R == 0). Only the last step needs it: c_i = k' >> i ranges over a contiguous interval fixed by i, so exhaustive interval arithmetic over the whole domain k in [0, n-1] shows the only reachable exceptional steps are i = 0 for k = 2 (accumulator == P, the bug) and i = 0 for k = 0 (accumulator == -P, result infinity, unchanged). These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/ec-mul-k2.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against @bsv/sdk's OWN secp256k1 implementation (Point.mul) for k = 1,2,3,4,5,7,12345, n-1, n/2 and pseudorandom scalars, plus a from-scratch double-and-add written from the curve parameters alone that is cross-checked against @bsv/sdk. ecMul(3G,2)==6G pins that the exception is not generator-specific. ec-add-doubling.test.ts still passes unchanged. Cross-tier: all 7 tiers (ts/go/rust/python/zig/ruby/java) produce byte-identical hex for this fixture in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +126 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/ec-primitives/expected-script.hex",
-      "sha256": "c73948973ab24af8741ec7724dcbc988ef6a4f4ac191db4cd14544d0471ec13f",
+      "sha256": "4464495425036024c2a48b90225c2c658354cb20c499710ec8c56352da9360f0",
       "verified-against": "second-implementation",
-      "reason": "ecMul / ecMulGen returned the ALL-ZERO point for the scalar k = 2 exactly. The Jacobian ladder adds the affine P to the accumulator; at the last step the accumulator is (k'-1)*P with k' = k + 3n, which for k = 2 IS P, and the mixed-add cannot double: H = U2 - X1 = 0 makes Z3 = Z1*H = 0 and fieldInv is Fermat, so fieldInv(0) = 0 and the Jacobian->affine conversion yields 64 zero bytes instead of 2P. Any contract multiplying by 2 deployed an UNSPENDABLE script, byte-identically across all seven tiers. The last step now computes both the mixed-add and the doubling of the saved accumulator and branchlessly selects on (H == 0 AND R == 0). Only the last step needs it: c_i = k' >> i ranges over a contiguous interval fixed by i, so exhaustive interval arithmetic over the whole domain k in [0, n-1] shows the only reachable exceptional steps are i = 0 for k = 2 (accumulator == P, the bug) and i = 0 for k = 0 (accumulator == -P, result infinity, unchanged). These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/ec-mul-k2.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against @bsv/sdk's OWN secp256k1 implementation (Point.mul) for k = 1,2,3,4,5,7,12345, n-1, n/2 and pseudorandom scalars, plus a from-scratch double-and-add written from the curve parameters alone that is cross-checked against @bsv/sdk. ecMul(3G,2)==6G pins that the exception is not generator-specific. ec-add-doubling.test.ts still passes unchanged. Cross-tier: all 7 tiers (ts/go/rust/python/zig/ruby/java) produce byte-identical hex for this fixture in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +126 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/schnorr-zkp/expected-script.hex",
-      "sha256": "9594e2593c9cfa25178c8249d4646fa271c562f1f7028ea03972433cec4a8b9f",
+      "sha256": "9f23e983c2b451019e52480282132599be6d7b6e32da570bf822c99a7434f8ad",
       "verified-against": "second-implementation",
-      "reason": "ecMul / ecMulGen returned the ALL-ZERO point for the scalar k = 2 exactly. The Jacobian ladder adds the affine P to the accumulator; at the last step the accumulator is (k'-1)*P with k' = k + 3n, which for k = 2 IS P, and the mixed-add cannot double: H = U2 - X1 = 0 makes Z3 = Z1*H = 0 and fieldInv is Fermat, so fieldInv(0) = 0 and the Jacobian->affine conversion yields 64 zero bytes instead of 2P. Any contract multiplying by 2 deployed an UNSPENDABLE script, byte-identically across all seven tiers. The last step now computes both the mixed-add and the doubling of the saved accumulator and branchlessly selects on (H == 0 AND R == 0). Only the last step needs it: c_i = k' >> i ranges over a contiguous interval fixed by i, so exhaustive interval arithmetic over the whole domain k in [0, n-1] shows the only reachable exceptional steps are i = 0 for k = 2 (accumulator == P, the bug) and i = 0 for k = 0 (accumulator == -P, result infinity, unchanged). These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/ec-mul-k2.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against @bsv/sdk's OWN secp256k1 implementation (Point.mul) for k = 1,2,3,4,5,7,12345, n-1, n/2 and pseudorandom scalars, plus a from-scratch double-and-add written from the curve parameters alone that is cross-checked against @bsv/sdk. ecMul(3G,2)==6G pins that the exception is not generator-specific. ec-add-doubling.test.ts still passes unchanged. Cross-tier: all 7 tiers (ts/go/rust/python/zig/ruby/java) produce byte-identical hex for this fixture in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +84 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/convergence-proof/expected-script.hex",
-      "sha256": "8ab4f0995f461ed5614c07f8ba61ebc739b8313fa27828d2ef0fbbc50af42500",
+      "sha256": "1b6bb5843a88e495c23d3a6cace532280fb179a46fba6d0eb0c06006bc70b128",
       "verified-against": "second-implementation",
-      "reason": "ecMul / ecMulGen returned the ALL-ZERO point for the scalar k = 2 exactly. The Jacobian ladder adds the affine P to the accumulator; at the last step the accumulator is (k'-1)*P with k' = k + 3n, which for k = 2 IS P, and the mixed-add cannot double: H = U2 - X1 = 0 makes Z3 = Z1*H = 0 and fieldInv is Fermat, so fieldInv(0) = 0 and the Jacobian->affine conversion yields 64 zero bytes instead of 2P. Any contract multiplying by 2 deployed an UNSPENDABLE script, byte-identically across all seven tiers. The last step now computes both the mixed-add and the doubling of the saved accumulator and branchlessly selects on (H == 0 AND R == 0). Only the last step needs it: c_i = k' >> i ranges over a contiguous interval fixed by i, so exhaustive interval arithmetic over the whole domain k in [0, n-1] shows the only reachable exceptional steps are i = 0 for k = 2 (accumulator == P, the bug) and i = 0 for k = 0 (accumulator == -P, result infinity, unchanged). These bytes are the regenerated output of that fix. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/ec-mul-k2.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against @bsv/sdk's OWN secp256k1 implementation (Point.mul) for k = 1,2,3,4,5,7,12345, n-1, n/2 and pseudorandom scalars, plus a from-scratch double-and-add written from the curve parameters alone that is cross-checked against @bsv/sdk. ecMul(3G,2)==6G pins that the exception is not generator-specific. ec-add-doubling.test.ts still passes unchanged. Cross-tier: all 7 tiers (ts/go/rust/python/zig/ruby/java) produce byte-identical hex for this fixture in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +42 bytes: ecMul / ecMulGen now reduce the scalar to [0, n-1] before the k+3n ladder offset (+42 bytes per call), so k >= n, k < 0 and k = 0 are defined instead of silently yielding a different multiple of P. The new behaviour is graded against @bsv/sdk's own secp256k1 Point.mul, cross-checked against a from-scratch double-and-add written from the curve parameters alone, both replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p256-primitives/expected-script.hex",
-      "sha256": "7417d6b31cfe8ec35256c9b8fc1426dfdf1eae18e41e7efb871e2629d38de87f",
+      "sha256": "65987946eba03590eb1c8116e05a5ba4047d502bc238844ca845209203265bf2",
       "verified-against": "second-implementation",
-      "reason": "Two defects in the NIST P-256 / P-384 codegen, both fund-safety. (1) cAffineAdd implemented only the chord slope (qy-py)/(qx-px), which is 0/0 when P == Q, so p256Add(P,P) and p384Add(P,P) produced a WRONG point — the tangent-select that 8a6494b4 applied to secp256k1 was never ported to the a = -3 curves, where the tangent numerator is 3px^2 - 3. (2) The scalar ladder's Jacobian mixed-add cannot double, so p256Mul(P,2n) / p384Mul(P,2n) returned 64 / 96 ZERO bytes (H = 0 -> Z3 = 0 -> Fermat inv(0) = 0). Both now fixed: the affine add selects tangent numerator/denominator before the single cFieldInv, and the ladder's last step selects between the mixed-add and a doubling on (H == 0 AND R == 0). Exhaustive interval arithmetic over k in [0, n-1] shows i = 0 is the only reachable exceptional step on either curve (cofactor 1, so every on-curve P has order n and the caller cannot move the exception). These bytes are the regenerated output of both fixes. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/p256-p384-point-ops.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against OPENSSL — Node's crypto.createECDH('prime256v1' / 'secp384r1') with the scalar set as the private key, whose derived public key is k*G — for k = 1,2,3,4,7, n-1 and a pseudorandom scalar, plus pNNNAdd(G,G)==2G, pNNNAdd(3G,3G)==6G, and the chord controls pNNNAdd(G,2G)==3G / pNNNAdd(2G,5G)==7G. A from-scratch double-and-add written from the curve parameters alone is cross-checked against OpenSSL first. The interpreter's p256*/p384* MOCKS (constant zero point, unconditional true on-curve) were replaced with real arithmetic in the same change, so the differential oracle is no longer vacuous for these fixtures. Cross-tier: all 7 tiers produce byte-identical hex in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +318 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p256-wallet/expected-script.hex",
-      "sha256": "6d7163db68aa06921c5b24c741a3a9f358bbcd154429f53ebe675295fccf6e81",
+      "sha256": "fad9112bc4e6144ae52ebc1c4eeb728dbb6df330bab7e268a0a3c830eed7af47",
       "verified-against": "second-implementation",
-      "reason": "Two defects in the NIST P-256 / P-384 codegen, both fund-safety. (1) cAffineAdd implemented only the chord slope (qy-py)/(qx-px), which is 0/0 when P == Q, so p256Add(P,P) and p384Add(P,P) produced a WRONG point — the tangent-select that 8a6494b4 applied to secp256k1 was never ported to the a = -3 curves, where the tangent numerator is 3px^2 - 3. (2) The scalar ladder's Jacobian mixed-add cannot double, so p256Mul(P,2n) / p384Mul(P,2n) returned 64 / 96 ZERO bytes (H = 0 -> Z3 = 0 -> Fermat inv(0) = 0). Both now fixed: the affine add selects tangent numerator/denominator before the single cFieldInv, and the ladder's last step selects between the mixed-add and a doubling on (H == 0 AND R == 0). Exhaustive interval arithmetic over k in [0, n-1] shows i = 0 is the only reachable exceptional step on either curve (cofactor 1, so every on-curve P has order n and the caller cannot move the exception). These bytes are the regenerated output of both fixes. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/p256-p384-point-ops.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against OPENSSL — Node's crypto.createECDH('prime256v1' / 'secp384r1') with the scalar set as the private key, whose derived public key is k*G — for k = 1,2,3,4,7, n-1 and a pseudorandom scalar, plus pNNNAdd(G,G)==2G, pNNNAdd(3G,3G)==6G, and the chord controls pNNNAdd(G,2G)==3G / pNNNAdd(2G,5G)==7G. A from-scratch double-and-add written from the curve parameters alone is cross-checked against OpenSSL first. The interpreter's p256*/p384* MOCKS (constant zero point, unconditional true on-curve) were replaced with real arithmetic in the same change, so the differential oracle is no longer vacuous for these fixtures. Cross-tier: all 7 tiers produce byte-identical hex in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +84 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p384-primitives/expected-script.hex",
-      "sha256": "8d2ee7f8d5089955321b04981799f3ad2dd08a25e9c5a2f999cdf86783b1714c",
+      "sha256": "724287cbdb689748b19f00518be145c37884dbcf60d5e9b541593bc6bd6b0203",
       "verified-against": "second-implementation",
-      "reason": "Two defects in the NIST P-256 / P-384 codegen, both fund-safety. (1) cAffineAdd implemented only the chord slope (qy-py)/(qx-px), which is 0/0 when P == Q, so p256Add(P,P) and p384Add(P,P) produced a WRONG point — the tangent-select that 8a6494b4 applied to secp256k1 was never ported to the a = -3 curves, where the tangent numerator is 3px^2 - 3. (2) The scalar ladder's Jacobian mixed-add cannot double, so p256Mul(P,2n) / p384Mul(P,2n) returned 64 / 96 ZERO bytes (H = 0 -> Z3 = 0 -> Fermat inv(0) = 0). Both now fixed: the affine add selects tangent numerator/denominator before the single cFieldInv, and the ladder's last step selects between the mixed-add and a doubling on (H == 0 AND R == 0). Exhaustive interval arithmetic over k in [0, n-1] shows i = 0 is the only reachable exceptional step on either curve (cofactor 1, so every on-curve P has order n and the caller cannot move the exception). These bytes are the regenerated output of both fixes. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/p256-p384-point-ops.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against OPENSSL — Node's crypto.createECDH('prime256v1' / 'secp384r1') with the scalar set as the private key, whose derived public key is k*G — for k = 1,2,3,4,7, n-1 and a pseudorandom scalar, plus pNNNAdd(G,G)==2G, pNNNAdd(3G,3G)==6G, and the chord controls pNNNAdd(G,2G)==3G / pNNNAdd(2G,5G)==7G. A from-scratch double-and-add written from the curve parameters alone is cross-checked against OpenSSL first. The interpreter's p256*/p384* MOCKS (constant zero point, unconditional true on-curve) were replaced with real arithmetic in the same change, so the differential oracle is no longer vacuous for these fixtures. Cross-tier: all 7 tiers produce byte-identical hex in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +446 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/tests/p384-wallet/expected-script.hex",
-      "sha256": "7bf9657436ea1ec362f8837c1d8e42834bed583e4011752af94bc895c4475bb0",
+      "sha256": "90405dc1ef21d3e5301dfa733ad814616eea0928a52903d0ee0414225015b9ca",
       "verified-against": "second-implementation",
-      "reason": "Two defects in the NIST P-256 / P-384 codegen, both fund-safety. (1) cAffineAdd implemented only the chord slope (qy-py)/(qx-px), which is 0/0 when P == Q, so p256Add(P,P) and p384Add(P,P) produced a WRONG point — the tangent-select that 8a6494b4 applied to secp256k1 was never ported to the a = -3 curves, where the tangent numerator is 3px^2 - 3. (2) The scalar ladder's Jacobian mixed-add cannot double, so p256Mul(P,2n) / p384Mul(P,2n) returned 64 / 96 ZERO bytes (H = 0 -> Z3 = 0 -> Fermat inv(0) = 0). Both now fixed: the affine add selects tangent numerator/denominator before the single cFieldInv, and the ladder's last step selects between the mixed-add and a doubling on (H == 0 AND R == 0). Exhaustive interval arithmetic over k in [0, n-1] shows i = 0 is the only reachable exceptional step on either curve (cofactor 1, so every on-curve P has order n and the caller cannot move the exception). These bytes are the regenerated output of both fixes. INDEPENDENT ORACLE: packages/runar-testing/src/__tests__/p256-p384-point-ops.test.ts executes the emitted script through the real @bsv/sdk Spend interpreter and compares every result against OPENSSL — Node's crypto.createECDH('prime256v1' / 'secp384r1') with the scalar set as the private key, whose derived public key is k*G — for k = 1,2,3,4,7, n-1 and a pseudorandom scalar, plus pNNNAdd(G,G)==2G, pNNNAdd(3G,3G)==6G, and the chord controls pNNNAdd(G,2G)==3G / pNNNAdd(2G,5G)==7G. A from-scratch double-and-add written from the curve parameters alone is cross-checked against OpenSSL first. The interpreter's p256*/p384* MOCKS (constant zero point, unconditional true on-curve) were replaced with real arithmetic in the same change, so the differential oracle is no longer vacuous for these fixtures. Cross-tier: all 7 tiers produce byte-identical hex in BOTH fold modes; sha256 of every tier's output equals the sha256 pinned here.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Codegen change, +116 bytes: pNNNOnCurve now rejects non-canonical coordinates (x >= p or y >= p, +79 / +111 bytes), matching secp256k1's ecOnCurve (GAP-301), and pNNNMul reduces the scalar to [0, n-1] before the k+3n ladder offset (+42 / +58 bytes per call). The new behaviour is graded against OpenSSL — ECDH.convertKey for point validity/canonicity and createECDH(prime256v1 | secp384r1) for k*G — cross-checked against a from-scratch double-and-add written from the curve parameters alone, all replayed through the real @bsv/sdk Spend interpreter in packages/runar-testing/src/__tests__/ec-on-curve-canonicity.test.ts and ec-scalar-domain.test.ts; all 7 tiers emit byte-identical hex for this fixture (conformance multi-format, both fold modes).",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     },
     {
       "path": "conformance/script-size-baseline.json",
-      "sha256": "ac9075965e86b5c8c711b67e4627a6c3141c4213fef08fcdac0a71d8e5cc315e",
+      "sha256": "cc2348d9fbd1c99526e906508b421edbfa85de12a6e17f9e8ae96d552d3aab86",
       "verified-against": "intentional-spec-change",
-      "reason": "Re-stamped after the ecMul/ecMulGen k=2 fix (secp256k1) and the p256Add/p384Add doubling + p256Mul/p384Mul k=2 fixes (NIST). Only the nine EC fixtures moved, all by +0.21%..+0.33%: convergence-proof +1151 B (+0.255%), ec-demo +3453 B (+0.260%), ec-primitives +3453 B (+0.260%), ec-unit +1151 B (+0.254%), p256-primitives +3025 B (+0.327%), p256-wallet +3025 B (+0.317%), p384-primitives +4049 B (+0.216%), p384-wallet +4049 B (+0.207%), schnorr-zkp +2302 B (+0.264%). All 57 other fixtures are byte-unchanged. The growth is bounded because the exceptional case is handled at the ladder's LAST step only, which is provably the only reachable one; handling it at every step was measured at +70%..+73% (ecMul 427,536 -> 726,618 B; p256Mul 458,464 -> 794,040 B; p384Mul 925,653 -> 1,594,684 B) and was rejected on that basis.",
-      "reviewer": "gh:icellan",
-      "date": "2026-08-06"
+      "reason": "Re-stamp after the GAP-301 canonicity guard and the ecMul / pNNNMul scalar reduction. Nine fixtures grew: convergence-proof +42, ec-unit +42, schnorr-zkp +84, p256-wallet +84, p384-wallet +116, ec-demo +126, ec-primitives +126, p256-primitives +318, p384-primitives +446 bytes (+0.01%..+0.03% each, all far inside the +10% tolerance). Every added byte is a coordinate range-check or a mod-n reduction that makes a previously unspecified input well defined; no fixture shrank.",
+      "reviewer": "unreviewed:generated-by-agent",
+      "date": "2026-08-06",
+      "review-status": "unreviewed"
     }
   ]
 }

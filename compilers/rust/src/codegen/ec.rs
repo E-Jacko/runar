@@ -24,6 +24,14 @@ const THREE_CURVE_N_SCRIPT_NUM: [u8; 33] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02,
 ];
 
+/// secp256k1 curve order n as a script number (little-endian sign-magnitude).
+/// Used by `emit_scalar_reduce`; the trailing 0x00 is the sign byte.
+const CURVE_N_SCRIPT_NUM: [u8; 33] = [
+    0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf, 0x3b, 0xa0, 0x48, 0xaf,
+    0xe6, 0xdc, 0xae, 0xba, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+];
+
 /// secp256k1 generator x-coordinate (32 bytes, big-endian).
 const GEN_X_BYTES: [u8; 32] = [
     0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95,
@@ -837,6 +845,32 @@ pub fn emit_ec_add(emit: &mut dyn FnMut(StackOp)) {
     compose_point(&mut t, "rx", "ry", "_result");
 }
 
+/// Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+///
+/// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+/// the `+ n, mod n` normalises the negative half. One push of n covers both
+/// reductions — the same shape as `emit_ec_mod_reduce`.
+///
+/// Without it, `emit_ec_mul`'s ladder is only correct while
+/// 2^257 <= k + 3n < 2^258: a scalar >= ~n sets bit 258, the 257-iteration loop
+/// never sees it, and the ladder returns a DIFFERENT multiple of P rather than
+/// failing. Scalars are contract input, so that is attacker-chosen. Reducing
+/// costs 1 push + 8 opcodes (42 bytes) against a ~429 KB script, and makes
+/// k >= n, k < 0 and k = 0 all well defined.
+fn emit_scalar_reduce(t: &mut ECTracker, k_name: &str, result_name: &str) {
+    t.push_bytes("_n_red", CURVE_N_SCRIPT_NUM.to_vec());
+    t.raw_block(&[k_name, "_n_red"], Some(result_name), |e| {
+        e(StackOp::Opcode("OP_2DUP".into()));
+        e(StackOp::Opcode("OP_MOD".into()));
+        e(StackOp::Rot);
+        e(StackOp::Drop);
+        e(StackOp::Over);
+        e(StackOp::Opcode("OP_ADD".into()));
+        e(StackOp::Swap);
+        e(StackOp::Opcode("OP_MOD".into()));
+    });
+}
+
 /// ecMul: scalar multiplication P * k.
 /// Stack in: [point, scalar] (scalar on top)
 /// Stack out: [result_point]
@@ -851,9 +885,13 @@ pub fn emit_ec_mul(emit: &mut dyn FnMut(StackOp)) {
     // k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
     // is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
     // Push 3*N directly (matches TS constant-fold output).
+    //
+    // "k ∈ [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar is
+    // usually an unlock argument — so reduce it first. See `emit_scalar_reduce`.
     t.to_top("_k");
+    emit_scalar_reduce(&mut t, "_k", "_kr");
     t.push_bytes("_3n", THREE_CURVE_N_SCRIPT_NUM.to_vec());
-    t.raw_block(&["_k", "_3n"], Some("_k3n"), |e| {
+    t.raw_block(&["_kr", "_3n"], Some("_k3n"), |e| {
         e(StackOp::Opcode("OP_ADD".into()));
     });
     t.rename("_k");

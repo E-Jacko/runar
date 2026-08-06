@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
+import runar.compiler.ir.stack.IfOp;
 import runar.compiler.ir.stack.StackMethod;
 import runar.compiler.ir.stack.StackOp;
 import runar.compiler.ir.stack.StackProgram;
@@ -44,16 +45,16 @@ class P256P384Test {
     void p256MulParity() {
         assertParity("p256Mul",
             P256P384::emitP256Mul,
-            73306, 459704,
-            "6f4af3c29b66639823c2a6314314bbeec77a0bdcb7738c6e02d45cfa3c94d46c");
+            140036, 459746,
+            "3f491aae5052651c50af692d7a2c16984e329bf5c790d18249af27171c442e17");
     }
 
     @Test
     void p256MulGenParity() {
         assertParity("p256MulGen",
             P256P384::emitP256MulGen,
-            73308, 459770,
-            "a29a0dd13d71bc5674e7ff416401a539265cf962340cc1a1f0eaf71344371acc");
+            140038, 459812,
+            "4e6e4fc58b14b14e9ab6c42a6adf8882d562d73b3754d6c28178a80b9b43a54a");
     }
 
     @Test
@@ -68,15 +69,15 @@ class P256P384Test {
     void p256OnCurveParity() {
         assertParity("p256OnCurve",
             P256P384::emitP256OnCurve,
-            546, 779,
-            "d0a7c849eaf9173a6db524645642f532583ff108c96ff0c7e6ffac026eb9c93f");
+            559, 858,
+            "3ae633ac4a1039e19b9c79e993e6f3567199a6d138d9e71f62edb58e8f124219");
     }
 
     @Test
     void p256EncodeCompressedParity() {
         assertParity("p256EncodeCompressed",
             P256P384::emitP256EncodeCompressed,
-            14, 19,
+            16, 19,
             "a4481881396c90da361f987c4adc581125b09103bfb6bd11f3d5acc5be1635d1");
     }
 
@@ -84,8 +85,8 @@ class P256P384Test {
     void verifyEcdsaP256Parity() {
         assertParity("verifyECDSA_P256",
             P256P384::emitVerifyECDSA_P256,
-            163726, 973564,
-            "5f4e8ac4269eceb73cdba915f9ea41cff8c10a2db11db58dc482f4ea205cd8df");
+            297188, 973648,
+            "fe6de26a521351ca374521aeb8d741cc87f2ef1870888c5f306015e9ce716642");
     }
 
     // --------------------------------------------------------------
@@ -104,16 +105,16 @@ class P256P384Test {
     void p384MulParity() {
         assertParity("p384Mul",
             P256P384::emitP384Mul,
-            111424, 927292,
-            "3a6f51cbc92582daf05d788749c01a5acf68c7001feefe88a897b714265fe0a2");
+            211178, 927350,
+            "ca64d51df61e1ba9f5fd26113cbff649036ee96c00d2d1d27442486e93520fb4");
     }
 
     @Test
     void p384MulGenParity() {
         assertParity("p384MulGen",
             P256P384::emitP384MulGen,
-            111426, 927391,
-            "487873bb3fee748588042a11c76d08eb1b8c1a6c86aac65fd58b5434b31e43a8");
+            211180, 927449,
+            "5a5149b884fac627c5b46488bfcb55c7bf5f275b255ed83026c193e8cb42250a");
     }
 
     @Test
@@ -128,15 +129,15 @@ class P256P384Test {
     void p384OnCurveParity() {
         assertParity("p384OnCurve",
             P256P384::emitP384OnCurve,
-            770, 1116,
-            "7494c921c04ce9b762ab0ead9047b7d6cb6d6b8c244e1c3e242704997407e7b9");
+            783, 1227,
+            "2d8d5ea7a9f059dc3087b62564feed5fac7c24c795e2142c2252e499b18bffe7");
     }
 
     @Test
     void p384EncodeCompressedParity() {
         assertParity("p384EncodeCompressed",
             P256P384::emitP384EncodeCompressed,
-            14, 19,
+            16, 19,
             "e32d98f40a17d26f70ce433663a01e3c476073419ab6109964d00cfbb57d6eae");
     }
 
@@ -144,8 +145,8 @@ class P256P384Test {
     void verifyEcdsaP384Parity() {
         assertParity("verifyECDSA_P384",
             P256P384::emitVerifyECDSA_P384,
-            253400, 1986535,
-            "c88f50ecf2d74985f505c052cffe14f377079b2d7e47e30363c21d7719225aef");
+            452910, 1986651,
+            "b5797efd8692bf9d8ae28e4d0dc1a89a590f5ed43087d83cf550d207807d243c");
     }
 
     // --------------------------------------------------------------
@@ -215,12 +216,36 @@ class P256P384Test {
     // Helpers
     // --------------------------------------------------------------
 
+    /**
+     * Total number of {@link StackOp}s in {@code ops}, INCLUDING the bodies of
+     * {@code if} ops.
+     *
+     * <p>A flat {@code ops.size()} cannot see inside a branch, so any emitter
+     * whose work sits in an {@code if} body — the scalar ladders emit 257 / 385
+     * conditional additions, WOTS+ and SLH-DSA are almost entirely conditional —
+     * reports a count that barely moves no matter what the branch contains.
+     * Adding +1.3 KB of script inside the ladder's last step left the
+     * {@code p256Mul} / {@code p384Mul} goldens byte-identical. Recursing is what
+     * makes the golden a gate.
+     */
+    private static int countOpTree(List<StackOp> ops) {
+        int total = 0;
+        for (StackOp op : ops) {
+            total++;
+            if (op instanceof IfOp ifOp) {
+                if (ifOp.thenBranch() != null) total += countOpTree(ifOp.thenBranch());
+                if (ifOp.elseBranch() != null) total += countOpTree(ifOp.elseBranch());
+            }
+        }
+        return total;
+    }
+
     private static void assertParity(String label, Consumer<Consumer<StackOp>> emitter,
                                      int expectedOpCount, int expectedHexBytes,
                                      String expectedHexSha256) {
         List<StackOp> ops = new ArrayList<>();
         emitter.accept(ops::add);
-        assertEquals(expectedOpCount, ops.size(), label + " op count drift");
+        assertEquals(expectedOpCount, countOpTree(ops), label + " op count drift");
 
         String hex = emitHex(ops);
         assertEquals(expectedHexBytes, hex.length() / 2, label + " hex byte count drift");

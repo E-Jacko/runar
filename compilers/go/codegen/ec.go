@@ -243,14 +243,14 @@ func ecFieldMod(t *ECTracker, aName, resultName string) {
 	ecPushFieldP(t, "_fmod_p")
 	// (a % p + p) % p
 	t.rawBlock([]string{aName, "_fmod_p"}, resultName, func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_2DUP"})  // a p a p
-		e(StackOp{Op: "opcode", Code: "OP_MOD"})    // a p (a%p)
-		e(StackOp{Op: "rot"})                        // p (a%p) a
-		e(StackOp{Op: "drop"})                       // p (a%p)
-		e(StackOp{Op: "over"})                       // p (a%p) p
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})     // p (a%p+p)
-		e(StackOp{Op: "swap"})                       // (a%p+p) p
-		e(StackOp{Op: "opcode", Code: "OP_MOD"})     // ((a%p+p)%p)
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"}) // a p a p
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})  // a p (a%p)
+		e(StackOp{Op: "rot"})                     // p (a%p) a
+		e(StackOp{Op: "drop"})                    // p (a%p)
+		e(StackOp{Op: "over"})                    // p (a%p) p
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})  // p (a%p+p)
+		e(StackOp{Op: "swap"})                    // (a%p+p) p
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})  // ((a%p+p)%p)
 	})
 }
 
@@ -634,10 +634,10 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 // one case these formulas cannot compute (see ecBuildJacobianAddOrDoubleInline).
 func ecJacobianAddAffineBody(it *ECTracker, keepHR bool) {
 	// Save copies of values that get consumed but are needed later
-	it.copyToTop("jz", "_jz_for_z1cu")  // consumed by Z1sq, needed for Z1cu
-	it.copyToTop("jz", "_jz_for_z3")    // needed for Z3
-	it.copyToTop("jy", "_jy_for_y3")    // consumed by R, needed for Y3
-	it.copyToTop("jx", "_jx_for_u1h2")  // consumed by H, needed for U1H2
+	it.copyToTop("jz", "_jz_for_z1cu") // consumed by Z1sq, needed for Z1cu
+	it.copyToTop("jz", "_jz_for_z3")   // needed for Z3
+	it.copyToTop("jy", "_jy_for_y3")   // consumed by R, needed for Y3
+	it.copyToTop("jx", "_jx_for_u1h2") // consumed by H, needed for U1H2
 
 	// Z1sq = jz^2
 	ecFieldSqr(it, "jz", "_Z1sq")
@@ -832,6 +832,32 @@ func EmitEcAdd(emit func(StackOp)) {
 	ecComposePoint(t, "rx", "ry", "_result")
 }
 
+// ecEmitScalarReduce reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+//
+// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+// the `+ n, mod n` normalises the negative half. One push of n covers both
+// reductions — the same shape as EmitEcModReduce.
+//
+// Without it, EmitEcMul's ladder is only correct while 2^257 <= k + 3n < 2^258:
+// a scalar >= ~n sets bit 258, the 257-iteration loop never sees it, and the
+// ladder returns a DIFFERENT multiple of P rather than failing. Scalars are
+// contract input, so that is attacker-chosen. Reducing costs 1 push + 8 opcodes
+// (42 bytes) against a ~429 KB script, and makes k >= n, k < 0 and k = 0 all
+// well defined.
+func ecEmitScalarReduce(t *ECTracker, kName, resultName string, n *big.Int) {
+	t.pushBigInt("_n_red", n)
+	t.rawBlock([]string{kName, "_n_red"}, resultName, func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+		e(StackOp{Op: "rot"})
+		e(StackOp{Op: "drop"})
+		e(StackOp{Op: "over"})
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+		e(StackOp{Op: "swap"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+	})
+}
+
 // EmitEcMul performs scalar multiplication P * k.
 // Stack in: [point, scalar] (scalar on top)
 // Stack out: [result_point]
@@ -845,10 +871,14 @@ func EmitEcMul(emit func(StackOp)) {
 	// k' = k + 3n: guarantees bit 257 is set.
 	// k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
 	// is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
+	//
+	// "k ∈ [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar is
+	// usually an unlock argument — so reduce it first. See ecEmitScalarReduce.
 	curveN, _ := new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
 	t.toTop("_k")
+	ecEmitScalarReduce(t, "_k", "_kr", curveN)
 	t.pushBigInt("_n", curveN)
-	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
+	t.rawBlock([]string{"_kr", "_n"}, "_kn", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_ADD"})
 	})
 	t.pushBigInt("_n2", curveN)
