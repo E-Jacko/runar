@@ -525,168 +525,193 @@ def _ec_affine_add(t: ECTracker) -> None:
 
 
 # ===========================================================================
-# Jacobian point operations (for ecMul)
+# Projective point operations (for ecMul) — RCB complete formulas, a = 0
 # ===========================================================================
 
-def _ec_jacobian_double(t: ECTracker) -> None:
-    """Perform Jacobian point doubling (a=0 for secp256k1).
+EC_CURVE_N = int("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
 
-    Expects jx, jy, jz on tracker. Replaces with updated values.
+
+def _ec_scalar_mod_n(t: ECTracker, a_name: str, result_name: str) -> None:
+    """Reduce TOS mod n (the curve ORDER, not the field prime), non-negative.
+
+    Same shape as _ec_field_mod but with a different modulus. This defines the
+    scalar domain of ecMul over the whole of script-number space: negative
+    scalars and scalars >= n both reduce into [0, n-1], and k = 0 / k = n give
+    the point at infinity. Under the old ladder anything outside [1, n-1] was
+    undefined behaviour.
     """
-    # Save copies of jx, jy, jz for later use
-    t.copy_to_top("jy", "_jy_save")
-    t.copy_to_top("jx", "_jx_save")
-    t.copy_to_top("jz", "_jz_save")
+    t.to_top(a_name)
+    t.push_big_int("_smod_n", EC_CURVE_N)
 
-    # A = jy^2
-    _ec_field_sqr(t, "jy", "_A")
+    def _fn(e: Callable) -> None:
+        e(_make_stack_op(op="opcode", code="OP_2DUP"))
+        e(_make_stack_op(op="opcode", code="OP_MOD"))
+        e(_make_stack_op(op="rot"))
+        e(_make_stack_op(op="drop"))
+        e(_make_stack_op(op="over"))
+        e(_make_stack_op(op="opcode", code="OP_ADD"))
+        e(_make_stack_op(op="swap"))
+        e(_make_stack_op(op="opcode", code="OP_MOD"))
+    t.raw_block([a_name, "_smod_n"], result_name, _fn)
 
-    # B = 4 * jx * A
-    t.copy_to_top("_A", "_A_save")
-    _ec_field_mul(t, "jx", "_A", "_xA")
-    t.push_int("_four", 4)
-    _ec_field_mul(t, "_xA", "_four", "_B")
 
-    # C = 8 * A^2
-    _ec_field_sqr(t, "_A_save", "_A2")
-    t.push_int("_eight", 8)
-    _ec_field_mul(t, "_A2", "_eight", "_C")
+def _ec_projective_double(t: ECTracker) -> None:
+    """Projective point doubling — RCB Algorithm 9 (a = 0), 6M + 2S + 1 m_3b.
 
-    # D = 3 * X^2
-    _ec_field_sqr(t, "_jx_save", "_x2")
-    t.push_int("_three", 3)
-    _ec_field_mul(t, "_x2", "_three", "_D")
+    Expects jx, jy, jz on the tracker; replaces them with the doubled point.
 
-    # nx = D^2 - 2*B
-    t.copy_to_top("_D", "_D_save")
-    t.copy_to_top("_B", "_B_save")
-    _ec_field_sqr(t, "_D", "_D2")
-    t.copy_to_top("_B", "_B1")
-    _ec_field_mul_const(t, "_B1", 2, "_2B")
-    _ec_field_sub(t, "_D2", "_2B", "_nx")
+    Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
 
-    # ny = D*(B - nx) - C
-    t.copy_to_top("_nx", "_nx_copy")
-    _ec_field_sub(t, "_B_save", "_nx_copy", "_B_nx")
-    _ec_field_mul(t, "_D_save", "_B_nx", "_D_B_nx")
-    _ec_field_sub(t, "_D_B_nx", "_C", "_ny")
+    Deviations from the paper, both exact mod p and strictly cheaper here
+    (a multiply by a small constant costs one push + OP_MUL, an addition costs
+    a full reduce): line 2-4's Z3 = 8*t0 is one mul_const rather than three
+    doublings, and line 11-12's t2 = 3*t2 is one mul_const rather than two adds.
+    """
+    # Copies of the inputs that outlive their first consumer.
+    t.copy_to_top("jy", "_d_yz")       # t1 = Y*Z
+    t.copy_to_top("jy", "_d_xy")       # t1 = X*Y  (line 16)
+    t.copy_to_top("jz", "_d_zz_src")   # t2 = Z*Z
 
-    # nz = 2 * Y * Z
-    _ec_field_mul(t, "_jy_save", "_jz_save", "_yz")
-    _ec_field_mul_const(t, "_yz", 2, "_nz")
+    _ec_field_sqr(t, "jy", "_d_t0")                       # t0 = Y^2
+    t.copy_to_top("_d_t0", "_d_t0a")
+    _ec_field_mul_const(t, "_d_t0a", 8, "_d_Z3")          # Z3 = 8*t0
+    _ec_field_mul(t, "_d_yz", "jz", "_d_t1")              # t1 = Y*Z
+    _ec_field_sqr(t, "_d_zz_src", "_d_zz")                # Z^2
+    _ec_field_mul_const(t, "_d_zz", 21, "_d_t2")          # t2 = b3*Z^2  (b3 = 3*7)
 
-    # Clean up leftovers: _B and old jz (only copied, never consumed)
-    t.to_top("_B")
-    t.drop()
-    t.to_top("jz")
-    t.drop()
-    t.to_top("_nx")
+    t.copy_to_top("_d_t2", "_d_t2a")
+    t.copy_to_top("_d_Z3", "_d_Z3a")
+    _ec_field_mul(t, "_d_t2a", "_d_Z3a", "_d_X3")         # X3 = t2*Z3
+
+    t.copy_to_top("_d_t0", "_d_t0b")
+    t.copy_to_top("_d_t2", "_d_t2b")
+    _ec_field_add(t, "_d_t0b", "_d_t2b", "_d_Y3")         # Y3 = t0+t2
+
+    _ec_field_mul(t, "_d_t1", "_d_Z3", "_d_Z3n")          # Z3 = t1*Z3
+    _ec_field_mul_const(t, "_d_t2", 3, "_d_t2c")          # t2 = 3*t2
+    _ec_field_sub(t, "_d_t0", "_d_t2c", "_d_t0n")         # t0 = t0-t2
+
+    t.copy_to_top("_d_t0n", "_d_t0na")
+    _ec_field_mul(t, "_d_t0na", "_d_Y3", "_d_Y3b")        # Y3 = t0*Y3
+    _ec_field_add(t, "_d_X3", "_d_Y3b", "_d_Y3c")         # Y3 = X3+Y3
+
+    _ec_field_mul(t, "jx", "_d_xy", "_d_xyv")             # t1 = X*Y
+    _ec_field_mul(t, "_d_t0n", "_d_xyv", "_d_X3b")        # X3 = t0*t1
+    _ec_field_mul_const(t, "_d_X3b", 2, "_d_X3c")         # X3 = X3+X3
+
+    t.to_top("_d_X3c")
     t.rename("jx")
-    t.to_top("_ny")
+    t.to_top("_d_Y3c")
     t.rename("jy")
-    t.to_top("_nz")
+    t.to_top("_d_Z3n")
     t.rename("jz")
 
 
-def _ec_jacobian_to_affine(t: ECTracker, rx_name: str, ry_name: str) -> None:
-    """Convert Jacobian to affine coordinates.
+def _ec_projective_to_affine(t: ECTracker, rx_name: str, ry_name: str) -> None:
+    """Projective -> affine. Consumes jx, jy, jz; produces rx_name, ry_name.
 
-    Consumes jx, jy, jz; produces *rx_name*, *ry_name*.
+    _ec_field_inv is Fermat exponentiation, so inv(0) = 0: the point at
+    infinity (Z = 0) converts to (0, 0), which is the all-zero Point blob.
+    That is the agreed encoding for infinity — it is not a curve point, so it
+    cannot be confused with a real result.
     """
     _ec_field_inv(t, "jz", "_zinv")
-    t.copy_to_top("_zinv", "_zinv_keep")
-    _ec_field_sqr(t, "_zinv", "_zinv2")
-    t.copy_to_top("_zinv2", "_zinv2_keep")
-    _ec_field_mul(t, "_zinv_keep", "_zinv2", "_zinv3")
-    _ec_field_mul(t, "jx", "_zinv2_keep", rx_name)
-    _ec_field_mul(t, "jy", "_zinv3", ry_name)
+    t.copy_to_top("_zinv", "_zinv_b")
+    _ec_field_mul(t, "jx", "_zinv", rx_name)
+    _ec_field_mul(t, "jy", "_zinv_b", ry_name)
 
 
 # ===========================================================================
-# Jacobian mixed addition (P_jacobian + Q_affine)
+# Projective mixed addition (P_projective + Q_affine)
 # ===========================================================================
 
-def _ec_build_jacobian_add_affine_inline(e: Callable, t: ECTracker) -> None:
-    """Build Jacobian mixed-add ops for use inside OP_IF.
+def _ec_build_projective_add_mixed_inline(e: Callable, t: ECTracker) -> None:
+    """Build complete mixed-add ops for use inside OP_IF.
 
-    Uses an inner ECTracker to leverage field arithmetic helpers.
+    RCB Algorithm 8 (a = 0), 11M + 2 m_3b. Adds the affine base point (ax, ay)
+    into the accumulator.
+
+    Complete: no exceptional cases. In particular
+      - accumulator == Q        -> correctly doubles (this is the case that
+        broke ecMul(P, 2n): the old Jacobian mixed-add computed H = R = 0 and
+        returned the zero point, which then absorbed every remaining iteration)
+      - accumulator == -Q       -> correctly yields the point at infinity
+      - accumulator == infinity -> correctly yields Q
+
+    Uses an inner ECTracker cloned from the outer one, because the ops run
+    under OP_IF: the outer tracker's model must describe the stack for BOTH
+    branches, so this block has to be stack-shape neutral — same names, same
+    depths, with jx/jy/jz replaced in place.
 
     Stack layout: [..., ax, ay, _k, jx, jy, jz]
     After:        [..., ax, ay, _k, jx', jy', jz']
     """
-    # Create inner tracker with cloned stack state
     it = ECTracker(list(t.nm), e)
 
-    # Save copies of values that get consumed but are needed later
-    it.copy_to_top("jz", "_jz_for_z1cu")   # consumed by Z1sq, needed for Z1cu
-    it.copy_to_top("jz", "_jz_for_z3")     # needed for Z3
-    it.copy_to_top("jy", "_jy_for_y3")     # consumed by R, needed for Y3
-    it.copy_to_top("jx", "_jx_for_u1h2")   # consumed by H, needed for U1H2
+    # The affine base survives every iteration, so only ever consume copies.
+    it.copy_to_top("ax", "_m_x2a")   # t0 = X1*X2
+    it.copy_to_top("ax", "_m_x2b")   # X2+Y2
+    it.copy_to_top("ax", "_m_x2c")   # X2*Z1
+    it.copy_to_top("ay", "_m_y2a")   # t1 = Y1*Y2
+    it.copy_to_top("ay", "_m_y2b")   # X2+Y2
+    it.copy_to_top("ay", "_m_y2c")   # Y2*Z1
+    it.copy_to_top("jx", "_m_x1a")   # X1+Y1
+    it.copy_to_top("jx", "_m_x1b")   # Y3+X1
+    it.copy_to_top("jy", "_m_y1a")   # X1+Y1
+    it.copy_to_top("jy", "_m_y1b")   # t4+Y1
+    it.copy_to_top("jz", "_m_z1a")   # X2*Z1
+    it.copy_to_top("jz", "_m_z1b")   # b3*Z1
 
-    # Z1sq = jz^2
-    _ec_field_sqr(it, "jz", "_Z1sq")
+    _ec_field_mul(it, "jx", "_m_x2a", "_m_t0")            # t0 = X1*X2
+    _ec_field_mul(it, "jy", "_m_y2a", "_m_t1")            # t1 = Y1*Y2
+    _ec_field_add(it, "_m_x2b", "_m_y2b", "_m_s1")        # X2+Y2
+    _ec_field_add(it, "_m_x1a", "_m_y1a", "_m_s2")        # X1+Y1
+    _ec_field_mul(it, "_m_s1", "_m_s2", "_m_t3")          # t3 = (X2+Y2)(X1+Y1)
 
-    # Z1cu = _jz_for_z1cu * Z1sq (copy Z1sq for U2)
-    it.copy_to_top("_Z1sq", "_Z1sq_for_u2")
-    _ec_field_mul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu")
+    it.copy_to_top("_m_t0", "_m_t0a")
+    it.copy_to_top("_m_t1", "_m_t1a")
+    _ec_field_add(it, "_m_t0a", "_m_t1a", "_m_s3")        # t4 = t0+t1
+    _ec_field_sub(it, "_m_t3", "_m_s3", "_m_t3b")         # t3 = t3-t4
 
-    # U2 = ax * Z1sq_for_u2
-    it.copy_to_top("ax", "_ax_c")
-    _ec_field_mul(it, "_ax_c", "_Z1sq_for_u2", "_U2")
+    _ec_field_mul(it, "_m_y2c", "jz", "_m_t4")            # t4 = Y2*Z1
+    _ec_field_add(it, "_m_t4", "_m_y1b", "_m_t4b")        # t4 = t4+Y1
+    _ec_field_mul(it, "_m_x2c", "_m_z1a", "_m_Y3")        # Y3 = X2*Z1
+    _ec_field_add(it, "_m_Y3", "_m_x1b", "_m_Y3b")        # Y3 = Y3+X1
 
-    # S2 = ay * Z1cu
-    it.copy_to_top("ay", "_ay_c")
-    _ec_field_mul(it, "_ay_c", "_Z1cu", "_S2")
+    _ec_field_mul_const(it, "_m_t0", 3, "_m_t0b")         # t0 = 3*t0
+    _ec_field_mul_const(it, "_m_z1b", 21, "_m_t2")        # t2 = b3*Z1
 
-    # H = U2 - jx
-    _ec_field_sub(it, "_U2", "jx", "_H")
+    it.copy_to_top("_m_t1", "_m_t1b")
+    it.copy_to_top("_m_t2", "_m_t2a")
+    _ec_field_add(it, "_m_t1b", "_m_t2a", "_m_Z3")        # Z3 = t1+t2
+    _ec_field_sub(it, "_m_t1", "_m_t2", "_m_t1c")         # t1 = t1-t2
+    _ec_field_mul_const(it, "_m_Y3b", 21, "_m_Y3c")       # Y3 = b3*Y3
 
-    # R = S2 - jy
-    _ec_field_sub(it, "_S2", "jy", "_R")
+    it.copy_to_top("_m_Y3c", "_m_Y3ca")
+    it.copy_to_top("_m_t4b", "_m_t4ba")
+    _ec_field_mul(it, "_m_t4ba", "_m_Y3ca", "_m_X3")      # X3 = t4*Y3
 
-    # Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
-    it.copy_to_top("_H", "_H_for_h3")
-    it.copy_to_top("_H", "_H_for_z3")
+    it.copy_to_top("_m_t3b", "_m_t3ba")
+    it.copy_to_top("_m_t1c", "_m_t1ca")
+    _ec_field_mul(it, "_m_t3ba", "_m_t1ca", "_m_t2b")     # t2 = t3*t1
+    _ec_field_sub(it, "_m_t2b", "_m_X3", "_m_X3b")        # X3 = t2-X3
 
-    # H2 = H^2
-    _ec_field_sqr(it, "_H", "_H2")
+    it.copy_to_top("_m_t0b", "_m_t0ba")
+    _ec_field_mul(it, "_m_Y3c", "_m_t0ba", "_m_Y3d")      # Y3 = Y3*t0
 
-    # Save H2 for U1H2
-    it.copy_to_top("_H2", "_H2_for_u1h2")
+    it.copy_to_top("_m_Z3", "_m_Z3a")
+    _ec_field_mul(it, "_m_t1c", "_m_Z3a", "_m_t1d")       # t1 = t1*Z3
+    _ec_field_add(it, "_m_t1d", "_m_Y3d", "_m_Y3e")       # Y3 = t1+Y3
 
-    # H3 = H_for_h3 * H2
-    _ec_field_mul(it, "_H_for_h3", "_H2", "_H3")
+    _ec_field_mul(it, "_m_t0b", "_m_t3b", "_m_t0c")       # t0 = t0*t3
+    _ec_field_mul(it, "_m_Z3", "_m_t4b", "_m_Z3b")        # Z3 = Z3*t4
+    _ec_field_add(it, "_m_Z3b", "_m_t0c", "_m_Z3c")       # Z3 = Z3+t0
 
-    # U1H2 = _jx_for_u1h2 * H2_for_u1h2
-    _ec_field_mul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2")
-
-    # Save R, U1H2, H3 for Y3 computation
-    it.copy_to_top("_R", "_R_for_y3")
-    it.copy_to_top("_U1H2", "_U1H2_for_y3")
-    it.copy_to_top("_H3", "_H3_for_y3")
-
-    # X3 = R^2 - H3 - 2*U1H2
-    _ec_field_sqr(it, "_R", "_R2")
-    _ec_field_sub(it, "_R2", "_H3", "_x3_tmp")
-    _ec_field_mul_const(it, "_U1H2", 2, "_2U1H2")
-    _ec_field_sub(it, "_x3_tmp", "_2U1H2", "_X3")
-
-    # Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
-    it.copy_to_top("_X3", "_X3_c")
-    _ec_field_sub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x")
-    _ec_field_mul(it, "_R_for_y3", "_u_minus_x", "_r_tmp")
-    _ec_field_mul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3")
-    _ec_field_sub(it, "_r_tmp", "_jy_h3", "_Y3")
-
-    # Z3 = _jz_for_z3 * _H_for_z3
-    _ec_field_mul(it, "_jz_for_z3", "_H_for_z3", "_Z3")
-
-    # Rename results to jx/jy/jz
-    it.to_top("_X3")
+    it.to_top("_m_X3b")
     it.rename("jx")
-    it.to_top("_Y3")
+    it.to_top("_m_Y3e")
     it.rename("jy")
-    it.to_top("_Z3")
+    it.to_top("_m_Z3c")
     it.rename("jz")
 
 
@@ -713,34 +738,37 @@ def emit_ec_mul(emit: Callable) -> None:
     Stack in: [point, scalar] (scalar on top)
     Stack out: [result_point]
 
-    Uses 256-iteration double-and-add with Jacobian coordinates.
+    256-iteration MSB-first double-and-add over homogeneous projective
+    coordinates, using the RCB COMPLETE formulas. The accumulator starts at
+    the point at infinity, so every one of the 256 bits is handled uniformly.
+
+    The previous version ran 257 iterations over k+3n with an accumulator
+    seeded at P, to guarantee a set leading bit. That relied on the INCOMPLETE
+    Jacobian mixed-add never being handed two equal points — which it was, for
+    k = 2, on the final iteration, yielding an all-zero point. No choice of
+    offset avoids this: every candidate multiple of n merely relocates the
+    collision onto different small scalars. Completeness is the only fix that
+    holds for an operand the caller chooses.
     """
     t = ECTracker(["_pt", "_k"], emit)
     # Decompose to affine base point
     _ec_decompose_point(t, "_pt", "ax", "ay")
 
-    # k' = k + 3n: guarantees bit 257 is set.
-    # k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
-    # is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
-    curve_n = int("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
-    t.to_top("_k")
-    t.push_big_int("_n", curve_n)
-    t.raw_block(["_k", "_n"], "_kn", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
-    t.push_big_int("_n2", curve_n)
-    t.raw_block(["_kn", "_n2"], "_kn2", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
-    t.push_big_int("_n3", curve_n)
-    t.raw_block(["_kn2", "_n3"], "_kn3", lambda e: e(_make_stack_op(op="opcode", code="OP_ADD")))
-    t.rename("_k")
+    # Reduce the scalar into [0, n-1] so the 256-bit ladder covers the whole
+    # domain: negative k and k >= n are now defined rather than undefined.
+    _ec_scalar_mod_n(t, "_k", "_k")
 
-    # Init accumulator = P (bit 257 of k+3n is always 1)
-    t.copy_to_top("ax", "jx")
-    t.copy_to_top("ay", "jy")
-    t.push_int("jz", 1)
+    # Accumulator := point at infinity (0 : 1 : 0). Legal input to both
+    # complete formulas, which is exactly why no special leading-bit handling
+    # is needed.
+    t.push_int("jx", 0)
+    t.push_int("jy", 1)
+    t.push_int("jz", 0)
 
-    # 257 iterations: bits 256 down to 0
-    for bit in range(256, -1, -1):
+    # 256 iterations: bits 255 down to 0
+    for bit in range(255, -1, -1):
         # Double accumulator
-        _ec_jacobian_double(t)
+        _ec_projective_double(t)
 
         # Extract bit: (k >> bit) & 1, using OP_RSHIFTNUM / OP_2DIV
         t.copy_to_top("_k", "_k_copy")
@@ -762,11 +790,11 @@ def emit_ec_mul(emit: Callable) -> None:
         t.nm.pop()  # _bit consumed by IF
         add_ops: list = []
         add_emit = lambda op: add_ops.append(op)
-        _ec_build_jacobian_add_affine_inline(add_emit, t)
+        _ec_build_projective_add_mixed_inline(add_emit, t)
         emit(_make_stack_op(op="if", then=add_ops, else_=[]))
 
-    # Convert Jacobian to affine
-    _ec_jacobian_to_affine(t, "_rx", "_ry")
+    # Convert projective to affine
+    _ec_projective_to_affine(t, "_rx", "_ry")
 
     # Clean up base point and scalar
     t.to_top("ax")

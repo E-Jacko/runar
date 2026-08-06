@@ -30,8 +30,8 @@ from runar_compiler.codegen.stack import StackOp
 
 @pytest.mark.parametrize("name,fn,expected", [
     ("ecAdd",              emit_ec_add,               8202),
-    ("ecMul",              emit_ec_mul,              63828),
-    ("ecMulGen",           emit_ec_mul_gen,          63830),
+    ("ecMul",              emit_ec_mul,              62304),
+    ("ecMulGen",           emit_ec_mul_gen,          62306),
     ("ecNegate",           emit_ec_negate,             945),
     ("ecOnCurve",          emit_ec_on_curve,           533),
     ("ecModReduce",        emit_ec_mod_reduce,           8),

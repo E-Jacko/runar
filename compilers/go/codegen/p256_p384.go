@@ -5,8 +5,9 @@
 // and generator points.
 //
 // Point representation:
-//   P-256: 64 bytes (x[32] || y[32], big-endian unsigned)
-//   P-384: 96 bytes (x[48] || y[48], big-endian unsigned)
+//
+//	P-256: 64 bytes (x[32] || y[32], big-endian unsigned)
+//	P-384: 96 bytes (x[48] || y[48], big-endian unsigned)
 //
 // Key difference from secp256k1: curve parameter a = -3 (not 0), which gives
 // an optimized Jacobian doubling formula.
@@ -21,14 +22,14 @@ import (
 // ===========================================================================
 
 var (
-	p256P        *big.Int
-	p256PMinus2  *big.Int
-	p256B        *big.Int
-	p256N        *big.Int
-	p256NMinus2  *big.Int
-	p256GX       *big.Int
-	p256GY       *big.Int
-	p256SqrtExp  *big.Int
+	p256P       *big.Int
+	p256PMinus2 *big.Int
+	p256B       *big.Int
+	p256N       *big.Int
+	p256NMinus2 *big.Int
+	p256GX      *big.Int
+	p256GY      *big.Int
+	p256SqrtExp *big.Int
 )
 
 // ===========================================================================
@@ -36,14 +37,14 @@ var (
 // ===========================================================================
 
 var (
-	p384P        *big.Int
-	p384PMinus2  *big.Int
-	p384B        *big.Int
-	p384N        *big.Int
-	p384NMinus2  *big.Int
-	p384GX       *big.Int
-	p384GY       *big.Int
-	p384SqrtExp  *big.Int
+	p384P       *big.Int
+	p384PMinus2 *big.Int
+	p384B       *big.Int
+	p384N       *big.Int
+	p384NMinus2 *big.Int
+	p384GX      *big.Int
+	p384GY      *big.Int
+	p384SqrtExp *big.Int
 )
 
 func init() {
@@ -77,6 +78,9 @@ func init() {
 type nistCurveParams struct {
 	fieldP       *big.Int
 	fieldPMinus2 *big.Int
+	// curveB is the curve b coefficient, needed by the RCB complete formulas
+	// (a = -3).
+	curveB       *big.Int
 	coordBytes   int // 32 for P-256, 48 for P-384
 	reverseBytes func(e func(StackOp))
 }
@@ -106,8 +110,10 @@ var p384GroupParams = &nistGroupParams{n: nil, nMinus2: nil}
 func init() {
 	p256CurveParams.fieldP = p256P
 	p256CurveParams.fieldPMinus2 = p256PMinus2
+	p256CurveParams.curveB = p256B
 	p384CurveParams.fieldP = p384P
 	p384CurveParams.fieldPMinus2 = p384PMinus2
+	p384CurveParams.curveB = p384B
 	p256GroupParams.n = p256N
 	p256GroupParams.nMinus2 = p256NMinus2
 	p384GroupParams.n = p384N
@@ -212,6 +218,17 @@ func cFieldMulConst(t *ECTracker, aName string, cv int64, resultName string, c *
 			e(StackOp{Op: "push", Value: bigIntPush(cv)})
 			e(StackOp{Op: "opcode", Code: "OP_MUL"})
 		}
+	})
+	cFieldMod(t, "_fmc_prod", resultName, c)
+}
+
+// cFieldMulBig computes (a * cv) mod p for a FULL-WIDTH constant such as the
+// curve b coefficient, which does not fit the int64 taken by cFieldMulConst.
+func cFieldMulBig(t *ECTracker, aName string, cv *big.Int, resultName string, c *nistCurveParams) {
+	t.toTop(aName)
+	t.rawBlock([]string{aName}, "_fmc_prod", func(e func(StackOp)) {
+		e(StackOp{Op: "push", Value: PushValue{Kind: "bigint", BigInt: cv}})
+		e(StackOp{Op: "opcode", Code: "OP_MUL"})
 	})
 	cFieldMod(t, "_fmc_prod", resultName, c)
 }
@@ -374,15 +391,57 @@ func cComposePoint(t *ECTracker, xName, yName, resultName string, c *nistCurvePa
 // ===========================================================================
 
 func cAffineAdd(t *ECTracker, c *nistCurveParams) {
-	// s_num = qy - py
+	// The chord slope (qy-py)/(qx-px) divides by zero when P == Q, so doubling
+	// needs the tangent (3*px^2 + a)/(2*py) — and a = -3 on both NIST curves,
+	// giving (3*px^2 - 3)/(2*py). Pick numerator and denominator BEFORE the one
+	// cFieldInv:
+	//   cond = (px == qx)                          1 when doubling, else 0
+	//   num  = cond ? 3*px^2 - 3 : (qy - py)
+	//   den  = cond ? 2*py       : (qx - px)
+	//
+	// selected as b + cond*(a - b) over the field, which needs no branch and so
+	// keeps the emitted op sequence — and the tracker's static stack model —
+	// identical on both paths. Mirrors the secp256k1 fix in ec.go.
+	//
+	// NOT handled: P == -Q, whose true result is the point at infinity, which
+	// affine coordinates cannot represent.
+	t.copyToTop("px", "_px_eq")
+	t.copyToTop("qx", "_qx_eq")
+	t.rawBlock([]string{"_px_eq", "_qx_eq"}, "_cond", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+
+	// chord numerator / denominator
 	t.copyToTop("qy", "_qy1")
 	t.copyToTop("py", "_py1")
-	cFieldSub(t, "_qy1", "_py1", "_s_num", c)
-
-	// s_den = qx - px
+	cFieldSub(t, "_qy1", "_py1", "_num_chord", c)
 	t.copyToTop("qx", "_qx1")
 	t.copyToTop("px", "_px1")
-	cFieldSub(t, "_qx1", "_px1", "_s_den", c)
+	cFieldSub(t, "_qx1", "_px1", "_den_chord", c)
+
+	// tangent numerator / denominator: 3*px^2 - 3 and 2*py
+	t.copyToTop("px", "_px_t")
+	cFieldSqr(t, "_px_t", "_px_sq", c)
+	cFieldMulConst(t, "_px_sq", 3, "_3x2", c)
+	t.pushInt("_three", 3)
+	cFieldSub(t, "_3x2", "_three", "_num_tan", c)
+	t.copyToTop("py", "_py_t")
+	cFieldMulConst(t, "_py_t", 2, "_den_tan", c)
+
+	// num = num_chord + cond*(num_tan - num_chord)
+	t.copyToTop("_num_chord", "_num_chord_c")
+	cFieldSub(t, "_num_tan", "_num_chord_c", "_num_diff", c)
+	t.copyToTop("_cond", "_cond_n")
+	cFieldMul(t, "_num_diff", "_cond_n", "_num_sel", c)
+	cFieldAdd(t, "_num_chord", "_num_sel", "_s_num", c)
+
+	// den = den_chord + cond*(den_tan - den_chord)
+	t.copyToTop("_den_chord", "_den_chord_c")
+	cFieldSub(t, "_den_tan", "_den_chord_c", "_den_diff", c)
+	t.toTop("_cond")
+	t.rename("_cond_d")
+	cFieldMul(t, "_den_diff", "_cond_d", "_den_sel", c)
+	cFieldAdd(t, "_den_chord", "_den_sel", "_s_den", c)
 
 	// s = s_num / s_den mod p
 	cFieldInv(t, "_s_den", "_s_den_inv", c)
@@ -419,207 +478,204 @@ func cAffineAdd(t *ECTracker, c *nistCurveParams) {
 // Jacobian point doubling with a=-3 optimization
 // ===========================================================================
 
-// cJacobianDouble performs Jacobian doubling for curves with a = -3 (P-256, P-384).
-// Uses optimization: A = 3*(X - Z^2)*(X + Z^2) instead of 3*X^2 + a*Z^4.
-func cJacobianDouble(t *ECTracker, c *nistCurveParams) {
-	// Z^2
-	t.copyToTop("jz", "_jz_sq_tmp")
-	cFieldSqr(t, "_jz_sq_tmp", "_Z2", c)
+// cProjectiveDouble performs projective point doubling — RCB Algorithm 6
+// (a = -3), 8M + 3S + 2 m_b. Expects jx, jy, jz on the tracker; replaces them
+// with the doubled point.
+//
+// Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
+//
+// P-256 and P-384 have a = -3, so these are the a = -3 algorithms (5 and 6),
+// NOT the a = 0 pair used for secp256k1 in ec.go.
+func cProjectiveDouble(t *ECTracker, c *nistCurveParams) {
+	B := c.curveB
 
-	// X - Z^2 and X + Z^2
-	t.copyToTop("jx", "_jx_c1")
-	t.copyToTop("_Z2", "_Z2_c1")
-	cFieldSub(t, "_jx_c1", "_Z2_c1", "_X_minus_Z2", c)
-	t.copyToTop("jx", "_jx_c2")
-	cFieldAdd(t, "_jx_c2", "_Z2", "_X_plus_Z2", c)
+	t.copyToTop("jx", "_d_x_xy")
+	t.copyToTop("jx", "_d_x_xz")
+	t.copyToTop("jy", "_d_y_xy")
+	t.copyToTop("jy", "_d_y_yz")
+	t.copyToTop("jz", "_d_z_xz")
+	t.copyToTop("jz", "_d_z_yz")
 
-	// A = 3*(X-Z^2)*(X+Z^2)
-	cFieldMul(t, "_X_minus_Z2", "_X_plus_Z2", "_prod", c)
-	t.pushInt("_three", 3)
-	cFieldMul(t, "_prod", "_three", "_A", c)
+	cFieldSqr(t, "jx", "_d_t0", c) // t0 = X^2
+	cFieldSqr(t, "jy", "_d_t1", c) // t1 = Y^2
+	cFieldSqr(t, "jz", "_d_t2", c) // t2 = Z^2
 
-	// B = 4*X*Y^2
-	t.copyToTop("jy", "_jy_sq_tmp")
-	cFieldSqr(t, "_jy_sq_tmp", "_Y2", c)
-	t.copyToTop("_Y2", "_Y2_c1")
-	t.copyToTop("jx", "_jx_c3")
-	cFieldMul(t, "_jx_c3", "_Y2", "_xY2", c)
-	t.pushInt("_four", 4)
-	cFieldMul(t, "_xY2", "_four", "_B", c)
+	cFieldMul(t, "_d_x_xy", "_d_y_xy", "_d_xy", c)
+	cFieldMulConst(t, "_d_xy", 2, "_d_t3", c) // t3 = 2*X*Y
+	cFieldMul(t, "_d_x_xz", "_d_z_xz", "_d_xz", c)
+	cFieldMulConst(t, "_d_xz", 2, "_d_Z3", c) // Z3 = 2*X*Z
 
-	// C = 8*Y^4
-	cFieldSqr(t, "_Y2_c1", "_Y4", c)
-	t.pushInt("_eight", 8)
-	cFieldMul(t, "_Y4", "_eight", "_C", c)
+	t.copyToTop("_d_t2", "_d_t2_b")
+	cFieldMulBig(t, "_d_t2_b", B, "_d_bt2", c)
+	t.copyToTop("_d_Z3", "_d_Z3_a")
+	cFieldSub(t, "_d_bt2", "_d_Z3_a", "_d_Y3", c)
+	cFieldMulConst(t, "_d_Y3", 3, "_d_Y3b", c)
 
-	// X3 = A^2 - 2*B
-	t.copyToTop("_A", "_A_save")
-	t.copyToTop("_B", "_B_save")
-	cFieldSqr(t, "_A", "_A2", c)
-	t.copyToTop("_B", "_B_c1")
-	cFieldMulConst(t, "_B_c1", 2, "_2B", c)
-	cFieldSub(t, "_A2", "_2B", "_X3", c)
+	t.copyToTop("_d_t1", "_d_t1_a")
+	t.copyToTop("_d_t1", "_d_t1_b")
+	t.copyToTop("_d_Y3b", "_d_Y3b_a")
+	cFieldSub(t, "_d_t1_a", "_d_Y3b_a", "_d_X3", c)
+	cFieldAdd(t, "_d_t1", "_d_Y3b", "_d_Y3c", c)
 
-	// Y3 = A*(B - X3) - C
-	t.copyToTop("_X3", "_X3_c")
-	cFieldSub(t, "_B_save", "_X3_c", "_B_minus_X3", c)
-	cFieldMul(t, "_A_save", "_B_minus_X3", "_A_tmp", c)
-	cFieldSub(t, "_A_tmp", "_C", "_Y3", c)
+	t.copyToTop("_d_X3", "_d_X3_a")
+	cFieldMul(t, "_d_X3_a", "_d_Y3c", "_d_Y3d", c)
+	cFieldMul(t, "_d_X3", "_d_t3", "_d_X3b", c)
 
-	// Z3 = 2*Y*Z
-	t.copyToTop("jy", "_jy_c")
-	t.copyToTop("jz", "_jz_c")
-	cFieldMul(t, "_jy_c", "_jz_c", "_yz", c)
-	cFieldMulConst(t, "_yz", 2, "_Z3", c)
+	cFieldMulConst(t, "_d_t2", 3, "_d_t2c", c)
 
-	// Clean up and rename
-	t.toTop("_B")
-	t.drop()
-	t.toTop("jz")
-	t.drop()
-	t.toTop("jx")
-	t.drop()
-	t.toTop("jy")
-	t.drop()
-	t.toTop("_X3")
+	cFieldMulBig(t, "_d_Z3", B, "_d_Z3b", c)
+	t.copyToTop("_d_t2c", "_d_t2c_a")
+	cFieldSub(t, "_d_Z3b", "_d_t2c_a", "_d_Z3c", c)
+	t.copyToTop("_d_t0", "_d_t0_a")
+	cFieldSub(t, "_d_Z3c", "_d_t0_a", "_d_Z3d", c)
+	cFieldMulConst(t, "_d_Z3d", 3, "_d_Z3e", c)
+
+	cFieldMulConst(t, "_d_t0", 3, "_d_t0b", c)
+	cFieldSub(t, "_d_t0b", "_d_t2c", "_d_t0c", c)
+
+	t.copyToTop("_d_Z3e", "_d_Z3e_a")
+	cFieldMul(t, "_d_t0c", "_d_Z3e_a", "_d_t0d", c)
+	cFieldAdd(t, "_d_Y3d", "_d_t0d", "_d_Y3e", c)
+
+	cFieldMul(t, "_d_y_yz", "_d_z_yz", "_d_yz", c)
+	cFieldMulConst(t, "_d_yz", 2, "_d_t0e", c)
+
+	t.copyToTop("_d_t0e", "_d_t0e_a")
+	cFieldMul(t, "_d_t0e_a", "_d_Z3e", "_d_Z3f", c)
+	cFieldSub(t, "_d_X3b", "_d_Z3f", "_d_X3c", c)
+
+	cFieldMul(t, "_d_t0e", "_d_t1_b", "_d_Z3g", c)
+	cFieldMulConst(t, "_d_Z3g", 4, "_d_Z3h", c)
+
+	t.toTop("_d_X3c")
 	t.rename("jx")
-	t.toTop("_Y3")
+	t.toTop("_d_Y3e")
 	t.rename("jy")
-	t.toTop("_Z3")
+	t.toTop("_d_Z3h")
 	t.rename("jz")
 }
 
-// ===========================================================================
-// Jacobian to affine conversion
-// ===========================================================================
-
-func cJacobianToAffine(t *ECTracker, rxName, ryName string, c *nistCurveParams) {
+// cProjectiveToAffine consumes jx, jy, jz; produces rxName, ryName.
+//
+// cFieldInv is Fermat exponentiation, so inv(0) = 0: the point at infinity
+// (Z = 0) converts to (0, 0), the all-zero point blob.
+func cProjectiveToAffine(t *ECTracker, rxName, ryName string, c *nistCurveParams) {
 	cFieldInv(t, "jz", "_zinv", c)
-	t.copyToTop("_zinv", "_zinv_keep")
-	cFieldSqr(t, "_zinv", "_zinv2", c)
-	t.copyToTop("_zinv2", "_zinv2_keep")
-	cFieldMul(t, "_zinv_keep", "_zinv2", "_zinv3", c)
-	cFieldMul(t, "jx", "_zinv2_keep", rxName, c)
-	cFieldMul(t, "jy", "_zinv3", ryName, c)
+	t.copyToTop("_zinv", "_zinv_b")
+	cFieldMul(t, "jx", "_zinv", rxName, c)
+	cFieldMul(t, "jy", "_zinv_b", ryName, c)
 }
 
-// ===========================================================================
-// Jacobian mixed addition (P_jacobian + Q_affine)
-// ===========================================================================
-
-// cBuildJacobianAddAffineInline builds Jacobian mixed-add ops for use inside OP_IF.
-func cBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker, c *nistCurveParams) {
+// cBuildProjectiveAddMixedInline builds complete mixed-add ops for use inside
+// OP_IF — RCB Algorithm 5 (a = -3), 11M + 2 m_b.
+//
+// Complete: accumulator == Q doubles correctly (the case that returned the
+// zero point for k = 2), accumulator == -Q yields infinity, and an infinity
+// accumulator yields Q.
+func cBuildProjectiveAddMixedInline(e func(StackOp), t *ECTracker, c *nistCurveParams) {
 	initNm := make([]string, len(t.nm))
 	copy(initNm, t.nm)
 	it := NewECTracker(initNm, e)
+	B := c.curveB
 
-	it.copyToTop("jz", "_jz_for_z1cu")
-	it.copyToTop("jz", "_jz_for_z3")
-	it.copyToTop("jy", "_jy_for_y3")
-	it.copyToTop("jx", "_jx_for_u1h2")
+	it.copyToTop("ax", "_m_x2a")
+	it.copyToTop("ax", "_m_x2b")
+	it.copyToTop("ax", "_m_x2c")
+	it.copyToTop("ay", "_m_y2a")
+	it.copyToTop("ay", "_m_y2b")
+	it.copyToTop("ay", "_m_y2c")
+	it.copyToTop("jx", "_m_x1a")
+	it.copyToTop("jx", "_m_x1b")
+	it.copyToTop("jy", "_m_y1a")
+	it.copyToTop("jy", "_m_y1b")
+	it.copyToTop("jz", "_m_z1a")
+	it.copyToTop("jz", "_m_z1b")
+	it.copyToTop("jz", "_m_z1c")
 
-	// Z1sq = jz^2
-	cFieldSqr(it, "jz", "_Z1sq", c)
+	cFieldMul(it, "jx", "_m_x2a", "_m_t0", c)
+	cFieldMul(it, "jy", "_m_y2a", "_m_t1", c)
+	cFieldAdd(it, "_m_x2b", "_m_y2b", "_m_s1", c)
+	cFieldAdd(it, "_m_x1a", "_m_y1a", "_m_s2", c)
+	cFieldMul(it, "_m_s1", "_m_s2", "_m_t3", c)
 
-	// Z1cu = _jz_for_z1cu * Z1sq
-	it.copyToTop("_Z1sq", "_Z1sq_for_u2")
-	cFieldMul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu", c)
+	it.copyToTop("_m_t0", "_m_t0a")
+	it.copyToTop("_m_t1", "_m_t1a")
+	cFieldAdd(it, "_m_t0a", "_m_t1a", "_m_s3", c)
+	cFieldSub(it, "_m_t3", "_m_s3", "_m_t3b", c)
 
-	// U2 = ax * Z1sq_for_u2
-	it.copyToTop("ax", "_ax_c")
-	cFieldMul(it, "_ax_c", "_Z1sq_for_u2", "_U2", c)
+	cFieldMul(it, "_m_y2c", "jz", "_m_t4", c)
+	cFieldAdd(it, "_m_t4", "_m_y1b", "_m_t4b", c)
+	cFieldMul(it, "_m_x2c", "_m_z1a", "_m_Y3", c)
+	cFieldAdd(it, "_m_Y3", "_m_x1b", "_m_Y3b", c)
 
-	// S2 = ay * Z1cu
-	it.copyToTop("ay", "_ay_c")
-	cFieldMul(it, "_ay_c", "_Z1cu", "_S2", c)
+	cFieldMulBig(it, "_m_z1b", B, "_m_Z3", c)
+	it.copyToTop("_m_Y3b", "_m_Y3b_a")
+	cFieldSub(it, "_m_Y3b_a", "_m_Z3", "_m_X3", c)
+	cFieldMulConst(it, "_m_X3", 3, "_m_X3b", c)
 
-	// H = U2 - jx
-	cFieldSub(it, "_U2", "jx", "_H", c)
+	it.copyToTop("_m_t1", "_m_t1b")
+	it.copyToTop("_m_X3b", "_m_X3b_a")
+	cFieldSub(it, "_m_t1b", "_m_X3b_a", "_m_Z3b", c)
+	cFieldAdd(it, "_m_t1", "_m_X3b", "_m_X3c", c)
 
-	// R = S2 - jy
-	cFieldSub(it, "_S2", "jy", "_R", c)
+	cFieldMulBig(it, "_m_Y3b", B, "_m_Y3c", c)
+	cFieldMulConst(it, "_m_z1c", 3, "_m_t2", c)
 
-	it.copyToTop("_H", "_H_for_h3")
-	it.copyToTop("_H", "_H_for_z3")
+	it.copyToTop("_m_t2", "_m_t2a")
+	cFieldSub(it, "_m_Y3c", "_m_t2a", "_m_Y3d", c)
+	it.copyToTop("_m_t0", "_m_t0b")
+	cFieldSub(it, "_m_Y3d", "_m_t0b", "_m_Y3e", c)
+	cFieldMulConst(it, "_m_Y3e", 3, "_m_Y3f", c)
 
-	// H2 = H^2
-	cFieldSqr(it, "_H", "_H2", c)
+	cFieldMulConst(it, "_m_t0", 3, "_m_t0c", c)
+	cFieldSub(it, "_m_t0c", "_m_t2", "_m_t0d", c)
 
-	it.copyToTop("_H2", "_H2_for_u1h2")
+	it.copyToTop("_m_t4b", "_m_t4b_a")
+	it.copyToTop("_m_Y3f", "_m_Y3f_a")
+	cFieldMul(it, "_m_t4b_a", "_m_Y3f_a", "_m_t1c", c)
+	it.copyToTop("_m_t0d", "_m_t0d_a")
+	cFieldMul(it, "_m_t0d_a", "_m_Y3f", "_m_t2b", c)
 
-	// H3 = H_for_h3 * H2
-	cFieldMul(it, "_H_for_h3", "_H2", "_H3", c)
+	it.copyToTop("_m_X3c", "_m_X3c_a")
+	it.copyToTop("_m_Z3b", "_m_Z3b_a")
+	cFieldMul(it, "_m_X3c_a", "_m_Z3b_a", "_m_Y3g", c)
+	cFieldAdd(it, "_m_Y3g", "_m_t2b", "_m_Y3h", c)
 
-	// U1H2 = _jx_for_u1h2 * H2_for_u1h2
-	cFieldMul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2", c)
+	it.copyToTop("_m_t3b", "_m_t3b_a")
+	cFieldMul(it, "_m_t3b_a", "_m_X3c", "_m_X3d", c)
+	cFieldSub(it, "_m_X3d", "_m_t1c", "_m_X3e", c)
 
-	it.copyToTop("_R", "_R_for_y3")
-	it.copyToTop("_U1H2", "_U1H2_for_y3")
-	it.copyToTop("_H3", "_H3_for_y3")
+	cFieldMul(it, "_m_t4b", "_m_Z3b", "_m_Z3c", c)
+	cFieldMul(it, "_m_t3b", "_m_t0d", "_m_t1d", c)
+	cFieldAdd(it, "_m_Z3c", "_m_t1d", "_m_Z3d", c)
 
-	// X3 = R^2 - H3 - 2*U1H2
-	cFieldSqr(it, "_R", "_R2", c)
-	cFieldSub(it, "_R2", "_H3", "_x3_tmp", c)
-	cFieldMulConst(it, "_U1H2", 2, "_2U1H2", c)
-	cFieldSub(it, "_x3_tmp", "_2U1H2", "_X3", c)
-
-	// Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
-	it.copyToTop("_X3", "_X3_c")
-	cFieldSub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x", c)
-	cFieldMul(it, "_R_for_y3", "_u_minus_x", "_r_tmp", c)
-	cFieldMul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3", c)
-	cFieldSub(it, "_r_tmp", "_jy_h3", "_Y3", c)
-
-	// Z3 = _jz_for_z3 * _H_for_z3
-	cFieldMul(it, "_jz_for_z3", "_H_for_z3", "_Z3", c)
-
-	it.toTop("_X3")
+	it.toTop("_m_X3e")
 	it.rename("jx")
-	it.toTop("_Y3")
+	it.toTop("_m_Y3h")
 	it.rename("jy")
-	it.toTop("_Z3")
+	it.toTop("_m_Z3d")
 	it.rename("jz")
 }
-
-// ===========================================================================
-// Scalar multiplication (generic for both P-256 and P-384)
-// ===========================================================================
 
 func cEmitMul(emit func(StackOp), c *nistCurveParams, g *nistGroupParams) {
 	t := NewECTracker([]string{"_pt", "_k"}, emit)
 	cDecomposePoint(t, "_pt", "ax", "ay", c)
 
-	// k' = k + 3n
-	t.toTop("_k")
-	t.pushBigInt("_n", g.n)
-	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})
-	})
-	t.pushBigInt("_n2", g.n)
-	t.rawBlock([]string{"_kn", "_n2"}, "_kn2", func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})
-	})
-	t.pushBigInt("_n3", g.n)
-	t.rawBlock([]string{"_kn2", "_n3"}, "_kn3", func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})
-	})
-	t.rename("_k")
+	// Reduce the scalar into [0, n-1] so the ladder covers the whole domain:
+	// negative k and k >= n are now defined rather than undefined behaviour.
+	cGroupMod(t, "_k", "_k", g)
 
-	// Determine iteration count based on 3*n bit length
-	// max value of k+3n is 4n-1
-	fourNMinus1 := new(big.Int).Mul(big.NewInt(4), g.n)
-	fourNMinus1.Sub(fourNMinus1, big.NewInt(1))
-	topBit := fourNMinus1.BitLen()
-	startBit := topBit - 2 // highest bit is always 1 (init), start from next
+	// Accumulator := point at infinity (0 : 1 : 0), a legal input to both
+	// complete formulas — which is why no leading-bit special case is needed.
+	t.pushInt("jx", 0)
+	t.pushInt("jy", 1)
+	t.pushInt("jz", 0)
 
-	// Init accumulator = P (top bit of k+3n is always 1)
-	t.copyToTop("ax", "jx")
-	t.copyToTop("ay", "jy")
-	t.pushInt("jz", 1)
+	// One iteration per bit of n: 256 for P-256, 384 for P-384.
+	startBit := g.n.BitLen() - 1
 
-	// Iterate from startBit down to 0
 	for bit := startBit; bit >= 0; bit-- {
-		cJacobianDouble(t, c)
+		cProjectiveDouble(t, c)
 
 		// Extract bit: (k >> bit) & 1
 		t.copyToTop("_k", "_k_copy")
@@ -645,11 +701,11 @@ func cEmitMul(emit func(StackOp), c *nistCurveParams, g *nistGroupParams) {
 		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
-		cBuildJacobianAddAffineInline(addEmit, t, c)
+		cBuildProjectiveAddMixedInline(addEmit, t, c)
 		emit(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 
-	cJacobianToAffine(t, "_rx", "_ry", c)
+	cProjectiveToAffine(t, "_rx", "_ry", c)
 
 	// Clean up
 	t.toTop("ax")
@@ -779,8 +835,8 @@ func cDecompressPubKey(
 	t.toTop("_dk_match")
 	t.nm = t.nm[:len(t.nm)-1] // condition consumed by IF
 
-	thenOps := []StackOp{{Op: "drop"}}  // remove neg_y, leaving y_cand
-	elseOps := []StackOp{{Op: "nip"}}   // remove y_cand, leaving neg_y
+	thenOps := []StackOp{{Op: "drop"}} // remove neg_y, leaving y_cand
+	elseOps := []StackOp{{Op: "nip"}}  // remove y_cand, leaving neg_y
 	t.e(StackOp{Op: "if", Then: thenOps, Else: elseOps})
 
 	// Remove one from tracker and rename the surviving item

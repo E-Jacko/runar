@@ -110,6 +110,8 @@ function emitReverse48(e: (op: StackOp) => void): void {
 type CurveParams = {
   fieldP: bigint;
   fieldPMinus2: bigint;
+  /** Curve b coefficient. Needed by the RCB complete formulas (a = -3). */
+  curveB: bigint;
   coordBytes: number; // 32 for P-256, 48 for P-384
   reverseBytes: (e: (op: StackOp) => void) => void;
 };
@@ -117,6 +119,7 @@ type CurveParams = {
 const P256_PARAMS: CurveParams = {
   fieldP: P256_P,
   fieldPMinus2: P256_P_MINUS_2,
+  curveB: P256_B,
   coordBytes: 32,
   reverseBytes: emitReverse32,
 };
@@ -124,6 +127,7 @@ const P256_PARAMS: CurveParams = {
 const P384_PARAMS: CurveParams = {
   fieldP: P384_P,
   fieldPMinus2: P384_P_MINUS_2,
+  curveB: P384_B,
   coordBytes: 48,
   reverseBytes: emitReverse48,
 };
@@ -362,15 +366,58 @@ function cComposePoint(t: ECTracker, xName: string, yName: string, resultName: s
 // ===========================================================================
 
 function cAffineAdd(t: ECTracker, c: CurveParams): void {
-  // s_num = qy - py
+  // The chord slope (qy-py)/(qx-px) divides by zero when P == Q, so doubling
+  // needs the tangent (3*px^2 + a)/(2*py) — and a = -3 on both NIST curves,
+  // giving (3*px^2 - 3)/(2*py). Pick numerator and denominator BEFORE the one
+  // cFieldInv:
+  //   cond = (px == qx)                          1 when doubling, else 0
+  //   num  = cond ? 3*px^2 - 3 : (qy - py)
+  //   den  = cond ? 2*py       : (qx - px)
+  //
+  // selected as `b + cond*(a - b)` over the field, which needs no branch and so
+  // keeps the emitted op sequence — and the tracker's static stack model —
+  // identical on both paths. Mirrors the secp256k1 fix in ec-codegen.ts.
+  //
+  // NOT handled: P == -Q (px == qx, py == -qy), whose true result is the point
+  // at infinity, which affine coordinates cannot represent. Callers that can
+  // hit that case must guard it themselves.
+  t.copyToTop('px', '_px_eq');
+  t.copyToTop('qx', '_qx_eq');
+  t.rawBlock(['_px_eq', '_qx_eq'], '_cond', (e) => {
+    e({ op: 'opcode', code: 'OP_NUMEQUAL' });
+  });
+
+  // chord numerator / denominator
   t.copyToTop('qy', '_qy1');
   t.copyToTop('py', '_py1');
-  cFieldSub(t, '_qy1', '_py1', '_s_num', c);
-
-  // s_den = qx - px
+  cFieldSub(t, '_qy1', '_py1', '_num_chord', c);
   t.copyToTop('qx', '_qx1');
   t.copyToTop('px', '_px1');
-  cFieldSub(t, '_qx1', '_px1', '_s_den', c);
+  cFieldSub(t, '_qx1', '_px1', '_den_chord', c);
+
+  // tangent numerator / denominator: 3*px^2 - 3 and 2*py
+  t.copyToTop('px', '_px_t');
+  cFieldSqr(t, '_px_t', '_px_sq', c);
+  cFieldMulConst(t, '_px_sq', 3n, '_3x2', c);
+  t.pushInt('_three', 3n);
+  cFieldSub(t, '_3x2', '_three', '_num_tan', c);
+  t.copyToTop('py', '_py_t');
+  cFieldMulConst(t, '_py_t', 2n, '_den_tan', c);
+
+  // num = num_chord + cond*(num_tan - num_chord)
+  t.copyToTop('_num_chord', '_num_chord_c');
+  cFieldSub(t, '_num_tan', '_num_chord_c', '_num_diff', c);
+  t.copyToTop('_cond', '_cond_n');
+  cFieldMul(t, '_num_diff', '_cond_n', '_num_sel', c);
+  cFieldAdd(t, '_num_chord', '_num_sel', '_s_num', c);
+
+  // den = den_chord + cond*(den_tan - den_chord)
+  t.copyToTop('_den_chord', '_den_chord_c');
+  cFieldSub(t, '_den_tan', '_den_chord_c', '_den_diff', c);
+  t.toTop('_cond');
+  t.rename('_cond_d');
+  cFieldMul(t, '_den_diff', '_cond_d', '_den_sel', c);
+  cFieldAdd(t, '_den_chord', '_den_sel', '_s_den', c);
 
   // s = s_num / s_den mod p
   cFieldInv(t, '_s_den', '_s_den_inv', c);
@@ -400,167 +447,199 @@ function cAffineAdd(t: ECTracker, c: CurveParams): void {
 }
 
 // ===========================================================================
-// Jacobian point doubling with a=-3 optimization
+// Projective point operations — RCB complete formulas, a = -3
 // ===========================================================================
 
 /**
- * Jacobian doubling for curves with a = -3 (P-256, P-384).
+ * Projective point doubling — RCB Algorithm 6 (a = -3), 8M + 3S + 2 m_b.
+ * Expects jx, jy, jz on the tracker; replaces them with the doubled point.
  *
- * Uses the optimization: A = 3*(X - Z^2)*(X + Z^2) instead of 3*X^2 + a*Z^4.
- * This saves 2 field squarings compared to the generic formula.
+ * Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
  *
- * Expects jx, jy, jz on tracker. Replaces with updated values.
+ * P-256 and P-384 have a = -3, so these are the a = -3 algorithms (5 and 6),
+ * NOT the a = 0 pair used for secp256k1 in ec-codegen.ts.
  */
-function cJacobianDouble(t: ECTracker, c: CurveParams): void {
-  // Z^2
-  t.copyToTop('jz', '_jz_sq_tmp');
-  cFieldSqr(t, '_jz_sq_tmp', '_Z2', c);
+function cProjectiveDouble(t: ECTracker, c: CurveParams): void {
+  const B = c.curveB;
 
-  // X - Z^2 and X + Z^2
-  t.copyToTop('jx', '_jx_c1');
-  t.copyToTop('_Z2', '_Z2_c1');
-  cFieldSub(t, '_jx_c1', '_Z2_c1', '_X_minus_Z2', c);
-  t.copyToTop('jx', '_jx_c2');
-  cFieldAdd(t, '_jx_c2', '_Z2', '_X_plus_Z2', c);
+  t.copyToTop('jx', '_d_x_xy');   // t3 = X*Y
+  t.copyToTop('jx', '_d_x_xz');   // Z3 = X*Z
+  t.copyToTop('jy', '_d_y_xy');
+  t.copyToTop('jy', '_d_y_yz');   // t0 = Y*Z (line 28)
+  t.copyToTop('jz', '_d_z_xz');
+  t.copyToTop('jz', '_d_z_yz');
 
-  // A = 3*(X-Z^2)*(X+Z^2)
-  cFieldMul(t, '_X_minus_Z2', '_X_plus_Z2', '_prod', c);
-  t.pushInt('_three', 3n);
-  cFieldMul(t, '_prod', '_three', '_A', c);
+  cFieldSqr(t, 'jx', '_d_t0', c);                       // t0 = X^2
+  cFieldSqr(t, 'jy', '_d_t1', c);                       // t1 = Y^2
+  cFieldSqr(t, 'jz', '_d_t2', c);                       // t2 = Z^2
 
-  // B = 4*X*Y^2
-  t.copyToTop('jy', '_jy_sq_tmp');
-  cFieldSqr(t, '_jy_sq_tmp', '_Y2', c);
-  t.copyToTop('_Y2', '_Y2_c1');
-  t.copyToTop('jx', '_jx_c3');
-  cFieldMul(t, '_jx_c3', '_Y2', '_xY2', c);
-  t.pushInt('_four', 4n);
-  cFieldMul(t, '_xY2', '_four', '_B', c);
+  cFieldMul(t, '_d_x_xy', '_d_y_xy', '_d_xy', c);
+  cFieldMulConst(t, '_d_xy', 2n, '_d_t3', c);           // t3 = 2*X*Y
+  cFieldMul(t, '_d_x_xz', '_d_z_xz', '_d_xz', c);
+  cFieldMulConst(t, '_d_xz', 2n, '_d_Z3', c);           // Z3 = 2*X*Z
 
-  // C = 8*Y^4
-  cFieldSqr(t, '_Y2_c1', '_Y4', c);
-  t.pushInt('_eight', 8n);
-  cFieldMul(t, '_Y4', '_eight', '_C', c);
+  t.copyToTop('_d_t2', '_d_t2_b');
+  cFieldMulConst(t, '_d_t2_b', B, '_d_bt2', c);         // b*t2
+  t.copyToTop('_d_Z3', '_d_Z3_a');
+  cFieldSub(t, '_d_bt2', '_d_Z3_a', '_d_Y3', c);        // Y3 = b*t2 - Z3
+  cFieldMulConst(t, '_d_Y3', 3n, '_d_Y3b', c);          // Y3 = 3*Y3  (lines 10-11)
 
-  // X3 = A^2 - 2*B
-  t.copyToTop('_A', '_A_save');
-  t.copyToTop('_B', '_B_save');
-  cFieldSqr(t, '_A', '_A2', c);
-  t.copyToTop('_B', '_B_c1');
-  cFieldMulConst(t, '_B_c1', 2n, '_2B', c);
-  cFieldSub(t, '_A2', '_2B', '_X3', c);
+  t.copyToTop('_d_t1', '_d_t1_a');
+  t.copyToTop('_d_t1', '_d_t1_b');   // survives to Z3 = t0*t1 (line 32)
+  t.copyToTop('_d_Y3b', '_d_Y3b_a');
+  cFieldSub(t, '_d_t1_a', '_d_Y3b_a', '_d_X3', c);      // X3 = t1 - Y3
+  cFieldAdd(t, '_d_t1', '_d_Y3b', '_d_Y3c', c);         // Y3 = t1 + Y3
 
-  // Y3 = A*(B - X3) - C
-  t.copyToTop('_X3', '_X3_c');
-  cFieldSub(t, '_B_save', '_X3_c', '_B_minus_X3', c);
-  cFieldMul(t, '_A_save', '_B_minus_X3', '_A_tmp', c);
-  cFieldSub(t, '_A_tmp', '_C', '_Y3', c);
+  t.copyToTop('_d_X3', '_d_X3_a');
+  cFieldMul(t, '_d_X3_a', '_d_Y3c', '_d_Y3d', c);       // Y3 = X3*Y3
+  cFieldMul(t, '_d_X3', '_d_t3', '_d_X3b', c);          // X3 = X3*t3
 
-  // Z3 = 2*Y*Z
-  t.copyToTop('jy', '_jy_c');
-  t.copyToTop('jz', '_jz_c');
-  cFieldMul(t, '_jy_c', '_jz_c', '_yz', c);
-  cFieldMulConst(t, '_yz', 2n, '_Z3', c);
+  cFieldMulConst(t, '_d_t2', 3n, '_d_t2c', c);          // t2 = 3*t2  (lines 16-17)
 
-  // Clean up and rename
-  t.toTop('_B'); t.drop();
-  t.toTop('jz'); t.drop();
-  t.toTop('jx'); t.drop();
-  t.toTop('jy'); t.drop();
-  t.toTop('_X3'); t.rename('jx');
-  t.toTop('_Y3'); t.rename('jy');
-  t.toTop('_Z3'); t.rename('jz');
+  cFieldMulConst(t, '_d_Z3', B, '_d_Z3b', c);           // Z3 = b*Z3
+  t.copyToTop('_d_t2c', '_d_t2c_a');
+  cFieldSub(t, '_d_Z3b', '_d_t2c_a', '_d_Z3c', c);      // Z3 = Z3 - t2
+  t.copyToTop('_d_t0', '_d_t0_a');
+  cFieldSub(t, '_d_Z3c', '_d_t0_a', '_d_Z3d', c);       // Z3 = Z3 - t0
+  cFieldMulConst(t, '_d_Z3d', 3n, '_d_Z3e', c);         // Z3 = 3*Z3  (lines 21-22)
+
+  cFieldMulConst(t, '_d_t0', 3n, '_d_t0b', c);          // t0 = 3*t0  (lines 23-24)
+  cFieldSub(t, '_d_t0b', '_d_t2c', '_d_t0c', c);        // t0 = t0 - t2
+
+  t.copyToTop('_d_Z3e', '_d_Z3e_a');
+  cFieldMul(t, '_d_t0c', '_d_Z3e_a', '_d_t0d', c);      // t0 = t0*Z3
+  cFieldAdd(t, '_d_Y3d', '_d_t0d', '_d_Y3e', c);        // Y3 = Y3 + t0
+
+  cFieldMul(t, '_d_y_yz', '_d_z_yz', '_d_yz', c);
+  cFieldMulConst(t, '_d_yz', 2n, '_d_t0e', c);          // t0 = 2*Y*Z
+
+  t.copyToTop('_d_t0e', '_d_t0e_a');
+  cFieldMul(t, '_d_t0e_a', '_d_Z3e', '_d_Z3f', c);      // Z3 = t0*Z3
+  cFieldSub(t, '_d_X3b', '_d_Z3f', '_d_X3c', c);        // X3 = X3 - Z3
+
+  cFieldMul(t, '_d_t0e', '_d_t1_b', '_d_Z3g', c);       // Z3 = t0*t1
+  cFieldMulConst(t, '_d_Z3g', 4n, '_d_Z3h', c);         // Z3 = 4*Z3 (lines 33-34)
+
+  t.toTop('_d_X3c'); t.rename('jx');
+  t.toTop('_d_Y3e'); t.rename('jy');
+  t.toTop('_d_Z3h'); t.rename('jz');
 }
 
 // ===========================================================================
-// Jacobian to affine conversion
+// Projective → affine
 // ===========================================================================
 
-function cJacobianToAffine(t: ECTracker, rxName: string, ryName: string, c: CurveParams): void {
+/**
+ * Consumes jx, jy, jz; produces rxName, ryName.
+ *
+ * cFieldInv is Fermat exponentiation, so inv(0) = 0: the point at infinity
+ * (Z = 0) converts to (0, 0), the all-zero point blob.
+ */
+function cProjectiveToAffine(t: ECTracker, rxName: string, ryName: string, c: CurveParams): void {
   cFieldInv(t, 'jz', '_zinv', c);
-  t.copyToTop('_zinv', '_zinv_keep');
-  cFieldSqr(t, '_zinv', '_zinv2', c);
-  t.copyToTop('_zinv2', '_zinv2_keep');
-  cFieldMul(t, '_zinv_keep', '_zinv2', '_zinv3', c);
-  cFieldMul(t, 'jx', '_zinv2_keep', rxName, c);
-  cFieldMul(t, 'jy', '_zinv3', ryName, c);
+  t.copyToTop('_zinv', '_zinv_b');
+  cFieldMul(t, 'jx', '_zinv', rxName, c);
+  cFieldMul(t, 'jy', '_zinv_b', ryName, c);
 }
 
 // ===========================================================================
-// Jacobian mixed addition (P_jacobian + Q_affine)
+// Projective mixed addition (P_projective + Q_affine)
 // ===========================================================================
 
 /**
- * Build Jacobian mixed-add ops for use inside OP_IF.
- * Stack layout: [..., ax, ay, _k, jx, jy, jz]
- * After:        [..., ax, ay, _k, jx', jy', jz']
+ * Build complete mixed-add ops for use inside OP_IF — RCB Algorithm 5
+ * (a = -3), 11M + 2 m_b. Adds the affine base point (ax, ay) into the
+ * accumulator.
+ *
+ * Complete: accumulator == Q doubles correctly (the case that returned the
+ * zero point for k = 2), accumulator == -Q yields infinity, and an infinity
+ * accumulator yields Q.
+ *
+ * Runs under OP_IF, so it must be stack-shape neutral: an inner tracker is
+ * cloned from the outer one and jx/jy/jz are replaced in place.
  */
-function buildJacobianAddAffineInline(e: (op: StackOp) => void, t: ECTracker, c: CurveParams): void {
+function cBuildProjectiveAddMixedInline(
+  e: (op: StackOp) => void,
+  t: ECTracker,
+  c: CurveParams,
+): void {
   const it = new ECTracker([...t.nm], e);
+  const B = c.curveB;
 
-  it.copyToTop('jz', '_jz_for_z1cu');
-  it.copyToTop('jz', '_jz_for_z3');
-  it.copyToTop('jy', '_jy_for_y3');
-  it.copyToTop('jx', '_jx_for_u1h2');
+  it.copyToTop('ax', '_m_x2a');   // t0 = X1*X2
+  it.copyToTop('ax', '_m_x2b');   // X2+Y2
+  it.copyToTop('ax', '_m_x2c');   // X2*Z1
+  it.copyToTop('ay', '_m_y2a');   // t1 = Y1*Y2
+  it.copyToTop('ay', '_m_y2b');   // X2+Y2
+  it.copyToTop('ay', '_m_y2c');   // Y2*Z1
+  it.copyToTop('jx', '_m_x1a');   // X1+Y1
+  it.copyToTop('jx', '_m_x1b');   // Y3+X1
+  it.copyToTop('jy', '_m_y1a');   // X1+Y1
+  it.copyToTop('jy', '_m_y1b');   // t4+Y1
+  it.copyToTop('jz', '_m_z1a');   // X2*Z1
+  it.copyToTop('jz', '_m_z1b');   // b*Z1
+  it.copyToTop('jz', '_m_z1c');   // 3*Z1
 
-  // Z1sq = jz^2
-  cFieldSqr(it, 'jz', '_Z1sq', c);
+  cFieldMul(it, 'jx', '_m_x2a', '_m_t0', c);            // t0 = X1*X2
+  cFieldMul(it, 'jy', '_m_y2a', '_m_t1', c);            // t1 = Y1*Y2
+  cFieldAdd(it, '_m_x2b', '_m_y2b', '_m_s1', c);        // X2+Y2
+  cFieldAdd(it, '_m_x1a', '_m_y1a', '_m_s2', c);        // X1+Y1
+  cFieldMul(it, '_m_s1', '_m_s2', '_m_t3', c);          // t3 = (X2+Y2)(X1+Y1)
 
-  // Z1cu = _jz_for_z1cu * Z1sq
-  it.copyToTop('_Z1sq', '_Z1sq_for_u2');
-  cFieldMul(it, '_jz_for_z1cu', '_Z1sq', '_Z1cu', c);
+  it.copyToTop('_m_t0', '_m_t0a');
+  it.copyToTop('_m_t1', '_m_t1a');
+  cFieldAdd(it, '_m_t0a', '_m_t1a', '_m_s3', c);        // t4 = t0+t1
+  cFieldSub(it, '_m_t3', '_m_s3', '_m_t3b', c);         // t3 = t3-t4
 
-  // U2 = ax * Z1sq_for_u2
-  it.copyToTop('ax', '_ax_c');
-  cFieldMul(it, '_ax_c', '_Z1sq_for_u2', '_U2', c);
+  cFieldMul(it, '_m_y2c', 'jz', '_m_t4', c);            // t4 = Y2*Z1
+  cFieldAdd(it, '_m_t4', '_m_y1b', '_m_t4b', c);        // t4 = t4+Y1
+  cFieldMul(it, '_m_x2c', '_m_z1a', '_m_Y3', c);        // Y3 = X2*Z1
+  cFieldAdd(it, '_m_Y3', '_m_x1b', '_m_Y3b', c);        // Y3 = Y3+X1
 
-  // S2 = ay * Z1cu
-  it.copyToTop('ay', '_ay_c');
-  cFieldMul(it, '_ay_c', '_Z1cu', '_S2', c);
+  cFieldMulConst(it, '_m_z1b', B, '_m_Z3', c);          // Z3 = b*Z1
+  it.copyToTop('_m_Y3b', '_m_Y3b_a');
+  cFieldSub(it, '_m_Y3b_a', '_m_Z3', '_m_X3', c);       // X3 = Y3 - Z3
+  cFieldMulConst(it, '_m_X3', 3n, '_m_X3b', c);         // X3 = 3*X3  (lines 14-15)
 
-  // H = U2 - jx
-  cFieldSub(it, '_U2', 'jx', '_H', c);
+  it.copyToTop('_m_t1', '_m_t1b');
+  it.copyToTop('_m_X3b', '_m_X3b_a');
+  cFieldSub(it, '_m_t1b', '_m_X3b_a', '_m_Z3b', c);     // Z3 = t1 - X3
+  cFieldAdd(it, '_m_t1', '_m_X3b', '_m_X3c', c);        // X3 = t1 + X3
 
-  // R = S2 - jy
-  cFieldSub(it, '_S2', 'jy', '_R', c);
+  cFieldMulConst(it, '_m_Y3b', B, '_m_Y3c', c);         // Y3 = b*Y3
+  cFieldMulConst(it, '_m_z1c', 3n, '_m_t2', c);         // t2 = 3*Z1  (lines 19-20)
 
-  it.copyToTop('_H', '_H_for_h3');
-  it.copyToTop('_H', '_H_for_z3');
+  it.copyToTop('_m_t2', '_m_t2a');
+  cFieldSub(it, '_m_Y3c', '_m_t2a', '_m_Y3d', c);       // Y3 = Y3 - t2
+  it.copyToTop('_m_t0', '_m_t0b');
+  cFieldSub(it, '_m_Y3d', '_m_t0b', '_m_Y3e', c);       // Y3 = Y3 - t0
+  cFieldMulConst(it, '_m_Y3e', 3n, '_m_Y3f', c);        // Y3 = 3*Y3  (lines 23-24)
 
-  // H2 = H^2
-  cFieldSqr(it, '_H', '_H2', c);
+  cFieldMulConst(it, '_m_t0', 3n, '_m_t0c', c);         // t0 = 3*t0  (lines 25-26)
+  cFieldSub(it, '_m_t0c', '_m_t2', '_m_t0d', c);        // t0 = t0 - t2
 
-  it.copyToTop('_H2', '_H2_for_u1h2');
+  it.copyToTop('_m_t4b', '_m_t4b_a');
+  it.copyToTop('_m_Y3f', '_m_Y3f_a');
+  cFieldMul(it, '_m_t4b_a', '_m_Y3f_a', '_m_t1c', c);   // t1 = t4*Y3
+  it.copyToTop('_m_t0d', '_m_t0d_a');
+  cFieldMul(it, '_m_t0d_a', '_m_Y3f', '_m_t2b', c);     // t2 = t0*Y3
 
-  // H3 = H_for_h3 * H2
-  cFieldMul(it, '_H_for_h3', '_H2', '_H3', c);
+  it.copyToTop('_m_X3c', '_m_X3c_a');
+  it.copyToTop('_m_Z3b', '_m_Z3b_a');
+  cFieldMul(it, '_m_X3c_a', '_m_Z3b_a', '_m_Y3g', c);   // Y3 = X3*Z3
+  cFieldAdd(it, '_m_Y3g', '_m_t2b', '_m_Y3h', c);       // Y3 = Y3 + t2
 
-  // U1H2 = _jx_for_u1h2 * H2_for_u1h2
-  cFieldMul(it, '_jx_for_u1h2', '_H2_for_u1h2', '_U1H2', c);
+  it.copyToTop('_m_t3b', '_m_t3b_a');
+  cFieldMul(it, '_m_t3b_a', '_m_X3c', '_m_X3d', c);     // X3 = t3*X3
+  cFieldSub(it, '_m_X3d', '_m_t1c', '_m_X3e', c);       // X3 = X3 - t1
 
-  it.copyToTop('_R', '_R_for_y3');
-  it.copyToTop('_U1H2', '_U1H2_for_y3');
-  it.copyToTop('_H3', '_H3_for_y3');
+  cFieldMul(it, '_m_t4b', '_m_Z3b', '_m_Z3c', c);       // Z3 = t4*Z3
+  cFieldMul(it, '_m_t3b', '_m_t0d', '_m_t1d', c);       // t1 = t3*t0
+  cFieldAdd(it, '_m_Z3c', '_m_t1d', '_m_Z3d', c);       // Z3 = Z3 + t1
 
-  // X3 = R^2 - H3 - 2*U1H2
-  cFieldSqr(it, '_R', '_R2', c);
-  cFieldSub(it, '_R2', '_H3', '_x3_tmp', c);
-  cFieldMulConst(it, '_U1H2', 2n, '_2U1H2', c);
-  cFieldSub(it, '_x3_tmp', '_2U1H2', '_X3', c);
-
-  // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
-  it.copyToTop('_X3', '_X3_c');
-  cFieldSub(it, '_U1H2_for_y3', '_X3_c', '_u_minus_x', c);
-  cFieldMul(it, '_R_for_y3', '_u_minus_x', '_r_tmp', c);
-  cFieldMul(it, '_jy_for_y3', '_H3_for_y3', '_jy_h3', c);
-  cFieldSub(it, '_r_tmp', '_jy_h3', '_Y3', c);
-
-  // Z3 = _jz_for_z3 * _H_for_z3
-  cFieldMul(it, '_jz_for_z3', '_H_for_z3', '_Z3', c);
-
-  it.toTop('_X3'); it.rename('jx');
-  it.toTop('_Y3'); it.rename('jy');
-  it.toTop('_Z3'); it.rename('jz');
+  it.toTop('_m_X3e'); it.rename('jx');
+  it.toTop('_m_Y3h'); it.rename('jy');
+  it.toTop('_m_Z3d'); it.rename('jz');
 }
 
 // ===========================================================================
@@ -572,9 +651,15 @@ function buildJacobianAddAffineInline(e: (op: StackOp) => void, t: ECTracker, c:
  * Stack in: [point, scalar] (scalar on top).
  * Stack out: [result_point].
  *
- * Uses MSB-first double-and-add with Jacobian coordinates.
- * Adds 3*n to scalar to guarantee the top bit position, avoiding
- * the need for infinity-point handling.
+ * MSB-first double-and-add over homogeneous projective coordinates using the
+ * RCB COMPLETE formulas for a = -3. The accumulator starts at the point at
+ * infinity, so all bit_length(n) iterations are uniform.
+ *
+ * The previous version added 3n to the scalar and seeded the accumulator at P
+ * to guarantee a fixed top bit. That relied on the INCOMPLETE Jacobian
+ * mixed-add never being handed two equal points — which it was, for k = 2, on
+ * the final iteration, yielding an all-zero point. Identical defect to the one
+ * fixed on secp256k1 in ec-codegen.ts; the two modules are structural copies.
  */
 function cEmitMul(
   emit: (op: StackOp) => void,
@@ -584,39 +669,21 @@ function cEmitMul(
   const t = new ECTracker(['_pt', '_k'], emit);
   cDecomposePoint(t, '_pt', 'ax', 'ay', c);
 
-  // k' = k + 3n: guarantees a fixed high bit for MSB-first double-and-add.
-  // For P-256: k ∈ [1, n-1], k+3n ∈ [3n+1, 4n-1], 3n > 2^257, so bit 257 is set.
-  //   Run 258 iterations (bit 257 down to 0).
-  // For P-384: k ∈ [1, n-1], k+3n ∈ [3n+1, 4n-1], 3n > 2^384, so bit 385 is set.
-  //   Run 386 iterations (bit 385 down to 0).
-  t.toTop('_k');
-  t.pushInt('_n', g.n);
-  t.rawBlock(['_k', '_n'], '_kn', (e) => {
-    e({ op: 'opcode', code: 'OP_ADD' });
-  });
-  t.pushInt('_n2', g.n);
-  t.rawBlock(['_kn', '_n2'], '_kn2', (e) => {
-    e({ op: 'opcode', code: 'OP_ADD' });
-  });
-  t.pushInt('_n3', g.n);
-  t.rawBlock(['_kn2', '_n3'], '_kn3', (e) => {
-    e({ op: 'opcode', code: 'OP_ADD' });
-  });
-  t.rename('_k');
+  // Reduce the scalar into [0, n-1] so the ladder covers the whole domain:
+  // negative k and k >= n are now defined rather than undefined behaviour.
+  cGroupMod(t, '_k', '_k', g);
 
-  // Determine iteration count based on 3*n bit length
-  const threeN = 3n * g.n;
-  const topBit = bitLength(threeN + g.n); // max value is 4n-1
-  const startBit = topBit - 2; // highest bit is always 1 (init), start from next
+  // Accumulator := point at infinity (0 : 1 : 0), a legal input to both
+  // complete formulas — which is why no leading-bit special case is needed.
+  t.pushInt('jx', 0n);
+  t.pushInt('jy', 1n);
+  t.pushInt('jz', 0n);
 
-  // Init accumulator = P (top bit of k+3n is always 1)
-  t.copyToTop('ax', 'jx');
-  t.copyToTop('ay', 'jy');
-  t.pushInt('jz', 1n);
+  // One iteration per bit of n: 256 for P-256, 384 for P-384.
+  const startBit = bitLength(g.n) - 1;
 
-  // Iterate from startBit down to 0
   for (let bit = startBit; bit >= 0; bit--) {
-    cJacobianDouble(t, c);
+    cProjectiveDouble(t, c);
 
     // Extract bit: (k >> bit) & 1
     t.copyToTop('_k', '_k_copy');
@@ -642,11 +709,11 @@ function cEmitMul(
     t.nm.pop(); // _bit consumed by IF
     const addOps: StackOp[] = [];
     const addEmit = (op: StackOp) => addOps.push(op);
-    buildJacobianAddAffineInline(addEmit, t, c);
+    cBuildProjectiveAddMixedInline(addEmit, t, c);
     emit({ op: 'if', then: addOps, else: [] });
   }
 
-  cJacobianToAffine(t, '_rx', '_ry', c);
+  cProjectiveToAffine(t, '_rx', '_ry', c);
 
   // Clean up
   t.toTop('ax'); t.drop();

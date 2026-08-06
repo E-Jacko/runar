@@ -213,8 +213,14 @@ describe('EC builtins — op-count goldens (T-11)', () => {
     // denominator so ecAdd can DOUBLE a point. One fieldInv still, so the cost
     // is +1.5%, not +100%.
     ['ecAdd',              emitEcAdd,                8202],
-    ['ecMul',              emitEcMul,               63828],
-    ['ecMulGen',           emitEcMulGen,            63830],
+    // 63828/63830 -> 62304/62306: the scalar ladder moved from incomplete
+    // Jacobian formulas over k+3n (257 iterations) to the RCB COMPLETE
+    // projective formulas over k mod n (256 iterations), so ecMul(P, 2n) no
+    // longer returns the zero point. Fewer StackOps but LARGER scripts
+    // (+18-19% bytes): the complete formulas trade multiplications for field
+    // additions, and every reduction pushes the 33-byte prime.
+    ['ecMul',              emitEcMul,               62304],
+    ['ecMulGen',           emitEcMulGen,            62306],
     ['ecNegate',           emitEcNegate,              945],
     ['ecOnCurve',          emitEcOnCurve,             533],
     ['ecModReduce',        emitEcModReduce,             8],

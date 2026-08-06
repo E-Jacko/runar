@@ -42,6 +42,14 @@ export {
   emitEcModReduce, emitEcEncodeCompressed, emitEcMakePoint,
   emitEcPointX, emitEcPointY,
 } from './passes/ec-codegen.js';
+// NIST P-256 / P-384 emitters, exported for the same reason: these carried the
+// SAME two defects as their secp256k1 peers (an affine add that could not
+// double, and a scalar ladder that returned the zero point for k = 2) and
+// nothing executed them.
+export {
+  emitP256Add, emitP256Mul, emitP256MulGen, emitVerifyECDSA_P256,
+  emitP384Add, emitP384Mul, emitP384MulGen, emitVerifyECDSA_P384,
+} from './passes/p256-p384-codegen.js';
 export {
   emitCheckPreimageBinding,
   emitCheckPreimageBindingRaw,

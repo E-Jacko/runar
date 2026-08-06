@@ -129,13 +129,14 @@ fn test_emit_reverse_32_deterministic() {
 // These goldens lock the exact op count for each Rust emitter so codegen
 // drift surfaces as a localized regression rather than only as a cross-tier
 // hex mismatch in the conformance harness. The counts match the Python /
-// TS / Java peers for every emitter EXCEPT ecMul / ecMulGen — those two
-// emit 4 fewer raw StackOps in the Rust tier than the other six (63824 /
-// 63826 vs the peer 63828 / 63830). The final compiled hex is still
-// byte-identical across all 7 tiers (enforced by the conformance harness),
-// so the divergence is in the pre-peephole StackOp granularity, not in
-// emitted opcodes — but it is real and pinned here so any further drift
-// fails locally.
+// TS / Java peers for EVERY emitter, including ecMul / ecMulGen.
+//
+// Those two used to be 4 ops lower here than in the peer tiers: the old
+// ladder added 3n to the scalar, and this tier pushed a pre-folded 3*N
+// constant where the peers pushed N three times and added. The complete-
+// formula ladder has no such prologue — it reduces k mod n with a single
+// pushed constant, the same shape in all seven tiers — so the divergence
+// is gone rather than merely re-pinned.
 //
 // To update goldens after an intentional codegen change, run the Java peer
 // EcTest and the Python peer test_ec.py, copy the new numbers, and update
@@ -153,7 +154,7 @@ fn test_ec_mul_op_count_golden() {
     let ops = collect(|s| emit_ec_mul(s));
     // Rust emits 4 fewer raw StackOps than the Python/TS/Java peer; see the
     // module-level comment above. Final hex is byte-identical.
-    assert_eq!(ops.len(), 63824, "ecMul op count drift");
+    assert_eq!(ops.len(), 62304, "ecMul op count drift");
 }
 
 #[test]
@@ -161,7 +162,7 @@ fn test_ec_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_ec_mul_gen(s));
     // Rust emits 4 fewer raw StackOps than the Python/TS/Java peer; see the
     // module-level comment above. Final hex is byte-identical.
-    assert_eq!(ops.len(), 63826, "ecMulGen op count drift");
+    assert_eq!(ops.len(), 62306, "ecMulGen op count drift");
 }
 
 #[test]
