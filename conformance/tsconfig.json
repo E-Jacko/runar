@@ -14,7 +14,20 @@
   "include": [
     "**/*.ts"
   ],
+  // `fuzz-findings*` holds RUNTIME OUTPUT, not sources: every fuzz mode dumps a
+  // repro tree there on a divergence, and several of those trees contain
+  // generated `.runar.ts` contracts. Without this exclusion the widened
+  // `include` above typechecks them, so FINDING A BUG BREAKS THE TYPECHECK —
+  // the one moment the build must not also fail for an unrelated reason.
+  //
+  // The glob deliberately covers every suffix rather than listing them, so a
+  // new fuzz mode's findings directory is excluded the day it is added.
+  // Directories currently written: fuzz-findings (differential.ts),
+  // -ir, -anf, -canonical, -execute, -trimodal, -spend, -metamorphic.
+  // `.tmp/` (the per-tier scratch sources) needs no entry — TypeScript's
+  // include globs never match dot-directories.
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "fuzz-findings*"
   ]
 }

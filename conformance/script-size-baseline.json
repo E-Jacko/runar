@@ -35,6 +35,7 @@
     "intent-current-block-height": 944,
     "intent-output-p2pkh": 843,
     "intent-prev-output-script": 942,
+    "loop-if-merged-locals": 2011,
     "math-demo": 17348,
     "merge-locals-prop-updates": 1006,
     "merge-locals-shapes": 3031,

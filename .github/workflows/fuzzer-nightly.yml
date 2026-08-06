@@ -23,6 +23,13 @@ name: Fuzzer nightly
 # reproducible and flake-free. The schedule/push path keeps the larger
 # run_id-seeded run for rotating coverage over time.
 #
+# PR-vs-nightly split for the CONTRACT-LEVEL (`--ir`) gates: both the
+# stateless and the stateful gate run on every PR at `--num 40` with the
+# fixed seed, because `--hex` was measured to cost nothing over the
+# ANF-depth compare it replaced (process spawn dominates; see the step
+# comments). Nightly re-runs both at `--num 200` on the rotating seed, and
+# additionally keeps the ANF-depth compare the PR gate traded away.
+#
 # Findings: a non-zero mismatch count fails the workflow AND uploads the
 # per-finding directory tree (canonical IR JSON + per-tier diverging hex)
 # as an artifact, so the failing case can be replayed offline via
@@ -216,22 +223,75 @@ jobs:
 
       # ----- Contract-level (`--ir`) PR gate (TS-GAP-007). The ANF gates above
       # ----- drive raw generated ANF programs; this gate drives the
-      # ----- contract-level generator (stateful + native renderers) through the
-      # ----- full `--ir` pipeline across all 7 tiers, fixed-seed for a
-      # ----- deterministic, flake-free merge gate. Hard-fails (fuzzer exit 1)
-      # ----- on any cross-tier divergence.
-      - name: Fuzz (PR gate — contract-level IR, fixed seed)
+      # ----- contract-level generator (native per-tier renderers) through the
+      # ----- full pipeline across all 7 tiers, fixed-seed for a deterministic,
+      # ----- flake-free merge gate. Hard-fails (fuzzer exit 1) on any
+      # ----- cross-tier divergence.
+      # -----
+      # ----- `--hex` (added 2026-08-06) is what makes this a BACK-END gate.
+      # ----- Without it the fuzzer compares `--emit-ir` ANF, which every tier
+      # ----- answers straight out of its frontend: stack lowering and emit were
+      # ----- never executed, so the two 2026-08 lowering miscompiles that moved
+      # ----- bytes across all seven tiers were structurally invisible here. The
+      # ----- repo's own `pnpm fuzz:ir` script had always passed `--hex`; the CI
+      # ----- gate was strictly weaker than the local one.
+      # -----
+      # ----- COST: none worth splitting for. Measured interleaved (same 40
+      # ----- programs, 7 tiers, alternating runs to cancel machine drift):
+      # ----- 12.4s ANF-depth vs 12.6s with `--hex` idle, and 32-35s vs 32-33s
+      # ----- under load ~30 — indistinguishable in both regimes. Process spawn
+      # ----- dominates; stack lowering + emit happen inside a process the gate
+      # ----- already pays for. So `--hex` runs on every PR, not nightly-only.
+      # ----- ANF-depth compare is still kept, in the nightly sweep below.
+      - name: Fuzz (PR gate — contract-level IR -> hex, fixed seed)
         if: github.event_name == 'pull_request'
         working-directory: conformance
         run: |
           set -euo pipefail
           node_modules/.bin/tsx fuzzer/index.ts \
             --ir \
+            --hex \
             --seed 424242 \
             --num 40 \
             --compilers ts,go,rust,python,zig,ruby,java \
             --render native \
             --output /tmp/ir-fuzz-pr.json
+
+      # ----- STATEFUL contract-level PR gate. `arbGeneratedStatefulContract`
+      # ----- had never run in CI at all — only under vitest and the local
+      # ----- `pnpm fuzz:ir:stateful` script — even though it is the generator
+      # ----- that reaches the state-carrying shapes: the `prop-write-in-arm`
+      # ----- branch topology (a property write inside a branch arm, one of the
+      # ----- exact shapes behind the 2026-08 fund-safety miscompile) and, since
+      # ----- 2026-08-06, the `this.addOutput(...)` multi-output intrinsic.
+      # -----
+      # ----- ZIG IS EXCLUDED, and only here. The Zig tier's `.runar.zig`
+      # ----- frontend never detects `self.x = ...` as a mutation, so readonly
+      # ----- INFERENCE marks every un-initialised stateful property readonly:
+      # ----- it emits "StatefulSmartContract has no mutable properties" and a
+      # ----- script with no state continuation, while the same file compiled by
+      # ----- any other tier is correct. Every checked-in `.runar.zig` stateful
+      # ----- example happens to give its mutable properties an INITIALISER
+      # ----- (`count: i64 = 0`), which takes a different branch of the readonly
+      # ----- rule, so no fixture had ever exercised the inference path. Zig is
+      # ----- still gated on the stateless corpus by the step above; restore it
+      # ----- here once the frontend is fixed.
+      # ----- Cost: one more run of the same size as the step above — 12.4s idle
+      # ----- / ~35s under load ~30, on the same interleaved measurement.
+      - name: Fuzz (PR gate — stateful contract-level IR -> hex, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --ir \
+            --hex \
+            --stateful \
+            --seed 424242 \
+            --num 40 \
+            --compilers ts,go,rust,python,ruby,java \
+            --render native \
+            --output /tmp/ir-fuzz-pr-stateful.json
 
       - name: Upload PR-gate fuzz findings
         if: always() && github.event_name == 'pull_request'
@@ -242,11 +302,13 @@ jobs:
             conformance/fuzz-findings-anf/
             conformance/fuzz-findings-execute/
             conformance/fuzz-findings-trimodal/
+            conformance/fuzz-findings-ir/
             /tmp/anf-fuzz-pr-foldoff.json
             /tmp/anf-fuzz-pr-foldon.json
             /tmp/anf-fuzz-pr-execute.json
             /tmp/anf-fuzz-pr-trimodal.json
             /tmp/ir-fuzz-pr.json
+            /tmp/ir-fuzz-pr-stateful.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -337,6 +399,68 @@ jobs:
             --seed "$SEED" \
             --output /tmp/anf-trimodal-nightly.json
 
+      # ----- Nightly contract-level sweeps: the same two gates the PR path runs
+      # ----- at `--num 40` / fixed seed, re-run at `--num 200` on the rotating
+      # ----- run_id-derived seed for coverage the fixed corpus cannot reach.
+      # ----- `$SEED` is the already-validated integer from the Resolve step
+      # ----- (reaches argv via env:, never shell-interpolated).
+      - name: Fuzz (contract-level IR -> hex, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --ir \
+            --hex \
+            --num 200 \
+            --seed "$SEED" \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --render native \
+            --output /tmp/ir-fuzz-nightly.json
+
+      - name: Fuzz (stateful contract-level IR -> hex, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        # Zig excluded for the readonly-inference defect documented on the PR
+        # gate above; every other tier is compared.
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --ir \
+            --hex \
+            --stateful \
+            --num 200 \
+            --seed "$SEED" \
+            --compilers ts,go,rust,python,ruby,java \
+            --render native \
+            --output /tmp/ir-fuzz-nightly-stateful.json
+
+      # ----- ANF-DEPTH contract-level compare. The PR gates above compare final
+      # ----- hex, which is downstream of the frontends: two tiers whose ANF
+      # ----- differs but whose lowering happens to converge look identical
+      # ----- there. This run compares `--emit-ir` ANF instead (source-map
+      # ----- `sourceLoc` stripped — under `--render native` every tier compiles
+      # ----- a different file, so those legitimately differ). It is the depth
+      # ----- the PR gate used to run, kept here rather than dropped.
+      - name: Fuzz (contract-level ANF-depth compare, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --ir \
+            --num 200 \
+            --seed "$SEED" \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --render native \
+            --output /tmp/ir-fuzz-nightly-anf.json
+
       # ----- Always upload the per-finding artifact tree so a failing
       # ----- run leaves behind a replayable repro corpus.
       - name: Upload fuzz findings
@@ -348,9 +472,13 @@ jobs:
             conformance/fuzz-findings-anf/
             conformance/fuzz-findings-execute/
             conformance/fuzz-findings-trimodal/
+            conformance/fuzz-findings-ir/
             /tmp/anf-fuzz-report.json
             /tmp/anf-exec-nightly.json
             /tmp/anf-trimodal-nightly.json
+            /tmp/ir-fuzz-nightly.json
+            /tmp/ir-fuzz-nightly-stateful.json
+            /tmp/ir-fuzz-nightly-anf.json
           if-no-files-found: ignore
           retention-days: 30
 

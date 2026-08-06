@@ -415,22 +415,38 @@ func collectLoopCarriedRebinds(body []ir.ANFBinding) map[string]bool {
 }
 
 // flattenNestedLoopBodies returns the binding sequence with every nested loop
-// binding replaced, in place, by its own (recursively flattened) body.
+// binding — and every if binding — replaced, in place, by its own (recursively
+// flattened) body.
 //
 // Only collectLoopCarriedRebinds uses this, and only to order reads against
-// rebindings. The loop binding itself contributes no stack slot (loops are
-// statements), so dropping it loses nothing; splicing the body in at its
-// position is what lets an outer loop see a rebinding that happens one level
-// down. if-branches are deliberately NOT flattened — their two arms are
-// alternatives, not a sequence, and reassignments inside them are reconciled by
-// lowerIf, not by protection here.
+// rebindings. Neither replaced binding contributes a stack slot that predicate
+// reasons about, so dropping it loses nothing; splicing the sub-body in at its
+// position is what lets an enclosing loop see a rebinding one level down.
 //
-// A body with no nested loop is returned entry-for-entry unchanged, which is
-// what makes this byte-neutral for every non-nesting loop.
+// if arms ARE spliced, in then ++ else order, even though they are
+// alternatives rather than a sequence. The predicate asks only "is this name
+// read, then rebound, then read again", and treating the arms as a sequence
+// can only ADD names to the carried set, never remove one — conservative in
+// the safe direction. Without it a local rebound ONLY inside an if arm was
+// bound at no index the predicate could see: neither an outer ref
+// (deepBodyBindingNames excludes it, since the body does bind it, deeply) nor
+// a carried rebind. The loop consumed it and the next iteration had nothing to
+// read, so `for (i<2) { if (i<5) { acc = acc + step; } wacc = wacc + acc; }`
+// was REJECTED outright with `Value 'acc' not found on stack` — the loud face
+// of the same gap the merged-local protection in lowerIf fixes silently at
+// K>=2.
+//
+// The if binding itself is NOT re-appended after its arms. Appending it would
+// count the arms' reads a second time at an index past every arm rebinding,
+// making a local that BOTH arms rebind look "read after its last rebinding" —
+// which protected a K=1 alias that must stay consumable.
+//
+// A body with no nested loop and no if is returned entry-for-entry unchanged,
+// which is what makes this byte-neutral for every flat loop.
 func flattenNestedLoopBodies(body []ir.ANFBinding) []ir.ANFBinding {
 	nested := false
 	for i := range body {
-		if body[i].Value.Kind == "loop" {
+		if body[i].Value.Kind == "loop" || body[i].Value.Kind == "if" {
 			nested = true
 			break
 		}
@@ -440,13 +456,35 @@ func flattenNestedLoopBodies(body []ir.ANFBinding) []ir.ANFBinding {
 	}
 	flat := make([]ir.ANFBinding, 0, len(body))
 	for i := range body {
-		if body[i].Value.Kind == "loop" {
+		switch body[i].Value.Kind {
+		case "loop":
 			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Body)...)
-		} else {
+		case "if":
+			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Then)...)
+			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Else)...)
+		default:
 			flat = append(flat, body[i])
 		}
 	}
 	return flat
+}
+
+// mergedLocalResultNames returns the names of the K branch-merged locals an
+// if-statement's arms carry as results, in the canonical order
+// appendMergedLocalResults emitted them.
+//
+// Empty unless both arms carry a normalised block of the same size — the same
+// gate countMergedLocalResults applies.
+func mergedLocalResultNames(thenBindings, elseBindings []ir.ANFBinding) []string {
+	k := countMergedLocalResults(thenBindings, elseBindings)
+	if k == 0 {
+		return nil
+	}
+	names := make([]string, 0, k)
+	for _, b := range thenBindings[len(thenBindings)-k:] {
+		names = append(names, b.Name)
+	}
+	return names
 }
 
 // countMergedLocalResults reports how many branch-merged locals an
@@ -1985,6 +2023,39 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	for ref, lastIdx := range lastUses {
 		if lastIdx > bindingIndex && ctx.sm.has(ref) {
 			protectedRefs[ref] = true
+		}
+	}
+
+	// The K>=2 merged-local block reads every merged local in BOTH arms, and
+	// that read is RECONCILIATION, not a use: it is what makes each arm leave
+	// exactly K equally-named result slots for the N>=2 reconcile below to
+	// adopt. So the merged locals must be copied, never consumed — regardless
+	// of whether the ENCLOSING scope reads them again.
+	//
+	// appendMergedLocalResults (ANF lowering) states that as its premise:
+	// "pass 1 always COPIES ... because a local live after the if is in
+	// outerProtectedRefs". Enclosing-scope liveness is the wrong question, and
+	// the premise silently failed for every merged local whose last enclosing
+	// use IS this if — which is EVERY merged local of an if in a loop body,
+	// since the body's last-use map ends at the if itself.
+	//
+	// What happened then: pass 1 ROLLED instead of picking, the arm's stack
+	// effect stopped being +K, the arms ended at different depths, phase 3
+	// padded the shortfall with EMPTY pushes, elseMatchesThenNResultLayout saw
+	// an unnamed slot where it needed the merged name, and control fell through
+	// to the single-slot fallback push(bindingName) — ONE stackMap name
+	// registered for K physical results, with acc/wacc still naming the dead
+	// pre-if slots. `for (i<2) { if (i<5) { acc = acc + step;
+	// wacc = wacc + acc; } }` with step = 3 produced wacc = 3 where the source
+	// says 9: silently in a stateless contract, and as a permanently
+	// unspendable UTXO in a stateful one.
+	//
+	// Byte-neutral for every program whose merged locals were already live
+	// after the if: those names are already protected above, which is precisely
+	// why those programs compiled correctly.
+	for _, name := range mergedLocalResultNames(thenBindings, elseBindings) {
+		if ctx.sm.has(name) {
+			protectedRefs[name] = true
 		}
 	}
 

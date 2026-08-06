@@ -109,11 +109,40 @@ function tsStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'add_output': {
+      const args = [`${stmt.satoshis}n`, ...stmt.values.map(tsExpr)].join(', ');
+      return `${indent}this.addOutput(${args});`;
+    }
     case 'expr':
       return `${indent}${tsExpr(stmt.expr)};`;
   }
 }
 
+// ---------------------------------------------------------------------------
+// READONLY PARITY — every renderer must carry `GeneratedProperty.readonly`
+// ---------------------------------------------------------------------------
+//
+// A property's readonly-ness is not cosmetic: on a StatefulSmartContract it
+// decides whether the property joins the serialized state or is baked into the
+// code part, which changes the emitted script BYTES. Under `--render native`
+// each tier compiles its OWN rendered source, so a renderer that drops the
+// marker hands that tier a semantically DIFFERENT contract, and the resulting
+// "cross-tier divergence" is a fuzzer artifact rather than a compiler bug.
+//
+// Until 2026-08 exactly that was true: renderPython, renderZig and renderRuby
+// emitted every property as mutable. The three-way split it produced
+// ({ts,go,rust,java} vs {python,ruby} vs {zig} — Zig differing again because
+// `01-parse-zig.ts` INFERS readonly for stateful properties no method mutates)
+// was invisible because the `--ir` PR gate ran without `--hex`. Each renderer
+// now emits its format's marker whenever `prop.readonly` is set:
+//
+//   TypeScript  `readonly x: bigint`        Go      `X int64 \`runar:"readonly"\``
+//   Rust        `#[readonly]`               Python  `x: Readonly[Bigint]`
+//   Zig         `x: runar.Readonly(i64)`    Ruby    `prop :x, Bigint, readonly: true`
+//   Java        `@Readonly long x`
+//
+// Stateless contracts mark every property readonly in every frontend anyway, so
+// the marker is redundant (never wrong) there.
 export function renderTypeScript(contract: GeneratedContract): string {
   const usedFns = collectUsedFunctions(contract);
   const usedTypes = collectUsedTypes(contract);
@@ -260,6 +289,10 @@ function goStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(goExpr)].join(', ');
+      return `${indent}c.AddOutput(${args})`;
+    }
     case 'expr':
       return `${indent}${goExpr(stmt.expr)}`;
   }
@@ -360,6 +393,10 @@ function rsStmt(stmt: Stmt, indent: string): string {
       for (const s of stmt.body) lines.push(rsStmt(s, indent + '    '));
       lines.push(`${indent}}`);
       return lines.join('\n');
+    }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(rsExpr)].join(', ');
+      return `${indent}self.add_output(${args});`;
     }
     case 'expr':
       return `${indent}${rsExpr(stmt.expr)};`;
@@ -470,6 +507,10 @@ function pyStmt(stmt: Stmt, indent: string): string {
       if (stmt.body.length === 0) lines.push(`${indent}    pass`);
       return lines.join('\n');
     }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(pyExpr)].join(', ');
+      return `${indent}self.add_output(${args})`;
+    }
     case 'expr':
       return `${indent}${pyExpr(stmt.expr)}`;
   }
@@ -496,6 +537,7 @@ export function renderPython(contract: GeneratedContract): string {
   if (usedFns.has('len')) imports.push('len');
   if (usedFns.has('cat')) imports.push('cat');
   imports.push('public');
+  if (contract.properties.some((p) => p.readonly)) imports.push('Readonly');
 
   for (const t of usedTypes) {
     if (t !== 'boolean') imports.push(pyType(t));
@@ -508,9 +550,11 @@ export function renderPython(contract: GeneratedContract): string {
   const base = isStateful ? 'StatefulSmartContract' : 'SmartContract';
   lines.push(`class ${contract.name}(${base}):`);
 
-  // Properties
+  // Properties. `Readonly[T]` must be rendered whenever the IR marks the
+  // property readonly — see the READONLY PARITY note above `renderTypeScript`.
   for (const prop of contract.properties) {
-    lines.push(`    ${toSnakeCase(prop.name)}: ${pyType(prop.type)}`);
+    const t = prop.readonly ? `Readonly[${pyType(prop.type)}]` : pyType(prop.type);
+    lines.push(`    ${toSnakeCase(prop.name)}: ${t}`);
   }
   lines.push('');
 
@@ -623,6 +667,10 @@ function zigStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(zigExpr)].join(', ');
+      return `${indent}self.addOutput(${args});`;
+    }
     case 'expr':
       return `${indent}${zigExpr(stmt.expr)};`;
   }
@@ -640,10 +688,12 @@ export function renderZig(contract: GeneratedContract): string {
   lines.push(`    pub const Contract = ${contractType};`);
   lines.push('');
 
-  // Fields
+  // Fields. `runar.Readonly(T)` must be rendered whenever the IR marks the
+  // property readonly — see the READONLY PARITY note above `renderTypeScript`.
   for (const prop of contract.properties) {
     const init = prop.initializer ? ` = ${zigExpr(prop.initializer)}` : '';
-    lines.push(`    ${prop.name}: ${zigType(prop.type)}${init},`);
+    const t = prop.readonly ? `runar.Readonly(${zigType(prop.type)})` : zigType(prop.type);
+    lines.push(`    ${prop.name}: ${t}${init},`);
   }
   lines.push('');
 
@@ -734,6 +784,12 @@ function rbStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}end`);
       return lines.join('\n');
     }
+    case 'add_output': {
+      // Ruby's surface form is a BARE call — `add_output(...)`, no `self.`
+      // receiver (see examples/ruby/add-raw-output/RawOutputTest.runar.rb).
+      const args = [String(stmt.satoshis), ...stmt.values.map(rbExpr)].join(', ');
+      return `${indent}add_output(${args})`;
+    }
     case 'expr':
       return `${indent}${rbExpr(stmt.expr)}`;
   }
@@ -749,9 +805,11 @@ export function renderRuby(contract: GeneratedContract): string {
 
   lines.push(`class ${contract.name} < ${base}`);
 
-  // Properties
+  // Properties. `readonly: true` must be rendered whenever the IR marks the
+  // property readonly — see the READONLY PARITY note above `renderTypeScript`.
   for (const prop of contract.properties) {
-    lines.push(`  prop :${toSnakeCase(prop.name)}, ${rbType(prop.type)}`);
+    const ro = prop.readonly ? ', readonly: true' : '';
+    lines.push(`  prop :${toSnakeCase(prop.name)}, ${rbType(prop.type)}${ro}`);
   }
   lines.push('');
 
@@ -1003,6 +1061,15 @@ function javaStmt(
       for (const s of stmt.body) lines.push(javaStmt(s, indent + '    ', bigintVars, boolVars));
       lines.push(`${indent}}`);
       return lines.join('\n');
+    }
+    case 'add_output': {
+      // The satoshi amount is a plain `long` in the Java surface, NOT a Bigint
+      // wrapper (see examples/.../RawOutputTest.runar.java).
+      const args = [
+        `${stmt.satoshis}L`,
+        ...stmt.values.map((v) => javaExpr(v, bigintVars, boolVars)),
+      ].join(', ');
+      return `${indent}this.addOutput(${args});`;
     }
     case 'expr':
       return `${indent}${javaExpr(stmt.expr, bigintVars, boolVars)};`;

@@ -420,25 +420,46 @@ module RunarCompiler::Codegen
   # by its own (recursively flattened) body.
   #
   # Only collect_loop_carried_rebinds uses this, and only to order reads
-  # against rebindings. The loop binding itself contributes no stack slot
-  # (loops are statements), so dropping it loses nothing; splicing the body in
-  # at its position is what lets an outer loop see a rebinding that happens one
-  # level down. +if+ branches are deliberately NOT flattened -- their two arms
-  # are alternatives, not a sequence, and reassignments inside them are
-  # reconciled by _lower_if, not by protection here.
+  # against rebindings. Neither replaced binding contributes a stack slot that
+  # predicate reasons about, so dropping it loses nothing; splicing the
+  # sub-body in at its position is what lets an enclosing loop see a rebinding
+  # one level down.
   #
-  # A body with no nested loop is returned entry-for-entry unchanged, which is
-  # what makes this byte-neutral for every non-nesting loop.
+  # +if+ arms ARE spliced, in +then ++ else+ order, even though they are
+  # alternatives rather than a sequence. The predicate asks only "is this name
+  # read, then rebound, then read again", and treating the arms as a sequence
+  # can only ADD names to the carried set, never remove one -- conservative in
+  # the safe direction. Without it a local rebound ONLY inside an +if+ arm was
+  # bound at no index the predicate could see: neither an outer ref
+  # (collect_deep_binding_names excludes it, since the body does bind it,
+  # deeply) nor a carried rebind. The loop consumed it and the next iteration
+  # had nothing to read, so
+  # <tt>for (i<2) { if (i<5) { acc = acc + step; } wacc = wacc + acc; }</tt>
+  # was REJECTED outright with <tt>Value 'acc' not found on stack</tt> -- the
+  # loud face of the same gap the merged-local protection in _lower_if fixes
+  # silently at K>=2.
+  #
+  # The +if+ binding itself is NOT re-appended after its arms. Appending it
+  # would count the arms' reads a second time at an index past every arm
+  # rebinding, making a local that BOTH arms rebind look "read after its last
+  # rebinding" -- which protected a K=1 alias that must stay consumable.
+  #
+  # A body with no nested loop and no +if+ is returned entry-for-entry
+  # unchanged, which is what makes this byte-neutral for every flat loop.
   #
   # @param body [Array<IR::ANFBinding>]
   # @return [Array<IR::ANFBinding>]
   def self.flatten_nested_loop_bodies(body)
-    return body unless body.any? { |b| b.value.kind == "loop" }
+    return body unless body.any? { |b| b.value.kind == "loop" || b.value.kind == "if" }
 
     flat = []
     body.each do |b|
-      if b.value.kind == "loop"
+      case b.value.kind
+      when "loop"
         flat.concat(flatten_nested_loop_bodies(b.value.body || []))
+      when "if"
+        flat.concat(flatten_nested_loop_bodies(b.value.then || []))
+        flat.concat(flatten_nested_loop_bodies(b.value.else_ || []))
       else
         flat << b
       end
@@ -481,6 +502,22 @@ module RunarCompiler::Codegen
     end
     then_count = trailing.call(then_bindings)
     then_count.positive? && then_count == trailing.call(else_bindings) ? then_count : 0
+  end
+
+  # The names of the K branch-merged locals an if-statement's arms carry as
+  # results, in the canonical order _append_merged_local_results emitted them.
+  #
+  # Empty unless both arms carry a normalised block of the same size -- the
+  # same gate count_merged_local_results applies.
+  #
+  # @param then_bindings [Array<IR::ANFBinding>]
+  # @param else_bindings [Array<IR::ANFBinding>]
+  # @return [Array<String>]
+  def self.merged_local_result_names(then_bindings, else_bindings)
+    k = count_merged_local_results(then_bindings, else_bindings)
+    return [] if k.zero?
+
+    then_bindings.last(k).map(&:name)
   end
 
   # @param n [Integer]
@@ -2075,6 +2112,38 @@ module RunarCompiler::Codegen
       protected_refs = Set.new
       last_uses.each do |ref, last_idx|
         protected_refs.add(ref) if last_idx > binding_index && @sm.has?(ref)
+      end
+
+      # The K>=2 merged-local block reads every merged local in BOTH arms, and
+      # that read is RECONCILIATION, not a use: it is what makes each arm leave
+      # exactly K equally-named result slots for the N>=2 reconcile below to
+      # adopt. So the merged locals must be copied, never consumed -- regardless
+      # of whether the ENCLOSING scope reads them again.
+      #
+      # _append_merged_local_results (ANF lowering) states that as its premise:
+      # "pass 1 always COPIES ... because a local live after the +if+ is in
+      # outer_protected_refs". Enclosing-scope liveness is the wrong question,
+      # and the premise silently failed for every merged local whose last
+      # enclosing use IS this +if+ -- which is EVERY merged local of an +if+ in
+      # a loop body, since the body's last-use map ends at the +if+ itself.
+      #
+      # What happened then: pass 1 ROLLED instead of picking, the arm's stack
+      # effect stopped being +K, the arms ended at different depths, phase 3
+      # padded the shortfall with EMPTY pushes, the N-result layout check saw an
+      # unnamed slot where it needed the merged name, and control fell through
+      # to the single-slot fallback push(binding_name) -- ONE stackMap name
+      # registered for K physical results, with acc/wacc still naming the dead
+      # pre-+if+ slots.
+      # <tt>for (i<2) { if (i<5) { acc = acc + step; wacc = wacc + acc; } }</tt>
+      # with step = 3 produced wacc = 3 where the source says 9: silently in a
+      # stateless contract, and as a permanently unspendable UTXO in a stateful
+      # one.
+      #
+      # Byte-neutral for every program whose merged locals were already live
+      # after the +if+: those names are already protected above, which is
+      # precisely why those programs compiled correctly.
+      RunarCompiler::Codegen.merged_local_result_names(then_bindings, else_bindings).each do |name|
+        protected_refs.add(name) if @sm.has?(name)
       end
 
       # Snapshot parent stackMap names before branches run

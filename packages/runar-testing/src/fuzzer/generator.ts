@@ -1380,13 +1380,73 @@ function arbStatefulMethodIR(
       fc.array(arbAssertStmtIR(bigintVars, boolVars), { minLength: 0, maxLength: 1 }),
       fc.array(branchBlock, { minLength: forceBranchShape ? 1 : 0, maxLength: 1 }),
       fc.array(loopBlock, { minLength: forceLoopShape ? 1 : 0, maxLength: 1 }),
-    ).map(([mutations, asserts, branches, loops]): GeneratedMethod => ({
+      // The multi-output intrinsic (`this.addOutput(sats, ...)`). Drawn as a
+      // 0-or-1 element array so roughly half the methods carry an EXPLICIT
+      // continuation and the rest keep the compiler-injected implicit one —
+      // both paths then have to agree across every tier.
+      arbAddOutputStmt(mutableProps),
+    ).map(([mutations, asserts, branches, loops, addOutputs]): GeneratedMethod => ({
       name,
       visibility: 'public',
       params,
-      body: [...asserts, ...branches.flat(), ...loops.flat(), ...mutations],
+      // `add_output` goes LAST: its operands are the post-mutation property
+      // values, which is the shape every checked-in example uses.
+      body: [...asserts, ...branches.flat(), ...loops.flat(), ...mutations, ...addOutputs],
       mutatesState: true,
     }));
+  });
+}
+
+/**
+ * `this.addOutput(satoshis, ...values)` — the multi-output intrinsic.
+ *
+ * Until 2026-08 `contract-ir.ts` had no node for it, so the intrinsic was
+ * unreachable from EVERY IR-based generator and its cross-tier parity was
+ * untested: `conformance/fuzzer/spend-shapes.ts` exercised it under the
+ * absolute post-state oracle, but that harness is TypeScript-only and proves
+ * nothing about the other six frontends.
+ *
+ * `values` is positional against the MUTABLE properties in DECLARATION ORDER,
+ * so the arity is fixed by the contract, not drawn. Passing each property's own
+ * post-mutation value makes the explicit continuation semantically equal to the
+ * implicit one the compiler would otherwise inject — any tier that disagrees
+ * about the state layout produces different bytes and fails the `--hex` gate.
+ */
+function arbAddOutputStmt(
+  mutableProps: GeneratedProperty[],
+): fc.Arbitrary<Stmt[]> {
+  if (mutableProps.length === 0) return fc.constant([]);
+  return fc.option(
+    fc.constantFrom(0n, 1n, 1000n).map((satoshis): Stmt => ({
+      kind: 'add_output',
+      satoshis,
+      values: mutableProps.map((p) => ({ kind: 'property_ref', name: p.name })),
+    })),
+    { nil: undefined },
+  ).map((s) => (s ? [s] : []));
+}
+
+/**
+ * Method names are drawn independently per method (`method0`..`method9`), so a
+ * contract with several methods can draw the same name twice. The surface
+ * languages do NOT agree on what that means: TypeScript and Ruby take the LAST
+ * definition and discard the first, while Java sees two different parameter
+ * lists and treats them as an OVERLOAD, keeping both. The same
+ * `GeneratedContract` therefore renders to genuinely different PROGRAMS per
+ * tier, and the "cross-tier divergence" that follows is a generator artifact,
+ * not a compiler bug. (Seed 987654 at `--num 200` hit it: {ts,go,rust,python}
+ * vs {java,ruby}, 2 bytes apart.)
+ *
+ * Uniquify with the same `X`-suffix convention the property and parameter draws
+ * already use.
+ */
+function dedupeMethodNames(methods: GeneratedMethod[]): GeneratedMethod[] {
+  const seen = new Set<string>();
+  return methods.map((m) => {
+    let name = m.name;
+    while (seen.has(name)) name += 'X';
+    seen.add(name);
+    return name === m.name ? m : { ...m, name };
   });
 }
 
@@ -1423,7 +1483,7 @@ function arbGeneratedContractOf(
         name,
         parentClass: 'SmartContract',
         properties,
-        methods,
+        methods: dedupeMethodNames(methods),
       }));
   });
 }
@@ -1491,7 +1551,7 @@ function arbGeneratedStatefulContractOf(
         name,
         parentClass: 'StatefulSmartContract',
         properties,
-        methods,
+        methods: dedupeMethodNames(methods),
       }));
   });
 }

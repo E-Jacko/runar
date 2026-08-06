@@ -7,6 +7,23 @@
  * `--execute` / `--tri-modal` (stateless fragments) and `--spend-oracle`
  * (full deploy->call transaction context + an independent post-state pin).
  * See `conformance/fuzzer/README.md`.
+ *
+ * GENERATOR REACH (2026-08-06). `this.addOutput(...)` used to be unreachable
+ * from every IR-based generator: `spend-shapes.ts` exercised it under the
+ * ABSOLUTE post-state oracle, but that harness renders TypeScript only and
+ * therefore said nothing about the other six frontends. `contract-ir.ts` now
+ * carries an `add_output` node, all seven renderers emit it, and the stateful
+ * generator draws it on roughly three quarters of stateful methods — so the
+ * intrinsic's CROSS-TIER parity is gated for the first time, by the
+ * `--ir --hex --stateful` PR gate added in `.github/workflows/fuzzer-nightly.yml`.
+ * It is load-bearing, not decorative: removing the node from a generated
+ * contract changes the emitted script in every tier.
+ *
+ * That node lives in the CONTRACT-level generator, not here. This module
+ * generates raw ANF directly and feeds it to each tier's `--ir <json>` loader,
+ * a different entry point; `add_output` is already in all seven loaders'
+ * known-kinds sets, so extending THIS generator to emit it needs no compiler
+ * change if someone wants that coverage too.
  */
 
 /**

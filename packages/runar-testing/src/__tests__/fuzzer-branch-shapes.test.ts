@@ -216,14 +216,14 @@ describe('IR generator branch shapes: reachability', () => {
       `seed ${SEED} / 120 samples reached: ${JSON.stringify(Object.fromEntries(firstIndex))}`,
     ).toEqual([]);
     expect(Object.fromEntries(firstIndex)).toEqual({
-      'both-arms-rebind-both': 1,
       'rebind-read-after': 2,
       'prop-write-in-arm': 3,
       'straight-line-rebind': 8,
-      'both-arms-rebind-one': 10,
-      'asymmetric-rebind': 20,
-      'multi-rebind-one-arm': 22,
-      'assert-only': 30,
+      'multi-rebind-one-arm': 10,
+      'assert-only': 13,
+      'asymmetric-rebind': 15,
+      'both-arms-rebind-one': 20,
+      'both-arms-rebind-both': 32,
     });
   });
 
@@ -239,8 +239,8 @@ describe('IR generator branch shapes: reachability', () => {
     });
     expect(Object.fromEntries(stateful)).toEqual({
       'k2-cross-read': 1,
-      'single-carrier': 2,
       'nested-cross-read': 7,
+      'single-carrier': 11,
     });
   });
 

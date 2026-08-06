@@ -342,10 +342,41 @@ function stringifyWithBigint(value: unknown): string {
 // Comparison helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Recursively sort object keys so two tiers that emit the same ANF in a
+ * different key order compare equal.
+ *
+ * The previous implementation was `JSON.stringify(obj, Object.keys(obj).sort(), 2)`.
+ * An ARRAY second argument to `JSON.stringify` is not a key ordering — it is a
+ * property ALLOW-LIST, applied at EVERY nesting depth. Seeded with the ROOT's
+ * keys (`contractName`, `methods`, `properties`), it deleted every key that did
+ * not happen to share a name with a root key, at every level: each method
+ * serialised as `{}` and each property as `{}`. ANF-compare mode was therefore
+ * asserting little beyond "the tiers agree on the contract name and on how many
+ * methods there are" — which is why it never saw the readonly-rendering split
+ * that `--hex` surfaced immediately (see the READONLY PARITY note in
+ * `packages/runar-testing/src/fuzzer/renderers.ts`).
+ */
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      // `sourceLoc` carries {file, line, column} back to the ORIGINATING source.
+      // Under `--render native` every tier compiles a DIFFERENT file, so these
+      // legitimately differ and say nothing about ANF parity. (Source-map
+      // fidelity has its own tests; it is not what this differential gates.)
+      if (k === 'sourceLoc') continue;
+      out[k] = sortKeysDeep((value as Record<string, unknown>)[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
 function canonicalizeJson(s: string): string {
   try {
-    const obj = JSON.parse(s);
-    return JSON.stringify(obj, Object.keys(obj).sort(), 2);
+    return JSON.stringify(sortKeysDeep(JSON.parse(s)), null, 2);
   } catch {
     return s;
   }

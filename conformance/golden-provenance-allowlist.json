@@ -1562,6 +1562,30 @@
       "reason": "Compiled by the TS reference compiler from conformance/sdk-vertical/contracts/CodeSepMatrix.runar.ts, NOW with a third public method `reseal` (remediation plan P0-1 fix: the artifact previously carried only ONE codeSepIndexSlot, always targeting bump's own separator at template offset 6 \u2014 before every ctor slot \u2014 so it always baked the constant 6 regardless of `tag`). Every declared claim (constructorSlots, codeSepIndexSlots, codeSeparatorIndex/Indices = [6, 1074, 2135]) is cross-checked against an independent opcode walker (reference/derive.ts T2-T8; reference/** imports nothing from packages/**). reseal's own codeSepIndexSlot (byteOffset 1910, codeSepIndex 1074) targets a separator AFTER the `tag` ctor slot (byteOffset 878), so its baked value is cross-tier-verified to shift correctly with `tag`'s encoded length by ALL SEVEN deployment SDKs (conformance/sdk-vertical/runner/vertical-runner.ts --filter codesep, measured 2026-08-06: 6/6 cases x 7 tiers green, 0 disagreements) before this artifact was pinned.",
       "reviewer": "gh:icellan",
       "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/tests/loop-if-merged-locals/expected-script.hex",
+      "sha256": "ffa73fbdc77a0f25c095796e958bb55065449414bbf463d2eedcf3aca3fe366e",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture, not a regeneration of existing bytes — it pins the last open member of the 'one stack carrier, N live values' family: branch-merged locals whose merged values are DEAD in the enclosing scope, which is what an `if` inside a loop body always makes them. The bytes are cross-checked by conformance/witnesses/real-crypto/loop-if-merged-locals.json, which deploys and spends this exact script on @bsv/sdk's real Spend with a real secp256k1 signature and a real BIP-143 continuation preimage, and pins expectedState for EVERY property on all five accepts (guarded: 14/21/9, 7/7/9, 0/0/9; afterIf: 10/15/9, 5/10/9) plus a tampered-continuation reject. Those state values were hand-derived from the source semantics before the script existed, never read off compiler output — which is what makes them independent of the compiler that produced these bytes. The pre-fix compilers produced a DIFFERENT, self-consistent script for `guarded` that the same oracle accepts on verdict but rejects on state (it committed b=7 where the source says 21), and did not compile `afterIf` at all. Cross-tier: all 7 compilers emit these exact bytes from all 9 source formats.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/tests/loop-if-merged-locals/expected-ir.json",
+      "sha256": "3b083bc539bff7fadd540e831e85f36b3aa856d793253ff605c62f6f195518a8",
+      "verified-against": "differential-oracle",
+      "reason": "The Stack IR the expected-script.hex above assembles from, for the same NEW fixture; justified by the same independent evidence (conformance/witnesses/real-crypto/loop-if-merged-locals.json: five hand-derived expectedState accepts on real secp256k1 + real BIP-143, one tampered-continuation reject). All 7 compilers emit this IR byte-identically from all 9 source formats, so no single tier's lowering is being trusted on its own.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
+    },
+    {
+      "path": "conformance/script-size-baseline.json",
+      "sha256": "c5484752538e87ea6a61af00dcc795686812c5e9dd2d362c62465624eb721796",
+      "verified-against": "intentional-spec-change",
+      "reason": "Adds exactly ONE line — the new `loop-if-merged-locals` fixture at 2011 bytes — and moves NO existing fixture's size (`git diff` reports 1 insertion, 0 deletions). The accompanying stack-lowering fix (merged-local protection in lowerIf + `if`-arm splicing in flattenNestedLoopBodies) is byte-neutral, independently confirmed two ways: a full `--update-golden` regeneration of all 68 pre-existing fixtures reproduced every expected-script.hex and expected-ir.json byte-identically (git reports 0 modified files), and a repo-wide sweep compiling all 757 .runar.* sources in BOTH fold modes (1472 pairs) against the pre-fix compiler found 0 differing outputs.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-06"
     }
   ]
 }
