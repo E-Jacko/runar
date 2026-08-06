@@ -52,16 +52,16 @@ class EcTest {
     void ecMulShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMul(ops::add);
-        assertEquals(63828, ops.size(), "ecMul op count drift");
-        assertEquals(427470, emitHex(ops).length() / 2);
+        assertEquals(62304, ops.size(), "ecMul op count drift");
+        assertEquals(510992, emitHex(ops).length() / 2);
     }
 
     @Test
     void ecMulGenShape() {
         List<StackOp> ops = new ArrayList<>();
         Ec.emitEcMulGen(ops::add);
-        assertEquals(63830, ops.size(), "ecMulGen op count drift");
-        assertEquals(427536, emitHex(ops).length() / 2);
+        assertEquals(62306, ops.size(), "ecMulGen op count drift");
+        assertEquals(511058, emitHex(ops).length() / 2);
     }
 
     @Test

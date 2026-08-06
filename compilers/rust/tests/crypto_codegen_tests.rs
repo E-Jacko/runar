@@ -314,7 +314,7 @@ fn test_blake3_hash_op_count_golden() {
 #[test]
 fn test_p256_add_op_count_golden() {
     let ops = collect(|s| emit_p256_add(s));
-    assert_eq!(ops.len(), 6505, "p256_add op count drift");
+    assert_eq!(ops.len(), 6642, "p256_add op count drift");
 }
 
 #[test]
@@ -323,14 +323,14 @@ fn test_p256_mul_op_count_golden() {
     // Rust emits 4 fewer raw StackOps than Python/Java peers; same pattern
     // as ecMul (see ec_codegen_tests.rs module comment). Final hex is
     // byte-identical (enforced by the conformance harness).
-    assert_eq!(ops.len(), 73302, "p256_mul op count drift");
+    assert_eq!(ops.len(), 107579, "p256_mul op count drift");
 }
 
 #[test]
 fn test_p256_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_p256_mul_gen(s));
     // See p256_mul_op_count_golden comment.
-    assert_eq!(ops.len(), 73304, "p256_mul_gen op count drift");
+    assert_eq!(ops.len(), 107581, "p256_mul_gen op count drift");
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn test_verify_ecdsa_p256_op_count_golden() {
     let ops = collect(|s| emit_verify_ecdsa_p256(s));
     // Rust emits 8 fewer raw StackOps than Python/Java peers (a verify
     // computes two mul/mul_gen invocations × the 4-op divergence).
-    assert_eq!(ops.len(), 163581, "verify_ecdsa_p256 op count drift");
+    assert_eq!(ops.len(), 232272, "verify_ecdsa_p256 op count drift");
 }
 
 // -- P-384 -----------------------------------------------------------------
@@ -364,21 +364,21 @@ fn test_verify_ecdsa_p256_op_count_golden() {
 #[test]
 fn test_p384_add_op_count_golden() {
     let ops = collect(|s| emit_p384_add(s));
-    assert_eq!(ops.len(), 11311, "p384_add op count drift");
+    assert_eq!(ops.len(), 11448, "p384_add op count drift");
 }
 
 #[test]
 fn test_p384_mul_op_count_golden() {
     let ops = collect(|s| emit_p384_mul(s));
     // See ec_codegen_tests.rs module comment for the 4-op divergence pattern.
-    assert_eq!(ops.len(), 111420, "p384_mul op count drift");
+    assert_eq!(ops.len(), 162977, "p384_mul op count drift");
 }
 
 #[test]
 fn test_p384_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_p384_mul_gen(s));
     // See p384_mul_op_count_golden comment.
-    assert_eq!(ops.len(), 111422, "p384_mul_gen op count drift");
+    assert_eq!(ops.len(), 162979, "p384_mul_gen op count drift");
 }
 
 #[test]

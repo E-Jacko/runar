@@ -85,14 +85,6 @@ const p256_n_minus_2_be = [_]u8{
 
 /// P-256 3*n (pre-computed for k+3n in scalar multiplication, matching Go peephole output)
 /// 3n = 0x02fffffffd00000002ffffffffffffffff36b4f008f546db8edb2d6048f5296ff3
-const p256_3n_be = [_]u8{
-    0x02, 0xff, 0xff, 0xff, 0xfd, 0x00, 0x00, 0x00,
-    0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0x36, 0xb4, 0xf0, 0x08, 0xf5, 0x46, 0xdb,
-    0x8e, 0xdb, 0x2d, 0x60, 0x48, 0xf5, 0x29, 0x6f,
-    0xf3,
-};
-
 /// P-256 sqrt exponent = (p+1)/4
 /// = 3fffffffc0000000400000000000000000000000400000000000000000000000
 const p256_sqrt_exp_be = [_]u8{
@@ -188,16 +180,6 @@ const p384_sqrt_exp_be = [_]u8{
 
 /// P-384 3*n (pre-computed for k+3n in scalar multiplication, matching Go peephole output)
 /// 3n = 0x02ffffffffffffffffffffffffffffffffffffffffffffffff5629e885dca5899e084e2916da11f670c6c44c40664f7c59
-const p384_3n_be = [_]u8{
-    0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0x56, 0x29, 0xe8, 0x85, 0xdc, 0xa5, 0x89,
-    0x9e, 0x08, 0x4e, 0x29, 0x16, 0xda, 0x11, 0xf6,
-    0x70, 0xc6, 0xc4, 0x4c, 0x40, 0x66, 0x4f, 0x7c,
-    0x59,
-};
-
 // ===========================================================================
 // Helper: encode big-endian bytes to Bitcoin Script number (unsigned LE + sign byte)
 // ===========================================================================
@@ -249,7 +231,6 @@ const NistCurveParams = struct {
     field_p_minus_2_be: []const u8,
     group_n_be: []const u8,
     group_n_minus_2_be: []const u8,
-    three_n_be: []const u8, // pre-computed 3*n for k+3n (matches Go peephole output)
     curve_b_be: []const u8,
     sqrt_exp_be: []const u8,
     gen_x_be: []const u8,
@@ -262,7 +243,6 @@ const p256_params = NistCurveParams{
     .field_p_minus_2_be = p256_p_minus_2_be[0..],
     .group_n_be = p256_n_be[0..],
     .group_n_minus_2_be = p256_n_minus_2_be[0..],
-    .three_n_be = p256_3n_be[0..],
     .curve_b_be = p256_b_be[0..],
     .sqrt_exp_be = p256_sqrt_exp_be[0..],
     .gen_x_be = p256_gx_be[0..],
@@ -275,7 +255,6 @@ const p384_params = NistCurveParams{
     .field_p_minus_2_be = p384_p_minus_2_be[0..],
     .group_n_be = p384_n_be[0..],
     .group_n_minus_2_be = p384_n_minus_2_be[0..],
-    .three_n_be = p384_3n_be[0..],
     .curve_b_be = p384_b_be[0..],
     .sqrt_exp_be = p384_sqrt_exp_be[0..],
     .gen_x_be = p384_gx_be[0..],
@@ -607,6 +586,17 @@ fn fieldMulConst(t: *NistTracker, a_name: []const u8, c: i64, p_be: []const u8, 
     try fieldMod(t, "_fmc_prod", p_be, result_name);
 }
 
+/// (a * cv) mod p for a FULL-WIDTH constant such as the curve b coefficient,
+/// which does not fit the i64 taken by fieldMulConst.
+fn fieldMulBig(t: *NistTracker, a_name: []const u8, cv_be: []const u8, p_be: []const u8, result_name: []const u8) !void {
+    try t.toTop(a_name);
+    try t.pushBigIntBE("_fmc_c", cv_be);
+    t.popNames(2);
+    try t.emitOpcode("OP_MUL");
+    try t.names.append(t.allocator, "_fmc_prod");
+    try fieldMod(t, "_fmc_prod", p_be, result_name);
+}
+
 /// Field inversion via Fermat's little theorem: a^(p-2) mod p.
 /// Iterates over bits of p-2 from MSB-1 down to 0, using square-and-multiply.
 fn fieldInv(t: *NistTracker, a_name: []const u8, exp_be: []const u8, p_be: []const u8, result_name: []const u8) !void {
@@ -706,13 +696,52 @@ fn groupInv(t: *NistTracker, a_name: []const u8, exp_be: []const u8, n_be: []con
 // ===========================================================================
 
 fn affineAdd(t: *NistTracker, p_be: []const u8) !void {
+    // The chord slope (qy-py)/(qx-px) divides by zero when P == Q, so doubling
+    // needs the tangent (3*px^2 + a)/(2*py) — and a = -3 on both NIST curves,
+    // giving (3*px^2 - 3)/(2*py). Pick numerator and denominator BEFORE the one
+    // fieldInv, selected as b + cond*(a - b) with cond = (px == qx): no branch,
+    // so the emitted op sequence and the tracker's static stack model stay
+    // identical on both paths. Mirrors the secp256k1 fix in ec_emitters.zig.
+    //
+    // NOT handled: P == -Q, whose true result is the point at infinity, which
+    // affine coordinates cannot represent.
+    try t.copyToTop("px", "_px_eq");
+    try t.copyToTop("qx", "_qx_eq");
+    t.popNames(2);
+    try t.emitOpcode("OP_NUMEQUAL");
+    try t.names.append(t.allocator, "_cond");
+
+    // chord numerator / denominator
     try t.copyToTop("qy", "_qy1");
     try t.copyToTop("py", "_py1");
-    try fieldSub(t, "_qy1", "_py1", p_be, "_s_num");
-
+    try fieldSub(t, "_qy1", "_py1", p_be, "_num_chord");
     try t.copyToTop("qx", "_qx1");
     try t.copyToTop("px", "_px1");
-    try fieldSub(t, "_qx1", "_px1", p_be, "_s_den");
+    try fieldSub(t, "_qx1", "_px1", p_be, "_den_chord");
+
+    // tangent numerator / denominator: 3*px^2 - 3 and 2*py
+    try t.copyToTop("px", "_px_t");
+    try fieldSqr(t, "_px_t", p_be, "_px_sq");
+    try fieldMulConst(t, "_px_sq", 3, p_be, "_3x2");
+    try t.pushInt("_three", 3);
+    try fieldSub(t, "_3x2", "_three", p_be, "_num_tan");
+    try t.copyToTop("py", "_py_t");
+    try fieldMulConst(t, "_py_t", 2, p_be, "_den_tan");
+
+    // num = num_chord + cond*(num_tan - num_chord)
+    try t.copyToTop("_num_chord", "_num_chord_c");
+    try fieldSub(t, "_num_tan", "_num_chord_c", p_be, "_num_diff");
+    try t.copyToTop("_cond", "_cond_n");
+    try fieldMul(t, "_num_diff", "_cond_n", p_be, "_num_sel");
+    try fieldAdd(t, "_num_chord", "_num_sel", p_be, "_s_num");
+
+    // den = den_chord + cond*(den_tan - den_chord)
+    try t.copyToTop("_den_chord", "_den_chord_c");
+    try fieldSub(t, "_den_tan", "_den_chord_c", p_be, "_den_diff");
+    try t.toTop("_cond");
+    t.renameTop("_cond_d");
+    try fieldMul(t, "_den_diff", "_cond_d", p_be, "_den_sel");
+    try fieldAdd(t, "_den_chord", "_den_sel", p_be, "_s_den");
 
     try fieldInv(t, "_s_den", t.params.field_p_minus_2_be, p_be, "_s_den_inv");
     try fieldMul(t, "_s_num", "_s_den_inv", p_be, "_s");
@@ -745,172 +774,184 @@ fn affineAdd(t: *NistTracker, p_be: []const u8) !void {
 // Jacobian point doubling with a=-3 optimization
 // ===========================================================================
 
-fn jacobianDouble(t: *NistTracker, p_be: []const u8) !void {
-    // Z^2
-    try t.copyToTop("jz", "_jz_sq_tmp");
-    try fieldSqr(t, "_jz_sq_tmp", p_be, "_Z2");
+/// Projective point doubling — RCB Algorithm 6 (a = -3), 8M + 3S + 2 m_b.
+/// Expects jx, jy, jz on the tracker; replaces them with the doubled point.
+///
+/// Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
+///
+/// P-256 and P-384 have a = -3, so these are the a = -3 algorithms (5 and 6),
+/// NOT the a = 0 pair used for secp256k1 in ec_emitters.zig.
+fn projectiveDouble(t: *NistTracker, p_be: []const u8, b_be: []const u8) !void {
+    try t.copyToTop("jx", "_d_x_xy");
+    try t.copyToTop("jx", "_d_x_xz");
+    try t.copyToTop("jy", "_d_y_xy");
+    try t.copyToTop("jy", "_d_y_yz");
+    try t.copyToTop("jz", "_d_z_xz");
+    try t.copyToTop("jz", "_d_z_yz");
 
-    // X - Z^2 and X + Z^2
-    try t.copyToTop("jx", "_jx_c1");
-    try t.copyToTop("_Z2", "_Z2_c1");
-    try fieldSub(t, "_jx_c1", "_Z2_c1", p_be, "_X_minus_Z2");
-    try t.copyToTop("jx", "_jx_c2");
-    try fieldAdd(t, "_jx_c2", "_Z2", p_be, "_X_plus_Z2");
+    try fieldSqr(t, "jx", p_be, "_d_t0"); // t0 = X^2
+    try fieldSqr(t, "jy", p_be, "_d_t1"); // t1 = Y^2
+    try fieldSqr(t, "jz", p_be, "_d_t2"); // t2 = Z^2
 
-    // A = 3*(X-Z^2)*(X+Z^2)
-    try fieldMul(t, "_X_minus_Z2", "_X_plus_Z2", p_be, "_prod");
-    try t.pushInt("_three", 3);
-    try fieldMul(t, "_prod", "_three", p_be, "_A");
+    try fieldMul(t, "_d_x_xy", "_d_y_xy", p_be, "_d_xy");
+    try fieldMulConst(t, "_d_xy", 2, p_be, "_d_t3"); // t3 = 2*X*Y
+    try fieldMul(t, "_d_x_xz", "_d_z_xz", p_be, "_d_xz");
+    try fieldMulConst(t, "_d_xz", 2, p_be, "_d_Z3"); // Z3 = 2*X*Z
 
-    // B = 4*X*Y^2
-    try t.copyToTop("jy", "_jy_sq_tmp");
-    try fieldSqr(t, "_jy_sq_tmp", p_be, "_Y2");
-    try t.copyToTop("_Y2", "_Y2_c1");
-    try t.copyToTop("jx", "_jx_c3");
-    try fieldMul(t, "_jx_c3", "_Y2", p_be, "_xY2");
-    try t.pushInt("_four", 4);
-    try fieldMul(t, "_xY2", "_four", p_be, "_B");
+    try t.copyToTop("_d_t2", "_d_t2_b");
+    try fieldMulBig(t, "_d_t2_b", b_be, p_be, "_d_bt2");
+    try t.copyToTop("_d_Z3", "_d_Z3_a");
+    try fieldSub(t, "_d_bt2", "_d_Z3_a", p_be, "_d_Y3");
+    try fieldMulConst(t, "_d_Y3", 3, p_be, "_d_Y3b");
 
-    // C = 8*Y^4
-    try fieldSqr(t, "_Y2_c1", p_be, "_Y4");
-    try t.pushInt("_eight", 8);
-    try fieldMul(t, "_Y4", "_eight", p_be, "_C");
+    try t.copyToTop("_d_t1", "_d_t1_a");
+    try t.copyToTop("_d_t1", "_d_t1_b");
+    try t.copyToTop("_d_Y3b", "_d_Y3b_a");
+    try fieldSub(t, "_d_t1_a", "_d_Y3b_a", p_be, "_d_X3");
+    try fieldAdd(t, "_d_t1", "_d_Y3b", p_be, "_d_Y3c");
 
-    // X3 = A^2 - 2*B
-    try t.copyToTop("_A", "_A_save");
-    try t.copyToTop("_B", "_B_save");
-    try fieldSqr(t, "_A", p_be, "_A2");
-    try t.copyToTop("_B", "_B_c1");
-    try fieldMulConst(t, "_B_c1", 2, p_be, "_2B");
-    try fieldSub(t, "_A2", "_2B", p_be, "_X3");
+    try t.copyToTop("_d_X3", "_d_X3_a");
+    try fieldMul(t, "_d_X3_a", "_d_Y3c", p_be, "_d_Y3d");
+    try fieldMul(t, "_d_X3", "_d_t3", p_be, "_d_X3b");
 
-    // Y3 = A*(B - X3) - C
-    try t.copyToTop("_X3", "_X3_c");
-    try fieldSub(t, "_B_save", "_X3_c", p_be, "_B_minus_X3");
-    try fieldMul(t, "_A_save", "_B_minus_X3", p_be, "_A_tmp");
-    try fieldSub(t, "_A_tmp", "_C", p_be, "_Y3");
+    try fieldMulConst(t, "_d_t2", 3, p_be, "_d_t2c");
 
-    // Z3 = 2*Y*Z
-    try t.copyToTop("jy", "_jy_c");
-    try t.copyToTop("jz", "_jz_c");
-    try fieldMul(t, "_jy_c", "_jz_c", p_be, "_yz");
-    try fieldMulConst(t, "_yz", 2, p_be, "_Z3");
+    try fieldMulBig(t, "_d_Z3", b_be, p_be, "_d_Z3b");
+    try t.copyToTop("_d_t2c", "_d_t2c_a");
+    try fieldSub(t, "_d_Z3b", "_d_t2c_a", p_be, "_d_Z3c");
+    try t.copyToTop("_d_t0", "_d_t0_a");
+    try fieldSub(t, "_d_Z3c", "_d_t0_a", p_be, "_d_Z3d");
+    try fieldMulConst(t, "_d_Z3d", 3, p_be, "_d_Z3e");
 
-    // Clean up and rename
-    try t.toTop("_B");
-    try t.drop();
-    try t.toTop("jz");
-    try t.drop();
-    try t.toTop("jx");
-    try t.drop();
-    try t.toTop("jy");
-    try t.drop();
-    try t.toTop("_X3");
+    try fieldMulConst(t, "_d_t0", 3, p_be, "_d_t0b");
+    try fieldSub(t, "_d_t0b", "_d_t2c", p_be, "_d_t0c");
+
+    try t.copyToTop("_d_Z3e", "_d_Z3e_a");
+    try fieldMul(t, "_d_t0c", "_d_Z3e_a", p_be, "_d_t0d");
+    try fieldAdd(t, "_d_Y3d", "_d_t0d", p_be, "_d_Y3e");
+
+    try fieldMul(t, "_d_y_yz", "_d_z_yz", p_be, "_d_yz");
+    try fieldMulConst(t, "_d_yz", 2, p_be, "_d_t0e");
+
+    try t.copyToTop("_d_t0e", "_d_t0e_a");
+    try fieldMul(t, "_d_t0e_a", "_d_Z3e", p_be, "_d_Z3f");
+    try fieldSub(t, "_d_X3b", "_d_Z3f", p_be, "_d_X3c");
+
+    try fieldMul(t, "_d_t0e", "_d_t1_b", p_be, "_d_Z3g");
+    try fieldMulConst(t, "_d_Z3g", 4, p_be, "_d_Z3h");
+
+    try t.toTop("_d_X3c");
     t.renameTop("jx");
-    try t.toTop("_Y3");
+    try t.toTop("_d_Y3e");
     t.renameTop("jy");
-    try t.toTop("_Z3");
+    try t.toTop("_d_Z3h");
     t.renameTop("jz");
 }
 
-// ===========================================================================
-// Jacobian to affine conversion
-// ===========================================================================
-
-fn jacobianToAffine(t: *NistTracker, rx_name: []const u8, ry_name: []const u8, p_be: []const u8, p_minus_2_be: []const u8) !void {
+/// Consumes jx, jy, jz; produces rx_name, ry_name.
+///
+/// fieldInv is Fermat exponentiation, so inv(0) = 0: the point at infinity
+/// (Z = 0) converts to (0, 0), the all-zero point blob.
+fn projectiveToAffine(t: *NistTracker, rx_name: []const u8, ry_name: []const u8, p_be: []const u8, p_minus_2_be: []const u8) !void {
     try fieldInv(t, "jz", p_minus_2_be, p_be, "_zinv");
-    try t.copyToTop("_zinv", "_zinv_keep");
-    try fieldSqr(t, "_zinv", p_be, "_zinv2");
-    try t.copyToTop("_zinv2", "_zinv2_keep");
-    try fieldMul(t, "_zinv_keep", "_zinv2", p_be, "_zinv3");
-    try fieldMul(t, "jx", "_zinv2_keep", p_be, rx_name);
-    try fieldMul(t, "jy", "_zinv3", p_be, ry_name);
+    try t.copyToTop("_zinv", "_zinv_b");
+    try fieldMul(t, "jx", "_zinv", p_be, rx_name);
+    try fieldMul(t, "jy", "_zinv_b", p_be, ry_name);
 }
 
-// ===========================================================================
-// Jacobian mixed addition (point_jacobian + point_affine) — for inside OP_IF
-// ===========================================================================
-
-fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]const u8, params: *const NistCurveParams) !EcOpBundle {
+/// Complete mixed-add ops for use inside OP_IF — RCB Algorithm 5 (a = -3),
+/// 11M + 2 m_b.
+///
+/// Complete: accumulator == Q doubles correctly (the case that returned the
+/// zero point for k = 2), accumulator == -Q yields infinity, and an infinity
+/// accumulator yields Q.
+fn buildProjectiveAddMixedInline(allocator: Allocator, base_names: []const ?[]const u8, params: *const NistCurveParams) !EcOpBundle {
     var inner = try NistTracker.init(allocator, base_names, params);
     errdefer inner.deinit();
-
     const p_be = params.field_p_be;
+    const b_be = params.curve_b_be;
 
-    try inner.copyToTop("jz", "_jz_for_z1cu");
-    try inner.copyToTop("jz", "_jz_for_z3");
-    try inner.copyToTop("jy", "_jy_for_y3");
-    try inner.copyToTop("jx", "_jx_for_u1h2");
+    try inner.copyToTop("ax", "_m_x2a");
+    try inner.copyToTop("ax", "_m_x2b");
+    try inner.copyToTop("ax", "_m_x2c");
+    try inner.copyToTop("ay", "_m_y2a");
+    try inner.copyToTop("ay", "_m_y2b");
+    try inner.copyToTop("ay", "_m_y2c");
+    try inner.copyToTop("jx", "_m_x1a");
+    try inner.copyToTop("jx", "_m_x1b");
+    try inner.copyToTop("jy", "_m_y1a");
+    try inner.copyToTop("jy", "_m_y1b");
+    try inner.copyToTop("jz", "_m_z1a");
+    try inner.copyToTop("jz", "_m_z1b");
+    try inner.copyToTop("jz", "_m_z1c");
 
-    // Z1sq = jz^2
-    try fieldSqr(&inner, "jz", p_be, "_Z1sq");
-    try inner.copyToTop("_Z1sq", "_Z1sq_for_u2");
-    try fieldMul(&inner, "_jz_for_z1cu", "_Z1sq", p_be, "_Z1cu");
+    try fieldMul(&inner, "jx", "_m_x2a", p_be, "_m_t0");
+    try fieldMul(&inner, "jy", "_m_y2a", p_be, "_m_t1");
+    try fieldAdd(&inner, "_m_x2b", "_m_y2b", p_be, "_m_s1");
+    try fieldAdd(&inner, "_m_x1a", "_m_y1a", p_be, "_m_s2");
+    try fieldMul(&inner, "_m_s1", "_m_s2", p_be, "_m_t3");
 
-    // U2 = ax * Z1sq_for_u2
-    try inner.copyToTop("ax", "_ax_c");
-    try fieldMul(&inner, "_ax_c", "_Z1sq_for_u2", p_be, "_U2");
+    try inner.copyToTop("_m_t0", "_m_t0a");
+    try inner.copyToTop("_m_t1", "_m_t1a");
+    try fieldAdd(&inner, "_m_t0a", "_m_t1a", p_be, "_m_s3");
+    try fieldSub(&inner, "_m_t3", "_m_s3", p_be, "_m_t3b");
 
-    // S2 = ay * Z1cu
-    try inner.copyToTop("ay", "_ay_c");
-    try fieldMul(&inner, "_ay_c", "_Z1cu", p_be, "_S2");
+    try fieldMul(&inner, "_m_y2c", "jz", p_be, "_m_t4");
+    try fieldAdd(&inner, "_m_t4", "_m_y1b", p_be, "_m_t4b");
+    try fieldMul(&inner, "_m_x2c", "_m_z1a", p_be, "_m_Y3");
+    try fieldAdd(&inner, "_m_Y3", "_m_x1b", p_be, "_m_Y3b");
 
-    // H = U2 - jx
-    try fieldSub(&inner, "_U2", "jx", p_be, "_H");
+    try fieldMulBig(&inner, "_m_z1b", b_be, p_be, "_m_Z3");
+    try inner.copyToTop("_m_Y3b", "_m_Y3b_a");
+    try fieldSub(&inner, "_m_Y3b_a", "_m_Z3", p_be, "_m_X3");
+    try fieldMulConst(&inner, "_m_X3", 3, p_be, "_m_X3b");
 
-    // R = S2 - jy
-    try fieldSub(&inner, "_S2", "jy", p_be, "_R");
+    try inner.copyToTop("_m_t1", "_m_t1b");
+    try inner.copyToTop("_m_X3b", "_m_X3b_a");
+    try fieldSub(&inner, "_m_t1b", "_m_X3b_a", p_be, "_m_Z3b");
+    try fieldAdd(&inner, "_m_t1", "_m_X3b", p_be, "_m_X3c");
 
-    try inner.copyToTop("_H", "_H_for_h3");
-    try inner.copyToTop("_H", "_H_for_z3");
+    try fieldMulBig(&inner, "_m_Y3b", b_be, p_be, "_m_Y3c");
+    try fieldMulConst(&inner, "_m_z1c", 3, p_be, "_m_t2");
 
-    // H2 = H^2
-    try fieldSqr(&inner, "_H", p_be, "_H2");
-    try inner.copyToTop("_H2", "_H2_for_u1h2");
+    try inner.copyToTop("_m_t2", "_m_t2a");
+    try fieldSub(&inner, "_m_Y3c", "_m_t2a", p_be, "_m_Y3d");
+    try inner.copyToTop("_m_t0", "_m_t0b");
+    try fieldSub(&inner, "_m_Y3d", "_m_t0b", p_be, "_m_Y3e");
+    try fieldMulConst(&inner, "_m_Y3e", 3, p_be, "_m_Y3f");
 
-    // H3 = H_for_h3 * H2
-    try fieldMul(&inner, "_H_for_h3", "_H2", p_be, "_H3");
+    try fieldMulConst(&inner, "_m_t0", 3, p_be, "_m_t0c");
+    try fieldSub(&inner, "_m_t0c", "_m_t2", p_be, "_m_t0d");
 
-    // U1H2 = _jx_for_u1h2 * H2_for_u1h2
-    try fieldMul(&inner, "_jx_for_u1h2", "_H2_for_u1h2", p_be, "_U1H2");
+    try inner.copyToTop("_m_t4b", "_m_t4b_a");
+    try inner.copyToTop("_m_Y3f", "_m_Y3f_a");
+    try fieldMul(&inner, "_m_t4b_a", "_m_Y3f_a", p_be, "_m_t1c");
+    try inner.copyToTop("_m_t0d", "_m_t0d_a");
+    try fieldMul(&inner, "_m_t0d_a", "_m_Y3f", p_be, "_m_t2b");
 
-    try inner.copyToTop("_R", "_R_for_y3");
-    try inner.copyToTop("_U1H2", "_U1H2_for_y3");
-    try inner.copyToTop("_H3", "_H3_for_y3");
+    try inner.copyToTop("_m_X3c", "_m_X3c_a");
+    try inner.copyToTop("_m_Z3b", "_m_Z3b_a");
+    try fieldMul(&inner, "_m_X3c_a", "_m_Z3b_a", p_be, "_m_Y3g");
+    try fieldAdd(&inner, "_m_Y3g", "_m_t2b", p_be, "_m_Y3h");
 
-    // X3 = R^2 - H3 - 2*U1H2
-    try fieldSqr(&inner, "_R", p_be, "_R2");
-    try fieldSub(&inner, "_R2", "_H3", p_be, "_x3_tmp");
-    try fieldMulConst(&inner, "_U1H2", 2, p_be, "_2U1H2");
-    try fieldSub(&inner, "_x3_tmp", "_2U1H2", p_be, "_X3");
+    try inner.copyToTop("_m_t3b", "_m_t3b_a");
+    try fieldMul(&inner, "_m_t3b_a", "_m_X3c", p_be, "_m_X3d");
+    try fieldSub(&inner, "_m_X3d", "_m_t1c", p_be, "_m_X3e");
 
-    // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
-    try inner.copyToTop("_X3", "_X3_c");
-    try fieldSub(&inner, "_U1H2_for_y3", "_X3_c", p_be, "_u_minus_x");
-    try fieldMul(&inner, "_R_for_y3", "_u_minus_x", p_be, "_r_tmp");
-    try fieldMul(&inner, "_jy_for_y3", "_H3_for_y3", p_be, "_jy_h3");
-    try fieldSub(&inner, "_r_tmp", "_jy_h3", p_be, "_Y3");
+    try fieldMul(&inner, "_m_t4b", "_m_Z3b", p_be, "_m_Z3c");
+    try fieldMul(&inner, "_m_t3b", "_m_t0d", p_be, "_m_t1d");
+    try fieldAdd(&inner, "_m_Z3c", "_m_t1d", p_be, "_m_Z3d");
 
-    // Z3 = _jz_for_z3 * _H_for_z3
-    try fieldMul(&inner, "_jz_for_z3", "_H_for_z3", p_be, "_Z3");
-
-    try inner.toTop("_X3");
+    try inner.toTop("_m_X3e");
     inner.renameTop("jx");
-    try inner.toTop("_Y3");
+    try inner.toTop("_m_Y3h");
     inner.renameTop("jy");
-    try inner.toTop("_Z3");
+    try inner.toTop("_m_Z3d");
     inner.renameTop("jz");
 
     return inner.takeBundle();
 }
 
-// ===========================================================================
-// Scalar multiplication (generic for P-256 and P-384)
-// ===========================================================================
-
-/// buildScalarMulBundle creates a standalone bundle for scalar multiplication.
-/// Expects exactly two items on the stack: [point, scalar] (scalar on top).
-/// Produces exactly one result item: the result point.
 fn buildScalarMulBundle(allocator: Allocator, params: *const NistCurveParams) !EcOpBundle {
     var t = try NistTracker.init(allocator, &.{ "_pt", "_k" }, params);
     errdefer t.deinit();
@@ -926,26 +967,23 @@ fn emitScalarMulOnTracker(t: *NistTracker) !void {
 
     try decomposePoint(t, "_pt", "ax", "ay");
 
-    // k' = k + 3n (pre-compute 3n to match Go peephole optimizer output)
-    try t.toTop("_k");
-    try t.pushBigIntBE("_3n", c.three_n_be);
-    t.popNames(2);
-    try t.emitOpcode("OP_ADD");
-    try t.names.append(t.allocator, "_k");
+    // Reduce the scalar into [0, n-1] so the ladder covers the whole domain:
+    // negative k and k >= n are now defined rather than undefined behaviour.
+    try groupMod(t, "_k", c.group_n_be, "_k");
 
-    // Determine iteration count based on 3n bit length.
-    // The max value of k+3n is 4n-1 which has the same MSB as 3n.
-    const three_n_msb = msbIndex(c.three_n_be).?;
-    const start_bit: i64 = @as(i64, @intCast(three_n_msb)) - 1;
+    // Accumulator := point at infinity (0 : 1 : 0), a legal input to both
+    // complete formulas — which is why no leading-bit special case is needed.
+    try t.pushInt("jx", 0);
+    try t.pushInt("jy", 1);
+    try t.pushInt("jz", 0);
 
-    // Init accumulator = P (top bit of k+3n is always 1)
-    try t.copyToTop("ax", "jx");
-    try t.copyToTop("ay", "jy");
-    try t.pushInt("jz", 1);
+    // One iteration per bit of n: 256 for P-256, 384 for P-384.
+    const n_msb = msbIndex(c.group_n_be).?;
+    const start_bit: i64 = @as(i64, @intCast(n_msb));
 
     var bit: i64 = start_bit;
     while (bit >= 0) : (bit -= 1) {
-        try jacobianDouble(t, p_be);
+        try projectiveDouble(t, p_be, c.curve_b_be);
 
         // Extract bit: (k >> bit) & 1
         try t.copyToTop("_k", "_k_copy");
@@ -970,7 +1008,7 @@ fn emitScalarMulOnTracker(t: *NistTracker) !void {
         try t.toTop("_bit");
         t.popNames(1);
 
-        var add_bundle = try buildJacobianAddAffineInline(t.allocator, t.names.items, c);
+        var add_bundle = try buildProjectiveAddMixedInline(t.allocator, t.names.items, c);
         errdefer add_bundle.deinit();
 
         try t.owned_bytes.appendSlice(t.allocator, add_bundle.owned_bytes);
@@ -981,7 +1019,7 @@ fn emitScalarMulOnTracker(t: *NistTracker) !void {
         add_bundle.ops = &.{};
     }
 
-    try jacobianToAffine(t, "_rx", "_ry", p_be, c.field_p_minus_2_be);
+    try projectiveToAffine(t, "_rx", "_ry", p_be, c.field_p_minus_2_be);
 
     try t.toTop("ax");
     try t.drop();
@@ -1553,15 +1591,15 @@ pub fn buildBuiltinOps(allocator: Allocator, builtin: registry.CryptoBuiltin) !E
 
 test "nist_ec helper op-count goldens" {
     const cases = .{
-        .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6495) },
-        .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 69185) },
-        .{ registry.CryptoBuiltin.p256_mul_gen, "p256MulGen", @as(usize, 69187) },
+        .{ registry.CryptoBuiltin.p256_add, "p256Add", @as(usize, 6623) },
+        .{ registry.CryptoBuiltin.p256_mul, "p256Mul", @as(usize, 98872) },
+        .{ registry.CryptoBuiltin.p256_mul_gen, "p256MulGen", @as(usize, 98874) },
         .{ registry.CryptoBuiltin.p256_negate, "p256Negate", @as(usize, 945) },
         .{ registry.CryptoBuiltin.p256_on_curve, "p256OnCurve", @as(usize, 543) },
         .{ registry.CryptoBuiltin.p256_encode_compressed, "p256EncodeCompressed", @as(usize, 14) },
-        .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11301) },
-        .{ registry.CryptoBuiltin.p384_mul, "p384Mul", @as(usize, 105255) },
-        .{ registry.CryptoBuiltin.p384_mul_gen, "p384MulGen", @as(usize, 105257) },
+        .{ registry.CryptoBuiltin.p384_add, "p384Add", @as(usize, 11429) },
+        .{ registry.CryptoBuiltin.p384_mul, "p384Mul", @as(usize, 149918) },
+        .{ registry.CryptoBuiltin.p384_mul_gen, "p384MulGen", @as(usize, 149920) },
         .{ registry.CryptoBuiltin.p384_negate, "p384Negate", @as(usize, 1393) },
     };
     inline for (cases) |c| {

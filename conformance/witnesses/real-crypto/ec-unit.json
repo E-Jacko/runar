@@ -1,0 +1,20 @@
+{
+  "fixture": "ec-unit",
+  "kind": "stateless-signed",
+  "acceptOnly": true,
+  "note": "testOps(): self-checking EC identity suite — ecMulGen(1), ecNegate, ecMul(g,2n), ecAdd(g,g), ecPointX/Y round-trip through ecMakePoint, ecEncodeCompressed length — each guarded by assert(ecOnCurve(...)). Moved OUT of coverage-ledger.json: this fixture used to be executed by no engine, because ecMul(g,2n) returned the all-zero point and the ecOnCurve assert made the deployed script UNSPENDABLE (rejected on a live regtest node with 'Script failed an OP_VERIFY operation'). Fixed by replacing the incomplete Jacobian mixed-add with the RCB complete projective formulas.",
+  "constructorArgs": {
+    "pubKey": {
+      "$pubkey": "alice"
+    }
+  },
+  "spends": [
+    {
+      "method": "testOps",
+      "args": [],
+      "expect": "accept",
+      "note": "every EC identity holds on the real Spend engine; interpreter agrees"
+    }
+  ],
+  "noRejectRationale": "testOps() takes no arguments and reads no constructor state — pubKey is stored but never referenced by the method — so no input exists that could steer it to a rejection, and a fabricated reject would be theatre. The real negative for this fixture is a CODEGEN negative and is pinned as one: packages/runar-testing/src/__tests__/ec-mul-scalars.test.ts runs this same spend, and against the previous ec-codegen it fails with 'Script evaluation error: OP_VERIFY' — the same rejection the live node gave. That RED proof is what makes this accept meaningful."
+}

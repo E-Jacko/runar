@@ -45,12 +45,14 @@ const curve_n_be = [_]u8{
     0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 };
 
-const curve_3n_script_num_le = [_]u8{
-    0xc3, 0xc3, 0xa2, 0x70, 0xa6, 0x1b, 0x77, 0x3f,
-    0xb3, 0xe0, 0xd9, 0x0d, 0xb4, 0x96, 0x0c, 0x30,
-    0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+// secp256k1 curve ORDER n as a script number (little-endian sign-magnitude).
+// The MSB has bit 7 set, so a 0x00 sign byte keeps it positive.
+const curve_n_script_num_le = [_]u8{
+    0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf,
+    0x3b, 0xa0, 0x48, 0xaf, 0xe6, 0xdc, 0xae, 0xba,
+    0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0x02,
+    0x00,
 };
 
 const gen_x_be = [_]u8{
@@ -647,116 +649,167 @@ fn affineAdd(t: *ECTracker) !void {
     try t.drop();
 }
 
-fn jacobianDouble(t: *ECTracker) !void {
-    try t.copyToTop("jy", "_jy_save");
-    try t.copyToTop("jx", "_jx_save");
-    try t.copyToTop("jz", "_jz_save");
+// scalarModN reduces TOS mod n (the curve ORDER, not the field prime), result
+// non-negative. Same op sequence as fieldMod, different modulus.
+//
+// This defines the scalar domain of ecMul over the whole of script-number
+// space: negative scalars and scalars >= n both reduce into [0, n-1], and
+// k = 0 / k = n give the point at infinity. Under the old ladder anything
+// outside [1, n-1] was undefined behaviour.
+fn scalarModN(t: *ECTracker, a_name: []const u8, result_name: []const u8) !void {
+    try t.toTop(a_name);
+    try t.pushStaticBytes("_smod_n", curve_n_script_num_le[0..]);
+    try t.rawBlock(2, result_name, emitFieldModSequence);
+}
 
-    try fieldSqr(t, "jy", "_A");
+// Projective point doubling — RCB Algorithm 9 (a = 0), 6M + 2S + 1 m_3b.
+// Expects jx, jy, jz on the tracker; replaces them with the doubled point.
+//
+// Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
+//
+// Deviations from the paper, both exact mod p and strictly cheaper here
+// (a multiply by a small constant costs one push + OP_MUL, an addition costs
+// a full reduce): line 2-4's Z3 = 8*t0 is one mulConst rather than three
+// doublings, and line 11-12's t2 = 3*t2 is one mulConst rather than two adds.
+fn projectiveDouble(t: *ECTracker) !void {
+    // Copies of the inputs that outlive their first consumer.
+    try t.copyToTop("jy", "_d_yz"); // t1 = Y*Z
+    try t.copyToTop("jy", "_d_xy"); // t1 = X*Y  (line 16)
+    try t.copyToTop("jz", "_d_zz_src"); // t2 = Z*Z
 
-    try t.copyToTop("_A", "_A_save");
-    try fieldMul(t, "jx", "_A", "_xA");
-    try t.pushInt("_four", 4);
-    try fieldMul(t, "_xA", "_four", "_B");
+    try fieldSqr(t, "jy", "_d_t0"); // t0 = Y^2
+    try t.copyToTop("_d_t0", "_d_t0a");
+    try fieldMulConst(t, "_d_t0a", 8, "_d_Z3"); // Z3 = 8*t0
+    try fieldMul(t, "_d_yz", "jz", "_d_t1"); // t1 = Y*Z
+    try fieldSqr(t, "_d_zz_src", "_d_zz"); // Z^2
+    try fieldMulConst(t, "_d_zz", 21, "_d_t2"); // t2 = b3*Z^2  (b3 = 3*7)
 
-    try fieldSqr(t, "_A_save", "_A2");
-    try t.pushInt("_eight", 8);
-    try fieldMul(t, "_A2", "_eight", "_C");
+    try t.copyToTop("_d_t2", "_d_t2a");
+    try t.copyToTop("_d_Z3", "_d_Z3a");
+    try fieldMul(t, "_d_t2a", "_d_Z3a", "_d_X3"); // X3 = t2*Z3
 
-    try fieldSqr(t, "_jx_save", "_x2");
-    try t.pushInt("_three", 3);
-    try fieldMul(t, "_x2", "_three", "_D");
+    try t.copyToTop("_d_t0", "_d_t0b");
+    try t.copyToTop("_d_t2", "_d_t2b");
+    try fieldAdd(t, "_d_t0b", "_d_t2b", "_d_Y3"); // Y3 = t0+t2
 
-    try t.copyToTop("_D", "_D_save");
-    try t.copyToTop("_B", "_B_save");
-    try fieldSqr(t, "_D", "_D2");
-    try t.copyToTop("_B", "_B1");
-    try fieldMulConst(t, "_B1", 2, "_2B");
-    try fieldSub(t, "_D2", "_2B", "_nx");
+    try fieldMul(t, "_d_t1", "_d_Z3", "_d_Z3n"); // Z3 = t1*Z3
+    try fieldMulConst(t, "_d_t2", 3, "_d_t2c"); // t2 = 3*t2
+    try fieldSub(t, "_d_t0", "_d_t2c", "_d_t0n"); // t0 = t0-t2
 
-    try t.copyToTop("_nx", "_nx_copy");
-    try fieldSub(t, "_B_save", "_nx_copy", "_B_nx");
-    try fieldMul(t, "_D_save", "_B_nx", "_D_B_nx");
-    try fieldSub(t, "_D_B_nx", "_C", "_ny");
+    try t.copyToTop("_d_t0n", "_d_t0na");
+    try fieldMul(t, "_d_t0na", "_d_Y3", "_d_Y3b"); // Y3 = t0*Y3
+    try fieldAdd(t, "_d_X3", "_d_Y3b", "_d_Y3c"); // Y3 = X3+Y3
 
-    try fieldMul(t, "_jy_save", "_jz_save", "_yz");
-    try fieldMulConst(t, "_yz", 2, "_nz");
+    try fieldMul(t, "jx", "_d_xy", "_d_xyv"); // t1 = X*Y
+    try fieldMul(t, "_d_t0n", "_d_xyv", "_d_X3b"); // X3 = t0*t1
+    try fieldMulConst(t, "_d_X3b", 2, "_d_X3c"); // X3 = X3+X3
 
-    try t.toTop("_B");
-    try t.drop();
-    try t.toTop("jz");
-    try t.drop();
-    try t.toTop("_nx");
+    try t.toTop("_d_X3c");
     t.renameTop("jx");
-    try t.toTop("_ny");
+    try t.toTop("_d_Y3c");
     t.renameTop("jy");
-    try t.toTop("_nz");
+    try t.toTop("_d_Z3n");
     t.renameTop("jz");
 }
 
-fn jacobianToAffine(t: *ECTracker, rx_name: []const u8, ry_name: []const u8) !void {
+// Projective -> affine. Consumes jx, jy, jz; produces rx_name, ry_name.
+//
+// fieldInv is Fermat exponentiation, so inv(0) = 0: the point at infinity
+// (Z = 0) converts to (0, 0), which is the all-zero Point blob. That is the
+// agreed encoding for infinity — it is not a curve point, so it cannot be
+// confused with a real result.
+fn projectiveToAffine(t: *ECTracker, rx_name: []const u8, ry_name: []const u8) !void {
     try fieldInv(t, "jz", "_zinv");
-    try t.copyToTop("_zinv", "_zinv_keep");
-    try fieldSqr(t, "_zinv", "_zinv2");
-    try t.copyToTop("_zinv2", "_zinv2_keep");
-    try fieldMul(t, "_zinv_keep", "_zinv2", "_zinv3");
-    try fieldMul(t, "jx", "_zinv2_keep", rx_name);
-    try fieldMul(t, "jy", "_zinv3", ry_name);
+    try t.copyToTop("_zinv", "_zinv_b");
+    try fieldMul(t, "jx", "_zinv", rx_name);
+    try fieldMul(t, "jy", "_zinv_b", ry_name);
 }
 
-fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]const u8) !EcOpBundle {
+// Build complete mixed-add ops for use inside OP_IF — RCB Algorithm 8 (a = 0),
+// 11M + 2 m_3b. Adds the affine base point (ax, ay) into the accumulator.
+//
+// Complete: no exceptional cases. In particular
+//   - accumulator == Q        -> correctly doubles (this is the case that broke
+//     ecMul(P, 2n): the old Jacobian mixed-add computed H = R = 0 and returned
+//     the zero point, which then absorbed every remaining iteration)
+//   - accumulator == -Q       -> correctly yields the point at infinity
+//   - accumulator == infinity -> correctly yields Q
+//
+// Uses an inner ECTracker cloned from the outer one, because the ops run under
+// OP_IF: the outer tracker's model must describe the stack for BOTH branches,
+// so this block has to be stack-shape neutral — same names, same depths, with
+// jx/jy/jz replaced in place.
+//
+// Stack layout: [..., ax, ay, _k, jx, jy, jz]
+// After:        [..., ax, ay, _k, jx', jy', jz']
+fn buildProjectiveAddMixedInline(allocator: Allocator, base_names: []const ?[]const u8) !EcOpBundle {
     var inner = try ECTracker.init(allocator, base_names);
     errdefer inner.deinit();
 
-    try inner.copyToTop("jz", "_jz_for_z1cu");
-    try inner.copyToTop("jz", "_jz_for_z3");
-    try inner.copyToTop("jy", "_jy_for_y3");
-    try inner.copyToTop("jx", "_jx_for_u1h2");
+    // The affine base survives every iteration, so only ever consume copies.
+    try inner.copyToTop("ax", "_m_x2a"); // t0 = X1*X2
+    try inner.copyToTop("ax", "_m_x2b"); // X2+Y2
+    try inner.copyToTop("ax", "_m_x2c"); // X2*Z1
+    try inner.copyToTop("ay", "_m_y2a"); // t1 = Y1*Y2
+    try inner.copyToTop("ay", "_m_y2b"); // X2+Y2
+    try inner.copyToTop("ay", "_m_y2c"); // Y2*Z1
+    try inner.copyToTop("jx", "_m_x1a"); // X1+Y1
+    try inner.copyToTop("jx", "_m_x1b"); // Y3+X1
+    try inner.copyToTop("jy", "_m_y1a"); // X1+Y1
+    try inner.copyToTop("jy", "_m_y1b"); // t4+Y1
+    try inner.copyToTop("jz", "_m_z1a"); // X2*Z1
+    try inner.copyToTop("jz", "_m_z1b"); // b3*Z1
 
-    try fieldSqr(&inner, "jz", "_Z1sq");
-    try inner.copyToTop("_Z1sq", "_Z1sq_for_u2");
-    try fieldMul(&inner, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
+    try fieldMul(&inner, "jx", "_m_x2a", "_m_t0"); // t0 = X1*X2
+    try fieldMul(&inner, "jy", "_m_y2a", "_m_t1"); // t1 = Y1*Y2
+    try fieldAdd(&inner, "_m_x2b", "_m_y2b", "_m_s1"); // X2+Y2
+    try fieldAdd(&inner, "_m_x1a", "_m_y1a", "_m_s2"); // X1+Y1
+    try fieldMul(&inner, "_m_s1", "_m_s2", "_m_t3"); // t3 = (X2+Y2)(X1+Y1)
 
-    try inner.copyToTop("ax", "_ax_c");
-    try fieldMul(&inner, "_ax_c", "_Z1sq_for_u2", "_U2");
+    try inner.copyToTop("_m_t0", "_m_t0a");
+    try inner.copyToTop("_m_t1", "_m_t1a");
+    try fieldAdd(&inner, "_m_t0a", "_m_t1a", "_m_s3"); // t4 = t0+t1
+    try fieldSub(&inner, "_m_t3", "_m_s3", "_m_t3b"); // t3 = t3-t4
 
-    try inner.copyToTop("ay", "_ay_c");
-    try fieldMul(&inner, "_ay_c", "_Z1cu", "_S2");
+    try fieldMul(&inner, "_m_y2c", "jz", "_m_t4"); // t4 = Y2*Z1
+    try fieldAdd(&inner, "_m_t4", "_m_y1b", "_m_t4b"); // t4 = t4+Y1
+    try fieldMul(&inner, "_m_x2c", "_m_z1a", "_m_Y3"); // Y3 = X2*Z1
+    try fieldAdd(&inner, "_m_Y3", "_m_x1b", "_m_Y3b"); // Y3 = Y3+X1
 
-    try fieldSub(&inner, "_U2", "jx", "_H");
-    try fieldSub(&inner, "_S2", "jy", "_R");
+    try fieldMulConst(&inner, "_m_t0", 3, "_m_t0b"); // t0 = 3*t0
+    try fieldMulConst(&inner, "_m_z1b", 21, "_m_t2"); // t2 = b3*Z1
 
-    try inner.copyToTop("_H", "_H_for_h3");
-    try inner.copyToTop("_H", "_H_for_z3");
+    try inner.copyToTop("_m_t1", "_m_t1b");
+    try inner.copyToTop("_m_t2", "_m_t2a");
+    try fieldAdd(&inner, "_m_t1b", "_m_t2a", "_m_Z3"); // Z3 = t1+t2
+    try fieldSub(&inner, "_m_t1", "_m_t2", "_m_t1c"); // t1 = t1-t2
+    try fieldMulConst(&inner, "_m_Y3b", 21, "_m_Y3c"); // Y3 = b3*Y3
 
-    try fieldSqr(&inner, "_H", "_H2");
-    try inner.copyToTop("_H2", "_H2_for_u1h2");
+    try inner.copyToTop("_m_Y3c", "_m_Y3ca");
+    try inner.copyToTop("_m_t4b", "_m_t4ba");
+    try fieldMul(&inner, "_m_t4ba", "_m_Y3ca", "_m_X3"); // X3 = t4*Y3
 
-    try fieldMul(&inner, "_H_for_h3", "_H2", "_H3");
-    try fieldMul(&inner, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
+    try inner.copyToTop("_m_t3b", "_m_t3ba");
+    try inner.copyToTop("_m_t1c", "_m_t1ca");
+    try fieldMul(&inner, "_m_t3ba", "_m_t1ca", "_m_t2b"); // t2 = t3*t1
+    try fieldSub(&inner, "_m_t2b", "_m_X3", "_m_X3b"); // X3 = t2-X3
 
-    try inner.copyToTop("_R", "_R_for_y3");
-    try inner.copyToTop("_U1H2", "_U1H2_for_y3");
-    try inner.copyToTop("_H3", "_H3_for_y3");
+    try inner.copyToTop("_m_t0b", "_m_t0ba");
+    try fieldMul(&inner, "_m_Y3c", "_m_t0ba", "_m_Y3d"); // Y3 = Y3*t0
 
-    try fieldSqr(&inner, "_R", "_R2");
-    try fieldSub(&inner, "_R2", "_H3", "_x3_tmp");
-    try fieldMulConst(&inner, "_U1H2", 2, "_2U1H2");
-    try fieldSub(&inner, "_x3_tmp", "_2U1H2", "_X3");
+    try inner.copyToTop("_m_Z3", "_m_Z3a");
+    try fieldMul(&inner, "_m_t1c", "_m_Z3a", "_m_t1d"); // t1 = t1*Z3
+    try fieldAdd(&inner, "_m_t1d", "_m_Y3d", "_m_Y3e"); // Y3 = t1+Y3
 
-    try inner.copyToTop("_X3", "_X3_c");
-    try fieldSub(&inner, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
-    try fieldMul(&inner, "_R_for_y3", "_u_minus_x", "_r_tmp");
-    try fieldMul(&inner, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
-    try fieldSub(&inner, "_r_tmp", "_jy_h3", "_Y3");
+    try fieldMul(&inner, "_m_t0b", "_m_t3b", "_m_t0c"); // t0 = t0*t3
+    try fieldMul(&inner, "_m_Z3", "_m_t4b", "_m_Z3b"); // Z3 = Z3*t4
+    try fieldAdd(&inner, "_m_Z3b", "_m_t0c", "_m_Z3c"); // Z3 = Z3+t0
 
-    try fieldMul(&inner, "_jz_for_z3", "_H_for_z3", "_Z3");
-
-    try inner.toTop("_X3");
+    try inner.toTop("_m_X3b");
     inner.renameTop("jx");
-    try inner.toTop("_Y3");
+    try inner.toTop("_m_Y3e");
     inner.renameTop("jy");
-    try inner.toTop("_Z3");
+    try inner.toTop("_m_Z3c");
     inner.renameTop("jz");
 
     return inner.takeBundle();
@@ -769,21 +822,33 @@ fn emitEcAdd(t: *ECTracker) !void {
     try composePoint(t, "rx", "ry", "_result");
 }
 
+// 256-iteration MSB-first double-and-add over homogeneous projective
+// coordinates, using the RCB COMPLETE formulas. The accumulator starts at the
+// point at infinity, so every one of the 256 bits is handled uniformly.
+//
+// The previous version ran 257 iterations over k+3n with an accumulator seeded
+// at P, to guarantee a set leading bit. That relied on the INCOMPLETE Jacobian
+// mixed-add never being handed two equal points — which it was, for k = 2, on
+// the final iteration, yielding an all-zero point. No choice of offset avoids
+// this: every candidate multiple of n merely relocates the collision onto
+// different small scalars. Completeness is the only fix that holds for an
+// operand the caller chooses.
 fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !void {
     try decomposePoint(t, point_name, "ax", "ay");
 
-    try t.toTop(scalar_name);
-    try t.pushStaticBytes("_3n", curve_3n_script_num_le[0..]);
-    try t.rawBlock(2, "_kn3", emitAddOpcode);
-    t.renameTop("_k");
+    // Reduce the scalar into [0, n-1] so the 256-bit ladder covers the whole
+    // domain: negative k and k >= n are now defined rather than undefined.
+    try scalarModN(t, scalar_name, "_k");
 
-    try t.copyToTop("ax", "jx");
-    try t.copyToTop("ay", "jy");
-    try t.pushInt("jz", 1);
+    // Accumulator := point at infinity (0 : 1 : 0). Legal input to both complete
+    // formulas, which is exactly why no special leading-bit handling is needed.
+    try t.pushInt("jx", 0);
+    try t.pushInt("jy", 1);
+    try t.pushInt("jz", 0);
 
-    var bit: i32 = 256;
+    var bit: i32 = 255;
     while (bit >= 0) : (bit -= 1) {
-        try jacobianDouble(t);
+        try projectiveDouble(t);
 
         try t.copyToTop("_k", "_k_copy");
         if (bit == 1) {
@@ -802,7 +867,7 @@ fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !vo
         try t.toTop("_bit");
         t.popNames(1);
 
-        var add_bundle = try buildJacobianAddAffineInline(t.allocator, t.names.items);
+        var add_bundle = try buildProjectiveAddMixedInline(t.allocator, t.names.items);
         errdefer add_bundle.deinit();
 
         try t.owned_bytes.appendSlice(t.allocator, add_bundle.owned_bytes);
@@ -813,7 +878,7 @@ fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !vo
         add_bundle.ops = &.{};
     }
 
-    try jacobianToAffine(t, "_rx", "_ry");
+    try projectiveToAffine(t, "_rx", "_ry");
 
     try t.toTop("ax");
     try t.drop();
@@ -933,8 +998,8 @@ test "ec add helper emits affine split and compose flow" {
 test "ec helper op-count goldens" {
     const cases = .{
         .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8183) },
-        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 59707) },
-        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 59709) },
+        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 57181) },
+        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 57183) },
         .{ registry.CryptoBuiltin.ec_negate, "ecNegate", @as(usize, 945) },
         .{ registry.CryptoBuiltin.ec_on_curve, "ecOnCurve", @as(usize, 530) },
     };
@@ -951,7 +1016,7 @@ test "ec helper op-count goldens" {
     }
 }
 
-test "ec mul helper emits 257 conditional additions" {
+test "ec mul helper emits 256 conditional additions" {
     var bundle = try buildBuiltinOps(std.testing.allocator, .ec_mul);
     defer bundle.deinit();
 
@@ -961,7 +1026,7 @@ test "ec mul helper emits 257 conditional additions" {
         else => {},
     };
 
-    try std.testing.expectEqual(@as(usize, 257), if_count);
+    try std.testing.expectEqual(@as(usize, 256), if_count);
 }
 
 test "ec mul gen helper seeds the generator point" {
@@ -1008,7 +1073,7 @@ test "ec negate helper uses field-prime script number bytes" {
     try std.testing.expect(found);
 }
 
-test "ec mul helper uses combined 3n scalar offset" {
+test "ec mul helper reduces the scalar mod the curve order" {
     var bundle = try buildBuiltinOps(std.testing.allocator, .ec_mul);
     defer bundle.deinit();
 
@@ -1017,7 +1082,7 @@ test "ec mul helper uses combined 3n scalar offset" {
         switch (op) {
             .push => |value| switch (value) {
                 .bytes => |bytes| {
-                    if (std.mem.eql(u8, bytes, curve_3n_script_num_le[0..])) {
+                    if (std.mem.eql(u8, bytes, curve_n_script_num_le[0..])) {
                         found = true;
                         break;
                     }

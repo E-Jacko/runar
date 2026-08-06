@@ -52,12 +52,14 @@ module RunarCompiler
       # Curve parameter structs
       # =================================================================
 
-      NistCurveParams = Struct.new(:field_p, :field_p_minus2, :coord_bytes, :reverse_bytes_fn, keyword_init: true)
+      # curve_b is needed by the RCB complete formulas (a = -3).
+      NistCurveParams = Struct.new(:field_p, :field_p_minus2, :curve_b, :coord_bytes, :reverse_bytes_fn, keyword_init: true)
       NistGroupParams = Struct.new(:n, :n_minus2, keyword_init: true)
 
       P256_CURVE = NistCurveParams.new(
         field_p:         P256_P,
         field_p_minus2:  P256_P_MINUS2,
+        curve_b:         P256_B,
         coord_bytes:     32,
         reverse_bytes_fn: ->(e) { NISTEC.emit_reverse32(e) }
       )
@@ -65,6 +67,7 @@ module RunarCompiler
       P384_CURVE = NistCurveParams.new(
         field_p:         P384_P,
         field_p_minus2:  P384_P_MINUS2,
+        curve_b:         P384_B,
         coord_bytes:     48,
         reverse_bytes_fn: ->(e) { NISTEC.emit_reverse48(e) }
       )
@@ -347,13 +350,51 @@ module RunarCompiler
       # =================================================================
 
       def self.c_affine_add(t, c)
+        # The chord slope (qy-py)/(qx-px) divides by zero when P == Q, so
+        # doubling needs the tangent (3*px^2 + a)/(2*py) — and a = -3 on both
+        # NIST curves, giving (3*px^2 - 3)/(2*py). Pick numerator and
+        # denominator BEFORE the one c_field_inv, selected as b + cond*(a - b)
+        # with cond = (px == qx): no branch, so the emitted op sequence and the
+        # tracker's static stack model stay identical on both paths. Mirrors
+        # the secp256k1 fix in ec.rb.
+        #
+        # NOT handled: P == -Q, whose true result is the point at infinity,
+        # which affine coordinates cannot represent.
+        t.copy_to_top("px", "_px_eq")
+        t.copy_to_top("qx", "_qx_eq")
+        t.raw_block(["_px_eq", "_qx_eq"], "_cond", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+
+        # chord numerator / denominator
         t.copy_to_top("qy", "_qy1")
         t.copy_to_top("py", "_py1")
-        c_field_sub(t, "_qy1", "_py1", "_s_num", c)
-
+        c_field_sub(t, "_qy1", "_py1", "_num_chord", c)
         t.copy_to_top("qx", "_qx1")
         t.copy_to_top("px", "_px1")
-        c_field_sub(t, "_qx1", "_px1", "_s_den", c)
+        c_field_sub(t, "_qx1", "_px1", "_den_chord", c)
+
+        # tangent numerator / denominator: 3*px^2 - 3 and 2*py
+        t.copy_to_top("px", "_px_t")
+        c_field_sqr(t, "_px_t", "_px_sq", c)
+        c_field_mul_const(t, "_px_sq", 3, "_3x2", c)
+        t.push_int("_three", 3)
+        c_field_sub(t, "_3x2", "_three", "_num_tan", c)
+        t.copy_to_top("py", "_py_t")
+        c_field_mul_const(t, "_py_t", 2, "_den_tan", c)
+
+        # num = num_chord + cond*(num_tan - num_chord)
+        t.copy_to_top("_num_chord", "_num_chord_c")
+        c_field_sub(t, "_num_tan", "_num_chord_c", "_num_diff", c)
+        t.copy_to_top("_cond", "_cond_n")
+        c_field_mul(t, "_num_diff", "_cond_n", "_num_sel", c)
+        c_field_add(t, "_num_chord", "_num_sel", "_s_num", c)
+
+        # den = den_chord + cond*(den_tan - den_chord)
+        t.copy_to_top("_den_chord", "_den_chord_c")
+        c_field_sub(t, "_den_tan", "_den_chord_c", "_den_diff", c)
+        t.to_top("_cond")
+        t.rename("_cond_d")
+        c_field_mul(t, "_den_diff", "_cond_d", "_den_sel", c)
+        c_field_add(t, "_den_chord", "_den_sel", "_s_den", c)
 
         c_field_inv(t, "_s_den", "_s_den_inv", c)
         c_field_mul(t, "_s_num", "_s_den_inv", "_s", c)
@@ -386,179 +427,202 @@ module RunarCompiler
       # Jacobian point doubling with a=-3 optimization
       # =================================================================
 
-      def self.c_jacobian_double(t, c)
-        # Z^2
-        t.copy_to_top("jz", "_jz_sq_tmp")
-        c_field_sqr(t, "_jz_sq_tmp", "_Z2", c)
+      # Projective point doubling — RCB Algorithm 6 (a = -3), 8M + 3S + 2 m_b.
+      # Expects jx, jy, jz on the tracker; replaces them with the doubled point.
+      # Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
+      #
+      # P-256 and P-384 have a = -3, so these are the a = -3 algorithms (5 and
+      # 6), NOT the a = 0 pair used for secp256k1 in ec.rb.
+      def self.c_projective_double(t, c)
+        b = c.curve_b
 
-        # X - Z^2 and X + Z^2
-        t.copy_to_top("jx", "_jx_c1")
-        t.copy_to_top("_Z2", "_Z2_c1")
-        c_field_sub(t, "_jx_c1", "_Z2_c1", "_X_minus_Z2", c)
-        t.copy_to_top("jx", "_jx_c2")
-        c_field_add(t, "_jx_c2", "_Z2", "_X_plus_Z2", c)
+        t.copy_to_top("jx", "_d_x_xy")
+        t.copy_to_top("jx", "_d_x_xz")
+        t.copy_to_top("jy", "_d_y_xy")
+        t.copy_to_top("jy", "_d_y_yz")
+        t.copy_to_top("jz", "_d_z_xz")
+        t.copy_to_top("jz", "_d_z_yz")
 
-        # A = 3*(X-Z^2)*(X+Z^2)
-        c_field_mul(t, "_X_minus_Z2", "_X_plus_Z2", "_prod", c)
-        t.push_int("_three", 3)
-        c_field_mul(t, "_prod", "_three", "_A", c)
+        c_field_sqr(t, "jx", "_d_t0", c)   # t0 = X^2
+        c_field_sqr(t, "jy", "_d_t1", c)   # t1 = Y^2
+        c_field_sqr(t, "jz", "_d_t2", c)   # t2 = Z^2
 
-        # B = 4*X*Y^2
-        t.copy_to_top("jy", "_jy_sq_tmp")
-        c_field_sqr(t, "_jy_sq_tmp", "_Y2", c)
-        t.copy_to_top("_Y2", "_Y2_c1")
-        t.copy_to_top("jx", "_jx_c3")
-        c_field_mul(t, "_jx_c3", "_Y2", "_xY2", c)
-        t.push_int("_four", 4)
-        c_field_mul(t, "_xY2", "_four", "_B", c)
+        c_field_mul(t, "_d_x_xy", "_d_y_xy", "_d_xy", c)
+        c_field_mul_const(t, "_d_xy", 2, "_d_t3", c)   # t3 = 2*X*Y
+        c_field_mul(t, "_d_x_xz", "_d_z_xz", "_d_xz", c)
+        c_field_mul_const(t, "_d_xz", 2, "_d_Z3", c)   # Z3 = 2*X*Z
 
-        # C = 8*Y^4
-        c_field_sqr(t, "_Y2_c1", "_Y4", c)
-        t.push_int("_eight", 8)
-        c_field_mul(t, "_Y4", "_eight", "_C", c)
+        t.copy_to_top("_d_t2", "_d_t2_b")
+        c_field_mul_const(t, "_d_t2_b", b, "_d_bt2", c)
+        t.copy_to_top("_d_Z3", "_d_Z3_a")
+        c_field_sub(t, "_d_bt2", "_d_Z3_a", "_d_Y3", c)
+        c_field_mul_const(t, "_d_Y3", 3, "_d_Y3b", c)
 
-        # X3 = A^2 - 2*B
-        t.copy_to_top("_A", "_A_save")
-        t.copy_to_top("_B", "_B_save")
-        c_field_sqr(t, "_A", "_A2", c)
-        t.copy_to_top("_B", "_B_c1")
-        c_field_mul_const(t, "_B_c1", 2, "_2B", c)
-        c_field_sub(t, "_A2", "_2B", "_X3", c)
+        t.copy_to_top("_d_t1", "_d_t1_a")
+        t.copy_to_top("_d_t1", "_d_t1_b")
+        t.copy_to_top("_d_Y3b", "_d_Y3b_a")
+        c_field_sub(t, "_d_t1_a", "_d_Y3b_a", "_d_X3", c)
+        c_field_add(t, "_d_t1", "_d_Y3b", "_d_Y3c", c)
 
-        # Y3 = A*(B - X3) - C
-        t.copy_to_top("_X3", "_X3_c")
-        c_field_sub(t, "_B_save", "_X3_c", "_B_minus_X3", c)
-        c_field_mul(t, "_A_save", "_B_minus_X3", "_A_tmp", c)
-        c_field_sub(t, "_A_tmp", "_C", "_Y3", c)
+        t.copy_to_top("_d_X3", "_d_X3_a")
+        c_field_mul(t, "_d_X3_a", "_d_Y3c", "_d_Y3d", c)
+        c_field_mul(t, "_d_X3", "_d_t3", "_d_X3b", c)
 
-        # Z3 = 2*Y*Z
-        t.copy_to_top("jy", "_jy_c")
-        t.copy_to_top("jz", "_jz_c")
-        c_field_mul(t, "_jy_c", "_jz_c", "_yz", c)
-        c_field_mul_const(t, "_yz", 2, "_Z3", c)
+        c_field_mul_const(t, "_d_t2", 3, "_d_t2c", c)
 
-        # Clean up and rename
-        t.to_top("_B")
-        t.drop
-        t.to_top("jz")
-        t.drop
-        t.to_top("jx")
-        t.drop
-        t.to_top("jy")
-        t.drop
-        t.to_top("_X3")
+        c_field_mul_const(t, "_d_Z3", b, "_d_Z3b", c)
+        t.copy_to_top("_d_t2c", "_d_t2c_a")
+        c_field_sub(t, "_d_Z3b", "_d_t2c_a", "_d_Z3c", c)
+        t.copy_to_top("_d_t0", "_d_t0_a")
+        c_field_sub(t, "_d_Z3c", "_d_t0_a", "_d_Z3d", c)
+        c_field_mul_const(t, "_d_Z3d", 3, "_d_Z3e", c)
+
+        c_field_mul_const(t, "_d_t0", 3, "_d_t0b", c)
+        c_field_sub(t, "_d_t0b", "_d_t2c", "_d_t0c", c)
+
+        t.copy_to_top("_d_Z3e", "_d_Z3e_a")
+        c_field_mul(t, "_d_t0c", "_d_Z3e_a", "_d_t0d", c)
+        c_field_add(t, "_d_Y3d", "_d_t0d", "_d_Y3e", c)
+
+        c_field_mul(t, "_d_y_yz", "_d_z_yz", "_d_yz", c)
+        c_field_mul_const(t, "_d_yz", 2, "_d_t0e", c)
+
+        t.copy_to_top("_d_t0e", "_d_t0e_a")
+        c_field_mul(t, "_d_t0e_a", "_d_Z3e", "_d_Z3f", c)
+        c_field_sub(t, "_d_X3b", "_d_Z3f", "_d_X3c", c)
+
+        c_field_mul(t, "_d_t0e", "_d_t1_b", "_d_Z3g", c)
+        c_field_mul_const(t, "_d_Z3g", 4, "_d_Z3h", c)
+
+        t.to_top("_d_X3c")
         t.rename("jx")
-        t.to_top("_Y3")
+        t.to_top("_d_Y3e")
         t.rename("jy")
-        t.to_top("_Z3")
+        t.to_top("_d_Z3h")
         t.rename("jz")
       end
 
-      # =================================================================
-      # Jacobian to affine conversion
-      # =================================================================
-
-      def self.c_jacobian_to_affine(t, rx_name, ry_name, c)
+      # Consumes jx, jy, jz; produces rx_name, ry_name.
+      #
+      # c_field_inv is Fermat exponentiation, so inv(0) = 0: the point at
+      # infinity (Z = 0) converts to (0, 0), the all-zero point blob.
+      def self.c_projective_to_affine(t, rx_name, ry_name, c)
         c_field_inv(t, "jz", "_zinv", c)
-        t.copy_to_top("_zinv", "_zinv_keep")
-        c_field_sqr(t, "_zinv", "_zinv2", c)
-        t.copy_to_top("_zinv2", "_zinv2_keep")
-        c_field_mul(t, "_zinv_keep", "_zinv2", "_zinv3", c)
-        c_field_mul(t, "jx", "_zinv2_keep", rx_name, c)
-        c_field_mul(t, "jy", "_zinv3", ry_name, c)
+        t.copy_to_top("_zinv", "_zinv_b")
+        c_field_mul(t, "jx", "_zinv", rx_name, c)
+        c_field_mul(t, "jy", "_zinv_b", ry_name, c)
       end
 
-      # =================================================================
-      # Jacobian mixed addition (P_jacobian + Q_affine)
-      # =================================================================
-
-      def self.c_build_jacobian_add_affine_inline(e, t, c)
+      # Complete mixed-add ops for use inside OP_IF — RCB Algorithm 5 (a = -3),
+      # 11M + 2 m_b.
+      #
+      # Complete: accumulator == Q doubles correctly (the case that returned
+      # the zero point for k = 2), accumulator == -Q yields infinity, and an
+      # infinity accumulator yields Q.
+      def self.c_build_projective_add_mixed_inline(e, t, c)
         it = EC::ECTracker.new(t.nm.dup, e)
+        b = c.curve_b
 
-        it.copy_to_top("jz", "_jz_for_z1cu")
-        it.copy_to_top("jz", "_jz_for_z3")
-        it.copy_to_top("jy", "_jy_for_y3")
-        it.copy_to_top("jx", "_jx_for_u1h2")
+        it.copy_to_top("ax", "_m_x2a")
+        it.copy_to_top("ax", "_m_x2b")
+        it.copy_to_top("ax", "_m_x2c")
+        it.copy_to_top("ay", "_m_y2a")
+        it.copy_to_top("ay", "_m_y2b")
+        it.copy_to_top("ay", "_m_y2c")
+        it.copy_to_top("jx", "_m_x1a")
+        it.copy_to_top("jx", "_m_x1b")
+        it.copy_to_top("jy", "_m_y1a")
+        it.copy_to_top("jy", "_m_y1b")
+        it.copy_to_top("jz", "_m_z1a")
+        it.copy_to_top("jz", "_m_z1b")
+        it.copy_to_top("jz", "_m_z1c")
 
-        c_field_sqr(it, "jz", "_Z1sq", c)
+        c_field_mul(it, "jx", "_m_x2a", "_m_t0", c)
+        c_field_mul(it, "jy", "_m_y2a", "_m_t1", c)
+        c_field_add(it, "_m_x2b", "_m_y2b", "_m_s1", c)
+        c_field_add(it, "_m_x1a", "_m_y1a", "_m_s2", c)
+        c_field_mul(it, "_m_s1", "_m_s2", "_m_t3", c)
 
-        it.copy_to_top("_Z1sq", "_Z1sq_for_u2")
-        c_field_mul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu", c)
+        it.copy_to_top("_m_t0", "_m_t0a")
+        it.copy_to_top("_m_t1", "_m_t1a")
+        c_field_add(it, "_m_t0a", "_m_t1a", "_m_s3", c)
+        c_field_sub(it, "_m_t3", "_m_s3", "_m_t3b", c)
 
-        it.copy_to_top("ax", "_ax_c")
-        c_field_mul(it, "_ax_c", "_Z1sq_for_u2", "_U2", c)
+        c_field_mul(it, "_m_y2c", "jz", "_m_t4", c)
+        c_field_add(it, "_m_t4", "_m_y1b", "_m_t4b", c)
+        c_field_mul(it, "_m_x2c", "_m_z1a", "_m_Y3", c)
+        c_field_add(it, "_m_Y3", "_m_x1b", "_m_Y3b", c)
 
-        it.copy_to_top("ay", "_ay_c")
-        c_field_mul(it, "_ay_c", "_Z1cu", "_S2", c)
+        c_field_mul_const(it, "_m_z1b", b, "_m_Z3", c)
+        it.copy_to_top("_m_Y3b", "_m_Y3b_a")
+        c_field_sub(it, "_m_Y3b_a", "_m_Z3", "_m_X3", c)
+        c_field_mul_const(it, "_m_X3", 3, "_m_X3b", c)
 
-        c_field_sub(it, "_U2", "jx", "_H", c)
-        c_field_sub(it, "_S2", "jy", "_R", c)
+        it.copy_to_top("_m_t1", "_m_t1b")
+        it.copy_to_top("_m_X3b", "_m_X3b_a")
+        c_field_sub(it, "_m_t1b", "_m_X3b_a", "_m_Z3b", c)
+        c_field_add(it, "_m_t1", "_m_X3b", "_m_X3c", c)
 
-        it.copy_to_top("_H", "_H_for_h3")
-        it.copy_to_top("_H", "_H_for_z3")
+        c_field_mul_const(it, "_m_Y3b", b, "_m_Y3c", c)
+        c_field_mul_const(it, "_m_z1c", 3, "_m_t2", c)
 
-        c_field_sqr(it, "_H", "_H2", c)
+        it.copy_to_top("_m_t2", "_m_t2a")
+        c_field_sub(it, "_m_Y3c", "_m_t2a", "_m_Y3d", c)
+        it.copy_to_top("_m_t0", "_m_t0b")
+        c_field_sub(it, "_m_Y3d", "_m_t0b", "_m_Y3e", c)
+        c_field_mul_const(it, "_m_Y3e", 3, "_m_Y3f", c)
 
-        it.copy_to_top("_H2", "_H2_for_u1h2")
+        c_field_mul_const(it, "_m_t0", 3, "_m_t0c", c)
+        c_field_sub(it, "_m_t0c", "_m_t2", "_m_t0d", c)
 
-        c_field_mul(it, "_H_for_h3", "_H2", "_H3", c)
-        c_field_mul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2", c)
+        it.copy_to_top("_m_t4b", "_m_t4b_a")
+        it.copy_to_top("_m_Y3f", "_m_Y3f_a")
+        c_field_mul(it, "_m_t4b_a", "_m_Y3f_a", "_m_t1c", c)
+        it.copy_to_top("_m_t0d", "_m_t0d_a")
+        c_field_mul(it, "_m_t0d_a", "_m_Y3f", "_m_t2b", c)
 
-        it.copy_to_top("_R", "_R_for_y3")
-        it.copy_to_top("_U1H2", "_U1H2_for_y3")
-        it.copy_to_top("_H3", "_H3_for_y3")
+        it.copy_to_top("_m_X3c", "_m_X3c_a")
+        it.copy_to_top("_m_Z3b", "_m_Z3b_a")
+        c_field_mul(it, "_m_X3c_a", "_m_Z3b_a", "_m_Y3g", c)
+        c_field_add(it, "_m_Y3g", "_m_t2b", "_m_Y3h", c)
 
-        c_field_sqr(it, "_R", "_R2", c)
-        c_field_sub(it, "_R2", "_H3", "_x3_tmp", c)
-        c_field_mul_const(it, "_U1H2", 2, "_2U1H2", c)
-        c_field_sub(it, "_x3_tmp", "_2U1H2", "_X3", c)
+        it.copy_to_top("_m_t3b", "_m_t3b_a")
+        c_field_mul(it, "_m_t3b_a", "_m_X3c", "_m_X3d", c)
+        c_field_sub(it, "_m_X3d", "_m_t1c", "_m_X3e", c)
 
-        it.copy_to_top("_X3", "_X3_c")
-        c_field_sub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x", c)
-        c_field_mul(it, "_R_for_y3", "_u_minus_x", "_r_tmp", c)
-        c_field_mul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3", c)
-        c_field_sub(it, "_r_tmp", "_jy_h3", "_Y3", c)
+        c_field_mul(it, "_m_t4b", "_m_Z3b", "_m_Z3c", c)
+        c_field_mul(it, "_m_t3b", "_m_t0d", "_m_t1d", c)
+        c_field_add(it, "_m_Z3c", "_m_t1d", "_m_Z3d", c)
 
-        c_field_mul(it, "_jz_for_z3", "_H_for_z3", "_Z3", c)
-
-        it.to_top("_X3")
+        it.to_top("_m_X3e")
         it.rename("jx")
-        it.to_top("_Y3")
+        it.to_top("_m_Y3h")
         it.rename("jy")
-        it.to_top("_Z3")
+        it.to_top("_m_Z3d")
         it.rename("jz")
       end
-
-      # =================================================================
-      # Scalar multiplication (generic for both P-256 and P-384)
-      # =================================================================
 
       def self.c_emit_mul(emit, c, g)
         t = EC::ECTracker.new(["_pt", "_k"], emit)
         c_decompose_point(t, "_pt", "ax", "ay", c)
 
-        # k' = k + 3n
-        t.to_top("_k")
-        t.push_big_int("_n", g.n)
-        t.raw_block(["_k", "_n"], "_kn", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
-        t.push_big_int("_n2", g.n)
-        t.raw_block(["_kn", "_n2"], "_kn2", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
-        t.push_big_int("_n3", g.n)
-        t.raw_block(["_kn2", "_n3"], "_kn3", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
-        t.rename("_k")
+        # Reduce the scalar into [0, n-1] so the ladder covers the whole
+        # domain: negative k and k >= n are now defined rather than undefined
+        # behaviour.
+        c_group_mod(t, "_k", "_k", g)
 
-        # Determine iteration count: highest bit of 4n-1
-        four_n_minus1 = 4 * g.n - 1
-        top_bit = bit_len(four_n_minus1)
-        start_bit = top_bit - 2 # highest bit is always 1 (init), start from next
+        # Accumulator := point at infinity (0 : 1 : 0), a legal input to both
+        # complete formulas — which is why no leading-bit special case is
+        # needed.
+        t.push_int("jx", 0)
+        t.push_int("jy", 1)
+        t.push_int("jz", 0)
 
-        # Init accumulator = P
-        t.copy_to_top("ax", "jx")
-        t.copy_to_top("ay", "jy")
-        t.push_int("jz", 1)
+        # One iteration per bit of n: 256 for P-256, 384 for P-384.
+        start_bit = bit_len(g.n) - 1
 
         start_bit.downto(0) do |bit|
-          c_jacobian_double(t, c)
+          c_projective_double(t, c)
 
           t.copy_to_top("_k", "_k_copy")
           if bit == 1
@@ -577,11 +641,11 @@ module RunarCompiler
 
           add_ops = []
           add_emit = ->(op) { add_ops.push(op) }
-          c_build_jacobian_add_affine_inline(add_emit, t, c)
+          c_build_projective_add_mixed_inline(add_emit, t, c)
           emit.call(make_stack_op(op: "if", then: add_ops, else_ops: []))
         end
 
-        c_jacobian_to_affine(t, "_rx", "_ry", c)
+        c_projective_to_affine(t, "_rx", "_ry", c)
 
         t.to_top("ax")
         t.drop

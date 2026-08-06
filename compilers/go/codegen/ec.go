@@ -243,14 +243,14 @@ func ecFieldMod(t *ECTracker, aName, resultName string) {
 	ecPushFieldP(t, "_fmod_p")
 	// (a % p + p) % p
 	t.rawBlock([]string{aName, "_fmod_p"}, resultName, func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_2DUP"})  // a p a p
-		e(StackOp{Op: "opcode", Code: "OP_MOD"})    // a p (a%p)
-		e(StackOp{Op: "rot"})                        // p (a%p) a
-		e(StackOp{Op: "drop"})                       // p (a%p)
-		e(StackOp{Op: "over"})                       // p (a%p) p
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})     // p (a%p+p)
-		e(StackOp{Op: "swap"})                       // (a%p+p) p
-		e(StackOp{Op: "opcode", Code: "OP_MOD"})     // ((a%p+p)%p)
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"}) // a p a p
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})  // a p (a%p)
+		e(StackOp{Op: "rot"})                     // p (a%p) a
+		e(StackOp{Op: "drop"})                    // p (a%p)
+		e(StackOp{Op: "over"})                    // p (a%p) p
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})  // p (a%p+p)
+		e(StackOp{Op: "swap"})                    // (a%p+p) p
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})  // ((a%p+p)%p)
 	})
 }
 
@@ -536,164 +536,186 @@ func ecAffineAdd(t *ECTracker) {
 }
 
 // ===========================================================================
-// Jacobian point operations (for ecMul)
+// Projective point operations (for ecMul) — RCB complete formulas, a = 0
 // ===========================================================================
 
-// ecJacobianDouble performs Jacobian point doubling (a=0 for secp256k1).
-// Expects jx, jy, jz on tracker. Replaces with updated values.
-func ecJacobianDouble(t *ECTracker) {
-	// Save copies of jx, jy, jz for later use
-	t.copyToTop("jy", "_jy_save")
-	t.copyToTop("jx", "_jx_save")
-	t.copyToTop("jz", "_jz_save")
+// ecScalarModN reduces TOS mod n (the curve ORDER, not the field prime),
+// result non-negative. Same shape as ecFieldMod but with a different modulus.
+//
+// This defines the scalar domain of ecMul over the whole of script-number
+// space: negative scalars and scalars >= n both reduce into [0, n-1], and
+// k = 0 / k = n give the point at infinity. Under the old ladder anything
+// outside [1, n-1] was undefined behaviour.
+func ecScalarModN(t *ECTracker, aName, resultName string) {
+	curveN, _ := new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
+	t.toTop(aName)
+	t.pushBigInt("_smod_n", curveN)
+	t.rawBlock([]string{aName, "_smod_n"}, resultName, func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+		e(StackOp{Op: "rot"})
+		e(StackOp{Op: "drop"})
+		e(StackOp{Op: "over"})
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+		e(StackOp{Op: "swap"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+	})
+}
 
-	// A = jy^2
-	ecFieldSqr(t, "jy", "_A")
+// ecProjectiveDouble performs projective point doubling — RCB Algorithm 9
+// (a = 0), 6M + 2S + 1 m_3b. Expects jx, jy, jz on the tracker; replaces them
+// with the doubled point.
+//
+// Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
+//
+// Deviations from the paper, both exact mod p and strictly cheaper here
+// (a multiply by a small constant costs one push + OP_MUL, an addition costs
+// a full reduce): line 2-4's Z3 = 8*t0 is one mulConst rather than three
+// doublings, and line 11-12's t2 = 3*t2 is one mulConst rather than two adds.
+func ecProjectiveDouble(t *ECTracker) {
+	// Copies of the inputs that outlive their first consumer.
+	t.copyToTop("jy", "_d_yz")     // t1 = Y*Z
+	t.copyToTop("jy", "_d_xy")     // t1 = X*Y  (line 16)
+	t.copyToTop("jz", "_d_zz_src") // t2 = Z*Z
 
-	// B = 4 * jx * A
-	t.copyToTop("_A", "_A_save")
-	ecFieldMul(t, "jx", "_A", "_xA")
-	t.pushInt("_four", 4)
-	ecFieldMul(t, "_xA", "_four", "_B")
+	ecFieldSqr(t, "jy", "_d_t0") // t0 = Y^2
+	t.copyToTop("_d_t0", "_d_t0a")
+	ecFieldMulConst(t, "_d_t0a", 8, "_d_Z3") // Z3 = 8*t0
+	ecFieldMul(t, "_d_yz", "jz", "_d_t1")    // t1 = Y*Z
+	ecFieldSqr(t, "_d_zz_src", "_d_zz")      // Z^2
+	ecFieldMulConst(t, "_d_zz", 21, "_d_t2") // t2 = b3*Z^2  (b3 = 3*7)
 
-	// C = 8 * A^2
-	ecFieldSqr(t, "_A_save", "_A2")
-	t.pushInt("_eight", 8)
-	ecFieldMul(t, "_A2", "_eight", "_C")
+	t.copyToTop("_d_t2", "_d_t2a")
+	t.copyToTop("_d_Z3", "_d_Z3a")
+	ecFieldMul(t, "_d_t2a", "_d_Z3a", "_d_X3") // X3 = t2*Z3
 
-	// D = 3 * X^2
-	ecFieldSqr(t, "_jx_save", "_x2")
-	t.pushInt("_three", 3)
-	ecFieldMul(t, "_x2", "_three", "_D")
+	t.copyToTop("_d_t0", "_d_t0b")
+	t.copyToTop("_d_t2", "_d_t2b")
+	ecFieldAdd(t, "_d_t0b", "_d_t2b", "_d_Y3") // Y3 = t0+t2
 
-	// nx = D^2 - 2*B
-	t.copyToTop("_D", "_D_save")
-	t.copyToTop("_B", "_B_save")
-	ecFieldSqr(t, "_D", "_D2")
-	t.copyToTop("_B", "_B1")
-	ecFieldMulConst(t, "_B1", 2, "_2B")
-	ecFieldSub(t, "_D2", "_2B", "_nx")
+	ecFieldMul(t, "_d_t1", "_d_Z3", "_d_Z3n")  // Z3 = t1*Z3
+	ecFieldMulConst(t, "_d_t2", 3, "_d_t2c")   // t2 = 3*t2
+	ecFieldSub(t, "_d_t0", "_d_t2c", "_d_t0n") // t0 = t0-t2
 
-	// ny = D*(B - nx) - C
-	t.copyToTop("_nx", "_nx_copy")
-	ecFieldSub(t, "_B_save", "_nx_copy", "_B_nx")
-	ecFieldMul(t, "_D_save", "_B_nx", "_D_B_nx")
-	ecFieldSub(t, "_D_B_nx", "_C", "_ny")
+	t.copyToTop("_d_t0n", "_d_t0na")
+	ecFieldMul(t, "_d_t0na", "_d_Y3", "_d_Y3b") // Y3 = t0*Y3
+	ecFieldAdd(t, "_d_X3", "_d_Y3b", "_d_Y3c")  // Y3 = X3+Y3
 
-	// nz = 2 * Y * Z
-	ecFieldMul(t, "_jy_save", "_jz_save", "_yz")
-	ecFieldMulConst(t, "_yz", 2, "_nz")
+	ecFieldMul(t, "jx", "_d_xy", "_d_xyv")      // t1 = X*Y
+	ecFieldMul(t, "_d_t0n", "_d_xyv", "_d_X3b") // X3 = t0*t1
+	ecFieldMulConst(t, "_d_X3b", 2, "_d_X3c")   // X3 = X3+X3
 
-	// Clean up leftovers: _B and old jz (only copied, never consumed)
-	t.toTop("_B")
-	t.drop()
-	t.toTop("jz")
-	t.drop()
-	t.toTop("_nx")
+	t.toTop("_d_X3c")
 	t.rename("jx")
-	t.toTop("_ny")
+	t.toTop("_d_Y3c")
 	t.rename("jy")
-	t.toTop("_nz")
+	t.toTop("_d_Z3n")
 	t.rename("jz")
 }
 
-// ecJacobianToAffine converts Jacobian to affine coordinates.
-// Consumes jx, jy, jz; produces rxName, ryName.
-func ecJacobianToAffine(t *ECTracker, rxName, ryName string) {
+// ecProjectiveToAffine converts projective to affine. Consumes jx, jy, jz;
+// produces rxName, ryName.
+//
+// ecFieldInv is Fermat exponentiation, so inv(0) = 0: the point at infinity
+// (Z = 0) converts to (0, 0), which is the all-zero Point blob. That is the
+// agreed encoding for infinity — it is not a curve point, so it cannot be
+// confused with a real result.
+func ecProjectiveToAffine(t *ECTracker, rxName, ryName string) {
 	ecFieldInv(t, "jz", "_zinv")
-	t.copyToTop("_zinv", "_zinv_keep")
-	ecFieldSqr(t, "_zinv", "_zinv2")
-	t.copyToTop("_zinv2", "_zinv2_keep")
-	ecFieldMul(t, "_zinv_keep", "_zinv2", "_zinv3")
-	ecFieldMul(t, "jx", "_zinv2_keep", rxName)
-	ecFieldMul(t, "jy", "_zinv3", ryName)
+	t.copyToTop("_zinv", "_zinv_b")
+	ecFieldMul(t, "jx", "_zinv", rxName)
+	ecFieldMul(t, "jy", "_zinv_b", ryName)
 }
 
 // ===========================================================================
-// Jacobian mixed addition (P_jacobian + Q_affine)
+// Projective mixed addition (P_projective + Q_affine)
 // ===========================================================================
 
-// ecBuildJacobianAddAffineInline builds Jacobian mixed-add ops for use inside OP_IF.
-// Uses an inner ECTracker to leverage field arithmetic helpers.
+// ecBuildProjectiveAddMixedInline builds complete mixed-add ops for use inside
+// OP_IF — RCB Algorithm 8 (a = 0), 11M + 2 m_3b. Adds the affine base point
+// (ax, ay) into the accumulator.
+//
+// Complete: no exceptional cases. In particular
+//   - accumulator == Q        -> correctly doubles (this is the case that broke
+//     ecMul(P, 2n): the old Jacobian mixed-add computed H = R = 0 and returned
+//     the zero point, which then absorbed every remaining iteration)
+//   - accumulator == -Q       -> correctly yields the point at infinity
+//   - accumulator == infinity -> correctly yields Q
+//
+// Uses an inner ECTracker cloned from the outer one, because the ops run under
+// OP_IF: the outer tracker's model must describe the stack for BOTH branches,
+// so this block has to be stack-shape neutral — same names, same depths, with
+// jx/jy/jz replaced in place.
 //
 // Stack layout: [..., ax, ay, _k, jx, jy, jz]
 // After:        [..., ax, ay, _k, jx', jy', jz']
-func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
-	// Create inner tracker with cloned stack state
-	initNm := make([]string, len(t.nm))
-	copy(initNm, t.nm)
-	it := NewECTracker(initNm, e)
+func ecBuildProjectiveAddMixedInline(e func(StackOp), t *ECTracker) {
+	it := NewECTracker(append([]string{}, t.nm...), e)
 
-	// Save copies of values that get consumed but are needed later
-	it.copyToTop("jz", "_jz_for_z1cu")  // consumed by Z1sq, needed for Z1cu
-	it.copyToTop("jz", "_jz_for_z3")    // needed for Z3
-	it.copyToTop("jy", "_jy_for_y3")    // consumed by R, needed for Y3
-	it.copyToTop("jx", "_jx_for_u1h2")  // consumed by H, needed for U1H2
+	// The affine base survives every iteration, so only ever consume copies.
+	it.copyToTop("ax", "_m_x2a") // t0 = X1*X2
+	it.copyToTop("ax", "_m_x2b") // X2+Y2
+	it.copyToTop("ax", "_m_x2c") // X2*Z1
+	it.copyToTop("ay", "_m_y2a") // t1 = Y1*Y2
+	it.copyToTop("ay", "_m_y2b") // X2+Y2
+	it.copyToTop("ay", "_m_y2c") // Y2*Z1
+	it.copyToTop("jx", "_m_x1a") // X1+Y1
+	it.copyToTop("jx", "_m_x1b") // Y3+X1
+	it.copyToTop("jy", "_m_y1a") // X1+Y1
+	it.copyToTop("jy", "_m_y1b") // t4+Y1
+	it.copyToTop("jz", "_m_z1a") // X2*Z1
+	it.copyToTop("jz", "_m_z1b") // b3*Z1
 
-	// Z1sq = jz^2
-	ecFieldSqr(it, "jz", "_Z1sq")
+	ecFieldMul(it, "jx", "_m_x2a", "_m_t0")     // t0 = X1*X2
+	ecFieldMul(it, "jy", "_m_y2a", "_m_t1")     // t1 = Y1*Y2
+	ecFieldAdd(it, "_m_x2b", "_m_y2b", "_m_s1") // X2+Y2
+	ecFieldAdd(it, "_m_x1a", "_m_y1a", "_m_s2") // X1+Y1
+	ecFieldMul(it, "_m_s1", "_m_s2", "_m_t3")   // t3 = (X2+Y2)(X1+Y1)
 
-	// Z1cu = _jz_for_z1cu * Z1sq (copy Z1sq for U2)
-	it.copyToTop("_Z1sq", "_Z1sq_for_u2")
-	ecFieldMul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu")
+	it.copyToTop("_m_t0", "_m_t0a")
+	it.copyToTop("_m_t1", "_m_t1a")
+	ecFieldAdd(it, "_m_t0a", "_m_t1a", "_m_s3") // t4 = t0+t1
+	ecFieldSub(it, "_m_t3", "_m_s3", "_m_t3b")  // t3 = t3-t4
 
-	// U2 = ax * Z1sq_for_u2
-	it.copyToTop("ax", "_ax_c")
-	ecFieldMul(it, "_ax_c", "_Z1sq_for_u2", "_U2")
+	ecFieldMul(it, "_m_y2c", "jz", "_m_t4")     // t4 = Y2*Z1
+	ecFieldAdd(it, "_m_t4", "_m_y1b", "_m_t4b") // t4 = t4+Y1
+	ecFieldMul(it, "_m_x2c", "_m_z1a", "_m_Y3") // Y3 = X2*Z1
+	ecFieldAdd(it, "_m_Y3", "_m_x1b", "_m_Y3b") // Y3 = Y3+X1
 
-	// S2 = ay * Z1cu
-	it.copyToTop("ay", "_ay_c")
-	ecFieldMul(it, "_ay_c", "_Z1cu", "_S2")
+	ecFieldMulConst(it, "_m_t0", 3, "_m_t0b")  // t0 = 3*t0
+	ecFieldMulConst(it, "_m_z1b", 21, "_m_t2") // t2 = b3*Z1
 
-	// H = U2 - jx
-	ecFieldSub(it, "_U2", "jx", "_H")
+	it.copyToTop("_m_t1", "_m_t1b")
+	it.copyToTop("_m_t2", "_m_t2a")
+	ecFieldAdd(it, "_m_t1b", "_m_t2a", "_m_Z3") // Z3 = t1+t2
+	ecFieldSub(it, "_m_t1", "_m_t2", "_m_t1c")  // t1 = t1-t2
+	ecFieldMulConst(it, "_m_Y3b", 21, "_m_Y3c") // Y3 = b3*Y3
 
-	// R = S2 - jy
-	ecFieldSub(it, "_S2", "jy", "_R")
+	it.copyToTop("_m_Y3c", "_m_Y3ca")
+	it.copyToTop("_m_t4b", "_m_t4ba")
+	ecFieldMul(it, "_m_t4ba", "_m_Y3ca", "_m_X3") // X3 = t4*Y3
 
-	// Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
-	it.copyToTop("_H", "_H_for_h3")
-	it.copyToTop("_H", "_H_for_z3")
+	it.copyToTop("_m_t3b", "_m_t3ba")
+	it.copyToTop("_m_t1c", "_m_t1ca")
+	ecFieldMul(it, "_m_t3ba", "_m_t1ca", "_m_t2b") // t2 = t3*t1
+	ecFieldSub(it, "_m_t2b", "_m_X3", "_m_X3b")    // X3 = t2-X3
 
-	// H2 = H^2
-	ecFieldSqr(it, "_H", "_H2")
+	it.copyToTop("_m_t0b", "_m_t0ba")
+	ecFieldMul(it, "_m_Y3c", "_m_t0ba", "_m_Y3d") // Y3 = Y3*t0
 
-	// Save H2 for U1H2
-	it.copyToTop("_H2", "_H2_for_u1h2")
+	it.copyToTop("_m_Z3", "_m_Z3a")
+	ecFieldMul(it, "_m_t1c", "_m_Z3a", "_m_t1d") // t1 = t1*Z3
+	ecFieldAdd(it, "_m_t1d", "_m_Y3d", "_m_Y3e") // Y3 = t1+Y3
 
-	// H3 = H_for_h3 * H2
-	ecFieldMul(it, "_H_for_h3", "_H2", "_H3")
+	ecFieldMul(it, "_m_t0b", "_m_t3b", "_m_t0c") // t0 = t0*t3
+	ecFieldMul(it, "_m_Z3", "_m_t4b", "_m_Z3b")  // Z3 = Z3*t4
+	ecFieldAdd(it, "_m_Z3b", "_m_t0c", "_m_Z3c") // Z3 = Z3+t0
 
-	// U1H2 = _jx_for_u1h2 * H2_for_u1h2
-	ecFieldMul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2")
-
-	// Save R, U1H2, H3 for Y3 computation
-	it.copyToTop("_R", "_R_for_y3")
-	it.copyToTop("_U1H2", "_U1H2_for_y3")
-	it.copyToTop("_H3", "_H3_for_y3")
-
-	// X3 = R^2 - H3 - 2*U1H2
-	ecFieldSqr(it, "_R", "_R2")
-	ecFieldSub(it, "_R2", "_H3", "_x3_tmp")
-	ecFieldMulConst(it, "_U1H2", 2, "_2U1H2")
-	ecFieldSub(it, "_x3_tmp", "_2U1H2", "_X3")
-
-	// Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
-	it.copyToTop("_X3", "_X3_c")
-	ecFieldSub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x")
-	ecFieldMul(it, "_R_for_y3", "_u_minus_x", "_r_tmp")
-	ecFieldMul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3")
-	ecFieldSub(it, "_r_tmp", "_jy_h3", "_Y3")
-
-	// Z3 = _jz_for_z3 * _H_for_z3
-	ecFieldMul(it, "_jz_for_z3", "_H_for_z3", "_Z3")
-
-	// Rename results to jx/jy/jz
-	it.toTop("_X3")
+	it.toTop("_m_X3b")
 	it.rename("jx")
-	it.toTop("_Y3")
+	it.toTop("_m_Y3e")
 	it.rename("jy")
-	it.toTop("_Z3")
+	it.toTop("_m_Z3c")
 	it.rename("jz")
 }
 
@@ -716,40 +738,36 @@ func EmitEcAdd(emit func(StackOp)) {
 // Stack in: [point, scalar] (scalar on top)
 // Stack out: [result_point]
 //
-// Uses 256-iteration double-and-add with Jacobian coordinates.
+// 256-iteration MSB-first double-and-add over homogeneous projective
+// coordinates, using the RCB COMPLETE formulas. The accumulator starts at the
+// point at infinity, so every one of the 256 bits is handled uniformly.
+//
+// The previous version ran 257 iterations over k+3n with an accumulator seeded
+// at P, to guarantee a set leading bit. That relied on the INCOMPLETE Jacobian
+// mixed-add never being handed two equal points — which it was, for k = 2, on
+// the final iteration, yielding an all-zero point. No choice of offset avoids
+// this: every candidate multiple of n merely relocates the collision onto
+// different small scalars. Completeness is the only fix that holds for an
+// operand the caller chooses.
 func EmitEcMul(emit func(StackOp)) {
 	t := NewECTracker([]string{"_pt", "_k"}, emit)
 	// Decompose to affine base point
 	ecDecomposePoint(t, "_pt", "ax", "ay")
 
-	// k' = k + 3n: guarantees bit 257 is set.
-	// k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
-	// is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
-	curveN, _ := new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
-	t.toTop("_k")
-	t.pushBigInt("_n", curveN)
-	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})
-	})
-	t.pushBigInt("_n2", curveN)
-	t.rawBlock([]string{"_kn", "_n2"}, "_kn2", func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})
-	})
-	t.pushBigInt("_n3", curveN)
-	t.rawBlock([]string{"_kn2", "_n3"}, "_kn3", func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})
-	})
-	t.rename("_k")
+	// Reduce the scalar into [0, n-1] so the 256-bit ladder covers the whole
+	// domain: negative k and k >= n are now defined rather than undefined.
+	ecScalarModN(t, "_k", "_k")
 
-	// Init accumulator = P (bit 257 of k+3n is always 1)
-	t.copyToTop("ax", "jx")
-	t.copyToTop("ay", "jy")
-	t.pushInt("jz", 1)
+	// Accumulator := point at infinity (0 : 1 : 0). Legal input to both complete
+	// formulas, which is exactly why no special leading-bit handling is needed.
+	t.pushInt("jx", 0)
+	t.pushInt("jy", 1)
+	t.pushInt("jz", 0)
 
-	// 257 iterations: bits 256 down to 0
-	for bit := 256; bit >= 0; bit-- {
+	// 256 iterations: bits 255 down to 0
+	for bit := 255; bit >= 0; bit-- {
 		// Double accumulator
-		ecJacobianDouble(t)
+		ecProjectiveDouble(t)
 
 		// Extract bit: (k >> bit) & 1, using OP_RSHIFTNUM / OP_2DIV
 		t.copyToTop("_k", "_k_copy")
@@ -778,12 +796,12 @@ func EmitEcMul(emit func(StackOp)) {
 		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
-		ecBuildJacobianAddAffineInline(addEmit, t)
+		ecBuildProjectiveAddMixedInline(addEmit, t)
 		emit(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 
-	// Convert Jacobian to affine
-	ecJacobianToAffine(t, "_rx", "_ry")
+	// Convert projective to affine
+	ecProjectiveToAffine(t, "_rx", "_ry")
 
 	// Clean up base point and scalar
 	t.toTop("ax")

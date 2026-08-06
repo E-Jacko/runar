@@ -503,151 +503,191 @@ public final class Ec {
     }
 
     // ==================================================================
-    // Jacobian point operations (for ecMul)
-    // ==================================================================
-
-    private static void jacobianDouble(ECTracker t) {
-        // Save copies for later use
-        t.copyToTop("jy", "_jy_save");
-        t.copyToTop("jx", "_jx_save");
-        t.copyToTop("jz", "_jz_save");
-
-        // A = jy^2
-        fieldSqr(t, "jy", "_A");
-
-        // B = 4 * jx * A
-        t.copyToTop("_A", "_A_save");
-        fieldMul(t, "jx", "_A", "_xA");
-        t.pushInt("_four", 4);
-        fieldMul(t, "_xA", "_four", "_B");
-
-        // C = 8 * A^2
-        fieldSqr(t, "_A_save", "_A2");
-        t.pushInt("_eight", 8);
-        fieldMul(t, "_A2", "_eight", "_C");
-
-        // D = 3 * X^2
-        fieldSqr(t, "_jx_save", "_x2");
-        t.pushInt("_three", 3);
-        fieldMul(t, "_x2", "_three", "_D");
-
-        // nx = D^2 - 2*B
-        t.copyToTop("_D", "_D_save");
-        t.copyToTop("_B", "_B_save");
-        fieldSqr(t, "_D", "_D2");
-        t.copyToTop("_B", "_B1");
-        fieldMulConst(t, "_B1", 2, "_2B");
-        fieldSub(t, "_D2", "_2B", "_nx");
-
-        // ny = D*(B - nx) - C
-        t.copyToTop("_nx", "_nx_copy");
-        fieldSub(t, "_B_save", "_nx_copy", "_B_nx");
-        fieldMul(t, "_D_save", "_B_nx", "_D_B_nx");
-        fieldSub(t, "_D_B_nx", "_C", "_ny");
-
-        // nz = 2 * Y * Z
-        fieldMul(t, "_jy_save", "_jz_save", "_yz");
-        fieldMulConst(t, "_yz", 2, "_nz");
-
-        // Clean up leftovers: _B and old jz (only copied, never consumed)
-        t.toTop("_B"); t.drop();
-        t.toTop("jz"); t.drop();
-        t.toTop("_nx"); t.rename("jx");
-        t.toTop("_ny"); t.rename("jy");
-        t.toTop("_nz"); t.rename("jz");
-    }
-
-    private static void jacobianToAffine(ECTracker t, String rxName, String ryName) {
-        fieldInv(t, "jz", "_zinv");
-        t.copyToTop("_zinv", "_zinv_keep");
-        fieldSqr(t, "_zinv", "_zinv2");
-        t.copyToTop("_zinv2", "_zinv2_keep");
-        fieldMul(t, "_zinv_keep", "_zinv2", "_zinv3");
-        fieldMul(t, "jx", "_zinv2_keep", rxName);
-        fieldMul(t, "jy", "_zinv3", ryName);
-    }
-
-    // ==================================================================
-    // Jacobian mixed addition (P_jacobian + Q_affine)
+    // Projective point operations (for ecMul) — RCB complete formulas, a = 0
     // ==================================================================
 
     /**
-     * Build Jacobian mixed-add ops for use inside OP_IF. Uses an inner
-     * ECTracker to leverage field arithmetic helpers.
+     * Reduce TOS mod n (the curve ORDER, not the field prime), non-negative.
      *
-     * Stack: [..., ax, ay, _k, jx, jy, jz]
+     * <p>Same shape as fieldMod but with a different modulus. This defines the
+     * scalar domain of ecMul over the whole of script-number space: negative
+     * scalars and scalars >= n both reduce into [0, n-1], and k = 0 / k = n
+     * give the point at infinity. Under the old ladder anything outside
+     * [1, n-1] was undefined behaviour.
      */
-    private static void buildJacobianAddAffineInline(Consumer<StackOp> e, ECTracker t) {
+    private static void scalarModN(ECTracker t, String aName, String resultName) {
+        t.toTop(aName);
+        t.pushBigInt("_smod_n", EC_CURVE_N);
+        t.rawBlock(List.of(aName, "_smod_n"), resultName, e -> {
+            e.accept(new OpcodeOp("OP_2DUP"));
+            e.accept(new OpcodeOp("OP_MOD"));
+            e.accept(new RotOp());
+            e.accept(new DropOp());
+            e.accept(new OverOp());
+            e.accept(new OpcodeOp("OP_ADD"));
+            e.accept(new SwapOp());
+            e.accept(new OpcodeOp("OP_MOD"));
+        });
+    }
+
+    /**
+     * Projective point doubling — RCB Algorithm 9 (a = 0), 6M + 2S + 1 m_3b.
+     * Expects jx, jy, jz on the tracker; replaces them with the doubled point.
+     *
+     * <p>Complete: doubling the point at infinity (0 : 1 : 0) yields
+     * (0 : 1 : 0).
+     *
+     * <p>Deviations from the paper, both exact mod p and strictly cheaper here
+     * (a multiply by a small constant costs one push + OP_MUL, an addition
+     * costs a full reduce): line 2-4's Z3 = 8*t0 is one mulConst rather than
+     * three doublings, and line 11-12's t2 = 3*t2 is one mulConst rather than
+     * two adds.
+     */
+    private static void projectiveDouble(ECTracker t) {
+        // Copies of the inputs that outlive their first consumer.
+        t.copyToTop("jy", "_d_yz");       // t1 = Y*Z
+        t.copyToTop("jy", "_d_xy");       // t1 = X*Y  (line 16)
+        t.copyToTop("jz", "_d_zz_src");   // t2 = Z*Z
+
+        fieldSqr(t, "jy", "_d_t0");                       // t0 = Y^2
+        t.copyToTop("_d_t0", "_d_t0a");
+        fieldMulConst(t, "_d_t0a", 8, "_d_Z3");           // Z3 = 8*t0
+        fieldMul(t, "_d_yz", "jz", "_d_t1");              // t1 = Y*Z
+        fieldSqr(t, "_d_zz_src", "_d_zz");                // Z^2
+        fieldMulConst(t, "_d_zz", 21, "_d_t2");           // t2 = b3*Z^2 (b3 = 3*7)
+
+        t.copyToTop("_d_t2", "_d_t2a");
+        t.copyToTop("_d_Z3", "_d_Z3a");
+        fieldMul(t, "_d_t2a", "_d_Z3a", "_d_X3");         // X3 = t2*Z3
+
+        t.copyToTop("_d_t0", "_d_t0b");
+        t.copyToTop("_d_t2", "_d_t2b");
+        fieldAdd(t, "_d_t0b", "_d_t2b", "_d_Y3");         // Y3 = t0+t2
+
+        fieldMul(t, "_d_t1", "_d_Z3", "_d_Z3n");          // Z3 = t1*Z3
+        fieldMulConst(t, "_d_t2", 3, "_d_t2c");           // t2 = 3*t2
+        fieldSub(t, "_d_t0", "_d_t2c", "_d_t0n");         // t0 = t0-t2
+
+        t.copyToTop("_d_t0n", "_d_t0na");
+        fieldMul(t, "_d_t0na", "_d_Y3", "_d_Y3b");        // Y3 = t0*Y3
+        fieldAdd(t, "_d_X3", "_d_Y3b", "_d_Y3c");         // Y3 = X3+Y3
+
+        fieldMul(t, "jx", "_d_xy", "_d_xyv");             // t1 = X*Y
+        fieldMul(t, "_d_t0n", "_d_xyv", "_d_X3b");        // X3 = t0*t1
+        fieldMulConst(t, "_d_X3b", 2, "_d_X3c");          // X3 = X3+X3
+
+        t.toTop("_d_X3c"); t.rename("jx");
+        t.toTop("_d_Y3c"); t.rename("jy");
+        t.toTop("_d_Z3n"); t.rename("jz");
+    }
+
+    /**
+     * Projective to affine. Consumes jx, jy, jz; produces rxName, ryName.
+     *
+     * <p>fieldInv is Fermat exponentiation, so inv(0) = 0: the point at
+     * infinity (Z = 0) converts to (0, 0), which is the all-zero Point blob.
+     * That is the agreed encoding for infinity — it is not a curve point, so
+     * it cannot be confused with a real result.
+     */
+    private static void projectiveToAffine(ECTracker t, String rxName, String ryName) {
+        fieldInv(t, "jz", "_zinv");
+        t.copyToTop("_zinv", "_zinv_b");
+        fieldMul(t, "jx", "_zinv", rxName);
+        fieldMul(t, "jy", "_zinv_b", ryName);
+    }
+
+    // ==================================================================
+    // Projective mixed addition (P_projective + Q_affine)
+    // ==================================================================
+
+    /**
+     * Build complete mixed-add ops for use inside OP_IF — RCB Algorithm 8
+     * (a = 0), 11M + 2 m_3b. Adds the affine base point (ax, ay) into the
+     * accumulator.
+     *
+     * <p>Complete: no exceptional cases. In particular
+     * <ul>
+     *   <li>accumulator == Q -> correctly doubles (this is the case that broke
+     *       ecMul(P, 2n): the old Jacobian mixed-add computed H = R = 0 and
+     *       returned the zero point, which then absorbed every remaining
+     *       iteration)</li>
+     *   <li>accumulator == -Q -> correctly yields the point at infinity</li>
+     *   <li>accumulator == infinity -> correctly yields Q</li>
+     * </ul>
+     *
+     * <p>Uses an inner ECTracker cloned from the outer one, because the ops run
+     * under OP_IF: the outer tracker's model must describe the stack for BOTH
+     * branches, so this block has to be stack-shape neutral — same names, same
+     * depths, with jx/jy/jz replaced in place.
+     *
+     * <p>Stack layout: [..., ax, ay, _k, jx, jy, jz]
+     * <br>After:       [..., ax, ay, _k, jx', jy', jz']
+     */
+    private static void buildProjectiveAddMixedInline(Consumer<StackOp> e, ECTracker t) {
         ECTracker it = new ECTracker(t.nm, e);
 
-        // Save copies of values consumed but needed later
-        it.copyToTop("jz", "_jz_for_z1cu");
-        it.copyToTop("jz", "_jz_for_z3");
-        it.copyToTop("jy", "_jy_for_y3");
-        it.copyToTop("jx", "_jx_for_u1h2");
+        // The affine base survives every iteration, so only ever consume copies.
+        it.copyToTop("ax", "_m_x2a");   // t0 = X1*X2
+        it.copyToTop("ax", "_m_x2b");   // X2+Y2
+        it.copyToTop("ax", "_m_x2c");   // X2*Z1
+        it.copyToTop("ay", "_m_y2a");   // t1 = Y1*Y2
+        it.copyToTop("ay", "_m_y2b");   // X2+Y2
+        it.copyToTop("ay", "_m_y2c");   // Y2*Z1
+        it.copyToTop("jx", "_m_x1a");   // X1+Y1
+        it.copyToTop("jx", "_m_x1b");   // Y3+X1
+        it.copyToTop("jy", "_m_y1a");   // X1+Y1
+        it.copyToTop("jy", "_m_y1b");   // t4+Y1
+        it.copyToTop("jz", "_m_z1a");   // X2*Z1
+        it.copyToTop("jz", "_m_z1b");   // b3*Z1
 
-        // Z1sq = jz^2
-        fieldSqr(it, "jz", "_Z1sq");
+        fieldMul(it, "jx", "_m_x2a", "_m_t0");            // t0 = X1*X2
+        fieldMul(it, "jy", "_m_y2a", "_m_t1");            // t1 = Y1*Y2
+        fieldAdd(it, "_m_x2b", "_m_y2b", "_m_s1");        // X2+Y2
+        fieldAdd(it, "_m_x1a", "_m_y1a", "_m_s2");        // X1+Y1
+        fieldMul(it, "_m_s1", "_m_s2", "_m_t3");          // t3 = (X2+Y2)(X1+Y1)
 
-        // Z1cu = _jz_for_z1cu * Z1sq
-        it.copyToTop("_Z1sq", "_Z1sq_for_u2");
-        fieldMul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
+        it.copyToTop("_m_t0", "_m_t0a");
+        it.copyToTop("_m_t1", "_m_t1a");
+        fieldAdd(it, "_m_t0a", "_m_t1a", "_m_s3");        // t4 = t0+t1
+        fieldSub(it, "_m_t3", "_m_s3", "_m_t3b");         // t3 = t3-t4
 
-        // U2 = ax * Z1sq_for_u2
-        it.copyToTop("ax", "_ax_c");
-        fieldMul(it, "_ax_c", "_Z1sq_for_u2", "_U2");
+        fieldMul(it, "_m_y2c", "jz", "_m_t4");            // t4 = Y2*Z1
+        fieldAdd(it, "_m_t4", "_m_y1b", "_m_t4b");        // t4 = t4+Y1
+        fieldMul(it, "_m_x2c", "_m_z1a", "_m_Y3");        // Y3 = X2*Z1
+        fieldAdd(it, "_m_Y3", "_m_x1b", "_m_Y3b");        // Y3 = Y3+X1
 
-        // S2 = ay * Z1cu
-        it.copyToTop("ay", "_ay_c");
-        fieldMul(it, "_ay_c", "_Z1cu", "_S2");
+        fieldMulConst(it, "_m_t0", 3, "_m_t0b");          // t0 = 3*t0
+        fieldMulConst(it, "_m_z1b", 21, "_m_t2");         // t2 = b3*Z1
 
-        // H = U2 - jx
-        fieldSub(it, "_U2", "jx", "_H");
+        it.copyToTop("_m_t1", "_m_t1b");
+        it.copyToTop("_m_t2", "_m_t2a");
+        fieldAdd(it, "_m_t1b", "_m_t2a", "_m_Z3");        // Z3 = t1+t2
+        fieldSub(it, "_m_t1", "_m_t2", "_m_t1c");         // t1 = t1-t2
+        fieldMulConst(it, "_m_Y3b", 21, "_m_Y3c");        // Y3 = b3*Y3
 
-        // R = S2 - jy
-        fieldSub(it, "_S2", "jy", "_R");
+        it.copyToTop("_m_Y3c", "_m_Y3ca");
+        it.copyToTop("_m_t4b", "_m_t4ba");
+        fieldMul(it, "_m_t4ba", "_m_Y3ca", "_m_X3");      // X3 = t4*Y3
 
-        // Save copies of H
-        it.copyToTop("_H", "_H_for_h3");
-        it.copyToTop("_H", "_H_for_z3");
+        it.copyToTop("_m_t3b", "_m_t3ba");
+        it.copyToTop("_m_t1c", "_m_t1ca");
+        fieldMul(it, "_m_t3ba", "_m_t1ca", "_m_t2b");     // t2 = t3*t1
+        fieldSub(it, "_m_t2b", "_m_X3", "_m_X3b");        // X3 = t2-X3
 
-        // H2 = H^2
-        fieldSqr(it, "_H", "_H2");
+        it.copyToTop("_m_t0b", "_m_t0ba");
+        fieldMul(it, "_m_Y3c", "_m_t0ba", "_m_Y3d");      // Y3 = Y3*t0
 
-        // Save H2 for U1H2
-        it.copyToTop("_H2", "_H2_for_u1h2");
+        it.copyToTop("_m_Z3", "_m_Z3a");
+        fieldMul(it, "_m_t1c", "_m_Z3a", "_m_t1d");       // t1 = t1*Z3
+        fieldAdd(it, "_m_t1d", "_m_Y3d", "_m_Y3e");       // Y3 = t1+Y3
 
-        // H3 = H_for_h3 * H2
-        fieldMul(it, "_H_for_h3", "_H2", "_H3");
+        fieldMul(it, "_m_t0b", "_m_t3b", "_m_t0c");       // t0 = t0*t3
+        fieldMul(it, "_m_Z3", "_m_t4b", "_m_Z3b");        // Z3 = Z3*t4
+        fieldAdd(it, "_m_Z3b", "_m_t0c", "_m_Z3c");       // Z3 = Z3+t0
 
-        // U1H2 = _jx_for_u1h2 * H2_for_u1h2
-        fieldMul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
-
-        // Save R, U1H2, H3 for Y3
-        it.copyToTop("_R", "_R_for_y3");
-        it.copyToTop("_U1H2", "_U1H2_for_y3");
-        it.copyToTop("_H3", "_H3_for_y3");
-
-        // X3 = R^2 - H3 - 2*U1H2
-        fieldSqr(it, "_R", "_R2");
-        fieldSub(it, "_R2", "_H3", "_x3_tmp");
-        fieldMulConst(it, "_U1H2", 2, "_2U1H2");
-        fieldSub(it, "_x3_tmp", "_2U1H2", "_X3");
-
-        // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
-        it.copyToTop("_X3", "_X3_c");
-        fieldSub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
-        fieldMul(it, "_R_for_y3", "_u_minus_x", "_r_tmp");
-        fieldMul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
-        fieldSub(it, "_r_tmp", "_jy_h3", "_Y3");
-
-        // Z3 = _jz_for_z3 * _H_for_z3
-        fieldMul(it, "_jz_for_z3", "_H_for_z3", "_Z3");
-
-        // Rename results to jx/jy/jz
-        it.toTop("_X3"); it.rename("jx");
-        it.toTop("_Y3"); it.rename("jy");
-        it.toTop("_Z3"); it.rename("jz");
+        it.toTop("_m_X3b"); it.rename("jx");
+        it.toTop("_m_Y3e"); it.rename("jy");
+        it.toTop("_m_Z3c"); it.rename("jz");
     }
 
     // ==================================================================
@@ -662,29 +702,42 @@ public final class Ec {
         composePoint(t, "rx", "ry", "_result");
     }
 
+    /**
+     * ecMul: scalar multiplication P * k.
+     *
+     * <p>256-iteration MSB-first double-and-add over homogeneous projective
+     * coordinates, using the RCB COMPLETE formulas. The accumulator starts at
+     * the point at infinity, so every one of the 256 bits is handled uniformly.
+     *
+     * <p>The previous version ran 257 iterations over k+3n with an accumulator
+     * seeded at P, to guarantee a set leading bit. That relied on the
+     * INCOMPLETE Jacobian mixed-add never being handed two equal points —
+     * which it was, for k = 2, on the final iteration, yielding an all-zero
+     * point. No choice of offset avoids this: every candidate multiple of n
+     * merely relocates the collision onto different small scalars.
+     * Completeness is the only fix that holds for an operand the caller
+     * chooses.
+     */
     public static void emitEcMul(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt", "_k"), emit);
         decomposePoint(t, "_pt", "ax", "ay");
 
-        // k' = k + 3n
-        t.toTop("_k");
-        t.pushBigInt("_n", EC_CURVE_N);
-        t.rawBlock(List.of("_k", "_n"), "_kn", e -> e.accept(new OpcodeOp("OP_ADD")));
-        t.pushBigInt("_n2", EC_CURVE_N);
-        t.rawBlock(List.of("_kn", "_n2"), "_kn2", e -> e.accept(new OpcodeOp("OP_ADD")));
-        t.pushBigInt("_n3", EC_CURVE_N);
-        t.rawBlock(List.of("_kn2", "_n3"), "_kn3", e -> e.accept(new OpcodeOp("OP_ADD")));
-        t.rename("_k");
+        // Reduce the scalar into [0, n-1] so the 256-bit ladder covers the
+        // whole domain: negative k and k >= n are now defined rather than
+        // undefined.
+        scalarModN(t, "_k", "_k");
 
-        // Init accumulator = P
-        t.copyToTop("ax", "jx");
-        t.copyToTop("ay", "jy");
-        t.pushInt("jz", 1);
+        // Accumulator := point at infinity (0 : 1 : 0). Legal input to both
+        // complete formulas, which is exactly why no special leading-bit
+        // handling is needed.
+        t.pushInt("jx", 0);
+        t.pushInt("jy", 1);
+        t.pushInt("jz", 0);
 
-        // 257 iterations: bits 256 down to 0
-        for (int bit = 256; bit >= 0; bit--) {
+        // 256 iterations: bits 255 down to 0
+        for (int bit = 255; bit >= 0; bit--) {
             // Double accumulator
-            jacobianDouble(t);
+            projectiveDouble(t);
 
             // Extract bit
             t.copyToTop("_k", "_k_copy");
@@ -706,12 +759,12 @@ public final class Ec {
             t.toTop("_bit");
             t.nm.remove(t.nm.size() - 1); // _bit consumed by IF
             List<StackOp> addOps = new ArrayList<>();
-            buildJacobianAddAffineInline(addOps::add, t);
+            buildProjectiveAddMixedInline(addOps::add, t);
             emit.accept(new IfOp(addOps, List.of()));
         }
 
-        // Convert Jacobian to affine
-        jacobianToAffine(t, "_rx", "_ry");
+        // Convert projective to affine
+        projectiveToAffine(t, "_rx", "_ry");
 
         // Clean up base point and scalar
         t.toTop("ax"); t.drop();
