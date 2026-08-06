@@ -49,6 +49,10 @@ class RunarContractSdkFixesTest {
         }
         RunarContract contract = new RunarContract(artifact, List.of(BigInteger.ZERO));
         contract.setCurrentUtxo(new UTXO("cc".repeat(32), 0, 5_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("cc".repeat(32), 0, 5_000L, contract.lockingScript()));
         return contract;
     }
 
@@ -157,6 +161,10 @@ class RunarContractSdkFixesTest {
         String pkhHex = java.util.HexFormat.of().formatHex(Hash160.hash160(signer.pubKey()));
         RunarContract contract = new RunarContract(artifact, List.of(pkhHex));
         contract.setCurrentUtxo(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
 
         // Terminal output pays out the full contract balance → fee must come
         // from the feeUtxo (issue #118), owned/signed by the funding key (#134).

@@ -43,6 +43,7 @@ import {
 } from './canonical-json-differential.js';
 import { runExecuteDifferential } from './execute-differential.js';
 import { runTriModalDifferential } from './tri-modal-differential.js';
+import { runSpendOracle } from './spend-oracle.js';
 import { runReplayAndReport } from '../fuzz-regressions/replay.js';
 import { shouldFailRun } from './run-policy.js';
 
@@ -101,6 +102,26 @@ interface FuzzerCLIOptions {
    */
   triModal: boolean;
   /**
+   * Phase E3 (testing-gap remediation) — the SPEND-ORACLE fuzzer. Every other
+   * mode in this file is either HORIZONTAL (tier vs tier: `--anf`, `--ir`,
+   * `--canonical`) or scoped to stateless fragments against a synthetic tx
+   * context (`--execute`, `--tri-modal`). This one generates construct-biased
+   * STATEFUL contracts (multi-local branch merges, 1-byte OP_N-range /
+   * negative state values, multi-slot constructor args), compiles them fold-ON,
+   * drives a real deploy + call through the SDK, replays both broadcasts
+   * through the real `@bsv/sdk` Spend engine, and compares the post-state
+   * decoded from the BROADCAST TRANSACTION'S BYTES against the generator's own
+   * independent model. See `spend-oracle.ts`.
+   */
+  spendOracle: boolean;
+  /**
+   * Spend-oracle mode only (Phase E4). Also run each generated case's
+   * SEMANTICS-PRESERVING metamorphic variants (renamed locals; swapped pure
+   * `if/else` arms) and require an identical engine verdict AND an identical
+   * `expectedState` outcome.
+   */
+  metamorphic: boolean;
+  /**
    * Regression-replay mode. Instead of generating anything, replay every
    * checked-in reproducer under `conformance/fuzz-regressions/entries/` through
    * the same differential oracle `--execute` uses. Deterministic and fast, so
@@ -146,6 +167,8 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
     canonical: false,
     execute: false,
     triModal: false,
+    spendOracle: false,
+    metamorphic: false,
     replay: false,
     foldOn: false,
   };
@@ -205,6 +228,12 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
         break;
       case '--tri-modal':
         opts.triModal = true;
+        break;
+      case '--spend-oracle':
+        opts.spendOracle = true;
+        break;
+      case '--metamorphic':
+        opts.metamorphic = true;
         break;
       case '--replay':
         opts.replay = true;
@@ -296,6 +325,28 @@ Options:
                          (bi-modal, fc.sample, no shrinking), a divergence is
                          SHRUNK to a minimal (contract, inputs) repro. --num =
                          property runs (~200 for the PR gate); --seed reproduces.
+  --spend-oracle         Phase E3 — SPEND-ORACLE fuzz. The only mode whose
+                         oracle is both ABSOLUTE and covers a full transaction
+                         context AND the state VALUE. Generates construct-biased
+                         STATEFUL contracts (multi-local branch merges incl. the
+                         asymmetric PALMER-1 shape; 1-byte OP_N-range / 0x00 /
+                         empty / negative state values; multi-slot constructor
+                         args with shifting offsets), compiles fold-ON, drives a
+                         real deploy + call through the SDK, replays both
+                         broadcasts through the real @bsv/sdk Spend engine, and
+                         compares the post-state decoded from the BROADCAST
+                         TRANSACTION'S BYTES against the generator's OWN model
+                         (never against the SDK's next-state computation, which
+                         runs through the same ANF the covenant does and is
+                         therefore poisoned by the very bug class this hunts).
+                         Fails on: reject-when-accept-intended,
+                         accept-when-reject-intended, interpreter-vs-Spend
+                         disagreement, and expectedState mismatch.
+                         --num = generated contracts; --seed reproduces exactly.
+  --metamorphic          Spend-oracle mode only (Phase E4). Also run each case's
+                         semantics-preserving rewrites (renamed locals; swapped
+                         pure if/else arms) and require an identical verdict AND
+                         an identical expectedState outcome. ~3x runtime.
   --replay               Regression replay. Generates NOTHING — replays every
                          checked-in minimised reproducer under
                          conformance/fuzz-regressions/entries/ through the same
@@ -398,8 +449,71 @@ async function main(): Promise<void> {
     console.log('  Generator: tri-modal (issue #124 — interpreter / ScriptVM / @bsv/sdk Spend, property mode)');
     console.log(`  Property runs: ${opts.num}`);
   }
+  if (opts.spendOracle) {
+    console.log('  Generator: spend-oracle (Phase E3 — construct-biased stateful deploy→call→Spend, fold-ON)');
+    console.log(`  Metamorphic: ${opts.metamorphic ? 'ON (Phase E4 variants)' : 'off'}`);
+    if (opts.timeBudgetMs !== undefined) {
+      console.log(`  Budget: ${opts.timeBudgetMs}ms`);
+    }
+  }
   console.log(`  Mode: ${opts.property ? 'property-based (with shrinking)' : 'sample-based'}`);
   console.log('');
+
+  if (opts.spendOracle) {
+    const report = await runSpendOracle({
+      numCases: opts.num,
+      seed: opts.seed,
+      timeBudgetMs: opts.timeBudgetMs,
+      findingsDir: opts.findingsDir,
+      metamorphic: opts.metamorphic,
+      verbose: opts.verbose,
+    });
+    console.log('');
+    console.log('Spend-oracle fuzzing complete:');
+    console.log(`  Cases run:     ${report.casesRun}/${report.totalCases}`);
+    console.log(`  Verdicts:      accept=${report.acceptCount} reject=${report.rejectCount}`);
+    console.log(`  Failures:      ${report.failureCount}`);
+    if (report.failureCount > 0) {
+      console.log(`  By kind:       ${Object.entries(report.byKind)
+        .map(([k, n]) => `${k}=${n}`)
+        .join(' ')}`);
+    }
+    console.log(`  Spend inputs:  ${report.validatedInputs} replayed through Spend.validate()`);
+    console.log(`  Constructs:    ${report.tagsCovered.length} tags (${report.tagsCovered.join(', ')})`);
+    console.log(`  Duration:      ${report.durationMs}ms`);
+    console.log(`  Seed:          ${report.effectiveSeed} (replay with --spend-oracle --seed ${report.effectiveSeed} --num ${opts.num})`);
+    if (report.earlyStop) console.log('  Early-stopped: time budget reached');
+    if (report.findings.length > 0) console.log(`  Findings dir:  ${report.findings[0]}`);
+    if (opts.output) {
+      writeOutput(opts.output, {
+        timestamp: new Date().toISOString(),
+        generator: 'spend-oracle',
+        ...report,
+      });
+      console.log(`\nResults written to: ${opts.output}`);
+    }
+    // Same C5 rule as the other budgeted modes: an early-stopped run that did
+    // not finish the generated corpus must never report an unqualified PASS.
+    const incompleteSpendRun = shouldFailRun({
+      earlyStop: report.earlyStop,
+      completed: report.casesRun,
+      total: report.totalCases,
+    });
+    if (incompleteSpendRun) {
+      console.error(
+        `INCOMPLETE RUN: time budget reached after ${report.casesRun}/${report.totalCases} cases — treating as a failure.`,
+      );
+    }
+    // A run in which NOTHING reached the real engine is a vacuous pass.
+    const vacuousRun = report.casesRun > 0 && report.validatedInputs === 0;
+    if (vacuousRun) {
+      console.error(
+        'VACUOUS RUN: no input was replayed through Spend.validate() — the oracle never ran.',
+      );
+    }
+    if (report.failureCount > 0 || incompleteSpendRun || vacuousRun) process.exit(1);
+    return;
+  }
 
   if (opts.triModal) {
     const report = await runTriModalDifferential({

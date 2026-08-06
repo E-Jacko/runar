@@ -1,0 +1,619 @@
+{
+  "_doc": [
+    "CONSTRUCT ledger — coverage counted in fund-critical LANGUAGE SHAPES and",
+    "WIRE VALUE CLASSES, not in fixtures. Reviewer point #2 / TG-003 / TG-015 /",
+    "plan Phase D0 (docs/audit/2026-08-testing-gap-remediation-plan.md).",
+    "",
+    "WHY THIS FILE EXISTS. The conformance suite counts fixtures. A fixture",
+    "count cannot answer 'is a 3-local branch merge ever executed?' or 'has any",
+    "test ever pinned an empty ByteString state value?'. Both 2026-08 fund-safety",
+    "bugs were construct holes hiding inside a green fixture suite:",
+    "  - branch-merged locals with >=2 merged locals: an `if` carries ONE value,",
+    "    so every post-branch reference kept naming the dead pre-branch binding",
+    "    and stack lowering registered one stackMap slot for N physical results.",
+    "    All seven compilers agreed, byte for byte, on a permanently unspendable",
+    "    locking script generated from idiomatic source.",
+    "  - a 1-byte ByteString state value in the OP_N range: #110 taught the seven",
+    "    SDKs MINIMALDATA and none of the seven compilers, so the state section",
+    "    was written OP_5 and read <len><data>.",
+    "Neither was an absent fixture. Both were EMPTY CELLS in this matrix, and",
+    "this file is the artefact that makes an empty cell visible.",
+    "",
+    "SCHEMA — one object per construct under `constructs`:",
+    "  id          — stable slug. Unique. The hard-coded REQUIRED_CONSTRUCTS set",
+    "                in construct-ledger.test.ts names the ids that MUST have a",
+    "                row; a new fund-critical construct cannot be introduced",
+    "                without one.",
+    "  category    — language | control-flow | wire | artifact (closed enum).",
+    "  description — free text, FOR HUMANS. Never machine-checked, never evidence.",
+    "  severity    — fund-critical | correctness (closed enum). fund-critical =",
+    "                getting this wrong loses or locks coins.",
+    "  coveredBy   — the MACHINE-CHECKED evidence. A non-empty array of",
+    "                {kind, path, note?}. Every `path` is repo-relative and must",
+    "                exist on disk AND be non-empty; construct-ledger.test.ts",
+    "                fails otherwise, so a deleted or renamed witness turns its",
+    "                construct RED rather than silently decaying into a false",
+    "                claim. `kind` is additionally checked against the SHAPE of",
+    "                `path` — enum membership alone once let a",
+    "                {kind:\"real-crypto-witness\", path:\"conformance/README.md\"}",
+    "                pass every gate while this file calls that kind the",
+    "                strongest one available.",
+    "  status      — the string \"UNCOVERED\", and ONLY when `coveredBy` is absent.",
+    "  issue       — mandatory on an UNCOVERED row: a tracking ref or a dated",
+    "                close plan. Required so an empty cell stays loud.",
+    "",
+    "A row carries `coveredBy` XOR (`status` + `issue`). Never both, never",
+    "neither — enforced in code, not documented here.",
+    "",
+    "`coveredBy.kind` vocabulary (closed; enforced in construct-ledger.test.ts):",
+    "  conformance-fixture — a conformance/tests/<fixture> directory (cross-tier",
+    "      Stack-IR + hex goldens) or its conformance/witnesses/<fixture>.json",
+    "      differential-oracle spend spec. Proves the shape compiles identically",
+    "      in all seven tiers and, for a witness, that the ANF interpreter and",
+    "      the @bsv/sdk ScriptVM agree on accept/reject.",
+    "  real-crypto-witness — conformance/witnesses/real-crypto/<fixture>.json,",
+    "      EXECUTED by real-crypto-execution.test.ts on @bsv/sdk's production",
+    "      Spend with real secp256k1 and a real BIP-143 preimage. The strongest",
+    "      kind in this file when it also pins `expectedState` (a value pin, not",
+    "      just an accept verdict).",
+    "  sdk-output — conformance/sdk-output/tests/<name>/, whose",
+    "      expected-locking.hex is an ABSOLUTE byte golden all seven SDK tools",
+    "      must reproduce. Cross-implementation, not a self-inverse.",
+    "  vertical-pin — a compiler<->SDK pin: it compiles real source with the real",
+    "      compiler and drives the real SDK against the result. Reviewer point #5",
+    "      — seven-way compiler agreement and seven-way SDK agreement do not",
+    "      substitute for one pin that crosses the boundary between them. Two",
+    "      legal path shapes: a test FILE, or a",
+    "      conformance/sdk-vertical/cases/<name>/ directory containing",
+    "      expected-locking.hex. The case directory IS the pin — that hex is what",
+    "      all seven SDK tools must reproduce and what vertical-pins.test.ts",
+    "      re-derives from the artifact with an implementation importing nothing",
+    "      from packages/** — and citing the case rather than only the test file",
+    "      is what makes a renamed or deleted case turn the row RED instead of",
+    "      silently vacuous.",
+    "  negative-compile — a source that MUST be rejected, with the diagnostic",
+    "      asserted. Reverting the guard to a silent emit turns it red.",
+    "  vm-unit — a unit test that pins absolute bytes and/or executes the shape on",
+    "      the real Script VM (MockProvider with broadcast validation enabled).",
+    "",
+    "WHAT IS NOT EVIDENCE. A pure round-trip — deserialize(serialize(x)) === x —",
+    "proves only that an implementation is its own inverse. It cannot detect a",
+    "change that moves encode and decode together, which is precisely how the",
+    "OP_N state-framing bug survived seven SDKs. construct-ledger.test.ts carries",
+    "a ROUND_TRIP_ONLY_PATHS denylist and hard-fails any row that cites one.",
+    "Reviewer point #4. The denylist is itself gated for LIVENESS — every entry",
+    "must still name a real file, because a renamed target turns a denylist entry",
+    "into a silent no-op and the renamed file becomes citable with nothing firing.",
+    "",
+    "THE REQUIRED SET CANNOT BE EDITED RED-TO-GREEN. There is no CODEOWNERS on",
+    "these files, so a PR that trips the 'every required construct has a row'",
+    "gate could otherwise delete the id it trips on in the same diff.",
+    "construct-ledger.test.ts holds a committed floor (MIN_REQUIRED_CONSTRUCTS)",
+    "that may only be raised, and requires REQUIRED_CONSTRUCTS and the ledger's",
+    "row ids to be the SAME set — the reverse direction matters because a",
+    "construct is otherwise demoted by deleting one line while its row stays put.",
+    "",
+    "RELATIONSHIP TO conformance/witnesses/coverage-ledger.json. That ledger",
+    "answers a per-FIXTURE question: 'the plain differential oracle does not",
+    "execute this fixture — what covers it instead?'. This file answers a",
+    "per-CONSTRUCT question: 'which fund-critical shape is exercised, by what?'.",
+    "One fixture supplies evidence to several constructs, and several constructs",
+    "have no fixture at all. Same machine-checked style, different axis; see",
+    "conformance/witnesses/README.md \"Why the other ledgers stay separate\"."
+  ],
+  "constructs": [
+    {
+      "id": "merge-locals-k1",
+      "category": "control-flow",
+      "description": "Exactly ONE local declared before an `if`, reassigned in both arms, read after the merge. The degenerate case an `if` node can carry natively (it holds one value), and the only merge arity that worked before the 2026-08 fix.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/if-else",
+          "note": "IfElse.check() declares `let result` before the if, both arms reassign it, `assert(result > 0n)` reads the merge. Cross-tier Stack-IR + hex goldens for all 7 compilers."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/witnesses/if-else.json",
+          "note": "2 accepts (then-arm and else-arm both taken) + 1 near-miss reject, run through the ANF interpreter AND the @bsv/sdk ScriptVM with agreement required — so both arms are actually executed, not just compiled."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts",
+          "note": "S1 (one merged local, both arms) and S2 (one merged local, no else) deployed and called on the real Script VM with broadcast validation, asserting the resulting state VALUE, not merely acceptance."
+        }
+      ]
+    },
+    {
+      "id": "merge-locals-k2-asymmetric",
+      "category": "control-flow",
+      "description": "TWO locals merged across an `if` whose arms reassign DIFFERENT ones (then-arm rebinds `na`, else-arm rebinds `nb`). The reported 2026-08 miscompilation: whichever local the taken arm did not rebind still had to survive into the continuation. Pre-fix, one arm was rejected outright by the real interpreter and the other committed stale state.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/branch-merged-locals.json",
+          "note": "The primary pin. Two accepts (toFirst>0 and toFirst==0, i.e. each arm) each pinning expectedState {a,b} — a VALUE pin, so a stale-state regression fails even though the spend would still be accepted — plus a tamperOutput reject proving the merged result block is committed to by hashOutputs. Executed on @bsv/sdk Spend with a real BIP-143 preimage."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/branch-merged-locals",
+          "note": "Cross-tier Stack-IR + hex goldens: all 7 compilers must emit byte-identical code for the fixed lowering."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/branch-merged-locals",
+          "note": "Absolute expected-locking.hex golden reproduced by all 7 SDK tools (two bigint state fields)."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts",
+          "note": "S4 (k=2 asymmetric) and S8 (the filed reproducer: k=4, asymmetric, mixed PubKey/bigint types, merged locals also feeding the output AMOUNT expression) on the real Script VM with state-value assertions."
+        }
+      ]
+    },
+    {
+      "id": "merge-locals-k2-both-arms",
+      "category": "control-flow",
+      "description": "TWO locals merged where BOTH arms reassign BOTH of them (the symmetric k=2 case), plus the no-else variant where the implicit fallthrough arm rebinds neither.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/merge-locals-shapes.json",
+          "note": "`bothArms` — both arms reassign BOTH locals — run on @bsv/sdk Spend with a real BIP-143 continuation preimage. Both arms accept with expectedState pinned ({a:11,b:12} and {a:13,b:14}), plus the untouched third property `c` pinned at 9 so a merge that shifts a stack slot corrupts a field the method never wrote. Value pins, not accept verdicts."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/merge-locals-shapes",
+          "note": "Cross-tier Stack-IR + hex goldens: all 7 compilers emit byte-identical code from all 9 source formats."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/merge-locals-shapes",
+          "note": "Absolute expected-locking.hex golden reproduced by all 7 SDK tools (three bigint state fields)."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts",
+          "note": "S3 (both arms set both `na` and `nb`) and S5 (k=2, `if` without `else`), each deployed and called on the real Script VM with broadcast validation and post-call state-value assertions."
+        }
+      ]
+    },
+    {
+      "id": "merge-locals-k3",
+      "category": "control-flow",
+      "description": "THREE OR MORE locals merged across a branch. The arity that proves the fix generalises rather than special-casing k=2.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/merge-locals-shapes.json",
+          "note": "`three` — k=3, both arms reassign all three locals — on @bsv/sdk Spend with a real BIP-143 continuation preimage. Both arms accept with all THREE merged values pinned ({21,22,23} and {24,25,26}), so an off-by-one slot resolution shows up as a wrong committed value; plus a tamperOutput reject proving the k=3 result block is committed to by hashOutputs."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/merge-locals-shapes",
+          "note": "Cross-tier Stack-IR + hex goldens for the k=3 method in all 7 compilers, from all 9 source formats."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts",
+          "note": "S6 (k=3, both arms reassign the same three) and S8 (k=4, asymmetric, mixed types) on the real Script VM with state-value assertions."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/if-without-else-multi-temp",
+          "note": "k=3 in the if-without-else form: `p`, `foundMnee` and `foundExtra` are declared before the ifs, reassigned inside, and all three read afterwards. Cross-tier Stack-IR + hex goldens for all 7 compilers."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/witnesses/if-without-else-multi-temp.json",
+          "note": "Differential-oracle spend spec (ANF interpreter vs @bsv/sdk ScriptVM must agree on accept/reject). CORRECTED 2026-08-06: until then this spec never entered the k=3 branch at all — its only spends were `other()` (a tautology on a different method) and a 47-byte all-zero rawTx whose byte[46] made outCount 0, so BOTH `if (0n < outCount)` and `if (1n < outCount)` were skipped and p/foundMnee/foundExtra were never reassigned. It executed only the path where the dead pre-branch binding happens to hold the right value, which is the one path the merge bug cannot show up on. It now carries a 67-byte rawTx with outCount 2 that enters BOTH ifs: `foundMnee` is assigned inside the first if and read after the second, and `p` must carry 57 into the second if for its substr to address the second output — so an accept verdict here requires all three merged locals to survive the branch boundary. A matching near-miss (same rawTx, non-matching expectedExtra) exercises the same both-taken path in the reject direction."
+        }
+      ]
+    },
+    {
+      "id": "merge-locals-nested-if",
+      "category": "control-flow",
+      "description": "Locals reassigned inside a NESTED conditional, merged at the OUTER level. Nesting is where a per-branch rewiring scheme is most likely to lose track of which binding is live.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/merge-locals-shapes.json",
+          "note": "`nested` — an OUTER `if` WITHOUT an else whose then-arm is an inner `if`/`else` rebinding a DIFFERENT local per arm — on @bsv/sdk Spend with a real BIP-143 continuation preimage. All THREE reachable states accept with expectedState pinned: inner-then ({a:31,b:0}), inner-else ({a:0,b:32}) and the outer fallthrough that rebinds neither ({a:0,b:0}). The fallthrough case is the one a per-branch rewiring scheme is most likely to lose."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/merge-locals-shapes",
+          "note": "Cross-tier Stack-IR + hex goldens for the nested method in all 7 compilers, from all 9 source formats."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts",
+          "note": "S9: an outer `if` whose then-arm is itself an `if`/`else` reassigning `na`/`nb`; the merge lands at the outer level and feeds the continuation. Real Script VM, state-value assertion."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/if-without-else-multi-temp",
+          "note": "Two inner `if`s nested inside an outer `if`, whose flags are read after the OUTER conditional — the same nesting shape, pinned as cross-tier goldens in all 7 compilers."
+        }
+      ]
+    },
+    {
+      "id": "loop-carried-locals-k2",
+      "category": "control-flow",
+      "description": "A bounded loop carrying TWO OR MORE locals across iterations, then feeding them to addOutput. The loop-shaped analogue of the branch-merge family: the same 'one carrier for N live values' assumption that broke branch merges applies to loop-carried bindings. Predicted a real defect and found one: a loop-carried local REASSIGNED and then READ AGAIN later in the SAME iteration was miscompiled by all seven tiers byte-identically. FIXED 2026-08-06 in the ANF->Stack lowering of all seven compilers (collectLoopCarriedRebinds / lowerLoop); the shape is representable, so it is compiled correctly rather than refused, and the fix moves ZERO bytes for any loop without the shape. The NESTED variant is now covered by this row too. When the cross-read sits in the body of an INNER loop, the OUTER loop used to resolve the carried local to a dead slot: `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }` with step=3 has source value wacc=30 and the emitted script computed 24 - silently, in all seven tiers, before AND after the 2026-08-06 single-level fix. The predicate keyed on TOP-LEVEL body binding names, and at the outer level `acc` is bound only inside the nested loop, so it was neither an outer ref (deepBodyBindingNames excludes it) nor a carried rebind; the inner loop's final iteration then consumed it, because usedAfterLoop asks the enclosing scope and the enclosing scope had not been told either. The sibling shape `for (i<2) { for (j<2) { acc = acc + step; } wacc = wacc + acc; }` failed LOUDLY (\"Value 'acc' not found on stack\") and is fixed by the same change. FIXED 2026-08-06 in all seven tiers: collectLoopCarriedRebinds now scans flattenNestedLoopBodies(body), which splices each nested loop's body in at the loop's position so the outer level sees the same read/rebind/read ordering the inner level already saw. A body with no nested loop flattens to itself, so the change moves ZERO bytes for any loop already in the tree - verified by compiling every conformance fixture in every source format in both fold modes (1242 compilations) with the flatten step on and off: 0 differing. No shipped contract nests loops (2026-08-06 sweep: 724 .runar.* files, 11 contain a loop statement - BoundedLoop in 9 formats plus CompanionVerifier.runar.ts - and none nests). NOW CLOSED - the same shape inside an `if` INSIDE a loop: `for (i<2) { if (i<5n) { acc = acc + step; wacc = wacc + acc; } }` with step=3 has source value wacc=9 and the emitted script computed 3, silently, in all seven tiers. ROOT CAUSE, and it is NOT the loop's: `appendMergedLocalResults` (ANF lowering) appends the same K-result block to BOTH arms, and its docstring states the premise the whole reconcile rests on - \"pass 1 always COPIES ... because a local live after the `if` is in outerProtectedRefs\". That premise only holds when EVERY merged local is live after the `if`. outerProtectedRefs is derived from the ENCLOSING scope's last-use map, and a loop body's last-use map ends AT the `if`, so no merged local is ever live after it there. Pass 1 then ROLLED instead of picking, the arm's stack effect stopped being +K, the arms ended at different depths, phase 3 padded the shortfall with EMPTY pushes, elseMatchesThenNResultLayout saw an unnamed slot where it needed the merged name, and control fell through to the single-slot fallback push(bindingName) - ONE stackMap name for K physical results, with `acc`/`wacc` still naming the dead pre-`if` slots. NOT loop-specific, and NOT the cross-read: the same defect reproduces with NO loop at all when both merged locals happen to be dead after the `if` (NL_DEAD in the reproducer), and K2NOCROSS (acc and wacc never reading each other) was equally wrong. The trigger is exactly \"K>=2 merged locals, at least one dead after the `if`\". FIXED 2026-08-06 in all seven tiers: lowerIf now adds every merged-local result name to protectedRefs before lowering the arms, making the block's stated premise TRUE instead of assumed. Byte-neutral for every program whose merged locals were already live after the `if` - those names were already in protectedRefs, which is precisely why those programs compiled correctly. Proven three ways: a full --update-golden regeneration reproduced all 68 pre-existing fixtures byte-identically (git reports 0 modified files), the conformance suite is 630/630 in BOTH fold modes, and a repo-wide sweep of all 757 .runar.* sources x 2 fold modes (1472 pairs) against the pre-fix compiler found 0 differing outputs. No shipped artifact hits the shape (structural audit 2026-08-06: 45 methods carry a K>=2 merge block, 22 sources contain a loop - 12 of them a concurrent agent's scratch under conformance/.tmp, leaving 10 checked in - and the intersection is EMPTY). The K=1 arity had a LOUD twin: `for (i<2) { if (i<5n) { acc = acc + step; } wacc = wacc + acc; }` was REJECTED outright with \"Value 'acc' not found on stack\", because at K=1 ANF lowering aliases instead of appending a block, so the rebind happened at no index collectLoopCarriedRebinds could see. Fixed by the same change: flattenNestedLoopBodies now splices `if` arms (then ++ else) as well as nested loop bodies. The `if` binding itself is deliberately NOT re-appended after its arms - doing so counts the arms' reads a second time past every arm rebinding and protects a K=1 alias that must stay consumable, which broke `if (c) { acc = acc + s } else { acc = acc + 1n }` in a loop.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/loop-carried-local-read-after-reassign-vm.test.ts",
+          "note": "The construct executed end to end. `K2` carries TWO locals (acc, wacc) across a bounded loop with an intra-iteration cross-read and feeds BOTH to addOutput, deployed and called through MockProvider broadcast validation on @bsv/sdk's real Spend, asserting the resulting state VALUES (a=120000, b=180000) hand-derived from the source, not read off the compiler. `K1` is the same shape at ONE iteration — value-identical to the source, so only the real Spend sees it. `S2` pins the loop through a stateful state continuation; R1/R2/R3/R2ACC pin the stateless values on the real Script VM. Five accepting controls (read-before-reassign, no cross-read, the same statements outside a loop, a single self-accumulating carrier, and a no-cross-read k=2 addOutput) keep the fix from being written too wide. Reverting the lowering fix turns 8 of the 14 cases red."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-compiler/src/__tests__/loop-outer-refs.test.ts",
+          "note": "Absolute-byte pin of the fixed lowering plus its byte-neutrality control, replicated in all seven tiers so a divergence turns exactly one tier red: compilers/go/compiler/loop_outer_refs_test.go, compilers/rust/tests/loop_outer_refs_tests.rs, compilers/python/tests/test_loop_outer_refs.py, compilers/ruby/test/test_loop_outer_refs.rb, compilers/zig/src/tests/language_constructs.zig, compilers/java/src/test/java/runar/compiler/passes/StackLowerTest.java. All seven emit 000000537953797c937b789351557a53797c937b7c93009c77777777 for the carried-rebind loop and 000052797b7c9351537a7b7c93009c7777 for the plain accumulator — the latter byte-identical to the pre-fix compiler. The nested pair was added 2026-08-06 alongside the same seven files: all seven emit 00000000547954797c93537a789351567953797c937b78935100597954797c93537a7893515b7a53797c937b7c93009c77777777777777777777 for the nested carried-rebind loop and 0000005379537a7c935154797b7c9351005679537a7c9351577a7b7c93009c777777777777 for the nested plain accumulator - the latter byte-identical to the pre-fix compiler, which is what proves nesting alone costs nothing."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/nested-loop-carried-local-vm.test.ts",
+          "note": "The NESTED construct executed end to end on @bsv/sdk's real Spend. N22/N23/N32 pin the stateless value at three nesting splits (2x2 -> wacc 30, 2x3 and 3x2 -> 63), N22ACC pins the carried local itself (12), N222 pins three levels deep (108), and each has a negative twin asserting the script does NOT compute the dead-slot value (24 / 6 / 12). SIB is the loud sibling, which threw out of stack lowering before the fix and now computes 18. K22 carries TWO locals across nested loops with an intra-iteration cross-read and feeds BOTH to addOutput, deployed and called through MockProvider broadcast validation, asserting the post-state VALUES (a=240000, b=600000) hand-derived from the source; S22 pins the same loops through a stateful continuation. Five accepting controls (nested single carrier, nested no-cross-read, nested over both iteration variables, nested read-before-reassign, and the single-level cross-read) keep the fix from being written too wide. Reverting the lowering fix turns 11 of the 17 cases red."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/branch-merged-locals-dead-after-vm.test.ts",
+          "note": "The `if`-inside-a-loop member executed end to end on @bsv/sdk's real Spend. K2 is the reported shape (wacc 9, with a negative twin asserting the script does NOT compute the pre-fix 3); K2ACC/K2BOTH/K2X3 pin the other merged local, both together, and a third iteration; K2NOCROSS proves the trigger is the merge block's arity, NOT the cross-read; K3 covers arity 3; HALF makes the branch taken on only 2 of 4 iterations; NESTED_IF puts the block one `if` deeper; NESTED_LOOP puts it inside nested loops; ITERVAR reads the iteration variable; IFELSE covers both arms rebinding. NL_DEAD reproduces the SAME defect with NO loop at all, which is what pins the root cause to the merge block rather than to lowerLoop. K1/K1ELSE cover the K=1 alias arity and K1AFTER the loud K=1 twin that did not compile before. Five accepting controls (loop-free merged locals live after the `if`, the plain loop cross-read, a pure guard `if` that reassigns nothing, and the two K=1 shapes) keep the fix from being written too wide. SG deploys and calls a stateful continuation through MockProvider broadcast validation; KG feeds two merged locals to addOutput and asserts the post-state VALUES (a=120000, b=180000) hand-derived from the source, with an unguarded twin as the control. Reverting the lowering fix turns 23 of the 32 cases red."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/loop-if-merged-locals",
+          "note": "Cross-tier Stack-IR + hex goldens for the shape: `guarded` (K=2 merged locals in an `if` without an `else` inside a bounded loop) and `afterIf` (the K=1 arity read after the `if`, which did not compile before). All 7 compilers emit byte-identical output from all 9 source formats, in both fold modes."
+        },
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/loop-if-merged-locals.json",
+          "note": "The independent state pin, which is the only thing that can see this defect class: a verdict-only oracle ACCEPTS the pre-fix script. Five accepts on real secp256k1 + a real BIP-143 continuation preimage, each pinning expectedState for every property - guarded at limit 2/1/0 (14/21/9, 7/7/9, 0/0/9) and afterIf at limit 2/1 (10/15/9, 5/10/9) - plus a tampered-continuation reject. All values hand-derived from the source before the script existed. The limit=0 case is the one the pre-fix else arm filled with EMPTY pushes instead of preserving 0/0."
+        
+        }
+      ]
+    },
+    {
+      "id": "merge-locals-with-prop-updates",
+      "category": "control-flow",
+      "description": "A method that BOTH merges >=2 locals across an `if` AND mutates contract properties (`this.x = ...`) in the same body. Property writes and merged locals both contend for the continuation's state slots, so they interact — and today they are only ever exercised apart.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/merge-locals-prop-updates.json",
+          "note": "The primary pin (plan Phase D1). `settle` merges `na`/`nb` across an `if` whose arms rebind DIFFERENT ones, then writes ALL THREE properties from the merged results — `total` reads BOTH, so a resurrected pre-branch binding cannot hide. Three accepts on @bsv/sdk Spend with a real BIP-143 continuation preimage, each pinning expectedState for every property: then-arm {10,5,15}, else-arm {3,12,15} (same total, different split — a check that reads only `total` would miss the swap), and amount=0 {3,5,8} proving the write-through is unconditional. Plus a tamperOutput reject."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/merge-locals-prop-updates",
+          "note": "Cross-tier Stack-IR + hex goldens: all 7 compilers emit byte-identical code from all 9 source formats."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/merge-locals-prop-updates",
+          "note": "Absolute expected-locking.hex golden reproduced by all 7 SDK tools."
+        }
+      ]
+    },
+    {
+      "id": "cond-write-multi-property",
+      "category": "control-flow",
+      "description": "Conditional write of TWO OR MORE state PROPERTIES inside an `if` without an `else` (issue #99). Both the update branch and the skip branch must produce a spendable continuation, and the skip branch must carry the ORIGINAL values rather than dropping the fields.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/cond-write-multi-field.json",
+          "note": "Two accepts pinning expectedState — the update branch (a=1,b=2) and the skip branch (a=0,b=0 unchanged) — plus a tamperOutput reject. Executed on @bsv/sdk Spend with a real checkPreimage continuation, so the skip branch is proven spendable, not merely compilable."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/cond-write-multi-field",
+          "note": "Cross-tier Stack-IR + hex goldens for all 7 compilers."
+        }
+      ]
+    },
+    {
+      "id": "if-outputs-and-merge-locals",
+      "category": "control-flow",
+      "description": "An `if` that BOTH declares outputs (addOutput / addRawOutput / addDataOutput inside a branch) AND merges >=2 locals. Unrepresentable: the branch's single carried value is already the output concat the continuation hash consumes, so there is nothing left to carry the merged locals. This MUST be a hard compile error in every tier — emitting anyway is what produced unspendable scripts.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "negative-compile",
+          "path": "packages/runar-compiler/src/__tests__/branch-outputs-merged-locals.test.ts",
+          "note": "TypeScript tier. Asserts compile fails, the diagnostic contains 'both declares outputs and merges', and that it names the offending locals '(na, nb)'; plus a positive control proving the guard does NOT fire once the addOutput moves after the if."
+        },
+        {
+          "kind": "negative-compile",
+          "path": "compilers/go/compiler/branch_outputs_merged_locals_test.go",
+          "note": "Go tier port of the same byte-identical source pair."
+        },
+        {
+          "kind": "negative-compile",
+          "path": "compilers/rust/tests/branch_outputs_merged_locals_tests.rs",
+          "note": "Rust tier port."
+        },
+        {
+          "kind": "negative-compile",
+          "path": "compilers/python/tests/test_branch_outputs_merged_locals.py",
+          "note": "Python tier port."
+        },
+        {
+          "kind": "negative-compile",
+          "path": "compilers/zig/src/tests/branch_outputs_merged_locals.zig",
+          "note": "Zig tier port (LowerError.MergedLocalsWithBranchOutputs)."
+        },
+        {
+          "kind": "negative-compile",
+          "path": "compilers/ruby/test/test_branch_outputs_merged_locals.rb",
+          "note": "Ruby tier port."
+        },
+        {
+          "kind": "negative-compile",
+          "path": "compilers/java/src/test/java/runar/compiler/passes/BranchOutputsMergedLocalsTest.java",
+          "note": "Java tier port. All seven tiers must fail closed; reverting any one guard to a silent emit turns that tier red."
+        }
+      ]
+    },
+    {
+      "id": "state-bytestring-1byte-op-n",
+      "category": "wire",
+      "description": "A ByteString state value of EXACTLY ONE byte whose payload is in {0x01..0x10, 0x81} — the OP_1..OP_16 / OP_1NEGATE range. The 2026-08 wire bug: #110 taught all seven SDK state serializers the MINIMALDATA rule and none of the seven compilers, so the SDK wrote OP_5 (0x55) where the on-chain reader expected <len><data> (0x0105). Two fund-loss faces — the rebuilt continuation never matches hashOutputs (write), and a contract deployed with such a value cannot be spent at all because the reader takes 0x55 as a length-85 push (read).",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "Both faces on the real Script VM with broadcast validation enabled: the WRITE path carries every 1-byte value 0x01..0x10 plus 0x81 through a real deploy->call continuation and asserts the value survives; the READ path deploys a contract whose initial state value is already 0x05 and proves it is spendable. Backed by absolute unit pins serializeState('05') === '0105' and serializeState('81') === '0181'."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/stateful-bytestring-op-n-state",
+          "note": "Absolute expected-locking.hex golden for a MessageBoard deployed with ByteString state '05'. All seven SDK tools must reproduce it byte for byte, so a single tier regressing to OP_5 fails cross-implementation, not just against its own inverse."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts",
+          "note": "Pins the DIVERGENCE deliberately: serializeState keeps <len><data> for the whole OP_N range while encodeArg (unlocking-script pushes, which the interpreter really does execute) keeps MINIMALDATA. Both directions are absolute byte assertions."
+        }
+      ]
+    },
+    {
+      "id": "state-bytestring-empty",
+      "category": "wire",
+      "description": "A zero-length ByteString state value. The boundary case of the push framing: it must serialize to a bare zero-length push (0x00) and read back as the empty string, and it must survive a continuation without collapsing the field or shifting every later field's offset.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "Absolute pin serializeState({b: ''}) === '00', plus the empty value is the first entry in the HANDLES table driven through a real deploy->call on the Script VM with broadcast validation, asserting both that the empty handle round-trips AND that the following `tail` field still reads 0n (i.e. the zero-length push did not shift the layout)."
+        }
+      ]
+    },
+    {
+      "id": "state-bytestring-0x00",
+      "category": "wire",
+      "description": "A 1-byte ByteString state value of 0x00. Distinct from empty and deliberately EXCLUDED from the MINIMALDATA set: OP_0 pushes the EMPTY array, not a 1-byte zero, so the minimal encoding is the direct push 01 00. The SDK previously special-cased 0x00 -> OP_0, which is not the inverse of any decoder — deep-review C9, where a byte of on-chain state was silently destroyed and the wrong value was recorded in a witness as if it were correct.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts",
+          "note": "Absolute pins on both sides of the divergence: serializeState('00') === '0100' and encodeArg('00') === '0100' — neither collapses to OP_0 — cross-referenced in the file header to the compiler's own encodePushBytesHex."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "Absolute pin serializeState('00') === '0100', plus '00' in the HANDLES table executed through a real continuation on the Script VM."
+        },
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/stateful-bytestring.json",
+          "note": "The burn() accept pins expectedState message === '0x00' after a spend that does NOT touch the field, so the constructor value must be preserved verbatim. This expectation previously read '0x' — the C9 bug recorded as correct behaviour — making this the regression pin for exactly that mistake. Executed on @bsv/sdk Spend with real checkSig."
+        }
+      ]
+    },
+    {
+      "id": "state-bytestring-multibyte",
+      "category": "wire",
+      "description": "A ByteString state value longer than one byte, including values long enough to exercise the length-prefix boundary. The control case that was ALWAYS fine and must stay fine: a fix aimed at the 1-byte OP_N range must not regress ordinary multi-byte state.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "Absolute pin serializeState('0011') === '020011', plus multi-byte HANDLES entries ('0102', '0500', 'aabbcc' and a 40-byte value) each carried through a real deploy->call continuation on the Script VM with broadcast validation."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/stateful-bytestring",
+          "note": "Absolute expected-locking.hex golden for a 5-byte ByteString state value (48656c6c6f), reproduced by all seven SDK tools."
+        }
+      ]
+    },
+    {
+      "id": "state-bigint-edges",
+      "category": "wire",
+      "description": "bigint state values at the encoding edges: NEGATIVE values, the sign-magnitude negative zero, and the 8-byte NUM2BIN field boundary. bigint state fields are written as a fixed 8-byte little-endian sign-magnitude field, so the sign bit lives in byte 7 and is a distinct code path from the magnitude bytes.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges",
+          "note": "The first CROSS-IMPLEMENTATION pin on the sign bit, and the first sdk-output golden anywhere carrying a NEGATIVE bigint (lo = -1, hi = +1). Every pre-existing bigint state golden was 0/100/1000/10000/1000000 — all non-negative — so no artefact that all seven SDK tools must reproduce ever touched the sign bit. Note what this row does NOT claim: absolute serialize-direction pins on a negative bigint already existed PER TIER before this golden landed — packages/runar-sdk/src/__tests__/extract-state.test.ts ('encodes negative bigint -128n with sign bit in MSB of last byte', serializeState(fields,{v:-128n}) === '8000000000000080'), packages/runar-go/sdk_test.go (TestStateEncode_Neg128, same bytes) and packages/runar-rs/src/sdk/state.rs (encodes_negative_42_with_sign_bit, '2a00000000000080'). Those are three independent tier-local pins, not one shared golden, so a tier that had NO such pin (or that drifted from the other two) was invisible; that is the gap these goldens close. The expected bytes were derived from the encoding rule FIRST and only then compared with the file: a bigint state field is OP_NUM2BIN(n, 8), a fixed 8-byte little-endian sign-magnitude word with the sign in bit 0x80 of byte 7, so |-1| = 0x01 gives LE 01 00 00 00 00 00 00 00 and the sign makes it `0100000000000080` — NOT the two's-complement `ffffffffffffffff`. The golden's tail after OP_RETURN is exactly `0100000000000080` `0100000000000000`, and all seven SDK tools reproduce it, so this is cross-implementation, not a self-inverse."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges-large",
+          "note": "The same absolute pin with a 5-byte magnitude either side of zero (-9999999999 / +9999999999), so the sign byte is exercised against a magnitude that spans several bytes rather than one. Spec-derived: 9999999999 = 0x02540BE3FF -> LE `ffe30b5402000000`; negated -> `ffe30b5402000080`. Reproduced by all seven SDK tools."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges-zero",
+          "note": "0 -> `0000000000000000` and +1 -> `0100000000000000`. The control word: a negative-zero encoder would set 0x80 in byte 7 here, and nothing else in the family would notice."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges-127",
+          "note": "-127 -> `7f00000000000080`, +127 -> `7f00000000000000`. The largest magnitude that leaves byte 0 below 0x80."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges-128",
+          "note": "-128 -> `8000000000000080`, +128 -> `8000000000000000`. Byte 0 now carries its own high bit, which is exactly where a two's-complement or a minimal-scriptnum encoder first diverges from the fixed 8-byte sign-magnitude word."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges-255",
+          "note": "-255 -> `ff00000000000080`, +255 -> `ff00000000000000`. Byte 0 saturated, magnitude still one byte."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/state-bigint-edges-256",
+          "note": "-256 -> `0001000000000080`, +256 -> `0001000000000000`. Magnitude spills into byte 1 while the sign stays in byte 7 — the pair that catches a big-endian or a sign-follows-magnitude encoder."
+        },
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/state-bigint-edges.json",
+          "note": "SPENDABILITY for the dangerous values, which no absolute byte pin can give. Six accepts on @bsv/sdk Spend with a real BIP-143 continuation preimage, each pinning a negative expectedState: 0 -> (-1,+1) (the minimal sign crossing), (-1,+1) -> (-127,+127), -> (-128,+128) (where a two's-complement encoder first disagrees), -> (-256,+256) (magnitude spills into byte 1), a deploy that is ALREADY negative with a 5-byte magnitude surviving a full deploy->call round, and +/-(2^63-1) at the 8-byte NUM2BIN field boundary. This crosses the implementation boundary the goldens cannot: the deployed state section is written by the SDK serializer while the covenant REBUILDS it on-chain with the compiler's own framing and checks hash256(outputs), so a sign-byte disagreement between the two is an unspendable UTXO, not a round-trip that agrees with itself. Plus a tamperOutput reject. The RESIDUAL this row carried - a magnitude of 2^63 or more overflowing the 8-byte field, deploying cleanly and never being spendable, with no compile-time or deploy-time diagnostic (verified 2026-08-05) - was CLOSED 2026-08-06 by a guard rather than by a witness pinning the old behaviour. Two halves: all seven compilers now refuse a MUTABLE bigint property whose literal initializer has magnitude >= 2^63 (checkStateBigintMagnitude in each tier's ANF lowering; readonly properties stay exempt because they are script pushes, not state), and the SDK serializer throws instead of truncating (encodeNum2Bin, packages/runar-sdk/src/state.ts), which is the only place a value that first exists at call time can be stopped. +/-(2^63-1) stays representable and byte-identical."
+        },
+        {
+          "kind": "conformance-fixture",
+          "path": "conformance/tests/state-bigint-edges",
+          "note": "Cross-tier Stack-IR + hex goldens: all 7 compilers emit byte-identical code from all 9 source formats for the contract that reads, arithmetics and rewrites signed bigint state."
+        }
+      ]
+    },
+    {
+      "id": "state-bool",
+      "category": "wire",
+      "description": "A `boolean` state value. State framing has THREE rules, not one (packages/runar-sdk/src/state.ts `encodeStateValue`), and this is the second: a bool is written as ONE RAW BYTE (01 / 00) with NO push header — unlike a ByteString, which is `<len><data>`. The comment at state.ts:327-335 records that this exact branch already shipped broken once: with no `boolean` case, a real boolean state field fell through to the push-data DEFAULT and was framed `0101` instead of `01`, shifting every LATER field's offset by one byte. Fund-critical for the same two reasons as the OP_N ByteString bug — the rebuilt continuation no longer matches hashOutputs, and a deployed contract whose state section is read one byte out of phase cannot be spent.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "The primary pin ('bool state — 1 raw byte, no push header, hand-derived against the deployed script'). For flag=true and flag=false it deploys a real compiler-produced BoolCarrier, reads the raw state section out of the DEPLOYED locking script and compares it to bytes derived BY HAND from the state.ts rule (`01`/`00` followed by the untouched 8-byte `tail` word) — never to serializeState's own output, so a co-changed encoder/decoder pair cannot satisfy it. Then it calls flip() through a real continuation on the Script VM with broadcast validation and asserts BOTH the rewritten flag and that `tail` still reads 0n, i.e. that the 1-byte field did not shift the field behind it. That trailing `tail` assertion is what makes this a pin on the FRAMING rather than only on the value."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-sdk/src/__tests__/extract-state.test.ts",
+          "note": "Absolute unit pins on the serializer in isolation: serializeState(bool true) === '01' and serializeState(bool false) === '00' — a bare byte, not a length-prefixed push. Mirrored per tier by packages/runar-go/sdk_test.go (TestStateEncode_BoolTrue) and packages/runar-rs/src/sdk/state.rs (encodes_bool_true)."
+        }
+      ]
+    },
+    {
+      "id": "state-raw-fixed-bytes",
+      "category": "wire",
+      "description": "A state value of a FIXED-WIDTH byte type — PubKey (33), Addr / Ripemd160 (20), Sha256 (32), Point (64). The third state-framing rule (packages/runar-sdk/src/state.ts `encodeStateValue`): raw fixed bytes, NO push header and NO length prefix, because the width is known from the type. The failure mode is the mirror of the bool one: a fixed-width value that falls through to the push-data default gains a length byte (0x21 for a PubKey) and shifts every later field, producing a continuation the covenant will not accept.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
+          "note": "'raw-fixed state class (PubKey) — raw fixed bytes, no push header'. Deploys a real compiler-produced RawFixedCarrier with a 33-byte compressed PubKey and asserts the deployed script's state section is EXACTLY the 33 key bytes followed by the untouched 8-byte `tail` word — no 0x21 length byte anywhere — then calls through a real continuation on the Script VM with broadcast validation and asserts both fields survive. The `tail` assertion is the framing check: a spurious length byte would corrupt the field behind it, not the PubKey itself."
+        },
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/state-ripemd160.json",
+          "note": "SPENDABILITY for a second width in the same class (Ripemd160, 20 bytes). HashRegistry.update() on @bsv/sdk Spend with a real BIP-143 continuation preimage, pinning expectedState currentHash === the new 20-byte value — a VALUE pin, so a framing change that still validates but records the wrong bytes fails — plus a tamperOutput reject proving the state section is committed to by hashOutputs. This crosses the boundary a unit pin cannot: the SDK writes the section, the covenant REBUILDS it on-chain with the compiler's framing, so a disagreement is an unspendable UTXO."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/token-nft",
+          "note": "Cross-implementation: an absolute expected-locking.hex whose only state field is a PubKey, reproduced byte for byte by all seven SDK tools. A single tier that started length-prefixing fixed-width state fails here against the other six rather than against its own inverse. conformance/sdk-output/tests/auction is the mixed case (PubKey followed by a bigint), where a spurious length byte would also displace the bigint word."
+        }
+      ]
+    },
+    {
+      "id": "continuation-output-ordering",
+      "category": "artifact",
+      "description": "The ORDER and INDEX of the outputs a call transaction builds: developer-declared outputs first, in source order, then the state continuation, then change — and the SDK must track the continuation at that exact index as the next spendable UTXO. The second fund-loss face this ledger's own `_doc` names: the covenant's checkPreimage commits to hash256(serialised outputs), so a reordering desynchronises hashOutputs and the continuation is rejected outright; and if the SDK records the wrong outputIndex, the NEXT call spends a non-existent or wrong UTXO. Both are silent off-chain — every state value can be individually correct while the transaction is unspendable.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-sdk/src/__tests__/g1-raw-outputs-spend.test.ts",
+          "note": "The primary pin. Compiles examples/ts/add-raw-output with the real compiler, deploys, and calls sendToScript through the real SDK, then VALIDATES the resulting call tx on @bsv/sdk's production Spend against the deploy tx's output — so the OP_PUSH_TX + hashOutputs covenant must actually accept the output list as built. On top of that verdict it pins the layout positionally: exactly 3 outputs, [0] the raw output (1000 sats, script === the caller-supplied bytes), [1] the state continuation (0 sats, codePart + OP_RETURN + serialised count), [2] a P2PKH change output, and contract.currentUtxo.outputIndex === 1 with a matching script. The Spend validation is what makes the ordering claim more than a shape assertion."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-java/src/test/java/runar/lang/sdk/G1RawOutputsCallTest.java",
+          "note": "Tier parity for the same [raw][state][change] ordering and the same next-UTXO index (assertEquals(1, next.outputIndex())). HONEST SCOPE: the Java tier has no ScriptVM (root CLAUDE.md, 'Off-chain Script VM'), so this asserts the built transaction's shape and does NOT re-validate the covenant. It catches a tier that orders outputs differently; it cannot independently confirm the covenant accepts them."
+        },
+        {
+          "kind": "real-crypto-witness",
+          "path": "conformance/witnesses/real-crypto/add-data-output.json",
+          "note": "The commitment half, on real crypto: publish() accepts with expectedState pinned while ALSO emitting a data output, and the paired tamperOutput spend — which corrupts output 0 so the recomputed sighash no longer matches the on-stack preimage — must REJECT. That reject is the direct evidence that the output list, ordering included, is committed to by hashOutputs rather than merely assembled correctly off-chain."
+        }
+      ]
+    },
+    {
+      "id": "constructor-slots-bytestring-op-n",
+      "category": "artifact",
+      "description": "A 1-byte ByteString CONSTRUCTOR argument in the OP_N range, spliced into the locking script at its constructorSlots byteOffset. The mirror image of state-bytestring-1byte-op-n and the reason that bug was subtle: constructor args land in the EXECUTED part of the locking script, so MINIMALDATA genuinely does apply here and the correct encoding is OP_5 — the opposite of the state section. Getting the two rules the same way round in both places is the fund-critical property.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/bytes-op-n-mid",
+          "note": "THE PRIMARY PIN — the composition, not the parts. A ByteString '05' constructor arg spliced into a real compiler-emitted SlotMatrix artifact at its constructorSlots byteOffset, pinned as an absolute expected-locking.hex that all seven SDK tools must reproduce (conformance/sdk-vertical/runner) and that vertical-pins.test.ts independently re-derives from the artifact with an implementation importing nothing from packages/**. This is the ZERO-DELTA case specifically: OP_5 replaces the 1-byte OP_0 placeholder with 1 byte, so the code part stays 79 bytes and every LATER slot resolves at byteOffset === templateByteOffset (count 3->3, owner 7->7, and the second owner occurrence 11->44 after the earlier splices). Compare cases/bytes-zero, where '00' -> 0100 is a +1 delta and the same later slots shift to 4 / 9 / 46 — the arithmetic path that every other splice test in the repo exercises. Sibling rows cases/bytes-op-n-low (0x01 -> OP_1) and cases/bytes-op-n-high (0x10 -> OP_16) pin the ends of the collapse range; cases/bytes-outside-low (0x11 -> 0111) pins one past it."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/cases/bytes-op1negate",
+          "note": "The same composition for 0x81 -> OP_1NEGATE (0x4f), the other single-opcode family, also zero-delta (code part 79 bytes, later slots unshifted). A collapse rule written for 0x01..0x10 only would leave this one as a 2-byte push and shift everything behind it."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "conformance/sdk-vertical/vertical-pins.test.ts",
+          "note": "The vitest-side gate that runs on every case directory above: it walks the compiled script opcode by opcode, checks each declared constructorSlots byteOffset lands on a real opcode boundary, applies the splice from an independent re-implementation of the push-data rules, and compares the result to the checked-in goldens. Carries its own RED-PROOFs, including RED-PROOF 2 — a co-changed encoder/decoder pair (the PALMER-2 shape) that every round-trip test would wave through."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-sdk/src/__tests__/encode-push-data-minimaldata.test.ts",
+          "note": "SUPPORTING, and deliberately narrow: absolute pins on encodeArg IN ISOLATION — encodeArg('05') === '55' (OP_5), encodeArg('81') === '4f', encodeArg('00') === '0100' (NOT OP_0), encodeArg('11') === '0111', encodeArg('deadbeef') === '04deadbeef'. It is the encoder contract.ts calls for every constructorSlot, but this file constructs no artifact, reads no constructorSlots and produces no script, so it cannot see a splice at the wrong offset or a mis-computed downstream slot. The composition is the sdk-vertical cases above."
+        },
+        {
+          "kind": "vm-unit",
+          "path": "packages/runar-sdk/src/__tests__/constructor-slots.test.ts",
+          "note": "SUPPORTING, and deliberately narrow: pins the splicer against absolute expected locking scripts for a 20-byte Addr, two 33-byte PubKeys, a bigint, the no-constructorSlots append fallback, and the negative case that a legitimate OP_0 outside a placeholder position is not corrupted. It has NO ByteString constructor parameter at all, and every value it splices encodes to a length-prefixed push, so every case has a POSITIVE length delta (+20, +33, +2, +1). The zero-delta OP_N splice — where the placeholder and the value are both one byte and the later slots must NOT move — does not occur in this file."
+        }
+      ]
+    },
+    {
+      "id": "codeseparator-indices-stateful",
+      "category": "artifact",
+      "description": "The OP_CODESEPARATOR byte offset(s) a stateful contract's artifact reports (codeSeparatorIndex / codeSeparatorIndices), and the SDK's recovery of the true offset by byte-walking the deployed script. The sighash subscript is trimmed at that separator, so an offset that is off by one byte produces a signature over the wrong scriptCode and an unspendable UTXO — while every off-chain check still passes.",
+      "severity": "fund-critical",
+      "coveredBy": [
+        {
+          "kind": "vertical-pin",
+          "path": "packages/runar-sdk/src/__tests__/codeseparator-signing.test.ts",
+          "note": "Compiles real contracts (examples/ts/auction, token-nft, covenant-vault) with the real compiler and drives the real SDK deploy->call against the emitted codeSeparatorIndex. What it genuinely proves is the DEPLOY->CALL BEHAVIOUR: terminal methods must not push _codePart (CLEANSTACK) and non-terminal methods must, each asserted by a real spend that fails if the sighash subscript is wrong. What it does NOT prove, despite reading that way: its two script-structure assertions are near-vacuous. `expect(artifact.script).toContain('ab')` (:283) searches a kilobyte-plus hex STRING for the substring 'ab', which any 0xab byte inside push data — or any odd-nibble coincidence — satisfies, and 'stateless checkSig is before OP_CODESEPARATOR' (:326-341) uses `script.indexOf('ad')`, a hex-string search that matches at odd nibble offsets and therefore does not locate an OP_CHECKSIGVERIFY opcode boundary at all. Treat neither as an offset pin. The opcode-boundary-aware version of that claim is conformance/sdk-vertical (its reference/script.ts walks the script and distinguishes an OP_CODESEPARATOR byte from a 0xab inside push data — cases/bytes-ab-trap and cases/codesep-tag-ab-trap exist for exactly that false positive)."
+        },
+        {
+          "kind": "vertical-pin",
+          "path": "packages/runar-sdk/src/__tests__/issue-132-restore-codesep.test.ts",
+          "note": "Issue #132: computeOpPushTxWithCodeSep must byte-walk the real _codeScript rather than re-deriving the offset from in-memory constructorArgs, which are wrong on the restore path. Validated on a real @bsv/sdk Spend, so a wrong offset fails as a real signature failure rather than a mismatched integer."
+        },
+        {
+          "kind": "sdk-output",
+          "path": "conformance/sdk-output/tests/stateful-bytestring-op-n-state",
+          "note": "The artifact input carries codeSeparatorIndices [6, 1061] and codeSepIndexSlots, and expected-locking.hex is an absolute byte golden all seven SDK tools must reproduce — so the separator bytes land at the pinned offsets in every tier. RESIDUAL: this pins the SCRIPT bytes, not the index array itself; no test asserts findCodesepOffsets(compiledScript) equals artifact.codeSeparatorIndices for a stateful contract. That vertical pin is plan Phase C4."
+        }
+      ]
+    }
+  ]
+}

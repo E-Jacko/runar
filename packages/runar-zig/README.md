@@ -2247,3 +2247,83 @@ upgrading.
 - BRC-100 wallet specification:
   <https://brc.dev/100>
 - Issues and roadmap: <https://github.com/icellan/runar/issues>
+
+---
+
+## How fund-path tests fail closed in the Zig tier
+
+**This tier has no Bitcoin Script VM, and this section does not pretend
+otherwise.** The `bsvz` library's `script/engine.zig` does not compile under the
+repo's pinned Zig 0.16 toolchain (`unreachable else prong` at
+`engine.zig:1172`), `zig-pkg/` is a gitignored fetch cache rather than an
+in-repo source tree, and project policy forbids hand-rolling an interpreter
+(root `CLAUDE.md`, "Off-chain Script VM"). So `MockProvider.broadcast` makes
+**no claim whatsoever about signature or covenant validity**.
+
+What it *does* do, as of testing-gap remediation Phase A5, is stop being a
+record-and-mint sink. It is now fail-closed on every check that is genuinely
+available from the serialized bytes — the same checks a real node applies before
+it ever reaches script evaluation.
+
+### What runs on every `broadcast`
+
+1. **Structural** — the payload must parse as a Bitcoin transaction. A
+   `deadbeef`-style byte string is refused with
+   `RejectionReason.not_a_transaction`.
+2. **Non-vacuity** — at least one spent outpoint must be known to the provider,
+   so the gate can never pass by checking nothing
+   (`RejectionReason.nothing_checked`). The TypeScript reference
+   (`packages/runar-sdk/src/providers/mock.ts`) accepts a transaction none of
+   whose inputs it knows; this tier does not.
+3. **Value conservation** — when every input's outpoint is known, outputs may
+   not exceed inputs (`RejectionReason.underfunded`). No satoshis from nowhere.
+4. **Script-size bound** — every output script stays under
+   `MAX_SCRIPT_BYTES`.
+
+`lastValidationReport()` returns a `ValidationReport` whose **`scripts_executed`
+field is always 0**. That field exists precisely so the absence of script
+execution stays visible in the data, not just in prose. If a Zig ScriptVM ever
+lands, extend the struct — do not quietly leave a 0 that readers assume means
+"nothing to check".
+
+`lastValidatedInputCount()` reports how many spent outpoints were actually
+recognised, so a test can assert its gate is not vacuous. Outputs of an accepted
+broadcast are registered as known outpoints, so a chained call spending the
+continuation the previous broadcast created is checkable too.
+
+### Where script-level correctness actually comes from in this tier
+
+Since the provider cannot execute Script, the fund-safety burden is carried
+**vertically**, not by the mock:
+
+- **Absolute hex pins.** The Zig compiler's output is byte-compared against the
+  checked-in `conformance/tests/*/expected-script.hex` goldens, which the other
+  six tiers must match byte-for-byte. A Zig-only codegen divergence cannot hide.
+- **On-chain integration spends** in `integration/zig`, which broadcast to a
+  real node and assert acceptance (and, for negatives, assert the node
+  *rejects*).
+- **The ANF interpreter** (`src/sdk_anf_interpreter.zig`) for off-chain
+  business-logic behaviour.
+
+### The opt-out, and how it is governed
+
+`MockProvider.initAlwaysAck(allocator, network)`,
+`disableBroadcastValidation()` and `enableBroadcastValidation(false)` restore
+the old behaviour. Every `src/**.zig` that uses one must have an entry in
+**`always_ack_allowlist.json`** with a file, a reason and a category;
+`src/sdk_always_ack_allowlist_test.zig` fails on unlisted usage **and** on stale
+entries, so the list can only shrink. Today exactly one file is listed: the test
+that exercises the opt-out surface itself.
+
+### What this caught
+
+`sdk_contract.zig`'s prepare/finalize and terminal-call round-trip tests
+injected the contract UTXO straight into the `RunarContract` and never told the
+provider about it, so the broadcast gate had nothing to check — the very
+vacuity this phase closes. Their comments explicitly leaned on the old
+behaviour ("MockProvider does not validate scripts on broadcast") while
+broadcasting a fabricated DER signature over constant `0x11…`/`0x22…` bytes.
+They now register the spent outpoint, so the structural, non-vacuity and
+value-conservation layers really run. The fabricated signature itself remains
+unjudgeable in this tier — which is exactly why the claim above is limited to
+what it is.

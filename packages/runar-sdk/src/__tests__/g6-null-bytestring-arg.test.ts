@@ -26,6 +26,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import type { RunarArtifact } from 'runar-ir-schema';
 
 const SIGNER_KEY = '0000000000000000000000000000000000000000000000000000000000000007';
@@ -58,14 +59,14 @@ const MEMO_SRC = `
 
 async function deploy(src: string, fileName: string, ctorArgs: unknown[]) {
   const artifact = compileSource(src, fileName);
-  const provider = new MockProvider();
+  const provider = new MockProvider('testnet');
   const signer = new LocalSigner(SIGNER_KEY);
   const address = await signer.getAddress();
   provider.addUtxo(address, {
     txid: SIGNER_KEY.slice(0, 64),
     outputIndex: 0,
     satoshis: 500_000,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   const contract = new RunarContract(artifact, ctorArgs);
   contract.connect(provider, signer);

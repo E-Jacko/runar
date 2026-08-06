@@ -10,6 +10,7 @@
 # names (t0, t1, ...).
 
 require "json"
+require "set"
 require_relative "../ir/types"
 require_relative "ast_nodes"
 require_relative "sighash_directive"
@@ -127,6 +128,7 @@ module RunarCompiler
         )
         unless prop.initializer.nil?
           anf_prop.initial_value = _extract_literal_value(prop.initializer)
+          _check_state_bigint_magnitude(anf_prop)
         end
         # Propagate the FixedArray-expansion marker so the artifact assembler
         # can re-group the synthetic scalar run back into a logical FixedArray
@@ -138,6 +140,47 @@ module RunarCompiler
       end
     end
     private_class_method :_lower_properties
+
+    # Magnitude a bigint state field gets: +num2bin-le8+ is a fixed 8-byte
+    # little-endian SIGN-MAGNITUDE word, so bytes 0..6 plus the low 7 bits of
+    # byte 7 carry the magnitude and 0x80 of byte 7 carries the sign.
+    STATE_BIGINT_MAGNITUDE_LIMIT = 1 << 63
+
+    # Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+    #
+    # The state section writes every bigint field with OP_NUM2BIN 8, which
+    # cannot represent a magnitude of 2**63 or more. Nothing used to check: the
+    # compiler stamped +encoding: "num2bin-le8"+ on the field and carried the
+    # initializer verbatim, the SDK wrote the low 8 bytes of it into the
+    # deployed state section, and the covenant then rebuilt the continuation
+    # with its own OP_NUM2BIN 8 -- which produces different bytes -- so
+    # hash256(outputs) never matched and the UTXO was permanently unspendable.
+    # It deployed cleanly, with no diagnostic at compile time or deploy time.
+    #
+    # This catches the statically-known half. Values that only exist at call
+    # time are stopped by the SDK serializer (packages/runar-rb/lib/runar/sdk/state.rb).
+    #
+    # READONLY properties are deliberately exempt: they are baked into the
+    # locking script as script-number pushes, never into the state section, and
+    # BSV script numbers are arbitrary-precision after Genesis.
+    #
+    # @param prop [IR::ANFProperty]
+    # @return [void]
+    def self._check_state_bigint_magnitude(prop)
+      return if prop.readonly
+      return unless ["bigint", "int"].include?(prop.type)
+
+      value = prop.initial_value
+      return unless value.is_a?(Integer)
+      return if value.abs < STATE_BIGINT_MAGNITUDE_LIMIT
+
+      raise ArgumentError,
+            "Cannot compile state property '#{prop.name}' initialised to #{value}: " \
+            "it does not fit the fixed 8-byte sign-magnitude state word (magnitude " \
+            "must be < 2^63). Reduce the value, or make the property readonly if it " \
+            "is a constant rather than state."
+    end
+    private_class_method :_check_state_bigint_magnitude
 
     # @param expr [Expression]
     # @return [String, Integer, Boolean, nil]
@@ -557,6 +600,10 @@ module RunarCompiler
         @method_scope = MethodScope.new
         # Issue #123: non-default @sighash flag for this method (nil = default).
         @sighash_flag = nil
+        # True in every context produced by +sub_context+ -- inside an if arm, a
+        # loop body, or an inlined helper's block -- and false only in the
+        # context a method's own body is lowered into.
+        @nested = false
       end
 
       # @return [MethodScope] shared per-method bookkeeping for intent intrinsics
@@ -566,6 +613,11 @@ module RunarCompiler
       # lowered, so a MANUAL +checkPreimage(pre)+ call binds under the same mode
       # as the method's declared sighash. nil = default ALL|FORKID.
       attr_accessor :sighash_flag
+
+      # True in every context produced by +sub_context+. +_lift_branch_update_props+
+      # walks method.body and does NOT recurse, so an +if+ its recogniser accepts
+      # is only actually REWRITTEN at method top level.
+      attr_accessor :nested
 
       # Push an alias for a parameter name, used while inlining the body of
       # a private method into this context: identifier references to that
@@ -800,6 +852,11 @@ module RunarCompiler
         # Propagate the method's declared @sighash flag (issue #123) so a manual
         # checkPreimage inside an if/else branch binds under the same mode.
         sub.sighash_flag = @sighash_flag
+        # _lift_branch_update_props walks method.body and does NOT recurse, so
+        # an +if+ its recogniser accepts is only actually REWRITTEN at method
+        # top level. lower_if_statement needs the same distinction before it
+        # defers to that pass.
+        sub.nested = true
         sub
       end
 
@@ -814,7 +871,11 @@ module RunarCompiler
       # -----------------------------------------------------------------
 
       # @param stmts [Array<Statement>]
-      def lower_statements(stmts)
+      # Lower a statement block, threading down the set of identifiers the
+      # enclosing blocks still read after this block ends. Only the
+      # block-forming statements (if / for) consume it; see
+      # +Frontend._reads_after_statement+.
+      def lower_statements(stmts, reads_after_block = Set.new)
         stmts.each_with_index do |stmt, i|
           # Early-return nesting: when an if-statement's then-block ends with a
           # return and there is no else-branch, the remaining statements after the
@@ -829,15 +890,24 @@ module RunarCompiler
               then: stmt.then,
               else_: remaining
             )
-            lower_statement(modified_if)
+            lower_statement(modified_if, reads_after_block)
             return
           end
-          lower_statement(stmt)
+          # Only the block-forming statements need to know what the code after
+          # them still reads; computing it for every statement would be
+          # quadratic for no benefit.
+          reads_after =
+            if stmt.is_a?(IfStmt) || stmt.is_a?(ForStmt)
+              Frontend._reads_after_statement(stmts, i, reads_after_block)
+            else
+              Set.new
+            end
+          lower_statement(stmt, reads_after)
         end
       end
 
       # @param stmt [Statement]
-      def lower_statement(stmt)
+      def lower_statement(stmt, reads_after = Set.new)
         # Propagate source location to emitted ANF bindings
         stmt_loc = stmt.respond_to?(:source_location) ? stmt.source_location : nil
         if stmt_loc
@@ -854,9 +924,9 @@ module RunarCompiler
         when AssignmentStmt
           _lower_assignment(stmt)
         when IfStmt
-          _lower_if_statement(stmt)
+          _lower_if_statement(stmt, reads_after)
         when ForStmt
-          _lower_for_statement(stmt)
+          _lower_for_statement(stmt, reads_after)
         when ExpressionStmt
           lower_expr_to_ref(stmt.expr)
         when ReturnStmt
@@ -998,18 +1068,18 @@ module RunarCompiler
       end
 
       # @param stmt [IfStmt]
-      def _lower_if_statement(stmt)
+      def _lower_if_statement(stmt, reads_after = Set.new)
         cond_ref = lower_expr_to_ref(stmt.condition)
 
         # Lower then-block into sub-context
         then_ctx = sub_context
-        then_ctx.lower_statements(stmt.then)
+        then_ctx.lower_statements(stmt.then, reads_after)
         sync_counter(then_ctx)
 
         # Lower else-block into sub-context
         else_ctx = sub_context
         if stmt.else_ && stmt.else_.any?
-          else_ctx.lower_statements(stmt.else_)
+          else_ctx.lower_statements(stmt.else_, reads_after)
         end
         sync_counter(else_ctx)
 
@@ -1028,9 +1098,11 @@ module RunarCompiler
           then_ctx.get_add_data_output_refs.any? ||
           else_ctx.get_add_data_output_refs.any?
 
+        then_output_bytes = ""
+        else_output_bytes = ""
         if branch_has_outputs
-          Frontend._append_branch_output_concat(then_ctx)
-          Frontend._append_branch_output_concat(else_ctx)
+          then_output_bytes = Frontend._append_branch_output_concat(then_ctx)
+          else_output_bytes = Frontend._append_branch_output_concat(else_ctx)
         end
 
         # Branch-merged locals (2 or more). An +if+ expression carries exactly
@@ -1045,20 +1117,104 @@ module RunarCompiler
         # Fix: give both arms the SAME result set in the SAME order by appending
         # an explicit rebind of every merged local to each arm.
         merged_locals = collect_branch_merged_locals(then_ctx, else_ctx)
-        if merged_locals.length >= 2
-          if branch_has_outputs
-            # The arms' single value is already spoken for: it is the output
-            # concat the continuation hash consumes. Refuse at compile time
-            # rather than emit the unspendable script this used to produce.
+
+        if branch_has_outputs
+          reason = Frontend._branch_output_rejection_reason(
+            then_ctx, else_ctx, then_output_bytes, else_output_bytes,
+            merged_locals, reads_after
+          )
+          unless reason.nil?
             raise ArgumentError,
-                  "Cannot compile conditional that both declares outputs and merges " \
-                  "#{merged_locals.length} local variables (#{merged_locals.join(', ')}). " \
-                  "Move the addOutput/addRawOutput/addDataOutput call after the " \
-                  "if-statement, or give each branch its own complete addOutput."
+                  "Cannot compile conditional that both declares outputs and " \
+                  "#{reason}. Move the addOutput/addRawOutput/addDataOutput " \
+                  "call after the if-statement."
           end
-          Frontend._append_merged_local_results(then_ctx, merged_locals)
+        end
+
+        # The +if+'s multi-result contract. Locals first, in the canonical
+        # merge order both arms agree on, then the properties either arm
+        # writes, in contract declaration order -- so all seven tiers derive
+        # the same list from the same source. results[0] is the deepest slot.
+        arm_props = []
+        Frontend._collect_updated_props(then_ctx.bindings, arm_props)
+        Frontend._collect_updated_props(else_ctx.bindings, arm_props)
+        result_names = merged_locals.dup
+        @contract.properties.each do |p|
+          result_names << p.name if arm_props.include?(p.name)
+        end
+
+        # The result list is keyed by NAME everywhere downstream, so a local
+        # that shares a contract property's name appears TWICE and both entries
+        # take the PROPERTY path -- the local's value is silently replaced by
+        # the property's, and the layout assertion cannot see it because both
+        # slots are legitimately named the same. Refuse the exact collision
+        # only; shadowing a property is otherwise fine.
+        shadowed = merged_locals.find { |n| arm_props.include?(n) }
+        if shadowed
+          raise ArgumentError,
+                "Local variable '#{shadowed}' shadows contract property " \
+                "'this.#{shadowed}', and the conditional assigns both. The " \
+                "branch's result slots are identified by name, so the two cannot " \
+                "be told apart and the local's value would be silently replaced " \
+                "by the property's. Rename the local."
+        end
+
+        # When to materialise the contract instead of leaving the arms to the
+        # stack-lowerer's inference:
+        #
+        #   - two or more merged locals -- the pre-existing normalisation. Kept
+        #     on exactly its old trigger so the four +__merge$+ goldens do not
+        #     move.
+        #   - any result at all when the ELSE arm carries code. This is the new
+        #     case, and it is where every measured miscompile lives: one arm
+        #     rebinds its local IN PLACE (net depth 0) while the other pushes a
+        #     fresh slot (net +1), or an arm writes a property beside a rebound
+        #     local, or the two arms write the same properties in a different
+        #     order. The arms then leave different LAYOUTS, which no depth or
+        #     liveness predicate can see.
+        #
+        # An +if+ WITHOUT an else keeps the preserve-the-old-value path in
+        # lower_if (phase 3 copies each missing slot's same-named parent
+        # value), which already produces exactly these results by construction
+        # -- deliberately left intact. An arm that emits outputs is excluded:
+        # its single value is the serialised output bytes, and
+        # _branch_output_rejection_reason above already refuses every
+        # combination that would need a second result.
+        #
+        # EXCLUDED: an +if+ that _lift_branch_update_props will rewrite. That
+        # pass (deep-review finding C20) turns a conditional-property-assignment
+        # chain into one flat single-valued +if+ per property plus a top-level
+        # +update_prop+, so the surviving +if+s carry no property result and
+        # need no declaration. Appending the normalisation block first would
+        # ALSO silently disable that pass: its recogniser requires the arm's
+        # last binding to be the +update_prop+ with everything before it
+        # side-effect free, and the block adds a second +update_prop+ behind it.
+        # TicTacToe's position dispatch is exactly that shape, and losing the
+        # lift there produced an unspendable +move+ script.
+        #
+        # The exclusion must be exactly "the lift WILL rewrite this +if+", which
+        # is narrower than "the lift's recogniser accepts it" in TWO ways -- both
+        # were live defects producing an unspendable UTXO: the lift only rewrites
+        # chains of TWO OR MORE branches (_collect_update_branches returns a
+        # ONE-element list for the assert-false-else guard), and it only walks
+        # method.body, passing loop bodies and surviving arms through untouched,
+        # while declares_results is evaluated at EVERY nesting depth.
+        #
+        # A chain's DEEPEST +if+ is never at top level, so it now declares
+        # results and carries a normalisation block -- which is why
+        # _collect_update_branches strips a declared block before matching
+        # (_strip_declared_results).
+        lifted = Frontend.send(:_collect_update_branches,
+                               cond_ref, then_ctx.bindings, else_ctx.bindings)
+        will_be_lifted = !nested && !lifted.nil? && lifted.length >= 2
+        declares_results = !branch_has_outputs && !will_be_lifted &&
+                           (merged_locals.length >= 2 ||
+                            (!result_names.empty? && else_ctx.bindings.any?))
+
+        if declares_results
+          Frontend._append_branch_results(then_ctx, result_names, arm_props)
           sync_counter(then_ctx)
-          Frontend._append_merged_local_results(else_ctx, merged_locals)
+          Frontend._append_branch_results(else_ctx, result_names, arm_props)
           sync_counter(else_ctx)
         end
 
@@ -1066,6 +1222,7 @@ module RunarCompiler
           v.cond = cond_ref
           v.then = then_ctx.bindings
           v.else_ = else_ctx.bindings
+          v.results = result_names.dup if declares_results
         end)
 
         if branch_has_outputs
@@ -1091,10 +1248,10 @@ module RunarCompiler
         # If both branches end by reassigning the same SINGLE local variable,
         # alias that variable to the if-expression result.
         #
-        # Skipped when the arms were normalised above: there the +if+ has N
-        # results, not one, and each merged local keeps its OWN name through the
-        # reconcile in the stack lowerer.
-        if merged_locals.length < 2 && then_ctx.bindings.any? && else_ctx.bindings.any?
+        # Skipped when the arms were normalised above: there the +if+ DECLARES
+        # its results, and each one keeps its OWN name through the reconcile in
+        # the stack lowerer.
+        if !declares_results && then_ctx.bindings.any? && else_ctx.bindings.any?
           then_last = then_ctx.bindings.last
           else_last = else_ctx.bindings.last
           if then_last.name == else_last.name && local?(then_last.name)
@@ -1128,15 +1285,19 @@ module RunarCompiler
       end
 
       # @param stmt [ForStmt]
-      def _lower_for_statement(stmt)
+      def _lower_for_statement(stmt, reads_after = Set.new)
         # Resolve the loop's compile-time shape: start value, step direction,
         # and iteration count. Non-zero starts and countdown loops are
         # supported (#121) — on iteration i the iterator holds start + i*step.
         shape = Frontend._extract_loop_shape(stmt)
 
-        # Lower body into sub-context
+        # Lower body into sub-context. The body repeats, so every read anywhere
+        # in it is a read that happens after any given statement inside it.
+        body_reads = reads_after.dup
+        stmt.body.each { |s| Frontend._collect_statement_reads(s, body_reads) }
+
         body_ctx = sub_context
-        body_ctx.lower_statements(stmt.body)
+        body_ctx.lower_statements(stmt.body, body_reads)
         sync_counter(body_ctx)
 
         emit(IR::ANFValue.new(kind: "loop").tap do |v|
@@ -1711,34 +1872,43 @@ module RunarCompiler
       end
     end
 
+    # Append the canonical result block to one arm of an if-statement: a copy
+    # of every declared result, in the declared order, rebound under its own
+    # name. This is what makes the +if+ node's +results+ contract true rather
+    # than hoped-for.
+    #
+    # Two passes on purpose. Pass 1 always COPIES: +@ref:<local>+ resolves to
+    # the arm's own new value if it rebound one, else to the enclosing scope's
+    # value, and either way stack lowering picks (never rolls) it, because a
+    # declared result is outer-protected. Pass 2 always CONSUMES, because the
+    # temps are bound in this arm and this is their last use. The arm's stack
+    # effect is therefore exactly +N regardless of which of the N results it
+    # assigned. Semantically a no-op for the off-chain ANF interpreters.
+    def self._append_branch_results(branch_ctx, result_names, props)
+      result_names.each_with_index do |name, i|
+        temp = "#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"
+        if props.include?(name)
+          branch_ctx.emit_named(temp, IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = name })
+        else
+          branch_ctx.emit_named(temp, _make_load_const_string("@ref:#{name}"))
+        end
+      end
+      result_names.each_with_index do |name, i|
+        temp = "#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"
+        if props.include?(name)
+          branch_ctx.emit(_make_update_prop(name, temp))
+        else
+          branch_ctx.emit_named(name, _make_load_const_string("@ref:#{temp}"))
+        end
+      end
+    end
+
     # Concatenate a branch's output refs (state then data, in
     # declaration order) into a single bytes-ref appended to the
     # branch's bindings. If the branch has no outputs, emits an empty
     # +load_const+ so the branch still leaves one item on the stack —
     # required to balance the if's branch shapes when the OTHER
     # branch has outputs. 2026-04-30 audit finding F2 fix.
-    # Append the canonical merged-local result block to one arm of an
-    # if-statement: a copy of every merged local, in canonical order, rebound
-    # under the local's own name.
-    #
-    # Two passes on purpose. Pass 1 always COPIES: +@ref:<local>+ resolves to
-    # the arm's own new value if it rebound one, else to the enclosing scope's
-    # value, and either way stack lowering picks (never rolls) it, because a
-    # local live after the +if+ is outer-protected. Pass 2 always CONSUMES,
-    # because the temps are bound in this arm and this is their last use. The
-    # arm's stack effect is therefore exactly +K regardless of which of the K
-    # locals it reassigned.
-    def self._append_merged_local_results(branch_ctx, merged_locals)
-      merged_locals.each_with_index do |name, i|
-        branch_ctx.emit_named("#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}",
-                              _make_load_const_string("@ref:#{name}"))
-      end
-      merged_locals.each_with_index do |name, i|
-        branch_ctx.emit_named(name,
-                              _make_load_const_string("@ref:#{IR::MERGED_LOCAL_TEMP_PREFIX}#{i}"))
-      end
-    end
-
     def self._append_branch_output_concat(branch_ctx)
       all_refs = branch_ctx.get_add_output_refs.dup
       all_refs.concat(branch_ctx.get_add_data_output_refs)
@@ -1751,6 +1921,163 @@ module RunarCompiler
         accumulated = branch_ctx.emit(_make_call("cat", [accumulated, ref]))
       end
       accumulated
+    end
+
+    # The identifiers still readable once statement +index+ of this block has
+    # run: everything the following statements in this block read, plus whatever
+    # the enclosing blocks read after this block.
+    #
+    # Used by +_lower_if_statement+ to tell a branch-merged local that is dead
+    # after the +if+ (safe) from one that is still live (not representable
+    # alongside a branch output -- see +_branch_output_rejection_reason+).
+    def self._reads_after_statement(stmts, index, reads_after_block)
+      reads = reads_after_block.dup
+      stmts[(index + 1)..].each { |stmt| _collect_statement_reads(stmt, reads) }
+      reads
+    end
+
+    # Collect every identifier a statement READS. The +x+ in +x = expr+ is a
+    # write, not a read, so a plain identifier assignment target is skipped;
+    # every other target form can still read locals.
+    def self._collect_statement_reads(stmt, out)
+      case stmt
+      when VariableDeclStmt
+        _collect_expression_reads(stmt.init, out)
+      when AssignmentStmt
+        _collect_expression_reads(stmt.target, out) unless stmt.target.is_a?(Identifier)
+        _collect_expression_reads(stmt.value, out)
+      when IfStmt
+        _collect_expression_reads(stmt.condition, out)
+        (stmt.then || []).each { |inner| _collect_statement_reads(inner, out) }
+        (stmt.else_ || []).each { |inner| _collect_statement_reads(inner, out) }
+      when ForStmt
+        _collect_statement_reads(stmt.init, out) if stmt.init
+        _collect_expression_reads(stmt.condition, out)
+        _collect_statement_reads(stmt.update, out) if stmt.update
+        (stmt.body || []).each { |inner| _collect_statement_reads(inner, out) }
+      when ReturnStmt
+        _collect_expression_reads(stmt.value, out)
+      when ExpressionStmt
+        _collect_expression_reads(stmt.expr, out)
+      end
+    end
+
+    # Collect every identifier an expression reads.
+    def self._collect_expression_reads(expr, out)
+      return if expr.nil?
+
+      case expr
+      when Identifier
+        out.add(expr.name)
+      when BinaryExpr
+        _collect_expression_reads(expr.left, out)
+        _collect_expression_reads(expr.right, out)
+      when UnaryExpr
+        _collect_expression_reads(expr.operand, out)
+      when CallExpr
+        (expr.args || []).each { |a| _collect_expression_reads(a, out) }
+      when MethodCallExpr
+        (expr.args || []).each { |a| _collect_expression_reads(a, out) }
+      when MemberExpr
+        _collect_expression_reads(expr.object, out)
+      when TernaryExpr
+        _collect_expression_reads(expr.condition, out)
+        _collect_expression_reads(expr.consequent, out)
+        _collect_expression_reads(expr.alternate, out)
+      when IndexAccessExpr
+        _collect_expression_reads(expr.object, out)
+        _collect_expression_reads(expr.index, out)
+      when IncrementExpr, DecrementExpr
+        _collect_expression_reads(expr.operand, out)
+      when ArrayLiteralExpr
+        (expr.elements || []).each { |e| _collect_expression_reads(e, out) }
+      end
+      # Literals and `this.x` property access read no locals.
+    end
+
+    # Why an +if+ whose arms declare outputs cannot be represented -- or +nil+
+    # when it can. The result is the reason clause the diagnostic embeds.
+    #
+    # An +if+ expression carries exactly ONE value, and when an arm emits an
+    # output that value is already spoken for: it is the output bytes the
+    # continuation hash consumes (+_append_branch_output_concat+). Anything ELSE
+    # the arm leaves behind breaks one of two invariants nothing downstream
+    # enforces:
+    #
+    # INV-A:: the parent registers the if-expression's value as the branch's
+    #         contribution to the continuation hash, so "the branch's output
+    #         bytes" really means "whatever the arm's LAST binding is". A binding
+    #         that lands after the output -- a rebound local, a property write --
+    #         silently replaces the serialized output with an unrelated value,
+    #         and the residue drain then physically drops the real output.
+    # INV-B:: an arm that emits an output AND leaves any other slot the parent
+    #         can still name -- a property write anywhere in the arm, or a
+    #         rebound local that is still read after the +if+ -- leaves 2+
+    #         results against the ONE stack-map name the stack lowerer
+    #         registers, desyncing the parent stack by a slot from there on.
+    #
+    # Neither is visible off-chain, so both shipped as permanently unspendable
+    # locking scripts. Refuse at compile time rather than emit one. See
+    # packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+    # for the real-Script-VM proof of each shape.
+    #
+    # The clauses are checked in a fixed order so all seven tiers report the same
+    # reason for a source that trips more than one.
+    def self._branch_output_rejection_reason(
+      then_ctx, else_ctx, then_output_bytes, else_output_bytes, merged_locals, reads_after
+    )
+      # 1. Two or more merged locals: normalising them would need a
+      #    multi-result +if+ node, and the arms' single value is already the
+      #    output concat.
+      if merged_locals.length >= 2
+        return "merges #{merged_locals.length} local variables " \
+               "(#{merged_locals.join(', ')})"
+      end
+
+      arms = [["then", then_ctx, then_output_bytes], ["else", else_ctx, else_output_bytes]]
+
+      # 2. INV-A: the arm's terminal binding must BE its output bytes.
+      arms.each do |label, branch_ctx, output_bytes|
+        if branch_ctx.bindings.empty? || branch_ctx.bindings.last.name != output_bytes
+          return "continues past its output in the #{label}-branch"
+        end
+      end
+
+      # 3. INV-B: a property write leaves a slot the parent can still name,
+      #    wherever in the arm it sits.
+      written_props = []
+      arms.each { |_, branch_ctx, _| _collect_updated_props(branch_ctx.bindings, written_props) }
+      unless written_props.empty?
+        return "assigns contract properties (#{written_props.join(', ')}) inside the branch"
+      end
+
+      # 4. INV-B: a rebound local that survives the +if+ is protected from being
+      #    rolled away, so the arm ends one slot deeper than lowerIf accounts
+      #    for.
+      live_merged = merged_locals.select { |name| reads_after.include?(name) }
+      unless live_merged.empty?
+        return "reassigns local variables read after it (#{live_merged.join(', ')})"
+      end
+
+      nil
+    end
+
+    # Append every property name an ANF binding list assigns, including the ones
+    # nested inside an +if+ arm or a +loop+ body -- a nested write is just as
+    # much a named slot the enclosing arm leaves behind.
+    def self._collect_updated_props(bindings, out)
+      bindings.each do |binding|
+        value = binding.value
+        case value.kind
+        when "update_prop"
+          out << value.name unless out.include?(value.name)
+        when "if"
+          _collect_updated_props(value.then || [], out)
+          _collect_updated_props(value.else_ || [], out)
+        when "loop"
+          _collect_updated_props(value.body || [], out)
+        end
+      end
     end
 
     # @param value_ref [String]
@@ -2234,6 +2561,25 @@ module RunarCompiler
     end
     private_class_method :_assert_false_else?
 
+    # An arm with its declared-results block removed.
+    #
+    # +_append_branch_results+ adds exactly <tt>2 * results.length</tt> trailing
+    # bindings to each arm of an +if+ that declares results. They are a
+    # materialisation mechanism, not program logic, and they hide the arm's real
+    # shape from this pass. A dispatch chain's deepest +if+ is nested by
+    # definition, so it declares results; without this the enclosing chain stops
+    # being recognised and TicTacToe's position dispatch loses the C20 lift (an
+    # unspendable +move+ script).
+    def self._strip_declared_results(bindings, results)
+      n = results.nil? ? 0 : results.length
+      return bindings if n.zero?
+
+      cut = bindings.length - (2 * n)
+      cut = 0 if cut.negative?
+      bindings[0...cut]
+    end
+    private_class_method :_strip_declared_results
+
     # Recursively collect update branches from a nested if-else chain.
     def self._collect_update_branches(if_cond, then_bindings, else_bindings)
       then_update = _extract_branch_update(then_bindings)
@@ -2255,7 +2601,9 @@ module RunarCompiler
         return nil unless _all_side_effect_free?(cond_setup)
 
         inner_branches = _collect_update_branches(
-          inner_if.cond, inner_if.then || [], inner_if.else_ || []
+          inner_if.cond,
+          _strip_declared_results(inner_if.then || [], inner_if.results),
+          _strip_declared_results(inner_if.else_ || [], inner_if.results)
         )
         return nil unless inner_branches
 
@@ -2426,7 +2774,9 @@ module RunarCompiler
 
         if_val = binding.value
         branches = _collect_update_branches(
-          if_val.cond, if_val.then || [], if_val.else_ || []
+          if_val.cond,
+          _strip_declared_results(if_val.then || [], if_val.results),
+          _strip_declared_results(if_val.else_ || [], if_val.results)
         )
 
         unless branches && branches.length >= 2

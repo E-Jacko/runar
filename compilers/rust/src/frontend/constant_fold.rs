@@ -410,48 +410,51 @@ fn fold_value(value: &ANFValue, env: &mut ConstEnv) -> ANFValue {
             cond,
             then,
             else_branch,
+            results,
         } => {
-            if let Some(ConstValue::Bool(cond_val)) = env.get(cond) {
-                let cond_val = *cond_val;
-                if cond_val {
-                    let mut then_env = env_clone(env);
-                    let folded_then = fold_bindings(then, &mut then_env);
-                    // Merge constants from taken branch back into env
-                    for b in &folded_then {
-                        if let Some(cv) = anf_value_to_const(&b.value) {
-                            env.insert(b.name.clone(), cv);
-                        }
-                    }
-                    ANFValue::If {
-                        cond: cond.clone(),
-                        then: folded_then,
-                        else_branch: vec![],
-                    }
-                } else {
-                    let mut else_env = env_clone(env);
-                    let folded_else = fold_bindings(else_branch, &mut else_env);
-                    for b in &folded_else {
-                        if let Some(cv) = anf_value_to_const(&b.value) {
-                            env.insert(b.name.clone(), cv);
-                        }
-                    }
-                    ANFValue::If {
-                        cond: cond.clone(),
-                        then: vec![],
-                        else_branch: folded_else,
-                    }
-                }
-            } else {
-                // Condition not known — fold both branches independently
-                let mut then_env = env_clone(env);
-                let mut else_env = env_clone(env);
-                let folded_then = fold_bindings(then, &mut then_env);
-                let folded_else = fold_bindings(else_branch, &mut else_env);
-                ANFValue::If {
-                    cond: cond.clone(),
-                    then: folded_then,
-                    else_branch: folded_else,
-                }
+            // Fold both arms independently, ALWAYS — including when the
+            // condition is a compile-time constant.
+            //
+            // This pass used to "optimise" a statically-known condition by
+            // blanking the untaken arm (`else_branch: vec![]`) while LEAVING
+            // the `if` node itself in place, and by propagating the taken arm's
+            // constants into the enclosing env. Both halves were unsound:
+            //
+            //   * An arm is not a free-floating binding list — it carries a
+            //     STACK-SHAPE CONTRACT that ANF lowering establishes and stack
+            //     lowering depends on. For two or more branch-merged locals
+            //     both arms end with the identical `__merge$<i>` result block,
+            //     which is how `lower_if` learns K and adopts the K results by
+            //     name. Blanking one arm makes the merged-result count 0, the
+            //     N>=2 name-matched reconcile cannot fire, and ONE stack slot
+            //     is registered for K physical results — every post-branch
+            //     operand then resolves one or more slots off. At K=2 that
+            //     miscompiled SILENTLY: the deployed script accepted spends the
+            //     source rejects and rejected spends the source accepts. At
+            //     K=1 it surfaced as "value not found on stack", a compile-time
+            //     rejection of source that compiles with folding disabled.
+            //   * Propagating the taken arm's constants outward is only sound
+            //     if the other arm is really gone. The `if` node survives this
+            //     pass, so both arms are still emitted and either can run.
+            //
+            // Correct dead-arm elimination would have to delete the `if` and
+            // splice the live arm into the parent, re-establishing the parent's
+            // shape. That is a lowering-level rewrite, not a fold, so it does
+            // not live here. The bytes given up are the statically-dead arm's
+            // ops, which never execute.
+            let mut then_env = env_clone(env);
+            let mut else_env = env_clone(env);
+            let folded_then = fold_bindings(then, &mut then_env);
+            let folded_else = fold_bindings(else_branch, &mut else_env);
+            ANFValue::If {
+                cond: cond.clone(),
+                then: folded_then,
+                else_branch: folded_else,
+                // The declared result list survives folding untouched: folding
+                // an arm's bindings cannot change WHICH slots the arm leaves,
+                // and dropping the list would silently return the `if` to the
+                // single-result reconcile it was migrated off.
+                results: results.clone(),
             }
         }
 
@@ -957,42 +960,73 @@ mod tests {
     // 8. If-branch folding
     // -----------------------------------------------------------------------
 
+    // A statically-known condition must NOT blank the untaken arm.
+    //
+    // The folder used to return an empty arm while leaving the `if` node itself
+    // in place. An arm is not a free-floating binding list — it carries the
+    // stack-shape contract ANF lowering builds (the `__merge$<i>` result block
+    // for K>=2 merged locals) and stack lowering consumes. Erasing one arm made
+    // `lower_if` register ONE stack slot for K physical results, which at K=2
+    // silently miscompiled the guard (the deployed script accepted spends the
+    // source rejects) and at K=1 rejected source that compiles with folding
+    // disabled.
     #[test]
-    fn test_fold_true_branch() {
+    fn test_keeps_both_arms_when_condition_known_true() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_bool(true)),
             b("t1", ANFValue::If {
                 cond: "t0".to_string(),
                 then: vec![b("t2", mk_int(42))],
                 else_branch: vec![b("t3", mk_int(99))],
+                results: Vec::new(),
             }),
         ])]);
         let r = fold_constants_only(&p);
         if let ANFValue::If { then, else_branch, .. } = &r.methods[0].body[1].value {
             assert_eq!(then.len(), 1);
-            assert_eq!(else_branch.len(), 0);
+            assert_eq!(else_branch.len(), 1);
         } else {
             panic!("expected If");
         }
     }
 
     #[test]
-    fn test_fold_false_branch() {
+    fn test_keeps_both_arms_when_condition_known_false() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_bool(false)),
             b("t1", ANFValue::If {
                 cond: "t0".to_string(),
                 then: vec![b("t2", mk_int(42))],
                 else_branch: vec![b("t3", mk_int(99))],
+                results: Vec::new(),
             }),
         ])]);
         let r = fold_constants_only(&p);
         if let ANFValue::If { then, else_branch, .. } = &r.methods[0].body[1].value {
-            assert_eq!(then.len(), 0);
+            assert_eq!(then.len(), 1);
             assert_eq!(else_branch.len(), 1);
         } else {
             panic!("expected If");
         }
+    }
+
+    // A statically-known condition must not leak an arm's constants into the
+    // enclosing environment either: the `if` survives the pass, so both arms
+    // are still emitted and either can run.
+    #[test]
+    fn test_does_not_propagate_taken_arm_constants() {
+        let p = make_program(vec![make_method("m", vec![
+            b("t0", mk_bool(true)),
+            b("t1", ANFValue::If {
+                cond: "t0".to_string(),
+                then: vec![b("x", mk_int(42))],
+                else_branch: vec![b("x", mk_int(99))],
+                results: Vec::new(),
+            }),
+            b("t2", bin_op("+", "x", "t0")),
+        ])]);
+        let r = fold_constants_only(&p);
+        assert_not_folded(&r.methods[0].body[2].value, "bin_op");
     }
 
     #[test]
@@ -1005,6 +1039,7 @@ mod tests {
                 cond: "t0".to_string(),
                 then: vec![b("t4", bin_op("+", "t1", "t2"))],
                 else_branch: vec![b("t5", bin_op("-", "t1", "t2"))],
+                results: Vec::new(),
             }),
         ])]);
         let r = fold_constants_only(&p);

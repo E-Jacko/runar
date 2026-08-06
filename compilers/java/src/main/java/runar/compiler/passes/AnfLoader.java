@@ -156,7 +156,8 @@ public final class AnfLoader {
             case "if" -> new If(
                 asString(obj.get("cond")),
                 toBindingList(obj.get("then")),
-                toBindingList(obj.get("else"))
+                toBindingList(obj.get("else")),
+                obj.containsKey("results") ? toStringList(obj.get("results")) : null
             );
             case "loop" -> new Loop(
                 asInt(obj.get("count")),

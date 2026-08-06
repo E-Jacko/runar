@@ -72,7 +72,7 @@ func TestCall_RejectsOversizedScript(t *testing.T) {
 	}, func(a *RunarArtifact) { a.ContractName = "OversizedContract" })
 
 	contract := NewRunarContract(artifact, nil)
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 	provider.AddUtxo(mockAddr, UTXO{

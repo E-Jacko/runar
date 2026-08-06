@@ -424,7 +424,13 @@ pub const BinOp = struct { op: []const u8, left: []const u8, right: []const u8, 
 pub const ANFUnaryOp = struct { op: []const u8, operand: []const u8, result_type: ?[]const u8 = null };
 pub const ANFCall = struct { func: []const u8, args: []const []const u8 };
 pub const ANFMethodCall = struct { object: []const u8, method: []const u8, args: []const []const u8 };
-pub const ANFIf = struct { cond: []const u8, then: []ANFBinding, @"else": []ANFBinding };
+/// `results`: ordered named result slots both arms leave (`results[0]`
+/// deepest). Entries name a branch-merged local or an arm-written contract
+/// property; stack lowering tells the two apart from the contract's property
+/// list, so the wire format stays a plain array of strings. Empty when the
+/// `if` carries at most one result — see the TypeScript reference in
+/// packages/runar-compiler/src/ir/anf-ir.ts for the full contract.
+pub const ANFIf = struct { cond: []const u8, then: []ANFBinding, @"else": []ANFBinding, results: []const []const u8 = &.{} };
 // Iterator start value and step direction (issue #121). The loop is unrolled
 // `count` times; on iteration `i` (0-based) the iterator variable holds
 // `start + i * step`. Zero-start counting-up loops carry `start = 0`, `step = 1`,
@@ -476,7 +482,7 @@ pub const ANFRawScript = struct { bytes: []const u8, in_arity: i32, out_arity: i
 pub const PropertyWrite = struct { name: []const u8, value_ref: []const u8 };
 pub const ANFBinaryOp = struct { op: BinOperator, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFBuiltinCall = struct { name: []const u8, args: []const []const u8 };
-pub const ANFIfExpr = struct { condition: []const u8, then_bindings: []ANFBinding, else_bindings: ?[]ANFBinding };
+pub const ANFIfExpr = struct { condition: []const u8, then_bindings: []ANFBinding, else_bindings: ?[]ANFBinding, results: []const []const u8 = &.{} };
 // Legacy bridge struct adapted from ANFLoop by stack_lower.zig's loop dispatch.
 // Issue #121: carries the iterator start value, step direction, and iteration
 // count directly; the unroll pushes `start + n*step` on iteration `n`.

@@ -17,6 +17,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -51,7 +52,7 @@ async function fundedSigner(provider: MockProvider, privKey: string, satoshis: n
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   return signer;
 }
@@ -91,7 +92,10 @@ function validateSpend(tx: Transaction, inputIdx: number, sourceTx: Transaction,
 describe('#116 — exact-cover call (change 0) omits the change output', () => {
   it('a call with no change validates (script must not demand a change output)', async () => {
     const artifact = compileSource(SRC, 'Counter.runar.ts');
-    const provider = new MockProvider();
+    // The whole point of this test is a change-clamps-to-0 (fee 0) call —
+    // opt out of P1-2's fee floor only; Spend + conservation still run via
+    // validateSpend() below.
+    const provider = new MockProvider('testnet', { enforceFeeFloor: false });
     const deployer = await fundedSigner(provider, DEPLOYER_KEY, 500_000);
     const caller = new LocalSigner(CALLER_KEY); // deliberately unfunded
 

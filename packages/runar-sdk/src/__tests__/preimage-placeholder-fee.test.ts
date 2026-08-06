@@ -31,6 +31,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -125,13 +126,13 @@ describe('call() funds the fee for the transaction it actually broadcasts', () =
   for (const c of CASES) {
     it(`${c.name}: fee covers the broadcast size`, async () => {
       const artifact = compileSource(c.source, c.fileName);
-      const provider = new MockProvider();
+      const provider = new MockProvider('testnet');
       const signer = new LocalSigner(SIGNER_KEY);
       provider.addUtxo(await signer.getAddress(), {
         txid: SIGNER_KEY.slice(0, 64),
         outputIndex: 0,
         satoshis: WALLET_SATS,
-        script: '76a914' + '00'.repeat(20) + '88ac',
+        script: buildP2PKHScript(await signer.getPublicKey()),
       });
 
       const contract = new RunarContract(artifact, c.args as never[]);

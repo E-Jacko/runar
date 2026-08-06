@@ -154,6 +154,18 @@ pub const StackMap = struct {
 
 const LowerError = error{
     OutOfMemory,
+    /// The ANF carries a `__merge$` block in a branch arm but the `if` node
+    /// declares no results — the pre-multi-result wire format. `--ir` /
+    /// `--ir-parity` are documented surfaces and ANF has no version field, so a
+    /// stored ANF from before the node landed deserialises cleanly and the
+    /// result count silently falls back to counting the arm's untrimmed block
+    /// residue. Refused rather than miscompiled.
+    StaleMergedLocalAnf,
+    /// The `if` node declares the same result name twice. Result slots are
+    /// matched by name, so duplicates cannot be told apart and one value would
+    /// silently replace the other while the layout assertion passes by
+    /// coincidence.
+    DuplicateDeclaredResults,
     VariableNotFound,
     InvalidBuiltin,
     UnsupportedOperation,
@@ -170,6 +182,12 @@ const LowerError = error{
     /// constructor argument's placeholder into the locking script, so we fail
     /// loudly instead.
     LoadPropNoConstructorSlot,
+    /// Layer C: after `lowerIf` returns, the parent stackMap must describe the
+    /// physical stack exactly. When it names FEWER slots than the arms left,
+    /// every later operand resolves to the wrong slot — the signature of the
+    /// whole 2026-08 branch/loop miscompile family. Silent until the UTXO is
+    /// already locked, so we fail loudly at compile time instead.
+    BranchResultDepthMismatch,
 };
 
 const LowerCtx = struct {
@@ -797,7 +815,7 @@ const LowerCtx = struct {
                     .@"if" => |ie| {
                         const legacy = try self.allocator.create(types.ANFIfExpr);
                         defer self.allocator.destroy(legacy);
-                        legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null };
+                        legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null, .results = ie.results };
                         try self.lowerIfExprTerminal(binding.name, legacy, true);
                     },
                     else => try self.lowerBinding(binding),
@@ -950,7 +968,7 @@ const LowerCtx = struct {
             .@"if" => |ie| {
                 const legacy = try self.allocator.create(types.ANFIfExpr);
                 defer self.allocator.destroy(legacy);
-                legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null };
+                legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null, .results = ie.results };
                 try self.lowerIfExpr(binding.name, legacy);
             },
             .loop => |lp| {
@@ -3995,6 +4013,7 @@ const LowerCtx = struct {
     // if_expr
     // ========================================================================
 
+
     fn lowerIfExprTerminal(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr, terminal_assert: bool) !void {
         return self.lowerIfExprImpl(bind_name, ie, terminal_assert);
     }
@@ -4004,6 +4023,41 @@ const LowerCtx = struct {
     }
 
     fn lowerIfExprImpl(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr, terminal_assert: bool) !void {
+        // The ANF wire format has no version field, and `--ir` / `--ir-parity`
+        // are documented surfaces that feed a checked-in ANF JSON straight into
+        // this pass. An ANF produced BEFORE the multi-result node carries the
+        // trailing `__merge$` block WITHOUT results — back then the block was a
+        // naming CONVENTION this pass recognised, and no tier recognises it any
+        // more. Refuse it: the block can only be emitted by
+        // `appendBranchResults`, which only runs for an `if` that declares
+        // results. Emits no opcodes.
+        if (ie.results.len == 0) {
+            for (ie.then_bindings) |b| {
+                if (std.mem.startsWith(u8, b.name, types.merged_local_temp_prefix)) {
+                    return LowerError.StaleMergedLocalAnf;
+                }
+            }
+            if (ie.else_bindings) |eb| {
+                for (eb) |b| {
+                    if (std.mem.startsWith(u8, b.name, types.merged_local_temp_prefix)) {
+                        return LowerError.StaleMergedLocalAnf;
+                    }
+                }
+            }
+        }
+
+        // Result slots are identified BY NAME — two identically-named results
+        // are indistinguishable, so the layout assertion would be satisfied by
+        // coincidence while one value silently replaced the other. ANF lowering
+        // refuses the source shape; this guards the `--ir` path.
+        if (ie.results.len > 1) {
+            for (ie.results, 0..) |a, i| {
+                for (ie.results[i + 1 ..]) |b| {
+                    if (std.mem.eql(u8, a, b)) return LowerError.DuplicateDeclaredResults;
+                }
+            }
+        }
+
         try self.bringToTopAuto(ie.condition);
         _ = self.stack.pop();
         var base_stack = try self.stack.clone(self.allocator);
@@ -4017,6 +4071,45 @@ const LowerCtx = struct {
         while (last_use_it.next()) |entry| {
             if (entry.value_ptr.* > self.current_idx and self.stack.findDepth(entry.key_ptr.*) != null) {
                 try protected_refs.put(self.allocator, entry.key_ptr.*, {});
+            }
+        }
+
+        // The K>=2 merged-local block reads every merged local in BOTH arms,
+        // and that read is RECONCILIATION, not a use: it is what makes each arm
+        // leave exactly K equally-named result slots for the N>=2 reconcile
+        // below to adopt. So the merged locals must be copied, never consumed —
+        // regardless of whether the ENCLOSING scope reads them again.
+        //
+        // `appendMergedLocalResults` (ANF lowering) states that as its premise:
+        // "pass 1 always COPIES ... because a local live after the `if` is in
+        // `outerProtectedRefs`". Enclosing-scope liveness is the wrong
+        // question, and the premise silently failed for every merged local
+        // whose last enclosing use IS this `if` — which is EVERY merged local
+        // of an `if` in a loop body, since the body's last-use map ends at the
+        // `if` itself.
+        //
+        // What happened then: pass 1 ROLLED instead of picking, the arm's stack
+        // effect stopped being +K, the arms ended at different depths, phase 3
+        // padded the shortfall with EMPTY pushes, the N-result layout check saw
+        // an unnamed slot where it needed the merged name, and control fell
+        // through to the single-slot fallback `push(bind_name)` — ONE stackMap
+        // name registered for K physical results, with `acc`/`wacc` still
+        // naming the dead pre-`if` slots.
+        // `for (i<2) { if (i<5) { acc = acc + step; wacc = wacc + acc; } }`
+        // with step = 3 produced wacc = 3 where the source says 9: silently in
+        // a stateless contract, and as a permanently unspendable UTXO in a
+        // stateful one.
+        //
+        // Byte-neutral for every program whose merged locals were already live
+        // after the `if`: those names are already protected above, which is
+        // precisely why those programs compiled correctly.
+        //
+        // Now driven by the node's DECLARED results instead of by recognising a
+        // trailing `__merge$` block, so an arm-written property is protected on
+        // the same footing as a rebound local.
+        for (ie.results) |name| {
+            if (self.stack.findDepth(name) != null) {
+                try protected_refs.put(self.allocator, name, {});
             }
         }
 
@@ -4111,8 +4204,8 @@ const LowerCtx = struct {
         //
         // Runs AFTER the phase-2 consumption drops, so both arms have given up
         // the same parent slots and share one base depth.
-        const merged_result_count = countMergedLocalResults(ie.then_bindings, else_bindings);
-        if (merged_result_count >= 2) {
+        const n_declared = ie.results.len;
+        if (n_declared >= 1) {
             var still_held = try then_ctx.stack.namedSlots(self.allocator);
             defer still_held.deinit(self.allocator);
             var consumed_from_parent: usize = 0;
@@ -4122,10 +4215,46 @@ const LowerCtx = struct {
                     consumed_from_parent += 1;
                 }
             }
-            const target_depth = self.stack.depth() - consumed_from_parent + merged_result_count;
+            const target_depth = self.stack.depth() - consumed_from_parent + n_declared;
             for ([_]*LowerCtx{ &then_ctx, &else_ctx }) |arm_ctx| {
                 while (arm_ctx.stack.depth() > target_depth) {
-                    try removeBranchValueAtDepth(arm_ctx, merged_result_count);
+                    try removeBranchValueAtDepth(arm_ctx, n_declared);
+                }
+            }
+
+            // The declared contract, checked rather than assumed: after the
+            // trim, each arm's top N slots must BE the declared results, in the
+            // declared order (`results[0]` deepest). `appendBranchResults` is
+            // what makes this true; if it ever stops being true the arms
+            // disagree on layout, which is precisely the failure that produced
+            // the 2026-08 miscompile family. Emits no opcodes.
+            const arms = [_]struct { label: []const u8, ctx: *LowerCtx }{
+                .{ .label = "then", .ctx = &then_ctx },
+                .{ .label = "else", .ctx = &else_ctx },
+            };
+            for (arms) |arm| {
+                if (arm.ctx.stack.depth() != target_depth) {
+                    std.log.warn(
+                        "stack lowering: branch result layout mismatch -- the {s}-arm of the " ++
+                            "conditional ends at depth {d}, but its {d} declared result(s) " ++
+                            "require depth {d}. binding='{s}'.",
+                        .{ arm.label, arm.ctx.stack.depth(), n_declared, target_depth, bind_name },
+                    );
+                    return LowerError.BranchResultDepthMismatch;
+                }
+                var li: usize = 0;
+                while (li < n_declared) : (li += 1) {
+                    const want = ie.results[n_declared - 1 - li];
+                    const got = arm.ctx.stack.peekAtDepth(li);
+                    if (got == null or !std.mem.eql(u8, got.?, want)) {
+                        std.log.warn(
+                            "stack lowering: branch result layout mismatch -- the {s}-arm of the " ++
+                                "conditional holds '{s}' where the node declares '{s}' (slot {d}). " ++
+                                "Every later operand would resolve to the wrong slot. binding='{s}'.",
+                            .{ arm.label, got orelse "<unnamed>", want, n_declared - 1 - li, bind_name },
+                        );
+                        return LowerError.BranchResultDepthMismatch;
+                    }
                 }
             }
         }
@@ -4179,6 +4308,14 @@ const LowerCtx = struct {
         try self.owned_push_data.appendSlice(self.allocator, else_ctx.owned_push_data.items);
         else_ctx.owned_push_data.clearRetainingCapacity();
 
+        // Physical slots this function drops AFTER OP_ENDIF, while reconciling
+        // the parent stackMap against the arms' results. Counted because the
+        // invariant at the end of lowerIf cannot compare the two depths
+        // directly: the post-ENDIF reconcile legitimately ROLL/DROPs stale slots
+        // out from under the results, so those drops have to be added back
+        // before comparing.
+        var post_endif_drops: usize = 0;
+
         var post_branch_names = try then_ctx.stack.namedSlots(self.allocator);
         defer post_branch_names.deinit(self.allocator);
         pre_it = pre_if_names.iterator();
@@ -4220,7 +4357,54 @@ const LowerCtx = struct {
             }
         }
 
-        if (then_depth > self_depth and n_results >= 2 and (else_bindings.len == 0 or else_matches_then_n_result_layout)) {
+        if (n_declared >= 1) {
+            // DECLARED RESULTS. Both arms were normalised by
+            // `appendBranchResults` and the layout check above proved they hold
+            // exactly `results`, so the parent adopts them BY THE DECLARED
+            // ORDER -- no counting of trailing `__merge$` bindings, no
+            // comparison of arm depths, no inference of which names are still
+            // live. `results[0]` is the deepest slot, matching the order pass 2
+            // of the normalisation rebound them in.
+            //
+            // Then each parent slot the block shadows (the pre-`if` binding of
+            // a merged local, the stale value of a written property) is
+            // physically rolled out from under the results, exactly as the
+            // pre-existing N>=2 reconcile did -- which is why the four
+            // `__merge$` goldens keep their bytes.
+            for (ie.results) |name| {
+                try self.stack.push(self.allocator, name);
+            }
+            var ri2: usize = n_declared;
+            while (ri2 > 0) {
+                ri2 -= 1;
+                const name = ie.results[ri2];
+                var d: usize = n_declared;
+                while (d < self.stack.depth()) : (d += 1) {
+                    if (self.stack.peekAtDepth(d)) |nm2| {
+                        if (std.mem.eql(u8, nm2, name)) {
+                            // The unconditional push/roll/drop of the
+                            // pre-existing N>=2 reconcile, NOT
+                            // `removeStalePropertyAtDepth` — that helper nips at
+                            // depth 1, and the reference tier does not, so using
+                            // it here would diverge by three bytes on every
+                            // single-result `if` whose stale slot sits at depth
+                            // 1 (`if-else`, `selector`).
+                            try self.emitPushInt(@intCast(d));
+                            try self.stack.push(self.allocator, null);
+                            try self.emitOp(.op_roll);
+                            _ = self.stack.pop();
+                            const rolled = self.stack.peekAtDepth(d);
+                            try self.stack.removeAtDepth(self.allocator, d);
+                            try self.stack.push(self.allocator, rolled);
+                            try self.emitOp(.op_drop);
+                            _ = self.stack.pop();
+                            post_endif_drops += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (then_depth > self_depth and n_results >= 2 and (else_bindings.len == 0 or else_matches_then_n_result_layout)) {
             // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
             // values on top; record them in their on-stack order, then remove
             // the N stale old property values beneath them.
@@ -4239,6 +4423,7 @@ const LowerCtx = struct {
                     if (self.stack.peekAtDepth(d)) |nm2| {
                         if (std.mem.eql(u8, nm2, name)) {
                             try removeStalePropertyAtDepth(self, d);
+                            post_endif_drops += 1;
                             break;
                         }
                     }
@@ -4264,6 +4449,7 @@ const LowerCtx = struct {
                     if (self.stack.peekAtDepth(d)) |name| {
                         if (std.mem.eql(u8, name, then_top.?)) {
                             try removeStalePropertyAtDepth(self, d);
+                            post_endif_drops += 1;
                             break;
                         }
                     }
@@ -4275,6 +4461,7 @@ const LowerCtx = struct {
                     if (self.stack.peekAtDepth(d)) |name| {
                         if (std.mem.eql(u8, name, then_top.?)) {
                             try removeStalePropertyAtDepth(self, d);
+                            post_endif_drops += 1;
                             break;
                         }
                     }
@@ -4285,6 +4472,45 @@ const LowerCtx = struct {
         } else if (else_ctx.stack.depth() > self.stack.depth()) {
             try self.stack.push(self.allocator, bind_name);
         }
+
+        // Layer C — branch result-depth invariant.
+        //
+        // The stackMap is the compiler's ONLY model of the stack, so a stackMap
+        // that names FEWER slots than the arms physically left is not detectable
+        // anywhere downstream: every later operand silently resolves N slots
+        // off. That single failure mode produced the whole 2026-08 branch/loop
+        // miscompile family -- wrong-but-accepted state continuations at best,
+        // and scripts the interpreter rejects outright (locked funds) at worst.
+        //
+        // What must hold when lowerIf returns: the parent stackMap describes
+        // exactly the physical stack. Both arms ended at arm_depth (Layer B
+        // above proves they agree), OP_ENDIF changes nothing, and the only
+        // physical effect after it is the post_endif_drops stale-slot drops the
+        // reconcile emitted. So:
+        //
+        //     self.stack.depth() + post_endif_drops == arm_depth
+        //
+        // The naive self.stack.depth() == arm_depth is WRONG -- the reconcile
+        // legitimately ROLL/DROPs stale slots out from under the results, which
+        // is exactly what post_endif_drops counts.
+        //
+        // A failure here is always a codegen bug, never a user error. Emits no
+        // opcodes: byte-neutral by construction. Same genre as Layer B (#99),
+        // added for the same reason.
+        const arm_depth = then_ctx.stack.depth();
+        if (self.stack.depth() + post_endif_drops != arm_depth) {
+            std.log.warn(
+                "stack lowering: branch result depth mismatch -- the parent stack " ++
+                    "model does not describe the physical stack after OP_ENDIF " ++
+                    "(stackMap depth {d} + {d} post-ENDIF drop(s) != arm depth {d}). " ++
+                    "The arms leave more physical slots than the compiler recorded, " ++
+                    "so every later operand would resolve to the wrong slot and the " ++
+                    "script would be wrong or unspendable. binding='{s}'.",
+                .{ self.stack.depth(), post_endif_drops, arm_depth, bind_name },
+            );
+            return LowerError.BranchResultDepthMismatch;
+        }
+
         self.trackDepth();
 
         if (then_ctx.max_depth > self.max_depth) self.max_depth = then_ctx.max_depth;
@@ -4391,6 +4617,154 @@ const LowerCtx = struct {
         }
     }
 
+    /// Collect the locals a loop body REBINDS and then READS AGAIN in the same
+    /// iteration. Mirrors the TS reference compiler's
+    /// `collectLoopCarriedRebinds` (05-stack-lower.ts).
+    ///
+    /// `computeLastUses` maps a name to the MAXIMUM index that references it,
+    /// so for a body like
+    ///
+    ///     t3   = acc + step     (index 1 — reads the value carried in)
+    ///     acc  = @ref:t3        (index 2 — rebinds: renames t3's slot to acc)
+    ///     t4   = wacc + acc     (index 3 — reads the value just rebound)
+    ///
+    /// `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies
+    /// (PICK) instead of consuming, leaving the incoming slot on the stack
+    /// under the same name as the rebound one; index 3 then IS the last use,
+    /// and findDepth resolves to the topmost match — so it consumes the
+    /// UPDATED value and leaves the dead incoming one. The next iteration
+    /// reads that dead slot, and every iteration recomputes from the pre-loop
+    /// value: `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc +
+    /// acc; }` produced `wacc = step*N` where the source says
+    /// `step*N*(N+1)/2` — silently in a stateless contract, and as a
+    /// permanently unspendable UTXO in a stateful one (the covenant commits to
+    /// a continuation the SDK never builds). `outer_refs` does not cover it:
+    /// `acc` is excluded there precisely because the body binds it.
+    ///
+    /// The value these names hold at the end of an iteration is live at the
+    /// start of the next one, so `lowerForLoop` protects them from consumption
+    /// exactly like an outer ref. The incoming slot each rebinding shadows is
+    /// left behind and drained with the rest of the frame at method exit — a
+    /// name always resolves to its newest slot, so the reads stay correct.
+    ///
+    /// Both halves of the predicate are load-bearing:
+    ///   - read BEFORE the first rebinding: the name is carried IN from the
+    ///     enclosing scope, rather than being a body-private temp that merely
+    ///     happens to be read after it is bound;
+    ///   - read AFTER the last rebinding: without it the rebound value is dead
+    ///     at the end of the iteration and consuming it is correct. This is
+    ///     what keeps every shipped accumulator (`sum = sum + i`, `off = off +
+    ///     len`) byte-for-byte unchanged.
+    ///
+    /// NESTED loops: the scan runs over `flattenNestedLoopBodies(body)`, not
+    /// over `body` itself. A name rebound only inside an INNER loop is bound
+    /// at no top-level index of the outer body, so the raw scan classified it
+    /// as neither an outer ref (`collectDeepBindingNames` excludes it — the
+    /// body does bind it, deeply) nor a carried rebind, and the outer loop
+    /// never marked it live. The inner loop's final iteration then consumed
+    /// it, because `used_after_loop` asks the enclosing scope and the
+    /// enclosing scope had not been told either, so every outer iteration
+    /// restarted from the slot the previous one left behind:
+    /// `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }` with
+    /// step = 3 produced `wacc = 24` where the source says 30. Splicing the
+    /// inner body in at the loop's position preserves the read/rebind/read
+    /// ordering the inner level already sees, so the outer level draws the
+    /// same conclusion.
+    fn collectLoopCarriedRebinds(
+        allocator: Allocator,
+        body: []const types.ANFBinding,
+        out: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        var flat_buf: std.ArrayListUnmanaged(types.ANFBinding) = .empty;
+        defer flat_buf.deinit(allocator);
+        try flattenNestedLoopBodies(allocator, body, &flat_buf);
+        const flat = flat_buf.items;
+
+        var first_bind: std.StringHashMapUnmanaged(usize) = .empty;
+        defer first_bind.deinit(allocator);
+        var last_bind: std.StringHashMapUnmanaged(usize) = .empty;
+        defer last_bind.deinit(allocator);
+        for (flat, 0..) |binding, i| {
+            if (!first_bind.contains(binding.name)) {
+                try first_bind.put(allocator, binding.name, i);
+            }
+            try last_bind.put(allocator, binding.name, i);
+        }
+
+        var read_before: std.StringHashMapUnmanaged(void) = .empty;
+        defer read_before.deinit(allocator);
+        var read_after: std.StringHashMapUnmanaged(void) = .empty;
+        defer read_after.deinit(allocator);
+        for (flat, 0..) |binding, i| {
+            var refs: std.StringHashMapUnmanaged(void) = .empty;
+            defer refs.deinit(allocator);
+            try collectValueRefs(allocator, binding.value, &refs);
+            var it = refs.iterator();
+            while (it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                if (first_bind.get(ref)) |first| {
+                    if (i < first) try read_before.put(allocator, ref, {});
+                }
+                if (last_bind.get(ref)) |last| {
+                    if (i > last) try read_after.put(allocator, ref, {});
+                }
+            }
+        }
+
+        var before_it = read_before.iterator();
+        while (before_it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (read_after.contains(ref)) try out.put(allocator, ref, {});
+        }
+    }
+
+    /// Append `body` to `out` with every nested `loop` binding — and every `if`
+    /// binding — replaced, in place, by its own (recursively flattened) body.
+    ///
+    /// Only `collectLoopCarriedRebinds` uses this, and only to order reads
+    /// against rebindings. Neither replaced binding contributes a stack slot
+    /// that predicate reasons about, so dropping it loses nothing; splicing the
+    /// sub-body in at its position is what lets an enclosing loop see a
+    /// rebinding one level down.
+    ///
+    /// `if` arms ARE spliced, in `then ++ else` order, even though they are
+    /// alternatives rather than a sequence. The predicate asks only "is this
+    /// name read, then rebound, then read again", and treating the arms as a
+    /// sequence can only ADD names to the carried set, never remove one —
+    /// conservative in the safe direction. Without it a local rebound ONLY
+    /// inside an `if` arm was bound at no index the predicate could see:
+    /// neither an outer ref (`collectDeepBindingNames` excludes it, since the
+    /// body does bind it, deeply) nor a carried rebind. The loop consumed it
+    /// and the next iteration had nothing to read, so
+    /// `for (i<2) { if (i<5) { acc = acc + step; } wacc = wacc + acc; }` was
+    /// REJECTED outright with `Value 'acc' not found on stack` — the loud face
+    /// of the same gap the merged-local protection in `lowerIfExprImpl` fixes
+    /// silently at K>=2.
+    ///
+    /// The `if` binding itself is NOT re-appended after its arms. Appending it
+    /// would count the arms' reads a second time at an index past every arm
+    /// rebinding, making a local that BOTH arms rebind look "read after its
+    /// last rebinding" — which protected a K=1 alias that must stay consumable.
+    ///
+    /// A body with no nested loop and no `if` is appended entry-for-entry
+    /// unchanged, which is what makes this byte-neutral for every flat loop.
+    fn flattenNestedLoopBodies(
+        allocator: Allocator,
+        body: []const types.ANFBinding,
+        out: *std.ArrayListUnmanaged(types.ANFBinding),
+    ) !void {
+        for (body) |binding| {
+            switch (binding.value) {
+                .loop => |lp| try flattenNestedLoopBodies(allocator, lp.body, out),
+                .@"if" => |ie| {
+                    try flattenNestedLoopBodies(allocator, ie.then, out);
+                    try flattenNestedLoopBodies(allocator, ie.@"else", out);
+                },
+                else => try out.append(allocator, binding),
+            }
+        }
+    }
+
     fn lowerForLoop(self: *LowerCtx, bind_name: []const u8, fl: *const types.ANFForLoop) !void {
         var body_binding_names: std.StringHashMapUnmanaged(void) = .empty;
         defer body_binding_names.deinit(self.allocator);
@@ -4426,6 +4800,22 @@ const LowerCtx = struct {
         while (all_refs_it.next()) |entry| {
             const ref = entry.key_ptr.*;
             if (!std.mem.eql(u8, ref, fl.var_name) and !deep_body_names.contains(ref)) {
+                try outer_refs.put(self.allocator, ref, {});
+            }
+        }
+
+        // A local the body REBINDS and then READS AGAIN in the same iteration
+        // is carried across iterations through the rebound slot, so it must
+        // survive the body exactly like an outer ref. `deep_body_names` above
+        // excludes it precisely because the body binds it — which is what made
+        // the updated value consumable. See `collectLoopCarriedRebinds`.
+        var carried_rebinds: std.StringHashMapUnmanaged(void) = .empty;
+        defer carried_rebinds.deinit(self.allocator);
+        try collectLoopCarriedRebinds(self.allocator, fl.body_bindings, &carried_rebinds);
+        var carried_it = carried_rebinds.iterator();
+        while (carried_it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (!std.mem.eql(u8, ref, fl.var_name)) {
                 try outer_refs.put(self.allocator, ref, {});
             }
         }
@@ -4962,48 +5352,6 @@ pub fn methodUsesCodePartFull(
         (methodUsesCodePart(bindings) or methodReadsVarLenState(bindings, properties, methods));
 }
 
-/// How many branch-merged locals an if-statement's two arms carry as results.
-///
-/// ANF lowering's appendMergedLocalResults ends both arms with the same
-/// K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
-/// merged values sit on top in the same canonical order whichever branch runs.
-/// Counting the trailing block is how stack lowering learns K: it must trim
-/// each arm down to exactly those K slots before the N>=2 reconcile compares
-/// the arms, since everything beneath them is the arm's own (dead, and
-/// arm-specific) working values.
-///
-/// Returns 0 unless BOTH arms end with a block of the same size — anything
-/// else is not a normalised merge and must not be trimmed.
-fn countMergedLocalResults(
-    then_bindings: []const types.ANFBinding,
-    else_bindings: []const types.ANFBinding,
-) usize {
-    const trailing = struct {
-        fn count(bindings: []const types.ANFBinding) usize {
-            var n: usize = 0;
-            var i: usize = bindings.len;
-            while (i > 0) {
-                i -= 1;
-                const value = bindings[i].value;
-                const const_str = switch (value) {
-                    .load_const => |lc| switch (lc.value) {
-                        .string => |str| str,
-                        else => return n,
-                    },
-                    else => return n,
-                };
-                if (!std.mem.startsWith(u8, const_str, "@ref:" ++ types.merged_local_temp_prefix)) {
-                    return n;
-                }
-                n += 1;
-            }
-            return n;
-        }
-    }.count;
-    const then_count = trailing(then_bindings);
-    if (then_count > 0 and then_count == trailing(else_bindings)) return then_count;
-    return 0;
-}
 
 fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.ANFMethod {
     for (methods) |method| {

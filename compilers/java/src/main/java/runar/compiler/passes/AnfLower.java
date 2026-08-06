@@ -138,9 +138,50 @@ public final class AnfLower {
         List<AnfProperty> out = new ArrayList<>(contract.properties().size());
         for (PropertyNode p : contract.properties()) {
             ConstValue init = p.initializer() != null ? extractLiteralValue(p.initializer()) : null;
-            out.add(new AnfProperty(p.name(), typeToString(p.type()), p.readonly(), init));
+            AnfProperty prop = new AnfProperty(p.name(), typeToString(p.type()), p.readonly(), init);
+            if (init != null) checkStateBigintMagnitude(prop);
+            out.add(prop);
         }
         return out;
+    }
+
+    /**
+     * Magnitude a bigint state field gets: {@code num2bin-le8} is a fixed
+     * 8-byte little-endian SIGN-MAGNITUDE word, so bytes 0..6 plus the low 7
+     * bits of byte 7 carry the magnitude and 0x80 of byte 7 carries the sign.
+     */
+    private static final BigInteger STATE_BIGINT_MAGNITUDE_LIMIT = BigInteger.ONE.shiftLeft(63);
+
+    /**
+     * Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+     *
+     * <p>The state section writes every bigint field with OP_NUM2BIN 8, which
+     * cannot represent a magnitude of 2^63 or more. Nothing used to check: the
+     * compiler stamped {@code encoding: "num2bin-le8"} on the field and carried
+     * the initializer verbatim, the SDK wrote the low 8 bytes of it into the
+     * deployed state section, and the covenant then rebuilt the continuation
+     * with its own OP_NUM2BIN 8 — which produces different bytes — so
+     * hash256(outputs) never matched and the UTXO was permanently unspendable.
+     * It deployed cleanly, with no diagnostic at compile time or deploy time.
+     *
+     * <p>This catches the statically-known half. Values that only exist at call
+     * time are stopped by the SDK serializer
+     * ({@code packages/runar-java/.../StateSerializer.java}).
+     *
+     * <p>READONLY properties are deliberately exempt: they are baked into the
+     * locking script as script-number pushes, never into the state section, and
+     * BSV script numbers are arbitrary-precision after Genesis.
+     */
+    private static void checkStateBigintMagnitude(AnfProperty prop) {
+        if (prop.readonly()) return;
+        if (!"bigint".equals(prop.type()) && !"int".equals(prop.type())) return;
+        if (!(prop.initialValue() instanceof BigIntConst bc)) return;
+        if (bc.value().abs().compareTo(STATE_BIGINT_MAGNITUDE_LIMIT) < 0) return;
+        throw new IllegalStateException(
+            "Cannot compile state property '" + prop.name() + "' initialised to "
+                + bc.value() + ": it does not fit the fixed 8-byte sign-magnitude "
+                + "state word (magnitude must be < 2^63). Reduce the value, or make "
+                + "the property readonly if it is a constant rather than state.");
     }
 
     private static ConstValue extractLiteralValue(Expression e) {
@@ -468,6 +509,15 @@ public final class AnfLower {
         // being lowered, so a MANUAL checkPreimage(pre) call binds under the
         // same mode as the method's declared sighash. null = default ALL|FORKID.
         Integer sighashFlag = null;
+        /**
+         * True in every context produced by {@link #subContext()} — inside an
+         * if arm, a loop body, or an inlined helper's block — and false only in
+         * the context a method's own body is lowered into. {@code
+         * liftBranchUpdateProps} walks {@code method.body()} and does NOT
+         * recurse, so an {@code if} its recogniser accepts is only actually
+         * REWRITTEN at method top level.
+         */
+        boolean nested = false;
 
         LowerCtx(ContractNode contract) {
             this.contract = contract;
@@ -648,6 +698,7 @@ public final class AnfLower {
             // bindings emitted inside an if/else / loop branch are still
             // mapped back to the originating AST statement.
             sub.currentSourceLoc = this.currentSourceLoc;
+            sub.nested = true;
             return sub;
         }
 
@@ -662,6 +713,16 @@ public final class AnfLower {
         // -----------------------------------------------------------
 
         void lowerStatements(List<Statement> stmts) {
+            lowerStatements(stmts, Set.of());
+        }
+
+        /**
+         * Lower a statement block, threading down the set of identifiers the
+         * enclosing blocks still read after this block ends. Only the
+         * block-forming statements (if / for) consume it; see
+         * {@link #readsAfterStatement}.
+         */
+        void lowerStatements(List<Statement> stmts, Set<String> readsAfterBlock) {
             for (int i = 0; i < stmts.size(); i++) {
                 Statement stmt = stmts.get(i);
                 // Early-return nesting: if an if-statement's then-block ends
@@ -675,14 +736,124 @@ public final class AnfLower {
                     IfStatement modified = new IfStatement(
                         is.condition(), is.thenBody(), new ArrayList<>(remaining), is.sourceLocation()
                     );
-                    lowerStatement(modified);
+                    lowerStatement(modified, readsAfterBlock);
                     return;
                 }
-                lowerStatement(stmt);
+                // Only the block-forming statements need to know what the code
+                // after them still reads; computing it for every statement
+                // would be quadratic for no benefit.
+                Set<String> readsAfter =
+                    (stmt instanceof IfStatement || stmt instanceof ForStatement)
+                        ? readsAfterStatement(stmts, i, readsAfterBlock)
+                        : Set.of();
+                lowerStatement(stmt, readsAfter);
             }
         }
 
+        /**
+         * The identifiers still readable once statement {@code index} of this
+         * block has run: everything the following statements in this block
+         * read, plus whatever the enclosing blocks read after this block.
+         *
+         * <p>Used by {@link #lowerIfStatement} to tell a branch-merged local
+         * that is dead after the {@code if} (safe) from one that is still live
+         * (not representable alongside a branch output — see
+         * {@link #branchOutputRejectionReason}).
+         */
+        private Set<String> readsAfterStatement(
+            List<Statement> stmts, int index, Set<String> readsAfterBlock) {
+            Set<String> reads = new HashSet<>(readsAfterBlock);
+            for (int j = index + 1; j < stmts.size(); j++) {
+                collectStatementReads(stmts.get(j), reads);
+            }
+            return reads;
+        }
+
+        /**
+         * Collect every identifier a statement READS. The {@code x} in
+         * {@code x = expr} is a write, not a read, so a plain identifier
+         * assignment target is skipped; every other target form can still read
+         * locals.
+         */
+        private void collectStatementReads(Statement stmt, Set<String> out) {
+            if (stmt instanceof VariableDeclStatement v) {
+                collectExpressionReads(v.init(), out);
+            } else if (stmt instanceof AssignmentStatement a) {
+                if (!(a.target() instanceof Identifier)) {
+                    collectExpressionReads(a.target(), out);
+                }
+                collectExpressionReads(a.value(), out);
+            } else if (stmt instanceof IfStatement i) {
+                collectExpressionReads(i.condition(), out);
+                for (Statement inner : i.thenBody()) {
+                    collectStatementReads(inner, out);
+                }
+                if (i.elseBody() != null) {
+                    for (Statement inner : i.elseBody()) {
+                        collectStatementReads(inner, out);
+                    }
+                }
+            } else if (stmt instanceof ForStatement f) {
+                if (f.init() != null) {
+                    collectStatementReads(f.init(), out);
+                }
+                collectExpressionReads(f.condition(), out);
+                if (f.update() != null) {
+                    collectStatementReads(f.update(), out);
+                }
+                for (Statement inner : f.body()) {
+                    collectStatementReads(inner, out);
+                }
+            } else if (stmt instanceof ReturnStatement r) {
+                collectExpressionReads(r.value(), out);
+            } else if (stmt instanceof ExpressionStatement e) {
+                collectExpressionReads(e.expression(), out);
+            }
+        }
+
+        /** Collect every identifier an expression reads. */
+        private void collectExpressionReads(Expression expr, Set<String> out) {
+            if (expr == null) {
+                return;
+            }
+            if (expr instanceof Identifier id) {
+                out.add(id.name());
+            } else if (expr instanceof BinaryExpr b) {
+                collectExpressionReads(b.left(), out);
+                collectExpressionReads(b.right(), out);
+            } else if (expr instanceof UnaryExpr u) {
+                collectExpressionReads(u.operand(), out);
+            } else if (expr instanceof CallExpr c) {
+                collectExpressionReads(c.callee(), out);
+                for (Expression a : c.args()) {
+                    collectExpressionReads(a, out);
+                }
+            } else if (expr instanceof MemberExpr m) {
+                collectExpressionReads(m.object(), out);
+            } else if (expr instanceof TernaryExpr t) {
+                collectExpressionReads(t.condition(), out);
+                collectExpressionReads(t.consequent(), out);
+                collectExpressionReads(t.alternate(), out);
+            } else if (expr instanceof IndexAccessExpr ia) {
+                collectExpressionReads(ia.object(), out);
+                collectExpressionReads(ia.index(), out);
+            } else if (expr instanceof IncrementExpr inc) {
+                collectExpressionReads(inc.operand(), out);
+            } else if (expr instanceof DecrementExpr dec) {
+                collectExpressionReads(dec.operand(), out);
+            } else if (expr instanceof ArrayLiteralExpr al) {
+                for (Expression e : al.elements()) {
+                    collectExpressionReads(e, out);
+                }
+            }
+            // Literals and `this.x` property access read no locals.
+        }
+
         void lowerStatement(Statement stmt) {
+            lowerStatement(stmt, Set.of());
+        }
+
+        void lowerStatement(Statement stmt, Set<String> readsAfter) {
             // GAP-002: pick up the statement's source location so every
             // AnfBinding emitted during the lowering of this statement
             // carries it forward.
@@ -696,9 +867,9 @@ public final class AnfLower {
                 } else if (stmt instanceof AssignmentStatement a) {
                     lowerAssignment(a);
                 } else if (stmt instanceof IfStatement i) {
-                    lowerIfStatement(i);
+                    lowerIfStatement(i, readsAfter);
                 } else if (stmt instanceof ForStatement f) {
-                    lowerForStatement(f);
+                    lowerForStatement(f, readsAfter);
                 } else if (stmt instanceof ExpressionStatement e) {
                     lowerExprToRef(e.expression());
                 } else if (stmt instanceof ReturnStatement r) {
@@ -741,15 +912,19 @@ public final class AnfLower {
         }
 
         void lowerIfStatement(IfStatement stmt) {
+            lowerIfStatement(stmt, Set.of());
+        }
+
+        void lowerIfStatement(IfStatement stmt, Set<String> readsAfter) {
             String condRef = lowerExprToRef(stmt.condition());
 
             LowerCtx thenCtx = subContext();
-            thenCtx.lowerStatements(stmt.thenBody());
+            thenCtx.lowerStatements(stmt.thenBody(), readsAfter);
             syncCounter(thenCtx);
 
             LowerCtx elseCtx = subContext();
             if (stmt.elseBody() != null) {
-                elseCtx.lowerStatements(stmt.elseBody());
+                elseCtx.lowerStatements(stmt.elseBody(), readsAfter);
             }
             syncCounter(elseCtx);
 
@@ -767,9 +942,11 @@ public final class AnfLower {
                 || !thenCtx.addDataOutputRefs.isEmpty()
                 || !elseCtx.addDataOutputRefs.isEmpty();
 
+            String thenOutputBytes = "";
+            String elseOutputBytes = "";
             if (branchHasOutputs) {
-                appendBranchOutputConcat(thenCtx);
-                appendBranchOutputConcat(elseCtx);
+                thenOutputBytes = appendBranchOutputConcat(thenCtx);
+                elseOutputBytes = appendBranchOutputConcat(elseCtx);
             }
 
             // Branch-merged locals (2 or more). An `if` expression carries
@@ -785,26 +962,118 @@ public final class AnfLower {
             // Fix: give both arms the SAME result set in the SAME order by
             // appending an explicit rebind of every merged local to each arm.
             List<String> mergedLocals = collectBranchMergedLocals(thenCtx, elseCtx);
-            if (mergedLocals.size() >= 2) {
-                if (branchHasOutputs) {
-                    // The arms' single value is already spoken for: it is the
-                    // output concat the continuation hash consumes. Refuse at
-                    // compile time rather than emit the unspendable script this
-                    // used to produce.
+
+            if (branchHasOutputs) {
+                String reason = branchOutputRejectionReason(
+                    thenCtx, elseCtx, thenOutputBytes, elseOutputBytes, mergedLocals, readsAfter);
+                if (reason != null) {
                     throw new IllegalStateException(
-                        "Cannot compile conditional that both declares outputs and merges "
-                        + mergedLocals.size() + " local variables ("
-                        + String.join(", ", mergedLocals) + "). Move the addOutput/"
-                        + "addRawOutput/addDataOutput call after the if-statement, or give "
-                        + "each branch its own complete addOutput.");
+                        "Cannot compile conditional that both declares outputs and "
+                        + reason + ". Move the addOutput/addRawOutput/addDataOutput "
+                        + "call after the if-statement.");
                 }
-                appendMergedLocalResults(thenCtx, mergedLocals);
+            }
+
+            // The `if`'s multi-result contract. Locals first, in the canonical
+            // merge order both arms agree on, then the properties either arm
+            // writes, in contract declaration order — so all seven tiers derive
+            // the same list from the same source. results[0] is the deepest
+            // slot of the block.
+            List<String> armProps = new ArrayList<>();
+            collectUpdatedProps(thenCtx.bindings, armProps);
+            collectUpdatedProps(elseCtx.bindings, armProps);
+            List<String> resultNames = new ArrayList<>(mergedLocals);
+            for (PropertyNode p : contract.properties()) {
+                if (armProps.contains(p.name())) {
+                    resultNames.add(p.name());
+                }
+            }
+
+            // The result list is keyed by NAME everywhere downstream:
+            // appendBranchResults picks the local path or the property path per
+            // entry with armProps.contains(name), and stack lowering's layout
+            // assertion compares the arm's top-N slot names against this list.
+            // A local sharing a contract property's name therefore appears
+            // TWICE and both entries take the PROPERTY path, so the local's
+            // value is silently replaced by the property's — and the layout
+            // assertion cannot see it, because both slots are legitimately
+            // named the same. Refuse the exact collision only.
+            for (String local : mergedLocals) {
+                if (armProps.contains(local)) {
+                    throw new IllegalStateException(
+                        "Local variable '" + local + "' shadows contract property 'this."
+                        + local + "', and the conditional assigns both. The branch's "
+                        + "result slots are identified by name, so the two cannot be "
+                        + "told apart and the local's value would be silently replaced "
+                        + "by the property's. Rename the local.");
+                }
+            }
+
+            // When to materialise the contract instead of leaving the arms to
+            // the stack-lowerer's inference:
+            //
+            //   - two or more merged locals — the pre-existing normalisation.
+            //     Kept on exactly its old trigger so the four `__merge$`
+            //     goldens do not move.
+            //   - any result at all when the ELSE arm carries code. This is the
+            //     new case, and it is where every measured miscompile lives:
+            //     one arm rebinds its local IN PLACE (net depth 0) while the
+            //     other pushes a fresh slot (net +1), or an arm writes a
+            //     property beside a rebound local, or the two arms write the
+            //     same properties in a different order. The arms then leave
+            //     different LAYOUTS, which no depth or liveness predicate can
+            //     see.
+            //
+            // An `if` WITHOUT an else keeps the preserve-the-old-value path in
+            // `lowerIf` (phase 3 copies each missing slot's same-named parent
+            // value), which already produces exactly these results by
+            // construction — deliberately left intact. An arm that emits
+            // outputs is excluded: its single value is the serialised output
+            // bytes, and `branchOutputRejectionReason` above already refuses
+            // every combination that would need a second result.
+            //
+            // EXCLUDED: an `if` that liftBranchUpdateProps will rewrite. That
+            // pass (deep-review finding C20) turns a
+            // conditional-property-assignment chain into one flat
+            // single-valued `if` per property plus a top-level update_prop, so
+            // the surviving `if`s carry no property result and need no
+            // declaration. Appending the normalisation block first would ALSO
+            // silently disable that pass: its recogniser requires the arm's
+            // last binding to be the update_prop with everything before it
+            // side-effect free, and the block adds a second update_prop behind
+            // it. TicTacToe's position dispatch is exactly that shape, and
+            // losing the lift there produced an unspendable `move` script.
+            //
+            // The exclusion must be exactly "the lift WILL rewrite this `if`",
+            // which is narrower than "the lift's recogniser accepts it" in TWO
+            // ways — both were live defects producing an unspendable UTXO: the
+            // lift only rewrites chains of TWO OR MORE branches
+            // (collectUpdateBranches returns a ONE-element list for the
+            // assert-false-else guard), and it only walks method.body(),
+            // passing loop bodies and surviving arms through untouched, while
+            // declaresResults is evaluated at EVERY nesting depth.
+            //
+            // A chain's DEEPEST `if` is never at top level, so it now declares
+            // results and carries a normalisation block — which is why
+            // collectUpdateBranches strips a declared block before matching
+            // (stripDeclaredResults).
+            List<UpdateBranch> lifted =
+                collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings);
+            boolean willBeLifted = !nested && lifted != null && lifted.size() >= 2;
+            boolean declaresResults = !branchHasOutputs
+                && !willBeLifted
+                && (mergedLocals.size() >= 2
+                    || (!resultNames.isEmpty() && !elseCtx.bindings.isEmpty()));
+
+            if (declaresResults) {
+                appendBranchResults(thenCtx, resultNames, armProps);
                 syncCounter(thenCtx);
-                appendMergedLocalResults(elseCtx, mergedLocals);
+                appendBranchResults(elseCtx, resultNames, armProps);
                 syncCounter(elseCtx);
             }
 
-            String ifName = emit(new If(condRef, thenCtx.bindings, elseCtx.bindings));
+            String ifName = emit(new If(condRef, thenCtx.bindings, elseCtx.bindings,
+                declaresResults ? List.copyOf(resultNames) : null));
 
             if (branchHasOutputs) {
                 // Register the if's value once with the parent's
@@ -831,10 +1100,10 @@ public final class AnfLower {
             // If both branches end by reassigning the same SINGLE local
             // variable, alias that variable to the if-expression result.
             //
-            // Skipped when the arms were normalised above: there the `if` has N
-            // results, not one, and each merged local keeps its OWN name
-            // through the reconcile in the stack lowerer.
-            if (mergedLocals.size() < 2
+            // Skipped when the arms were normalised above: there the `if`
+            // DECLARES its results, and each one keeps its OWN name through the
+            // reconcile in the stack lowerer.
+            if (!declaresResults
                 && !thenCtx.bindings.isEmpty() && !elseCtx.bindings.isEmpty()) {
                 AnfBinding thenLast = thenCtx.bindings.get(thenCtx.bindings.size() - 1);
                 AnfBinding elseLast = elseCtx.bindings.get(elseCtx.bindings.size() - 1);
@@ -880,27 +1149,44 @@ public final class AnfLower {
         }
 
         /**
-         * Append the canonical merged-local result block to one arm of an
-         * if-statement: a copy of every merged local, in canonical order,
-         * rebound under the local's own name.
+         * Append the canonical result block to one arm of an if-statement: a
+         * copy of every declared result, in the declared order, rebound under
+         * its own name. This is what makes the {@code if} node's
+         * {@code results} contract true rather than hoped-for.
          *
          * <p>Two passes on purpose. Pass 1 always COPIES: {@code @ref:<local>}
          * resolves to the arm's own new value if it rebound one, else to the
-         * enclosing scope's value, and either way stack lowering picks (never
-         * rolls) it, because a local live after the {@code if} is
-         * outer-protected. Pass 2 always CONSUMES, because the temps are bound
-         * in this arm and this is their last use. The arm's stack effect is
-         * therefore exactly +K regardless of which of the K locals it
-         * reassigned.
+         * enclosing scope's value; for a PROPERTY, {@code load_prop} picks the
+         * arm's updated slot when the arm wrote it and otherwise the enclosing
+         * value. Either way stack lowering picks (never rolls) it, because a
+         * declared result is outer-protected. Pass 2 always CONSUMES, because
+         * the temps are bound in this arm and this is their last use. The arm's
+         * stack effect is therefore exactly +N regardless of which of the N
+         * results it assigned.
+         *
+         * <p>Semantically a no-op for the off-chain ANF interpreters: every
+         * binding is an ordinary read-then-write of a value the arm already
+         * holds.
          */
-        private void appendMergedLocalResults(LowerCtx branchCtx, List<String> mergedLocals) {
-            for (int i = 0; i < mergedLocals.size(); i++) {
-                branchCtx.emitNamed(AnfValue.MERGED_LOCAL_TEMP_PREFIX + i,
-                    makeLoadConstString("@ref:" + mergedLocals.get(i)));
+        private void appendBranchResults(LowerCtx branchCtx, List<String> resultNames,
+                                         List<String> props) {
+            for (int i = 0; i < resultNames.size(); i++) {
+                String name = resultNames.get(i);
+                String temp = AnfValue.MERGED_LOCAL_TEMP_PREFIX + i;
+                if (props.contains(name)) {
+                    branchCtx.emitNamed(temp, new LoadProp(name));
+                } else {
+                    branchCtx.emitNamed(temp, makeLoadConstString("@ref:" + name));
+                }
             }
-            for (int i = 0; i < mergedLocals.size(); i++) {
-                branchCtx.emitNamed(mergedLocals.get(i),
-                    makeLoadConstString("@ref:" + AnfValue.MERGED_LOCAL_TEMP_PREFIX + i));
+            for (int i = 0; i < resultNames.size(); i++) {
+                String name = resultNames.get(i);
+                String temp = AnfValue.MERGED_LOCAL_TEMP_PREFIX + i;
+                if (props.contains(name)) {
+                    branchCtx.emit(new UpdateProp(name, temp));
+                } else {
+                    branchCtx.emitNamed(name, makeLoadConstString("@ref:" + temp));
+                }
             }
         }
 
@@ -927,14 +1213,138 @@ public final class AnfLower {
             return accumulated;
         }
 
+        /**
+         * Why an {@code if} whose arms declare outputs cannot be represented —
+         * or {@code null} when it can. The result is the reason clause the
+         * diagnostic embeds.
+         *
+         * <p>An {@code if} expression carries exactly ONE value, and when an arm
+         * emits an output that value is already spoken for: it is the output
+         * bytes the continuation hash consumes
+         * ({@link #appendBranchOutputConcat}). Anything ELSE the arm leaves
+         * behind breaks one of two invariants nothing downstream enforces:
+         *
+         * <ul>
+         *   <li>INV-A: the parent registers the if-expression's value as the
+         *       branch's contribution to the continuation hash, so "the
+         *       branch's output bytes" really means "whatever the arm's LAST
+         *       binding is". A binding that lands after the output — a rebound
+         *       local, a property write — silently replaces the serialized
+         *       output with an unrelated value, and the residue drain then
+         *       physically drops the real output.</li>
+         *   <li>INV-B: an arm that emits an output AND leaves any other slot
+         *       the parent can still name — a property write anywhere in the
+         *       arm, or a rebound local that is still read after the {@code if}
+         *       — leaves 2+ results against the ONE stack-map name the stack
+         *       lowerer registers, desyncing the parent stack by a slot from
+         *       there on.</li>
+         * </ul>
+         *
+         * <p>Neither is visible off-chain, so both shipped as permanently
+         * unspendable locking scripts. Refuse at compile time rather than emit
+         * one. See
+         * packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+         * for the real-Script-VM proof of each shape.
+         *
+         * <p>The clauses are checked in a fixed order so all seven tiers report
+         * the same reason for a source that trips more than one.
+         */
+        private String branchOutputRejectionReason(
+            LowerCtx thenCtx,
+            LowerCtx elseCtx,
+            String thenOutputBytes,
+            String elseOutputBytes,
+            List<String> mergedLocals,
+            Set<String> readsAfter) {
+            // 1. Two or more merged locals: normalising them would need a
+            //    multi-result `if` node, and the arms' single value is already
+            //    the output concat.
+            if (mergedLocals.size() >= 2) {
+                return "merges " + mergedLocals.size() + " local variables ("
+                    + String.join(", ", mergedLocals) + ")";
+            }
+
+            String[] labels = {"then", "else"};
+            LowerCtx[] branches = {thenCtx, elseCtx};
+            String[] outputBytes = {thenOutputBytes, elseOutputBytes};
+
+            // 2. INV-A: the arm's terminal binding must BE its output bytes.
+            for (int i = 0; i < branches.length; i++) {
+                List<AnfBinding> items = branches[i].bindings;
+                if (items.isEmpty()
+                    || !items.get(items.size() - 1).name().equals(outputBytes[i])) {
+                    return "continues past its output in the " + labels[i] + "-branch";
+                }
+            }
+
+            // 3. INV-B: a property write leaves a slot the parent can still
+            //    name, wherever in the arm it sits.
+            List<String> writtenProps = new ArrayList<>();
+            for (LowerCtx branchCtx : branches) {
+                collectUpdatedProps(branchCtx.bindings, writtenProps);
+            }
+            if (!writtenProps.isEmpty()) {
+                return "assigns contract properties (" + String.join(", ", writtenProps)
+                    + ") inside the branch";
+            }
+
+            // 4. INV-B: a rebound local that survives the `if` is protected from
+            //    being rolled away, so the arm ends one slot deeper than
+            //    lowerIf accounts for.
+            List<String> liveMerged = new ArrayList<>();
+            for (String name : mergedLocals) {
+                if (readsAfter.contains(name)) {
+                    liveMerged.add(name);
+                }
+            }
+            if (!liveMerged.isEmpty()) {
+                return "reassigns local variables read after it ("
+                    + String.join(", ", liveMerged) + ")";
+            }
+
+            return null;
+        }
+
+        /**
+         * Append every property name an ANF binding list assigns, including the
+         * ones nested inside an {@code if} arm or a {@code loop} body — a nested
+         * write is just as much a named slot the enclosing arm leaves behind.
+         */
+        private void collectUpdatedProps(List<AnfBinding> bindings, List<String> out) {
+            for (AnfBinding binding : bindings) {
+                AnfValue value = binding.value();
+                if (value instanceof UpdateProp up) {
+                    if (!out.contains(up.name())) {
+                        out.add(up.name());
+                    }
+                } else if (value instanceof If ifValue) {
+                    collectUpdatedProps(ifValue.thenBranch(), out);
+                    collectUpdatedProps(ifValue.elseBranch(), out);
+                } else if (value instanceof Loop loopValue) {
+                    collectUpdatedProps(loopValue.body(), out);
+                }
+            }
+        }
+
         void lowerForStatement(ForStatement stmt) {
+            lowerForStatement(stmt, Set.of());
+        }
+
+        void lowerForStatement(ForStatement stmt, Set<String> readsAfter) {
             // Resolve the loop's compile-time shape: start value, step
             // direction, and iteration count. Rúnar requires bounded loops, so
             // all three must be statically determinable (issue #121).
             LoopShape shape = extractLoopShape(stmt);
 
+            // The body repeats, so every read anywhere in it is a read that
+            // happens after any given statement inside it.
+            Set<String> bodyReads = new HashSet<>(readsAfter);
+            for (Statement s : stmt.body()) {
+                collectStatementReads(s, bodyReads);
+            }
+
             LowerCtx bodyCtx = subContext();
-            bodyCtx.lowerStatements(stmt.body());
+            bodyCtx.lowerStatements(stmt.body(), bodyReads);
             syncCounter(bodyCtx);
 
             String iterVar = stmt.init() != null ? stmt.init().name() : "";
@@ -1933,6 +2343,25 @@ public final class AnfLower {
         return false;
     }
 
+    /**
+     * An arm with its declared-results block removed.
+     *
+     * <p>{@code appendBranchResults} adds exactly {@code 2 * results.size()}
+     * trailing bindings to each arm of an {@code if} that declares results.
+     * They are a materialisation mechanism, not program logic, and they hide
+     * the arm's real shape from this pass. A dispatch chain's deepest {@code
+     * if} is nested by definition, so it declares results; without this the
+     * enclosing chain stops being recognised and TicTacToe's position dispatch
+     * loses the C20 lift (an unspendable {@code move} script).
+     */
+    private static List<AnfBinding> stripDeclaredResults(
+        List<AnfBinding> bindings, List<String> results) {
+        int n = results == null ? 0 : results.size();
+        if (n == 0) return bindings;
+        int cut = Math.max(0, bindings.size() - 2 * n);
+        return bindings.subList(0, cut);
+    }
+
     private static List<UpdateBranch> collectUpdateBranches(
         String ifCond, List<AnfBinding> thenBindings, List<AnfBinding> elseBindings) {
         BranchUpdate thenUpdate = extractBranchUpdate(thenBindings);
@@ -1952,7 +2381,9 @@ public final class AnfLower {
             if (!allBindingsSideEffectFree(condSetup)) return null;
 
             List<UpdateBranch> inner = collectUpdateBranches(
-                innerIf.cond(), innerIf.thenBranch(), innerIf.elseBranch()
+                innerIf.cond(),
+                stripDeclaredResults(innerIf.thenBranch(), innerIf.results()),
+                stripDeclaredResults(innerIf.elseBranch(), innerIf.results())
             );
             if (inner == null) return null;
 
@@ -2017,7 +2448,7 @@ public final class AnfLower {
             return new MethodCall(mapOr(mc.object(), nameMap), mc.method(), args);
         }
         if (value instanceof If ifv) {
-            return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch());
+            return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch(), ifv.results());
         }
         if (value instanceof Loop lp) {
             return new Loop(lp.count(), lp.body(), lp.iterVar(), lp.start(), lp.step());
@@ -2076,7 +2507,9 @@ public final class AnfLower {
             }
 
             List<UpdateBranch> branches = collectUpdateBranches(
-                ifv.cond(), ifv.thenBranch(), ifv.elseBranch()
+                ifv.cond(),
+                stripDeclaredResults(ifv.thenBranch(), ifv.results()),
+                stripDeclaredResults(ifv.elseBranch(), ifv.results())
             );
 
             if (branches == null || branches.size() < 2) {

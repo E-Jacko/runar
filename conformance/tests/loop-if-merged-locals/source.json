@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./LoopIfMergedLocals.runar.ts",
+    ".runar.sol": "./LoopIfMergedLocals.runar.sol",
+    ".runar.move": "./LoopIfMergedLocals.runar.move",
+    ".runar.go": "./LoopIfMergedLocals.runar.go",
+    ".runar.rs": "./LoopIfMergedLocals.runar.rs",
+    ".runar.py": "./LoopIfMergedLocals.runar.py",
+    ".runar.zig": "./LoopIfMergedLocals.runar.zig",
+    ".runar.rb": "./LoopIfMergedLocals.runar.rb",
+    ".runar.java": "./LoopIfMergedLocals.runar.java"
+  }
+}

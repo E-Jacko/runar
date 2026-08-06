@@ -25,6 +25,11 @@ module Runar
       end
     end
 
+    # Raised when MockProvider refuses to acknowledge a broadcast (testing-gap
+    # remediation Phase A5). Distinct typed exception so a spec can assert the
+    # fund-safety gate fired, rather than matching on a generic RuntimeError.
+    class BroadcastRejected < StandardError; end
+
     # Raise ScriptSizeExceededError if `script_hex` (hex-encoded) exceeds
     # `limit` bytes. Hex is 2 chars per byte; tolerate odd-length defensively.
     def self.assert_script_hex_under_limit(script_hex, limit, context)

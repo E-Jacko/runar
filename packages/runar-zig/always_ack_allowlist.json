@@ -1,0 +1,10 @@
+{
+  "$comment": "Zig tier. Source files permitted to disable MockProvider broadcast validation (MockProvider.initAlwaysAck / disableBroadcastValidation / enableBroadcastValidation(false)). See docs/audit/2026-08-testing-gap-remediation-plan.md Phase A5 and packages/runar-zig/README.md 'How fund-path tests fail closed in the Zig tier'. Fund-path deploy/call tests MUST NOT appear here.",
+  "entries": [
+    {
+      "file": "src/sdk_mock_broadcast_validation_test.zig",
+      "reason": "Directly tests the opt-out surface itself (MockProvider.initAlwaysAck, disableBroadcastValidation, enableBroadcastValidation(false)) so those escape hatches keep working. Every other test in the file uses the default validating provider.",
+      "category": "negative-api"
+    }
+  ]
+}

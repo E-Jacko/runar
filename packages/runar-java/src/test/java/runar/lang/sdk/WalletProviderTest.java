@@ -76,9 +76,18 @@ class WalletProviderTest {
         assertEquals(1, wp.listUtxos("addr1").size());
         assertSame(u, wp.getUtxo("ab".repeat(32), 0));
 
-        String txid = wp.broadcastRaw("deadbeef");
+        // Phase A5: the inner MockProvider is fail-closed, so delegation must be
+        // proven with a REAL transaction whose spent outpoint it knows. This
+        // previously broadcast the literal string "deadbeef" and asserted success.
+        inner.addKnownOutpoint("cd".repeat(32), 0, "51", 10_000L);
+        RawTx delegated = new RawTx();
+        delegated.addInput("cd".repeat(32), 0, "");
+        delegated.addOutput(9_000L, "51");
+        String delegatedHex = delegated.toHex();
+
+        String txid = wp.broadcastRaw(delegatedHex);
         assertEquals(1, inner.getBroadcastedTxs().size());
-        assertEquals("deadbeef", inner.getBroadcastedTxs().get(0));
+        assertEquals(delegatedHex, inner.getBroadcastedTxs().get(0));
         assertNotNull(txid);
     }
 
@@ -115,6 +124,10 @@ class WalletProviderTest {
         String pkhHex = HexFormat.of().formatHex(Hash160.hash160(inner.pubKey()));
         RunarContract contract = new RunarContract(artifact, List.of(pkhHex));
         contract.setCurrentUtxo(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
 
         // Prepare: pass WalletProvider as the signer so PubKey auto-fills.
         PreparedCall prepared = contract.prepareCall(

@@ -1,3 +1,8 @@
+// INTERPRETER-ONLY: spendability covered by conformance/witnesses/real-crypto/stateful-bytestring.json
+// (the `stateful-bytestring` conformance fixture compiles THIS file's MessageBoard.runar.ts;
+//  real deploy->call->@bsv/sdk Spend with a pinned expectedState). The ByteString state this
+//  contract carries is also the PALMER-2 value class: framing is pinned vertically by
+//  conformance/sdk-output/tests/stateful-bytestring-op-n-state.
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';

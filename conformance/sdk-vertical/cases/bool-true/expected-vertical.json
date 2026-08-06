@@ -1,0 +1,45 @@
+{
+  "case": "bool-true",
+  "contract": "SlotBool",
+  "valueClass": "bool true → OP_TRUE (0x51)",
+  "constructorArgs": [
+    {
+      "type": "bool",
+      "value": "true"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 38,
+  "slots": [
+    {
+      "name": "flag",
+      "paramIndex": 0,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 0,
+      "valueByteLength": 1,
+      "encoding": "bool",
+      "pushedHex": "01"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 1,
+      "templateByteOffset": 3,
+      "byteOffset": 3,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 4,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

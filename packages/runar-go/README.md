@@ -1770,3 +1770,60 @@ The `MockSignerImpl` name (rather than `MockSigner` as in the other SDKs) is pre
 - Go integration tests (regtest): [`integration/go/`](../../integration/go)
 - Cross-SDK output conformance suite: [`conformance/sdk-output/`](../../conformance/sdk-output)
 - Sister SDKs: [`packages/runar-sdk/`](../runar-sdk) (TypeScript), [`packages/runar-rs/`](../runar-rs) (Rust), [`packages/runar-py/`](../runar-py) (Python), [`packages/runar-zig/`](../runar-zig) (Zig), [`packages/runar-rb/`](../runar-rb) (Ruby), [`packages/runar-java/`](../runar-java) (Java).
+
+---
+
+## How fund-path tests fail closed in the Go tier
+
+`MockProvider.Broadcast` used to ack every transaction it was handed and return
+a fake txid. Roughly half the SDK suite therefore never ran a single opcode, and
+several tests were building transactions a real node would have rejected — they
+just never found out. Testing-gap remediation Phase A5 flipped it to
+**fail-closed by default**.
+
+### What runs on every `Broadcast`
+
+Go is the strongest tier here: it has a real script interpreter with full
+transaction context.
+
+1. **Script execution** — every input whose outpoint the provider knows is
+   replayed through `github.com/bsv-blockchain/go-sdk/script/interpreter` with
+   `WithTx(tx, i, prevOut)`, `WithAfterGenesis()`, `WithAfterChronicle()` and
+   `WithForkID()`. That is the same engine `packages/runar-go/script_vm.go`
+   wraps, and the same options the covenant-replay assertions in
+   `sdk_g1_raw_outputs_test.go` / `sdk_continuation_satoshis_test.go` use. Real
+   secp256k1, real BIP-143 sighash, real OP_PUSH_TX covenant checks.
+2. **Non-vacuity** — the validated-input count is tracked, and **`Broadcast`
+   fails when it is zero**. A transaction none of whose inputs the provider
+   knows is REJECTED rather than waved through. (The TypeScript reference
+   `packages/runar-sdk/src/providers/mock.ts` still accepts that case; the Go
+   port deliberately does not. A gate that validates nothing is worse than no
+   gate.) `LastValidatedInputCount()` / `LastBroadcastInputCount()` expose the
+   counts so a test can assert non-vacuity directly.
+3. **Value conservation** — when every input's outpoint is known, outputs may
+   not exceed inputs.
+
+Outputs of an accepted broadcast are registered as known outpoints, so a chained
+call spending the continuation the previous broadcast created is validated too.
+
+### The opt-out, and how it is governed
+
+`NewAlwaysAckMockProvider(network)`, `DisableBroadcastValidation()` and
+`EnableBroadcastValidation(false)` restore the old behaviour. Every `_test.go`
+that uses one must have an entry in **`always_ack_allowlist.json`** with a file,
+a reason and a category; `always_ack_allowlist_test.go` fails CI on unlisted
+usage **and** on stale entries, so the list can only shrink.
+
+Fund-path tests with a real `LocalSigner` and a real compiled contract are **not
+allowlisted** — they all run under the validating provider. The allowlist covers
+only tests driving a synthetic `makeArtifact("51", ...)` OP_TRUE contract with
+`NewMockSigner`, whose placeholder signatures no OP_CHECKSIG can ever verify,
+plus the negatives that verify script rejection themselves.
+
+### What this caught
+
+Seven fund-path tests were funding their transactions from a P2PKH coin locked
+to `76a914 <20 zero bytes> 88ac` — a hash nobody holds. The SDK signed with the
+real key, so `OP_EQUALVERIFY` on `hash160(pubkey)` failed: those deploys and
+calls were **unspendable**, and the always-ack provider reported success. They
+now use `BuildP2PKHScript(addr)` and pass under full script validation.

@@ -31,6 +31,8 @@ test {
     _ = @import("passes/embed_always_warn.zig");
     _ = @import("tests/e2e.zig");
     _ = @import("tests/repeated_operand_consume.zig");
+    _ = @import("tests/branch_outputs_merged_locals.zig");
+    _ = @import("tests/branch_merge_dead_arm_k1.zig");
     _ = @import("tests/private_varlen_state_read.zig");
     _ = @import("tests/private_check_preimage_recursion.zig");
     _ = @import("tests/math_builtins.zig");
@@ -38,6 +40,7 @@ test {
     _ = @import("tests/check_multisig.zig");
     _ = @import("tests/language_constructs.zig");
     _ = @import("tests/frontend.zig");
+    _ = @import("tests/zig_readonly_inference.zig");
     _ = @import("tests/embed_always.zig");
     _ = @import("tests/sighash_codegen.zig");
     _ = @import("tests/sighash_validate_test.zig");

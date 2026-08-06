@@ -55,11 +55,11 @@ export function serializeState(
         } else {
           elem = undefined;
         }
-        hex += encodeStateValue(elem, leafType);
+        hex += encodeStateValue(elem, leafType, synthName);
       }
     } else {
       const value = values[field.name];
-      hex += encodeStateValue(value, field.type);
+      hex += encodeStateValue(value, field.type, field.name);
     }
   }
 
@@ -309,7 +309,7 @@ export function findLastOpReturn(scriptHex: string): number {
  * compiler's OP_NUM2BIN-based fixed-width serialization.
  * The result is raw hex bytes that are concatenated after OP_RETURN.
  */
-function encodeStateValue(value: unknown, type: string): string {
+function encodeStateValue(value: unknown, type: string, label = '?'): string {
   switch (type) {
     case 'int':
     case 'bigint': {
@@ -322,7 +322,7 @@ function encodeStateValue(value: unknown, type: string): string {
       } else {
         n = BigInt(value as number);
       }
-      return encodeNum2Bin(n, 8);
+      return encodeNum2Bin(n, 8, label);
     }
     case 'bool':
     case 'boolean': {
@@ -355,8 +355,35 @@ function encodeStateValue(value: unknown, type: string): string {
 /**
  * Encode an integer as a fixed-width LE sign-magnitude byte string,
  * matching OP_NUM2BIN behaviour. The sign bit is in the MSB of the last byte.
+ *
+ * FAILS CLOSED on an out-of-range magnitude. `width` bytes of sign-magnitude
+ * hold `8*width - 1` magnitude bits — the top bit of the last byte is the
+ * sign. The loop below writes the low `width` bytes and drops everything
+ * above, then ORs the sign bit in on top of whatever landed there, so an
+ * oversized value used to serialise to a plausible but WRONG word:
+ *
+ *     2^63      -> 0000000000000080   reads back as 0   (negative zero)
+ *     2^63 + 5  -> 0500000000000080   reads back as -5  (sign flip)
+ *     2^64      -> 0000000000000000   reads back as 0
+ *
+ * The deploy then succeeded and the UTXO was unspendable: the covenant
+ * rebuilds the continuation with the compiler's own OP_NUM2BIN 8, which cannot
+ * produce those bytes from that number, so hash256(outputs) never matches.
+ * Throwing here is the only place a runtime-computed state value can be
+ * stopped — `±(2^63 - 1)` remains representable and is unaffected.
  */
-function encodeNum2Bin(n: bigint, width: number): string {
+function encodeNum2Bin(n: bigint, width: number, label = '?'): string {
+  const limit = 1n << BigInt(8 * width - 1);
+  if (n >= limit || n <= -limit) {
+    throw new Error(
+      `serializeState: bigint state field "${label}" = ${n} does not fit the ` +
+        `fixed ${width}-byte sign-magnitude state word (magnitude must be ` +
+        `< 2^${8 * width - 1}). Serializing it would write a different number ` +
+        `into the state section than the contract's on-chain OP_NUM2BIN ` +
+        `${width} rebuilds, leaving the output unspendable.`,
+    );
+  }
+
   const bytes = new Uint8Array(width);
   const negative = n < 0n;
   let absVal = negative ? -n : n;

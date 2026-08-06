@@ -76,6 +76,18 @@ const GOLDEN_MATCHERS = [
   (p) => /^conformance\/runtime-vectors\/.*\.json$/.test(p),
   // Cross-SDK deployed-locking-script goldens.
   (p) => /^conformance\/sdk-output\/tests\/[^/]+\/expected-.*\.hex$/.test(p),
+  // Compiler<->SDK VERTICAL pins (plan Phase C3/C4). Three families, all
+  // self-produced by `sdk-vertical/generate.ts` / the vertical runner's
+  // `--update-golden`: the independently-derived `expected-code-part.hex` +
+  // `expected-vertical.json`, and the seven-tier-agreed `expected-locking.hex`.
+  // "Derived from an independent reference implementation" is a reason to
+  // TRUST a regeneration, not a reason to skip reviewing one — the reference
+  // lives in this repo and can be changed by the same PR that moves the bytes.
+  (p) => /^conformance\/sdk-vertical\/cases\/[^/]+\/expected-[^/]+\.(hex|json)$/.test(p),
+  // The compiled artifacts those cases splice. `constructorSlots[].byteOffset`
+  // and `codeSeparatorIndices` live here, and they are exactly the integers
+  // the C3/C4 pins exist to check.
+  (p) => /^conformance\/sdk-vertical\/artifacts\/[^/]+\.json$/.test(p),
   // Static-analyzer report goldens.
   (p) => /^conformance\/analyzer\/[^/]+\/expected-analyzer-report\.json$/.test(p),
   // Source-map goldens (per-tier).
@@ -92,10 +104,14 @@ const GOLDEN_MATCHERS = [
 // NOTE on deliberately-EXCLUDED near-goldens: conformance/sdk-envelope/fixtures.json
 // (validate-fixtures.ts cryptographically re-verifies the committed signature),
 // conformance/sdk-bip143/fixtures.json (`generate-fixtures.ts --check` regenerates
-// and diffs), and packages/decompiler/{templates-data,fingerprints}.json (CI
-// regenerates and git-diffs them) each already carry an independent gate that a
-// silent hand-edit cannot pass. Adding them here would be pure friction, not
-// coverage. Add a matcher above only for goldens with NO such gate.
+// and diffs), conformance/sdk-vertical/cases/*/input.json (a verbatim copy of the
+// gated `artifacts/*.json` plus literal constructor args — `generate.ts` writes
+// both from one artifact, and a lone hand-edit turns the vertical runner red
+// against the derived `expected-*` goldens it cannot also move), and
+// packages/decompiler/{templates-data,fingerprints}.json (CI regenerates and
+// git-diffs them) each already carry an independent gate that a silent hand-edit
+// cannot pass. Adding them here would be pure friction, not coverage. Add a
+// matcher above only for goldens with NO such gate.
 
 const VALID_VERIFIED_AGAINST = new Set([
   'official-KAT',

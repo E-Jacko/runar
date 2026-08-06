@@ -179,6 +179,29 @@ export function generateReport(results: ConformanceResult[]): ConformanceReport 
       : 0,
   });
 
+  // Java compiler.
+  //
+  // This block was missing while `javaCompiler` was already being populated
+  // (runner.ts) and already participating in the cross-tier comparison and the
+  // per-fixture duration map below. So the Java tier really was compiling and
+  // being compared, but the human-readable banner listed only six tiers --
+  // which reads exactly like "Java did not run" and invites a reviewer to
+  // believe a 7-tier parity claim rests on 6. Under-reporting coverage is the
+  // same failure mode as over-reporting it: the number stops meaning what it
+  // says. Keep this in step with `runner.ts`'s tier list.
+  const javaResults = results.filter((r) => r.javaCompiler !== undefined);
+  const javaSuccess = javaResults.filter((r) => r.javaCompiler?.success);
+  const javaDurations = javaSuccess.map((r) => r.javaCompiler!.durationMs);
+  compilers.push({
+    name: 'Java',
+    available: javaResults.length > 0,
+    testsRun: javaResults.length,
+    testsSucceeded: javaSuccess.length,
+    averageDurationMs: javaDurations.length > 0
+      ? javaDurations.reduce((a, b) => a + b, 0) / javaDurations.length
+      : 0,
+  });
+
   return {
     timestamp,
     totalTests: results.length,

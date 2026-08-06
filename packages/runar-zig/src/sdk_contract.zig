@@ -3862,6 +3862,9 @@ test "prepareCall → finalizeCall round-trip on stateful Sig-bearing contract" 
     defer prov.deinit();
     var signer = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
 
+    // The fail-closed MockProvider must also know the outpoint the call
+    // spends, or it would have nothing to check (Phase A5 non-vacuity).
+    try prov.addKnownOutpoint("ee" ** 32, 0, "005100", 2_000);
     try contract.setCurrentUtxo(.{
         .txid = "ee" ** 32,
         .output_index = 0,
@@ -3944,6 +3947,9 @@ test "prepareCall → finalizeCall round-trip broadcasts a tx" {
     defer prov.deinit();
     var signer = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
 
+    // The fail-closed MockProvider must also know the outpoint the call
+    // spends, or it would have nothing to check (Phase A5 non-vacuity).
+    try prov.addKnownOutpoint("12" ** 32, 0, "5151", 4_000);
     try contract.setCurrentUtxo(.{
         .txid = "12" ** 32,
         .output_index = 0,
@@ -3990,6 +3996,9 @@ test "call with terminal_outputs builds tx with exact outputs and clears UTXO" {
     defer prov.deinit();
     var signer = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
 
+    // The fail-closed MockProvider must also know the outpoint the call
+    // spends, or it would have nothing to check (Phase A5 non-vacuity).
+    try prov.addKnownOutpoint("fe" ** 32, 0, "51", 5_000);
     try contract.setCurrentUtxo(.{
         .txid = "fe" ** 32,
         .output_index = 0,
@@ -4052,6 +4061,10 @@ test "terminal call adds fee_utxo input to pay the miner fee (#118)" {
         defer contract.deinit();
         var prov = provider_mod.MockProvider.init(allocator, "testnet");
         defer prov.deinit();
+        // Phase A5 non-vacuity: teach the validating provider the contract
+        // outpoint (and, below, the fee coin) this call spends.
+        try prov.addKnownOutpoint("fe" ** 32, 0, "51", 5000);
+        try prov.addKnownOutpoint(fee_utxo.txid, fee_utxo.output_index, fee_utxo.script, fee_utxo.satoshis);
         try contract.setCurrentUtxo(.{ .txid = "fe" ** 32, .output_index = 0, .satoshis = 5000, .script = "51" });
         const opts = types.CallOptions{ .terminal_outputs = &term_outputs, .fee_utxo = fee_utxo };
         const txid = try contract.call("go", &.{}, prov.provider(), signer.signer(), opts);
@@ -4069,6 +4082,10 @@ test "terminal call adds fee_utxo input to pay the miner fee (#118)" {
         defer contract.deinit();
         var prov = provider_mod.MockProvider.init(allocator, "testnet");
         defer prov.deinit();
+        // Phase A5 non-vacuity: teach the validating provider the contract
+        // outpoint (and, below, the fee coin) this call spends.
+        try prov.addKnownOutpoint("fe" ** 32, 0, "51", 5000);
+        try prov.addKnownOutpoint(fee_utxo.txid, fee_utxo.output_index, fee_utxo.script, fee_utxo.satoshis);
         try contract.setCurrentUtxo(.{ .txid = "fe" ** 32, .output_index = 0, .satoshis = 5000, .script = "51" });
         const opts = types.CallOptions{ .terminal_outputs = &term_outputs };
         const txid = try contract.call("go", &.{}, prov.provider(), signer.signer(), opts);

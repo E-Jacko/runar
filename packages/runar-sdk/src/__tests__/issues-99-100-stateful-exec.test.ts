@@ -14,6 +14,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -40,7 +41,7 @@ async function setupWallet(provider: MockProvider, privKey: string, satoshis: nu
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(pubKeyHex),
   });
   return { signer, pubKeyHex };
 }
@@ -91,7 +92,7 @@ describe('#99 Bug 1 — conditional multi-field state write spendability', () =>
 
   it('spend that TAKES the update branch validates (best 100 -> offer 5)', async () => {
     const artifact = compileSource(SRC, 'CondWrite2.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [100n, ADDR_A]);
     await contract.deploy(provider, wallet.signer, {});
@@ -106,7 +107,7 @@ describe('#99 Bug 1 — conditional multi-field state write spendability', () =>
 
   it('spend that SKIPS the update branch validates (best 3 -> offer 5)', async () => {
     const artifact = compileSource(SRC, 'CondWrite2.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [3n, ADDR_A]);
     await contract.deploy(provider, wallet.signer, {});
@@ -134,7 +135,7 @@ describe('#100 — terminal method reads live ByteString state after on-chain up
 
   it('terminal read after update sees the LIVE slice, not the deploy-time initial', async () => {
     const artifact = compileSource(SRC, 'StateRead.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [INIT]);
     await contract.deploy(provider, wallet.signer, {});

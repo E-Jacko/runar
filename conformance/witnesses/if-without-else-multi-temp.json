@@ -1,7 +1,13 @@
 {
   "fixture": "if-without-else-multi-temp",
   "spends": [
-    { "method": "other", "args": ["0x01"], "expect": "accept", "note": "assert(x === x) is always true" },
-    { "method": "verifyMneeTxContainsBothOutputs", "args": ["0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "0x00", "0x00"], "expect": "reject", "note": "near-miss: rawTx byte[46]=0x00 → outCount 0 → foundMnee/foundExtra false → assert(foundMnee) fails" }
+    { "method": "other", "args": ["0x01"], "expect": "accept",
+      "note": "assert(x === x) is always true" },
+    { "method": "verifyMneeTxContainsBothOutputs", "args": ["0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "0x00", "0x00"], "expect": "reject",
+      "note": "near-miss: rawTx byte[46]=0x00 → outCount 0 → NEITHER `if` is entered → foundMnee/foundExtra keep their pre-branch false → assert(foundMnee) fails. This spend exercises the SKIP path only; it is here for the boundary, not for the merge." },
+    { "method": "verifyMneeTxContainsBothOutputs", "args": ["0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000011100000000000000000122", "0x00000000000000000111", "0x00000000000000000122"], "expect": "accept",
+      "note": "THE k=3 MERGE SPEND — the only one that enters BOTH ifs. rawTx byte[46]=0x02 → outCount 2, so `0n < outCount` AND `1n < outCount` are both taken. Layout: 46 filler bytes, outCount 0x02, then two 10-byte outputs (8-byte amount || scriptLen 0x01 || 1 script byte), 67 bytes total. The FIRST if matches expectedMnee and sets foundMnee=true; the SECOND if matches expectedExtra and sets foundExtra=true. All three merged locals are therefore live across a branch boundary: `p` must carry 57 (46+1+10) INTO the second if for its substr to land on the second output at all, and `foundMnee` — assigned inside the first if — must survive the second if to satisfy assert(foundMnee). A lowering that resolves a post-branch reference to the dead pre-branch binding reads foundMnee back as false here, which the previous outCount=0 witness could not see because it never assigned any of them." },
+    { "method": "verifyMneeTxContainsBothOutputs", "args": ["0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000011100000000000000000122", "0x00000000000000000111", "0x00000000000000000133"], "expect": "reject",
+      "note": "near-miss on the SAME both-ifs-taken path: identical rawTx, but expectedExtra is 0x…33 while the second output carries 0x…22, so foundExtra is never assigned and assert(foundExtra) fails. Pairs with the accept above so the merge is exercised in both verdict directions rather than only where it happens to pass." }
   ]
 }

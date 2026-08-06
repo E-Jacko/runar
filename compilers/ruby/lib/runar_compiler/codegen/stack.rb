@@ -340,42 +340,137 @@ module RunarCompiler::Codegen
     names
   end
 
+  # Locals a loop body REBINDS and then READS AGAIN in the same iteration.
+  #
+  # compute_last_uses maps a name to the MAXIMUM index that references it, so
+  # for a body like
+  #
+  #   t3   = acc + step     (index 1 -- reads the value carried in)
+  #   acc  = @ref:t3        (index 2 -- rebinds: renames t3's slot to `acc`)
+  #   t4   = wacc + acc     (index 3 -- reads the value just rebound)
+  #
+  # `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies
+  # (PICK) instead of consuming, leaving the incoming slot on the stack under
+  # the same name as the rebound one; index 3 then IS the last use, and
+  # find_depth resolves to the topmost match -- so it consumes the UPDATED
+  # value and leaves the dead incoming one. The next iteration reads that dead
+  # slot, and every iteration recomputes from the pre-loop value:
+  # `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc + acc; }`
+  # produced `wacc = step*N` where the source says `step*N*(N+1)/2` -- silently
+  # in a stateless contract, and as a permanently unspendable UTXO in a
+  # stateful one (the covenant commits to a continuation the SDK never builds).
+  # outer_refs does not cover it: `acc` is excluded there precisely because the
+  # body binds it.
+  #
+  # The value these names hold at the end of an iteration is live at the start
+  # of the next one, so _lower_loop protects them from consumption exactly like
+  # an outer ref. The incoming slot each rebinding shadows is left behind and
+  # drained with the rest of the frame at method exit -- a name always resolves
+  # to its newest slot, so the reads stay correct.
+  #
+  # Both halves of the predicate are load-bearing:
+  #   - read BEFORE the first rebinding: the name is carried IN from the
+  #     enclosing scope, rather than being a body-private temp that merely
+  #     happens to be read after it is bound;
+  #   - read AFTER the last rebinding: without it the rebound value is dead at
+  #     the end of the iteration and consuming it is correct. This is what
+  #     keeps every shipped accumulator (`sum = sum + i`, `off = off + len`)
+  #     byte-for-byte unchanged.
+  #
+  # NESTED loops: the scan runs over flatten_nested_loop_bodies(body), not over
+  # +body+ itself. A name rebound only inside an INNER loop is bound at no
+  # top-level index of the outer body, so the raw scan classified it as neither
+  # an outer ref (collect_deep_binding_names excludes it -- the body does bind
+  # it, deeply) nor a carried rebind, and the outer loop never marked it live.
+  # The inner loop's final iteration then consumed it, because used_after_loop
+  # asks the enclosing scope and the enclosing scope had not been told either,
+  # so every outer iteration restarted from the slot the previous one left
+  # behind: `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }`
+  # with step = 3 produced `wacc = 24` where the source says 30. Splicing the
+  # inner body in at the loop's position preserves the read/rebind/read
+  # ordering the inner level already sees, so the outer level draws the same
+  # conclusion.
+  #
+  # @param body [Array<IR::ANFBinding>]
+  # @return [Set<String>]
+  def self.collect_loop_carried_rebinds(body)
+    flat = flatten_nested_loop_bodies(body || [])
+    first_bind = {}
+    last_bind = {}
+    flat.each_with_index do |b, i|
+      first_bind[b.name] = i unless first_bind.key?(b.name)
+      last_bind[b.name] = i
+    end
+
+    read_before_bind = Set.new
+    read_after_bind = Set.new
+    flat.each_with_index do |b, i|
+      collect_refs(b.value).each do |ref|
+        first = first_bind[ref]
+        read_before_bind.add(ref) if !first.nil? && i < first
+        last = last_bind[ref]
+        read_after_bind.add(ref) if !last.nil? && i > last
+      end
+    end
+
+    read_before_bind & read_after_bind
+  end
+
+  # The binding sequence with every nested +loop+ binding replaced, in place,
+  # by its own (recursively flattened) body.
+  #
+  # Only collect_loop_carried_rebinds uses this, and only to order reads
+  # against rebindings. Neither replaced binding contributes a stack slot that
+  # predicate reasons about, so dropping it loses nothing; splicing the
+  # sub-body in at its position is what lets an enclosing loop see a rebinding
+  # one level down.
+  #
+  # +if+ arms ARE spliced, in +then ++ else+ order, even though they are
+  # alternatives rather than a sequence. The predicate asks only "is this name
+  # read, then rebound, then read again", and treating the arms as a sequence
+  # can only ADD names to the carried set, never remove one -- conservative in
+  # the safe direction. Without it a local rebound ONLY inside an +if+ arm was
+  # bound at no index the predicate could see: neither an outer ref
+  # (collect_deep_binding_names excludes it, since the body does bind it,
+  # deeply) nor a carried rebind. The loop consumed it and the next iteration
+  # had nothing to read, so
+  # <tt>for (i<2) { if (i<5) { acc = acc + step; } wacc = wacc + acc; }</tt>
+  # was REJECTED outright with <tt>Value 'acc' not found on stack</tt> -- the
+  # loud face of the same gap the merged-local protection in _lower_if fixes
+  # silently at K>=2.
+  #
+  # The +if+ binding itself is NOT re-appended after its arms. Appending it
+  # would count the arms' reads a second time at an index past every arm
+  # rebinding, making a local that BOTH arms rebind look "read after its last
+  # rebinding" -- which protected a K=1 alias that must stay consumable.
+  #
+  # A body with no nested loop and no +if+ is returned entry-for-entry
+  # unchanged, which is what makes this byte-neutral for every flat loop.
+  #
+  # @param body [Array<IR::ANFBinding>]
+  # @return [Array<IR::ANFBinding>]
+  def self.flatten_nested_loop_bodies(body)
+    return body unless body.any? { |b| b.value.kind == "loop" || b.value.kind == "if" }
+
+    flat = []
+    body.each do |b|
+      case b.value.kind
+      when "loop"
+        flat.concat(flatten_nested_loop_bodies(b.value.body || []))
+      when "if"
+        flat.concat(flatten_nested_loop_bodies(b.value.then || []))
+        flat.concat(flatten_nested_loop_bodies(b.value.else_ || []))
+      else
+        flat << b
+      end
+    end
+    flat
+  end
+
   # -----------------------------------------------------------------------
   # Helpers
   # -----------------------------------------------------------------------
 
-  # How many branch-merged locals an if-statement's two arms carry as results.
-  #
-  # ANF lowering's _append_merged_local_results ends both arms with the same
-  # K-binding block -- +<local> = @ref:__merge$<i>+ for i in 0..K-1 -- so the
-  # merged values sit on top in the same canonical order whichever branch runs.
-  # Counting the trailing block is how stack lowering learns K: it must trim
-  # each arm down to exactly those K slots before the N>=2 reconcile compares
-  # the arms, since everything beneath them is the arm's own (dead, and
-  # arm-specific) working values.
-  #
-  # Returns 0 unless BOTH arms end with a block of the same size -- anything
-  # else is not a normalised merge and must not be trimmed.
-  #
-  # @param then_bindings [Array<IR::ANFBinding>]
-  # @param else_bindings [Array<IR::ANFBinding>]
-  # @return [Integer]
-  def self.count_merged_local_results(then_bindings, else_bindings)
-    prefix = "@ref:#{RunarCompiler::IR::MERGED_LOCAL_TEMP_PREFIX}"
-    trailing = lambda do |bindings|
-      n = 0
-      bindings.reverse_each do |b|
-        v = b.value
-        break unless v.kind == "load_const" && v.const_string.is_a?(String)
-        break unless v.const_string.start_with?(prefix)
-
-        n += 1
-      end
-      n
-    end
-    then_count = trailing.call(then_bindings)
-    then_count.positive? && then_count == trailing.call(else_bindings) ? then_count : 0
-  end
 
   # @param n [Integer]
   # @return [Hash] PushValue hash for a big integer
@@ -1242,6 +1337,7 @@ module RunarCompiler::Codegen
           _lower_if(
             binding.name, binding.value.cond,
             binding.value.then, binding.value.else_,
+            binding.value.results || [],
             i, last_uses, true
           )
         else
@@ -1306,7 +1402,8 @@ module RunarCompiler::Codegen
 
       # --- Advanced kinds ---
       when "if"
-        _lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
+        _lower_if(name, value.cond, value.then, value.else_, value.results || [],
+                  binding_index, last_uses)
       when "loop"
         _lower_loop(name, value.count, value.body, value.iter_var, value.start, value.step, binding_index, last_uses)
       when "check_preimage"
@@ -1914,9 +2011,55 @@ module RunarCompiler::Codegen
     # if (basic structure -- full implementation in Part 2)
     # -----------------------------------------------------------------
 
-    def _lower_if(binding_name, cond, then_bindings, else_bindings, binding_index, last_uses, terminal_assert = false)
+
+    # +results+ is the +if+ node's declared result slots, deepest first (see
+    # IR::ANFValue#results). Empty for an +if+ that carries at most one
+    # result, and then every path below behaves exactly as it did before the
+    # multi-result contract existed.
+    def _lower_if(binding_name, cond, then_bindings, else_bindings, results,
+                  binding_index, last_uses, terminal_assert = false)
       then_bindings ||= []
       else_bindings ||= []
+      results ||= []
+
+      # The ANF wire format has no version field, and --ir / --ir-parity are
+      # documented surfaces that feed a checked-in ANF JSON straight into this
+      # pass. An ANF produced BEFORE the multi-result node carries the trailing
+      # +__merge$+ block WITHOUT results -- back then the block was a naming
+      # CONVENTION this pass recognised, and no tier recognises it any more. It
+      # deserialises cleanly, the declared count is 0, and the result count
+      # falls back to then_depth - parent_depth, which counts the arm's
+      # untrimmed block residue as results. Refuse it: the block can only be
+      # emitted by _append_branch_results, which only runs for an +if+ that
+      # declares results. Emits no opcodes.
+      if results.empty?
+        stale = (then_bindings + else_bindings).find do |b|
+          b.name.start_with?(::RunarCompiler::IR::MERGED_LOCAL_TEMP_PREFIX)
+        end
+        if stale
+          raise ArgumentError,
+                "ANF produced by a pre-multi-result compiler: the conditional's " \
+                "arm carries a " \
+                "'#{::RunarCompiler::IR::MERGED_LOCAL_TEMP_PREFIX}' block but the " \
+                "node declares no results (binding '#{stale.name}'). That block " \
+                "used to be a naming convention this pass inferred results from; " \
+                "it is now a declared contract, and no tier reads the convention " \
+                "any more. Recompile the source with the current compiler instead " \
+                "of reusing the stored ANF. binding='#{binding_name}'."
+        end
+      end
+
+      # Result slots are identified BY NAME -- two identically-named results are
+      # indistinguishable, so the layout assertion would be satisfied by
+      # coincidence while one value silently replaced the other. ANF lowering
+      # refuses the source shape; this guards the --ir path.
+      if results.length > 1 && results.uniq.length != results.length
+        raise ArgumentError,
+              "Internal codegen error: the conditional declares duplicate result " \
+              "names [#{results.join(', ')}]. Result slots are matched by name, " \
+              "so duplicates cannot be told apart and one value would silently " \
+              "replace the other. binding='#{binding_name}'."
+      end
 
       is_last = _is_last_use(cond, binding_index, last_uses)
       bring_to_top(cond, is_last)
@@ -1926,6 +2069,42 @@ module RunarCompiler::Codegen
       protected_refs = Set.new
       last_uses.each do |ref, last_idx|
         protected_refs.add(ref) if last_idx > binding_index && @sm.has?(ref)
+      end
+
+      # The K>=2 merged-local block reads every merged local in BOTH arms, and
+      # that read is RECONCILIATION, not a use: it is what makes each arm leave
+      # exactly K equally-named result slots for the N>=2 reconcile below to
+      # adopt. So the merged locals must be copied, never consumed -- regardless
+      # of whether the ENCLOSING scope reads them again.
+      #
+      # _append_merged_local_results (ANF lowering) states that as its premise:
+      # "pass 1 always COPIES ... because a local live after the +if+ is in
+      # outer_protected_refs". Enclosing-scope liveness is the wrong question,
+      # and the premise silently failed for every merged local whose last
+      # enclosing use IS this +if+ -- which is EVERY merged local of an +if+ in
+      # a loop body, since the body's last-use map ends at the +if+ itself.
+      #
+      # What happened then: pass 1 ROLLED instead of picking, the arm's stack
+      # effect stopped being +K, the arms ended at different depths, phase 3
+      # padded the shortfall with EMPTY pushes, the N-result layout check saw an
+      # unnamed slot where it needed the merged name, and control fell through
+      # to the single-slot fallback push(binding_name) -- ONE stackMap name
+      # registered for K physical results, with acc/wacc still naming the dead
+      # pre-+if+ slots.
+      # <tt>for (i<2) { if (i<5) { acc = acc + step; wacc = wacc + acc; } }</tt>
+      # with step = 3 produced wacc = 3 where the source says 9: silently in a
+      # stateless contract, and as a permanently unspendable UTXO in a stateful
+      # one.
+      #
+      # Byte-neutral for every program whose merged locals were already live
+      # after the +if+: those names are already protected above, which is
+      # precisely why those programs compiled correctly.
+      #
+      # Now driven by the node's DECLARED results instead of by recognising a
+      # trailing +__merge$+ block, so an arm-written property is protected on
+      # the same footing as a rebound local.
+      results.each do |name|
+        protected_refs.add(name) if @sm.has?(name)
       end
 
       # Snapshot parent stackMap names before branches run
@@ -2031,13 +2210,39 @@ module RunarCompiler::Codegen
       #
       # Runs AFTER the phase-2 consumption drops, so both arms have given up the
       # same parent slots and share one base depth.
-      merged_result_count = RunarCompiler::Codegen.count_merged_local_results(then_bindings, else_bindings)
-      if merged_result_count >= 2
+      n_declared = results.length
+      if n_declared >= 1
         still_held = then_ctx.sm.named_slots
         consumed_from_parent = pre_if_names.count { |n| !still_held.include?(n) && @sm.has?(n) }
-        target_depth = @sm.depth - consumed_from_parent + merged_result_count
+        target_depth = @sm.depth - consumed_from_parent + n_declared
         [then_ctx, else_ctx].each do |arm_ctx|
-          arm_ctx.drop_slot_at_depth(merged_result_count) while arm_ctx.sm.depth > target_depth
+          arm_ctx.drop_slot_at_depth(n_declared) while arm_ctx.sm.depth > target_depth
+        end
+
+        # The declared contract, checked rather than assumed: after the trim,
+        # each arm's top N slots must BE the declared results, in the declared
+        # order (results[0] deepest). _append_branch_results is what makes this
+        # true; if it ever stops being true the arms disagree on layout, which
+        # is precisely the failure that produced the 2026-08 miscompile family.
+        # Emits no opcodes.
+        [["then", then_ctx], ["else", else_ctx]].each do |label, arm_ctx|
+          if arm_ctx.sm.depth != target_depth
+            raise "internal codegen error: branch result layout mismatch -- the " \
+                  "#{label}-arm of the conditional ends at depth #{arm_ctx.sm.depth}, " \
+                  "but its #{n_declared} declared result(s) require depth " \
+                  "#{target_depth}; binding=#{binding_name.inspect}"
+          end
+          n_declared.times do |i|
+            want = results[n_declared - 1 - i]
+            got = arm_ctx.sm.peek_at_depth(i)
+            next if got == want
+
+            raise "internal codegen error: branch result layout mismatch -- the " \
+                  "#{label}-arm of the conditional holds #{got.inspect} where the " \
+                  "node declares #{want.inspect} (slot #{n_declared - 1 - i} of " \
+                  "[#{results.join(', ')}]); every later operand would resolve to " \
+                  "the wrong slot; binding=#{binding_name.inspect}"
+          end
         end
       end
 
@@ -2091,6 +2296,13 @@ module RunarCompiler::Codegen
       if_op[:else_ops] = else_ops if else_ops.any?
       emit_op(if_op)
 
+      # Physical slots this method drops AFTER OP_ENDIF, while reconciling the
+      # parent stackMap against the arms' results. Counted because the invariant
+      # at the end of _lower_if cannot compare the two depths directly: the
+      # post-ENDIF reconcile legitimately ROLL/DROPs stale slots out from under
+      # the results, so those drops have to be added back before comparing.
+      post_endif_drops = 0
+
       # Reconcile parent stackMap
       post_branch_names = then_ctx.sm.named_slots
       pre_if_names.each do |n|
@@ -2124,9 +2336,42 @@ module RunarCompiler::Codegen
         }
 
       # The if expression may produce a result value on top.
-      if then_ctx.sm.depth > @sm.depth &&
-         n_results >= 2 &&
-         (else_bindings.empty? || else_matches_then_n_result_layout)
+      if n_declared >= 1
+        # DECLARED RESULTS. Both arms were normalised by _append_branch_results
+        # and the layout check above proved they hold exactly +results+, so the
+        # parent adopts them BY THE DECLARED ORDER -- no counting of trailing
+        # +__merge$+ bindings, no comparison of arm depths, no inference of
+        # which names are still live. results[0] is the deepest slot, matching
+        # the order pass 2 of the normalisation rebound them in.
+        #
+        # Then each parent slot the block shadows (the pre-+if+ binding of a
+        # merged local, the stale value of a written property) is physically
+        # rolled out from under the results, exactly as the pre-existing N>=2
+        # reconcile did -- which is why the four +__merge$+ goldens keep their
+        # bytes.
+        results.each { |name| @sm.push(name) }
+        (n_declared - 1).downto(0) do |i|
+          name = results[i]
+          d = n_declared
+          while d < @sm.depth
+            if @sm.peek_at_depth(d) == name
+              emit_push_int(d)
+              @sm.push("")
+              emit_op({ op: "roll", depth: d + 1 })
+              @sm.pop
+              rolled = @sm.remove_at_depth(d)
+              @sm.push(rolled)
+              emit_op({ op: "drop" })
+              @sm.pop
+              post_endif_drops += 1
+              break
+            end
+            d += 1
+          end
+        end
+      elsif then_ctx.sm.depth > @sm.depth &&
+            n_results >= 2 &&
+            (else_bindings.empty? || else_matches_then_n_result_layout)
         # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
         # values on top; record them in their on-stack order, then remove the
         # N stale old property values beneath them.
@@ -2150,6 +2395,7 @@ module RunarCompiler::Codegen
               @sm.push(rolled)
               emit_op({ op: "drop" })
               @sm.pop
+              post_endif_drops += 1
               break
             end
             d += 1
@@ -2178,6 +2424,7 @@ module RunarCompiler::Codegen
               emit_op({ op: "drop" })
               @sm.pop
             end
+            post_endif_drops += 1
             break
           end
         elsif then_top && !is_property && else_bindings.empty? && then_top != binding_name && @sm.has?(then_top)
@@ -2199,6 +2446,7 @@ module RunarCompiler::Codegen
               emit_op({ op: "drop" })
               @sm.pop
             end
+            post_endif_drops += 1
             break
           end
         else
@@ -2206,8 +2454,45 @@ module RunarCompiler::Codegen
         end
       elsif else_ctx.sm.depth > @sm.depth
         @sm.push(binding_name)
+      else
+        # Otherwise a void if -- don't push phantom
       end
-      # Void if -- don't push phantom
+
+      # Layer C -- branch result-depth invariant.
+      #
+      # The stackMap is the compiler's ONLY model of the stack, so a stackMap
+      # that names FEWER slots than the arms physically left is not detectable
+      # anywhere downstream: every later operand silently resolves N slots off.
+      # That single failure mode produced the whole 2026-08 branch/loop
+      # miscompile family -- wrong-but-accepted state continuations at best, and
+      # scripts the interpreter rejects outright (locked funds) at worst.
+      #
+      # What must hold when _lower_if returns: the parent stackMap describes
+      # exactly the physical stack. Both arms ended at arm_depth (the
+      # branch-balance guard above proves they agree), OP_ENDIF changes nothing,
+      # and the only physical effect after it is the post_endif_drops stale-slot
+      # drops the reconcile emitted. So:
+      #
+      #     @sm.depth + post_endif_drops == arm_depth
+      #
+      # The naive @sm.depth == arm_depth is WRONG -- the reconcile legitimately
+      # ROLL/DROPs stale slots out from under the results, which is exactly what
+      # post_endif_drops counts.
+      #
+      # A failure here is always a codegen bug, never a user error. Emits no
+      # opcodes: byte-neutral by construction. Same genre as the branch-balance
+      # guard (#99), added for the same reason.
+      arm_depth = then_ctx.sm.depth
+      if @sm.depth + post_endif_drops != arm_depth
+        raise "internal codegen error: branch result depth mismatch -- the " \
+              "parent stack model does not describe the physical stack after " \
+              "OP_ENDIF (stackMap depth #{@sm.depth} + #{post_endif_drops} " \
+              "post-ENDIF drop(s) != arm depth #{arm_depth}); the arms leave " \
+              "#{arm_depth - @sm.depth - post_endif_drops} more physical " \
+              "slot(s) than the compiler recorded, so every later operand " \
+              "would resolve to the wrong slot and the script would be wrong " \
+              "or unspendable; binding=#{binding_name.inspect}"
+      end
 
       _track_depth
 
@@ -2249,6 +2534,15 @@ module RunarCompiler::Codegen
         RunarCompiler::Codegen.collect_refs(b.value).each do |ref|
           outer_refs.add(ref) if ref != iter_var && !deep_body_binding_names.include?(ref)
         end
+      end
+
+      # A local the body REBINDS and then READS AGAIN in the same iteration is
+      # carried across iterations through the rebound slot, so it must survive
+      # the body exactly like an outer ref. deep_body_binding_names above
+      # excludes it precisely because the body binds it -- which is what made
+      # the updated value consumable. See collect_loop_carried_rebinds.
+      RunarCompiler::Codegen.collect_loop_carried_rebinds(body).each do |ref|
+        outer_refs.add(ref) if ref != iter_var
       end
 
       # Temporarily extend localBindings with body binding names

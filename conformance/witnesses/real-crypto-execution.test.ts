@@ -34,7 +34,7 @@ import {
   runStatefulSpend,
   testKey,
   type StatelessArg,
-} from 'runar-testing';
+} from '../../packages/runar-testing/src/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TESTS_DIR = join(__dirname, '..', 'tests');
@@ -68,8 +68,14 @@ interface SpendSpec {
    *  spend unless `noStateCheck` is set. */
   expectedState?: Record<string, unknown>;
   /** Opt out of the state-value check (justify in `note`) — only for a stateful
-   *  accept whose continuation genuinely carries no decodable state. */
+   *  accept whose continuation genuinely carries no decodable state. Requires
+   *  a non-empty `issue` field alongside `note` (audit P2-3) — a free opt-out
+   *  with no residual accounting is exactly the hole this check exists to
+   *  keep loud. Nothing uses it today; `coverage-claims.test.ts` pins the
+   *  count at 0. */
   noStateCheck?: boolean;
+  /** Mandatory when `noStateCheck` is set — see above. */
+  issue?: string;
   // both
   cryptoNearMiss?: boolean;
 }
@@ -245,7 +251,8 @@ describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () =>
                 expect(
                   r.continuationState,
                   `${spec.fixture}.${s.method}: on-chain continuation state must equal the ` +
-                    `hand-authored expectation (audit #4)`,
+                    `hand-authored expectation (audit #4)` +
+                    (r.stateDecodeError ? ` — state decode error: ${r.stateDecodeError}` : ''),
                 ).toEqual(want);
               } else if (!s.noStateCheck) {
                 throw new Error(
@@ -253,6 +260,24 @@ describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () =>
                     `"expectedState" (independent state-value check, audit #4) or set ` +
                     `"noStateCheck": true with a reason in "note"`,
                 );
+              } else {
+                // "noStateCheck": true is an opt-OUT, not a free pass. Enforce
+                // the same honesty requirement at RUN TIME that
+                // coverage-claims.test.ts already enforces statically (audit
+                // P2-3) — a non-empty "note" AND a non-empty "issue" field —
+                // so the two gates can never silently diverge.
+                if (typeof s.note !== 'string' || s.note.trim().length === 0) {
+                  throw new Error(
+                    `${spec.fixture}: stateful accept spend "${s.method}" sets ` +
+                      `"noStateCheck": true but has no non-empty "note" explaining why`,
+                  );
+                }
+                if (typeof s.issue !== 'string' || s.issue.trim().length === 0) {
+                  throw new Error(
+                    `${spec.fixture}: stateful accept spend "${s.method}" sets ` +
+                      `"noStateCheck": true but has no non-empty "issue" field describing the follow-up`,
+                  );
+                }
               }
             }
           }

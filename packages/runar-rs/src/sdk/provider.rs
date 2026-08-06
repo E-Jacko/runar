@@ -42,10 +42,46 @@ pub trait Provider {
 // MockProvider
 // ---------------------------------------------------------------------------
 
+/// Script + value of an outpoint the MockProvider knows about. Broadcast
+/// validation can only execute inputs whose outpoint appears here.
+#[derive(Clone, Debug)]
+struct KnownOutpoint {
+    script: String,
+    satoshis: i64,
+}
+
+/// Outcome of validating one broadcast transaction.
+///
+/// Every input lands in exactly one bucket, and only `validated` means "a
+/// script really ran and really passed". The other buckets exist so a
+/// not-checked input can never masquerade as a checked one.
+#[derive(Clone, Debug, Default)]
+pub struct BroadcastValidationReport {
+    /// Inputs actually executed by `Spend` and accepted.
+    pub validated: usize,
+    /// Inputs whose outpoint this provider does not know (nothing was run).
+    pub unknown: usize,
+    /// Inputs the bundled `bsv-sdk` script parser cannot handle — see
+    /// [`validate_broadcast_tx`]. NOT counted as validated.
+    pub unvalidatable: usize,
+    /// Inputs at index > 0, which `bsv-sdk` 0.1.72 cannot sighash correctly —
+    /// see [`validate_broadcast_tx`]. NOT counted as validated.
+    pub unsupported_index: usize,
+    /// True when every input's outpoint was known, so the outputs-vs-inputs
+    /// value-conservation check actually ran.
+    pub value_conserved: bool,
+    /// Total inputs in the transaction.
+    pub total: usize,
+}
+
 /// In-memory mock provider for unit tests and local development.
 ///
 /// Allows injecting transactions and UTXOs, and records broadcasts for
 /// assertion in tests.
+///
+/// Broadcast validation is DEFAULT-ON (testing-gap remediation Phase A5) —
+/// see [`MockProvider::broadcast`] and README "How fund-path tests fail closed
+/// in the Rust tier".
 pub struct MockProvider {
     transactions: HashMap<String, TransactionData>,
     raw_transactions: HashMap<String, String>,
@@ -55,10 +91,19 @@ pub struct MockProvider {
     network: String,
     broadcast_count: u32,
     fee_rate: i64,
+    /// Gates the fail-closed check in `broadcast`. Default `true`; the opt-out
+    /// is governed by `always_ack_allowlist.json`
+    /// (see `tests/always_ack_allowlist.rs`).
+    validate_broadcasts: bool,
+    /// "txid:vout" -> script + value for every outpoint this provider knows.
+    known_outpoints: HashMap<String, KnownOutpoint>,
+    /// Non-vacuity witness of the most recent validating `broadcast`.
+    last_report: BroadcastValidationReport,
 }
 
 impl MockProvider {
-    /// Create a new MockProvider for the given network.
+    /// Create a new MockProvider for the given network, with broadcast
+    /// validation ON.
     pub fn new(network: &str) -> Self {
         MockProvider {
             transactions: HashMap::new(),
@@ -69,6 +114,9 @@ impl MockProvider {
             network: network.to_string(),
             broadcast_count: 0,
             fee_rate: 100,
+            validate_broadcasts: true,
+            known_outpoints: HashMap::new(),
+            last_report: BroadcastValidationReport::default(),
         }
     }
 
@@ -77,17 +125,67 @@ impl MockProvider {
         Self::new("testnet")
     }
 
+    /// Create a MockProvider whose `broadcast` never validates — the
+    /// pre-Phase-A5 behaviour.
+    ///
+    /// FOR ALLOWLISTED TESTS ONLY: every test file that calls this (or the
+    /// other opt-outs) must carry a matching entry in
+    /// `always_ack_allowlist.json`, enforced by `tests/always_ack_allowlist.rs`.
+    /// Fund-path deploy/call tests must not use it.
+    pub fn always_ack(network: &str) -> Self {
+        let mut p = Self::new(network);
+        p.validate_broadcasts = false;
+        p
+    }
+
+    /// Turn the fail-closed `broadcast` check on or off. Passing `false` is an
+    /// allowlisted opt-out — see [`MockProvider::always_ack`].
+    pub fn enable_broadcast_validation(&mut self, enabled: bool) {
+        self.validate_broadcasts = enabled;
+    }
+
+    /// Restore the legacy always-ack `broadcast`. Allowlisted opt-out.
+    pub fn disable_broadcast_validation(&mut self) {
+        self.validate_broadcasts = false;
+    }
+
+    /// Report from the most recent validating `broadcast`. Exposed so a test
+    /// can assert its gate is NOT vacuous.
+    pub fn last_validation_report(&self) -> &BroadcastValidationReport {
+        &self.last_report
+    }
+
+    /// Shorthand for `last_validation_report().validated`.
+    pub fn last_validated_input_count(&self) -> usize {
+        self.last_report.validated
+    }
+
+    fn remember_outpoint(&mut self, txid: &str, vout: u32, script: &str, satoshis: i64) {
+        if script.is_empty() {
+            return;
+        }
+        self.known_outpoints.insert(
+            format!("{}:{}", txid, vout),
+            KnownOutpoint { script: script.to_string(), satoshis },
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test data injection
     // -----------------------------------------------------------------------
 
     /// Add a transaction to the mock store.
     pub fn add_transaction(&mut self, tx: TransactionData) {
+        for (i, out) in tx.outputs.iter().enumerate() {
+            let (script, satoshis) = (out.script.clone(), out.satoshis);
+            self.remember_outpoint(&tx.txid, i as u32, &script, satoshis);
+        }
         self.transactions.insert(tx.txid.clone(), tx);
     }
 
     /// Add a UTXO for an address.
     pub fn add_utxo(&mut self, address: &str, utxo: Utxo) {
+        self.remember_outpoint(&utxo.txid, utxo.output_index, &utxo.script, utxo.satoshis);
         self.utxos
             .entry(address.to_string())
             .or_insert_with(Vec::new)
@@ -96,6 +194,7 @@ impl MockProvider {
 
     /// Add a contract UTXO for lookup by script hash.
     pub fn add_contract_utxo(&mut self, script_hash: &str, utxo: Utxo) {
+        self.remember_outpoint(&utxo.txid, utxo.output_index, &utxo.script, utxo.satoshis);
         self.contract_utxos.insert(script_hash.to_string(), utxo);
     }
 
@@ -110,6 +209,134 @@ impl MockProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fail-closed broadcast validation (testing-gap remediation Phase A5)
+// ---------------------------------------------------------------------------
+
+/// Replay the inputs the bundled interpreter can actually judge through
+/// `bsv-sdk`'s `Spend` with FULL transaction context, then check value
+/// conservation when every input is known.
+///
+/// # What this tier can and cannot check — stated, not papered over
+///
+/// The Rust tier's `Spend` wrapper is **execute-only** (upstream keeps the
+/// stack / program counter `pub(crate)`) — the divergence recorded in the root
+/// CLAUDE.md. Two further `bsv-sdk` 0.1.72 defects bound what a Rust-tier
+/// broadcast gate can honestly assert, and each gets its OWN bucket in
+/// [`BroadcastValidationReport`] so a not-checked input can never be mistaken
+/// for a passing one:
+///
+/// 1. **Only `input_index == 0` gets a correct BIP-143 preimage.**
+///    `spend_ops.rs` builds `hashPrevouts` as *current input's outpoint first,
+///    then `other_inputs`* — transaction input order only for index 0. A valid
+///    BIP-143 signature on input 1 (produced by this very SDK's `LocalSigner`,
+///    and accepted by the Go tier's go-sdk interpreter) evaluates to FALSE
+///    here. Inputs at index > 0 are therefore counted as `unsupported_index`.
+/// 2. **Rúnar OP_PUSH_TX covenants do not parse.** The compiled covenant
+///    embeds a `0x8d` byte; the parser desyncs and aborts with
+///    `disabled opcode: OP_2MUL` (`spend_ops.rs:779`, hard-disabled with no
+///    config escape). Those inputs are counted as `unvalidatable`.
+///
+/// If either defect is fixed upstream, `mock_broadcast_validation.rs` pins
+/// both with dedicated tests that go RED — at which point this function should
+/// be tightened.
+fn validate_broadcast_tx(
+    tx: &BsvTransaction,
+    known: &HashMap<String, KnownOutpoint>,
+) -> Result<BroadcastValidationReport, String> {
+    use bsv::script::locking_script::LockingScript;
+    use bsv::script::spend::{Spend, SpendParams};
+
+    let mut report = BroadcastValidationReport { total: tx.inputs.len(), ..Default::default() };
+    let mut all_inputs_known = true;
+    let mut total_known_in: i64 = 0;
+
+    for (i, input) in tx.inputs.iter().enumerate() {
+        let key = match &input.source_txid {
+            Some(txid) => format!("{}:{}", txid, input.source_output_index),
+            None => {
+                all_inputs_known = false;
+                report.unknown += 1;
+                continue;
+            }
+        };
+        let ko = match known.get(&key) {
+            Some(ko) => ko,
+            None => {
+                all_inputs_known = false;
+                report.unknown += 1;
+                continue;
+            }
+        };
+        total_known_in += ko.satoshis;
+
+        if i > 0 {
+            // Defect (1) above: the preimage upstream would build here is not
+            // BIP-143, so a pass/fail from it would be meaningless.
+            report.unsupported_index += 1;
+            continue;
+        }
+
+        let locking_script = LockingScript::from_hex(&ko.script)
+            .map_err(|e| format!("input {}: known outpoint {} has invalid script hex: {}", i, key, e))?;
+        let unlocking_script = match &input.unlocking_script {
+            Some(u) => u.clone(),
+            None => return Err(format!("input {}: no unlocking script (transaction is unsigned)", i)),
+        };
+        let other_inputs: Vec<_> = tx
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, v)| v.clone())
+            .collect();
+
+        let mut spend = Spend::new(SpendParams {
+            locking_script,
+            unlocking_script,
+            source_txid: input.source_txid.clone().unwrap_or_default(),
+            source_output_index: input.source_output_index as usize,
+            source_satoshis: ko.satoshis.max(0) as u64,
+            transaction_version: tx.version,
+            transaction_lock_time: tx.lock_time,
+            transaction_sequence: input.sequence,
+            other_inputs,
+            other_outputs: tx.outputs.clone(),
+            input_index: i,
+        });
+
+        match spend.validate() {
+            Ok(true) => report.validated += 1,
+            Ok(false) => {
+                return Err(format!("input {}: script evaluated to false", i));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // The ONLY tolerated class: the upstream parser desync on a
+                // Rúnar push-tx covenant. Counted, never treated as a pass.
+                if msg.contains("disabled opcode") {
+                    report.unvalidatable += 1;
+                } else {
+                    return Err(format!("input {}: script REJECTED by bsv-sdk Spend: {}", i, msg));
+                }
+            }
+        }
+    }
+
+    if all_inputs_known {
+        report.value_conserved = true;
+        let total_out: i64 = tx.outputs.iter().map(|o| o.satoshis.unwrap_or(0) as i64).sum();
+        if total_out > total_known_in {
+            return Err(format!(
+                "underfunded: outputs ({} sats) exceed known inputs ({} sats)",
+                total_out, total_known_in
+            ));
+        }
+    }
+
+    Ok(report)
+}
+
 impl Provider for MockProvider {
     fn get_transaction(&self, txid: &str) -> Result<TransactionData, String> {
         self.transactions
@@ -118,7 +345,56 @@ impl Provider for MockProvider {
             .ok_or_else(|| format!("MockProvider: transaction {} not found", txid))
     }
 
+    /// Validate the transaction (unless validation has been opted out of) and
+    /// then record it, returning a deterministic fake txid.
+    ///
+    /// Fail-closed by default (testing-gap remediation Phase A5): every input
+    /// whose outpoint the provider knows is executed by `bsv-sdk`'s `Spend`
+    /// with full transaction context, outputs may not exceed known inputs, and
+    /// a transaction on which ZERO inputs could actually be executed is
+    /// REJECTED rather than waved through — a gate that validates nothing is
+    /// worse than no gate.
     fn broadcast(&mut self, tx: &BsvTransaction) -> Result<String, String> {
+        if self.validate_broadcasts {
+            let report = validate_broadcast_tx(tx, &self.known_outpoints);
+            match report {
+                Ok(r) => {
+                    // Non-vacuity: at least ONE real check must have run —
+                    // either a script actually executed, or (when every input's
+                    // outpoint is known) the value-conservation check. If
+                    // neither did, nothing was verified and the ack would be a
+                    // lie.
+                    let vacuous = r.validated == 0 && !r.value_conserved;
+                    self.last_report = r;
+                    if vacuous {
+                        return Err(format!(
+                            "MockProvider: refusing to broadcast — NOTHING was checked \
+                             (0 of {} inputs executed; unknown outpoints: {}, unparseable by \
+                             bsv-sdk: {}, index>0 unsupported by bsv-sdk: {}; value conservation \
+                             could not run because not every input's outpoint is known). \
+                             Seed the spent outpoints via add_utxo/add_contract_utxo/\
+                             add_transaction, or use MockProvider::always_ack (allowlisted) if \
+                             this test genuinely needs always-ack",
+                            self.last_report.total,
+                            self.last_report.unknown,
+                            self.last_report.unvalidatable,
+                            self.last_report.unsupported_index,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.last_report = BroadcastValidationReport {
+                        total: tx.inputs.len(),
+                        ..Default::default()
+                    };
+                    return Err(format!(
+                        "MockProvider: refusing to broadcast invalid transaction: {}",
+                        e
+                    ));
+                }
+            }
+        }
+
         let raw_tx = tx.to_hex().map_err(|e| format!("broadcast: to_hex failed: {}", e))?;
         self.broadcasted_txs.push(raw_tx.clone());
         self.broadcast_count += 1;
@@ -130,6 +406,13 @@ impl Provider for MockProvider {
         ));
         // Auto-store raw hex for subsequent get_raw_transaction lookups
         self.raw_transactions.insert(fake_txid.clone(), raw_tx);
+        // Register this tx's own outputs so a chained call (spending the
+        // continuation this broadcast just created) can be validated too.
+        for (i, out) in tx.outputs.iter().enumerate() {
+            let script = out.locking_script.to_hex();
+            let sats = out.satoshis.unwrap_or(0) as i64;
+            self.remember_outpoint(&fake_txid, i as u32, &script, sats);
+        }
         Ok(fake_txid)
     }
 
@@ -272,11 +555,22 @@ mod tests {
         use bsv::script::LockingScript;
 
         let mut provider = MockProvider::testnet();
+        // Seed the spent outpoint so the default (fail-closed) broadcast check
+        // has something to actually execute — a validating provider rejects a
+        // tx none of whose inputs it knows rather than passing vacuously.
+        provider.add_utxo("mock", Utxo {
+            txid: "00".repeat(32),
+            output_index: 0,
+            satoshis: 100_000,
+            script: "51".to_string(),
+        });
         let mut tx = BsvTx::new();
         tx.add_input(BsvTxIn {
             source_txid: Some("00".repeat(32)),
             source_output_index: 0,
-            unlocking_script: None,
+            // OP_TRUE coin: empty (but PRESENT) scriptSig. `None` means the
+            // transaction is unsigned, which the validating provider rejects.
+            unlocking_script: Some(bsv::script::UnlockingScript::from_hex("").unwrap()),
             sequence: 0xffffffff,
             source_transaction: None,
         });
@@ -308,7 +602,7 @@ mod tests {
             tx.add_input(BsvTxIn {
                 source_txid: Some("aa".repeat(32)),
                 source_output_index: 0,
-                unlocking_script: None,
+                unlocking_script: Some(bsv::script::UnlockingScript::from_hex("").unwrap()),
                 sequence: 0xffffffff,
                 source_transaction: None,
             });
@@ -320,8 +614,19 @@ mod tests {
             tx
         }
 
-        let mut p1 = MockProvider::testnet();
-        let mut p2 = MockProvider::testnet();
+        fn seeded() -> MockProvider {
+            let mut p = MockProvider::testnet();
+            p.add_utxo("mock", Utxo {
+                txid: "aa".repeat(32),
+                output_index: 0,
+                satoshis: 100_000,
+                script: "51".to_string(),
+            });
+            p
+        }
+
+        let mut p1 = seeded();
+        let mut p2 = seeded();
 
         let txid1 = p1.broadcast(&make_test_tx()).unwrap();
         let txid2 = p2.broadcast(&make_test_tx()).unwrap();

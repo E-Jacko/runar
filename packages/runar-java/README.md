@@ -2315,3 +2315,83 @@ bytes are bumped at the major level.
   [`runar-zig`](../runar-zig),
   [`runar-rb`](../runar-rb)
 - Format guide: [`../../docs/formats/java.md`](../../docs/formats/java.md)
+
+---
+
+## How fund-path tests fail closed in the Java tier
+
+**This tier has no Bitcoin Script VM, and this section does not pretend
+otherwise.** There is no canonical upstream BSV Java SDK whose script
+interpreter could be wrapped, and project policy forbids hand-rolling one (root
+`CLAUDE.md`, "Off-chain Script VM"). So `MockProvider.broadcastRaw` makes **no
+claim whatsoever about signature or covenant validity**.
+
+What it *does* do, as of testing-gap remediation Phase A5, is stop being a
+record-and-mint sink. It is now fail-closed on every check that is genuinely
+available from the serialized bytes — the same checks a real node applies before
+it ever reaches script evaluation.
+
+### What runs on every `broadcastRaw`
+
+1. **Structural** — the payload must parse as a Bitcoin transaction (via
+   `RawTxParser`). A `"deadbeef"`-style string is refused with
+   `BroadcastRejectedException` and `RejectionReason.NOT_A_TRANSACTION`.
+2. **Non-vacuity** — at least one spent outpoint must be known to the provider,
+   so the gate can never pass by checking nothing
+   (`RejectionReason.NOTHING_CHECKED`). The TypeScript reference
+   (`packages/runar-sdk/src/providers/mock.ts`) accepts a transaction none of
+   whose inputs it knows; this tier does not.
+3. **Value conservation** — when every input's outpoint is known, outputs may
+   not exceed inputs (`RejectionReason.UNDERFUNDED`). No satoshis from nowhere.
+4. **Script-size bound** — every output script stays under
+   `InputLimits.MAX_SCRIPT_BYTES`.
+
+`lastValidationReport()` returns a `ValidationReport` record whose
+**`scriptsExecuted` is always 0**. That component exists precisely so the
+absence of script execution stays visible in the data, not just in prose. If a
+Java ScriptVM ever lands, extend the record — do not quietly leave a 0 that
+readers assume means "nothing to check".
+
+`lastValidatedInputCount()` reports how many spent outpoints were actually
+recognised, so a test can assert its gate is not vacuous. Outputs of an accepted
+broadcast are registered as known outpoints, so a chained call spending the
+continuation the previous broadcast created is checkable too. When a test
+injects a contract UTXO straight into a `RunarContract` (bypassing the
+provider), register it with `provider.addKnownOutpoint(utxo)` — otherwise the
+gate correctly refuses to ack a transaction it cannot check at all.
+
+### Where script-level correctness actually comes from in this tier
+
+Since the provider cannot execute Script, the fund-safety burden is carried
+**vertically**, not by the mock:
+
+- **Absolute hex pins.** The Java compiler's output is byte-compared against the
+  checked-in `conformance/tests/*/expected-script.hex` goldens, which the other
+  six tiers must match byte-for-byte. A Java-only codegen divergence cannot
+  hide.
+- **On-chain integration spends** in `integration/java`, which broadcast to a
+  real node and assert acceptance (and, for negatives, assert the node
+  *rejects*).
+- **`ContractSimulator`** (`runar.lang.runtime.ContractSimulator`) for
+  off-chain contract behaviour against real hashes and real secp256k1.
+
+### The opt-out, and how it is governed
+
+`MockProvider.alwaysAck()`, `disableBroadcastValidation()` and
+`enableBroadcastValidation(false)` restore the old behaviour. Every test file
+that uses one must have an entry in **`always_ack_allowlist.json`** with a file,
+a reason and a category; `AlwaysAckAllowlistTest` fails on unlisted usage **and**
+on stale entries, so the list can only shrink. Today exactly one file is listed:
+the test that exercises the opt-out surface itself — **no Java fund-path test
+needed an opt-out**.
+
+### What this caught
+
+`MockProviderTest` and `WalletProviderTest` were broadcasting the literal string
+`"deadbeef"` — not a transaction at all — and asserting success. They now use
+genuine transactions (which proves the same properties: recording, ordering,
+distinct txids, delegation to the inner provider) plus an explicit rejection
+test for the non-transaction case. Ten call-path tests injected the contract
+UTXO straight into the `RunarContract` and never told the provider about it, so
+the gate had nothing to check — the very vacuity this phase closes; they now
+register the outpoint.

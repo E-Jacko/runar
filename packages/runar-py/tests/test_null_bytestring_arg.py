@@ -42,7 +42,7 @@ def _artifact(byte_string_param_name: str) -> RunarArtifact:
 def _deploy(artifact: RunarArtifact):
     contract = RunarContract(artifact, [0])
     signer = MockSigner(address='00' * 20)
-    provider = MockProvider('testnet')
+    provider = MockProvider.always_ack('testnet')
     provider.add_utxo(signer.get_address(), Utxo(
         txid='aa' * 32, output_index=0, satoshis=100_000,
         script='76a914' + '00' * 20 + '88ac',

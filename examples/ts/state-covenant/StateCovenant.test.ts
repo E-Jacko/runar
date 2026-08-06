@@ -1,3 +1,9 @@
+// INTERPRETER-ONLY: spendability covered by integration/zig/src/state_covenant_test.zig
+// (real deploy + spend on a live regtest node: two accepts plus four reject cases;
+//  it compiles THIS directory's StateCovenant.runar.ts and checks the bytes against
+//  conformance/tests/state-covenant/expected-script.hex). No real-crypto witness exists
+//  because the contract is Go-only codegen (compilers: ["go"]) — see
+//  conformance/witnesses/coverage-ledger.json entry "state-covenant".
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';

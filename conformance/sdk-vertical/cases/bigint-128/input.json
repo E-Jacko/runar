@@ -1,0 +1,150 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "SlotMatrix",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "count",
+            "type": "bigint"
+          },
+          {
+            "name": "tag",
+            "type": "ByteString"
+          },
+          {
+            "name": "owner",
+            "type": "PubKey"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "unlock",
+          "params": [
+            {
+              "name": "sig",
+              "type": "Sig"
+            },
+            {
+              "name": "witness",
+              "type": "ByteString"
+            },
+            {
+              "name": "n",
+              "type": "bigint"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "007b88007c9d000087916900ac",
+    "constructorSlots": [
+      {
+        "paramIndex": 1,
+        "byteOffset": 0,
+        "name": "tag",
+        "type": "ByteString",
+        "valueEncoding": "data"
+      },
+      {
+        "paramIndex": 0,
+        "byteOffset": 3,
+        "name": "count",
+        "type": "bigint",
+        "valueEncoding": "scriptnum"
+      },
+      {
+        "paramIndex": 1,
+        "byteOffset": 6,
+        "name": "tag",
+        "type": "ByteString",
+        "valueEncoding": "data"
+      },
+      {
+        "paramIndex": 2,
+        "byteOffset": 7,
+        "name": "owner",
+        "type": "PubKey",
+        "valueEncoding": "data",
+        "fixedValueByteLength": 33,
+        "fixedPushHeaderBytes": 1
+      },
+      {
+        "paramIndex": 2,
+        "byteOffset": 11,
+        "name": "owner",
+        "type": "PubKey",
+        "valueEncoding": "data",
+        "fixedValueByteLength": 33,
+        "fixedPushHeaderBytes": 1
+      }
+    ],
+    "templateDigest": {
+      "algorithm": "hash256-excised-slots",
+      "pieces": [
+        {
+          "kind": "code"
+        },
+        {
+          "kind": "slot",
+          "byteOffset": 0,
+          "slot": "tag"
+        },
+        {
+          "kind": "code"
+        },
+        {
+          "kind": "slot",
+          "byteOffset": 3,
+          "slot": "count"
+        },
+        {
+          "kind": "code"
+        },
+        {
+          "kind": "slot",
+          "byteOffset": 6,
+          "slot": "tag"
+        },
+        {
+          "kind": "code"
+        },
+        {
+          "kind": "slot",
+          "byteOffset": 7,
+          "slot": "owner"
+        },
+        {
+          "kind": "code"
+        },
+        {
+          "kind": "slot",
+          "byteOffset": 11,
+          "slot": "owner"
+        },
+        {
+          "kind": "code"
+        }
+      ]
+    }
+  },
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "128"
+    },
+    {
+      "type": "ByteString",
+      "value": "11"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ]
+}

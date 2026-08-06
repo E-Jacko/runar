@@ -75,27 +75,6 @@ public final class StackLower {
 
     private static final int MAX_STACK_DEPTH = 800;
 
-    /**
-     * How many branch-merged locals an if-statement's two arms carry as
-     * results.
-     *
-     * <p>ANF lowering's {@code appendMergedLocalResults} ends both arms with
-     * the same K-binding block — {@code <local> = @ref:__merge$<i>} for i in
-     * 0..K-1 — so the merged values sit on top in the same canonical order
-     * whichever branch runs. Counting the trailing block is how stack lowering
-     * learns K: it must trim each arm down to exactly those K slots before the
-     * N&gt;=2 reconcile compares the arms, since everything beneath them is the
-     * arm's own (dead, and arm-specific) working values.
-     *
-     * <p>Returns 0 unless BOTH arms end with a block of the same size —
-     * anything else is not a normalised merge and must not be trimmed.
-     */
-    private static int countMergedLocalResults(List<AnfBinding> thenBindings,
-                                               List<AnfBinding> elseBindings) {
-        int thenCount = trailingMergedLocalResults(thenBindings);
-        return thenCount > 0 && thenCount == trailingMergedLocalResults(elseBindings)
-            ? thenCount : 0;
-    }
 
     private static int trailingMergedLocalResults(List<AnfBinding> bindings) {
         String prefix = "@ref:" + AnfValue.MERGED_LOCAL_TEMP_PREFIX;
@@ -402,6 +381,147 @@ public final class StackLower {
                 collectDeepBindingNamesInto(l.body(), names);
             }
         }
+    }
+
+    /**
+     * Locals a loop body REBINDS and then READS AGAIN in the same iteration.
+     *
+     * <p>{@code computeLastUses} maps a name to the MAXIMUM index that
+     * references it, so for a body like
+     *
+     * <pre>
+     * t3   = acc + step     (index 1 — reads the value carried in)
+     * acc  = &#64;ref:t3         (index 2 — rebinds: renames t3's slot to `acc`)
+     * t4   = wacc + acc     (index 3 — reads the value just rebound)
+     * </pre>
+     *
+     * <p>{@code acc} gets last-use 3. Index 1 is therefore NOT a last use and
+     * copies (PICK) instead of consuming, leaving the incoming slot on the
+     * stack under the same name as the rebound one; index 3 then IS the last
+     * use, and findDepth resolves to the topmost match — so it consumes the
+     * UPDATED value and leaves the dead incoming one. The next iteration reads
+     * that dead slot, and every iteration recomputes from the pre-loop value:
+     * {@code for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc +
+     * acc; }} produced {@code wacc = step*N} where the source says
+     * {@code step*N*(N+1)/2} — silently in a stateless contract, and as a
+     * permanently unspendable UTXO in a stateful one (the covenant commits to a
+     * continuation the SDK never builds). {@code outerRefs} does not cover it:
+     * {@code acc} is excluded there precisely because the body binds it.
+     *
+     * <p>The value these names hold at the end of an iteration is live at the
+     * start of the next one, so lowerLoop protects them from consumption
+     * exactly like an outer ref. The incoming slot each rebinding shadows is
+     * left behind and drained with the rest of the frame at method exit — a
+     * name always resolves to its newest slot, so the reads stay correct.
+     *
+     * <p>Both halves of the predicate are load-bearing:
+     * <ul>
+     *   <li>read BEFORE the first rebinding: the name is carried IN from the
+     *       enclosing scope, rather than being a body-private temp that merely
+     *       happens to be read after it is bound;</li>
+     *   <li>read AFTER the last rebinding: without it the rebound value is dead
+     *       at the end of the iteration and consuming it is correct. This is
+     *       what keeps every shipped accumulator ({@code sum = sum + i},
+     *       {@code off = off + len}) byte-for-byte unchanged.</li>
+     * </ul>
+     *
+     * <p>NESTED loops: the scan runs over {@code flattenNestedLoopBodies(body)},
+     * not over {@code body} itself. A name rebound only inside an INNER loop is
+     * bound at no top-level index of the outer body, so the raw scan classified
+     * it as neither an outer ref ({@code collectDeepBindingNames} excludes it —
+     * the body does bind it, deeply) nor a carried rebind, and the outer loop
+     * never marked it live. The inner loop's final iteration then consumed it,
+     * because {@code usedAfterLoop} asks the enclosing scope and the enclosing
+     * scope had not been told either, so every outer iteration restarted from
+     * the slot the previous one left behind:
+     * {@code for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }}
+     * with step = 3 produced {@code wacc = 24} where the source says 30.
+     * Splicing the inner body in at the loop's position preserves the
+     * read/rebind/read ordering the inner level already sees, so the outer
+     * level draws the same conclusion.
+     */
+    static Set<String> collectLoopCarriedRebinds(List<AnfBinding> body) {
+        List<AnfBinding> flat = flattenNestedLoopBodies(body);
+
+        Map<String, Integer> firstBind = new HashMap<>();
+        Map<String, Integer> lastBind = new HashMap<>();
+        for (int i = 0; i < flat.size(); i++) {
+            String name = flat.get(i).name();
+            firstBind.putIfAbsent(name, i);
+            lastBind.put(name, i);
+        }
+
+        Set<String> readBeforeBind = new LinkedHashSet<>();
+        Set<String> readAfterBind = new LinkedHashSet<>();
+        for (int i = 0; i < flat.size(); i++) {
+            for (String ref : collectRefs(flat.get(i).value())) {
+                Integer first = firstBind.get(ref);
+                if (first != null && i < first) readBeforeBind.add(ref);
+                Integer last = lastBind.get(ref);
+                if (last != null && i > last) readAfterBind.add(ref);
+            }
+        }
+
+        readBeforeBind.retainAll(readAfterBind);
+        return readBeforeBind;
+    }
+
+    /**
+     * The binding sequence with every nested {@code loop} binding — and every
+     * {@code if} binding — replaced, in place, by its own (recursively
+     * flattened) body.
+     *
+     * <p>Only {@code collectLoopCarriedRebinds} uses this, and only to order
+     * reads against rebindings. Neither replaced binding contributes a stack
+     * slot that predicate reasons about, so dropping it loses nothing; splicing
+     * the sub-body in at its position is what lets an enclosing loop see a
+     * rebinding one level down.
+     *
+     * <p>{@code if} arms ARE spliced, in {@code then ++ else} order, even
+     * though they are alternatives rather than a sequence. The predicate asks
+     * only "is this name read, then rebound, then read again", and treating the
+     * arms as a sequence can only ADD names to the carried set, never remove
+     * one — conservative in the safe direction. Without it a local rebound ONLY
+     * inside an {@code if} arm was bound at no index the predicate could see:
+     * neither an outer ref ({@code collectDeepBindingNames} excludes it, since
+     * the body does bind it, deeply) nor a carried rebind. The loop consumed it
+     * and the next iteration had nothing to read, so
+     * {@code for (i<2) { if (i<5) { acc = acc + step; } wacc = wacc + acc; }}
+     * was REJECTED outright with {@code Value 'acc' not found on stack} — the
+     * loud face of the same gap the merged-local protection in {@code lowerIf}
+     * fixes silently at K&gt;=2.
+     *
+     * <p>The {@code if} binding itself is NOT re-appended after its arms.
+     * Appending it would count the arms' reads a second time at an index past
+     * every arm rebinding, making a local that BOTH arms rebind look "read
+     * after its last rebinding" — which protected a K=1 alias that must stay
+     * consumable.
+     *
+     * <p>A body with no nested loop and no {@code if} is returned
+     * entry-for-entry unchanged, which is what makes this byte-neutral for
+     * every flat loop.
+     */
+    static List<AnfBinding> flattenNestedLoopBodies(List<AnfBinding> body) {
+        boolean nested = false;
+        for (AnfBinding b : body) {
+            if (b.value() instanceof Loop || b.value() instanceof If) {
+                nested = true;
+                break;
+            }
+        }
+        if (!nested) return body;
+        List<AnfBinding> flat = new ArrayList<>(body.size());
+        for (AnfBinding b : body) {
+            if (b.value() instanceof Loop l) {
+                flat.addAll(flattenNestedLoopBodies(l.body()));
+            } else if (b.value() instanceof If iv) {
+                flat.addAll(flattenNestedLoopBodies(iv.thenBranch()));
+                flat.addAll(flattenNestedLoopBodies(iv.elseBranch()));
+            } else {
+                flat.add(b);
+            }
+        }
+        return flat;
     }
 
     static List<String> collectRefs(AnfValue value) {
@@ -984,7 +1104,8 @@ public final class StackLower {
                     if (b.value() instanceof Assert a && i == lastAssertIdx) {
                         lowerAssert(a.value(), i, lastUses, true);
                     } else if (b.value() instanceof If iv && i == terminalIfIdx) {
-                        lowerIf(b.name(), iv.cond(), iv.thenBranch(), iv.elseBranch(), i, lastUses, true);
+                        lowerIf(b.name(), iv.cond(), iv.thenBranch(), iv.elseBranch(),
+                            iv.results() == null ? List.of() : iv.results(), i, lastUses, true);
                     } else {
                         lowerBinding(b, i, lastUses);
                     }
@@ -1015,7 +1136,8 @@ public final class StackLower {
             } else if (v instanceof MethodCall mc) {
                 lowerMethodCall(name, mc.object(), mc.method(), mc.args(), idx, lastUses);
             } else if (v instanceof If iv) {
-                lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(), idx, lastUses, false);
+                lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(),
+                    iv.results() == null ? List.of() : iv.results(), idx, lastUses, false);
             } else if (v instanceof Loop l) {
                 lowerLoop(name, l.count(), l.body(), l.iterVar(), l.start(), l.step(), idx, lastUses);
             } else if (v instanceof Assert a) {
@@ -2102,10 +2224,64 @@ public final class StackLower {
 
         // ---------------- if ----------------
 
+
+        /**
+         * {@code results} is the {@code if} node's declared result slots,
+         * deepest first (see {@link If#results()}). Empty for an {@code if}
+         * that carries at most one result, and then every path below behaves
+         * exactly as it did before the multi-result contract existed.
+         */
         void lowerIf(String bindingName, String cond,
                      List<AnfBinding> thenB, List<AnfBinding> elseB,
+                     List<String> results,
                      int idx, Map<String, Integer> lastUses,
                      boolean terminalAssert) {
+            // The ANF wire format has no version field, and --ir / --ir-parity
+            // are documented surfaces that feed a checked-in ANF JSON straight
+            // into this pass. An ANF produced BEFORE the multi-result node
+            // carries the trailing `__merge$` block WITHOUT results — back then
+            // the block was a naming CONVENTION this pass recognised, and no
+            // tier recognises it any more. It deserialises cleanly, the declared
+            // count is 0, and the result count falls back to
+            // thenDepth - parentDepth, which counts the arm's untrimmed block
+            // residue as results. Refuse it: the block can only be emitted by
+            // appendBranchResults, which only runs for an `if` that declares
+            // results. Emits no opcodes.
+            if (results == null || results.isEmpty()) {
+                List<AnfBinding> arms = new ArrayList<>();
+                if (thenB != null) arms.addAll(thenB);
+                if (elseB != null) arms.addAll(elseB);
+                for (AnfBinding b : arms) {
+                    if (b.name().startsWith(AnfValue.MERGED_LOCAL_TEMP_PREFIX)) {
+                        throw new IllegalStateException(
+                            "ANF produced by a pre-multi-result compiler: the "
+                            + "conditional's arm carries a '"
+                            + AnfValue.MERGED_LOCAL_TEMP_PREFIX + "' block but the node "
+                            + "declares no results (binding '" + b.name() + "'). That "
+                            + "block used to be a naming convention this pass inferred "
+                            + "results from; it is now a declared contract, and no tier "
+                            + "reads the convention any more. Recompile the source with "
+                            + "the current compiler instead of reusing the stored ANF. "
+                            + "binding='" + bindingName + "'.");
+                    }
+                }
+            }
+
+            // Result slots are identified BY NAME — two identically-named
+            // results are indistinguishable, so the layout assertion would be
+            // satisfied by coincidence while one value silently replaced the
+            // other. ANF lowering refuses the source shape; this guards the
+            // --ir path, where the list arrives as data.
+            if (results != null && results.size() > 1
+                && new LinkedHashSet<>(results).size() != results.size()) {
+                throw new IllegalStateException(
+                    "Internal codegen error: the conditional declares duplicate result "
+                    + "names [" + String.join(", ", results) + "]. Result slots are "
+                    + "matched by name, so duplicates cannot be told apart and one "
+                    + "value would silently replace the other. binding='"
+                    + bindingName + "'.");
+            }
+
             bringToTop(cond, isLastUse(cond, idx, lastUses));
             sm.pop();
 
@@ -2114,6 +2290,44 @@ public final class StackLower {
                 if (e.getValue() > idx && sm.has(e.getKey())) {
                     protectedRefs.add(e.getKey());
                 }
+            }
+
+            // The K>=2 merged-local block reads every merged local in BOTH
+            // arms, and that read is RECONCILIATION, not a use: it is what
+            // makes each arm leave exactly K equally-named result slots for the
+            // N>=2 reconcile below to adopt. So the merged locals must be
+            // copied, never consumed — regardless of whether the ENCLOSING
+            // scope reads them again.
+            //
+            // appendMergedLocalResults (ANF lowering) states that as its
+            // premise: "pass 1 always COPIES ... because a local live after the
+            // `if` is in outerProtectedRefs". Enclosing-scope liveness is the
+            // wrong question, and the premise silently failed for every merged
+            // local whose last enclosing use IS this `if` — which is EVERY
+            // merged local of an `if` in a loop body, since the body's last-use
+            // map ends at the `if` itself.
+            //
+            // What happened then: pass 1 ROLLED instead of picking, the arm's
+            // stack effect stopped being +K, the arms ended at different
+            // depths, phase 3 padded the shortfall with EMPTY pushes, the
+            // N-result layout check saw an unnamed slot where it needed the
+            // merged name, and control fell through to the single-slot fallback
+            // push(bindingName) — ONE stackMap name registered for K physical
+            // results, with acc/wacc still naming the dead pre-`if` slots.
+            // `for (i<2) { if (i<5) { acc = acc + step; wacc = wacc + acc; } }`
+            // with step = 3 produced wacc = 3 where the source says 9: silently
+            // in a stateless contract, and as a permanently unspendable UTXO in
+            // a stateful one.
+            //
+            // Byte-neutral for every program whose merged locals were already
+            // live after the `if`: those names are already protected above,
+            // which is precisely why those programs compiled correctly.
+            //
+            // Now driven by the node's DECLARED results instead of by
+            // recognising a trailing `__merge$` block, so an arm-written
+            // property is protected on the same footing as a rebound local.
+            for (String name : results) {
+                if (sm.has(name)) protectedRefs.add(name);
             }
 
             Set<String> preIfNames = sm.namedSlots();
@@ -2188,17 +2402,50 @@ public final class StackLower {
             //
             // Runs AFTER the phase-2 consumption drops, so both arms have given
             // up the same parent slots and share one base depth.
-            int mergedResultCount = countMergedLocalResults(thenB, elseB);
-            if (mergedResultCount >= 2) {
+            int nDeclared = results.size();
+            if (nDeclared >= 1) {
                 Set<String> stillHeld = thenCtx.sm.namedSlots();
                 int consumedFromParent = 0;
                 for (String n : preIfNames) {
                     if (!stillHeld.contains(n) && sm.has(n)) consumedFromParent++;
                 }
-                int targetDepth = sm.depth() - consumedFromParent + mergedResultCount;
+                int targetDepth = sm.depth() - consumedFromParent + nDeclared;
                 for (LoweringContext armCtx : List.of(thenCtx, elseCtx)) {
                     while (armCtx.sm.depth() > targetDepth) {
-                        armCtx.dropSlotAtDepth(mergedResultCount);
+                        armCtx.dropSlotAtDepth(nDeclared);
+                    }
+                }
+
+                // The declared contract, checked rather than assumed: after the
+                // trim, each arm's top N slots must BE the declared results, in
+                // the declared order (results[0] deepest). appendBranchResults
+                // is what makes this true; if it ever stops being true the arms
+                // disagree on layout, which is precisely the failure that
+                // produced the 2026-08 miscompile family. Emits no opcodes.
+                String[] labels = { "then", "else" };
+                List<LoweringContext> arms = List.of(thenCtx, elseCtx);
+                for (int ai = 0; ai < arms.size(); ai++) {
+                    LoweringContext armCtx = arms.get(ai);
+                    if (armCtx.sm.depth() != targetDepth) {
+                        throw new IllegalStateException(
+                            "Internal codegen error: branch result layout mismatch — the "
+                            + labels[ai] + "-arm of the conditional ends at depth "
+                            + armCtx.sm.depth() + ", but its " + nDeclared
+                            + " declared result(s) require depth " + targetDepth
+                            + ". binding='" + bindingName + "'.");
+                    }
+                    for (int i = 0; i < nDeclared; i++) {
+                        String want = results.get(nDeclared - 1 - i);
+                        String got = armCtx.sm.peekAtDepth(i);
+                        if (!want.equals(got)) {
+                            throw new IllegalStateException(
+                                "Internal codegen error: branch result layout mismatch — the "
+                                + labels[ai] + "-arm of the conditional holds '" + got
+                                + "' where the node declares '" + want + "' (slot "
+                                + (nDeclared - 1 - i) + " of [" + String.join(", ", results)
+                                + "]). Every later operand would resolve to the wrong slot. "
+                                + "binding='" + bindingName + "'.");
+                        }
                     }
                 }
             }
@@ -2265,6 +2512,14 @@ public final class StackLower {
             }
             emitOp(ifOp);
 
+            // Physical slots this method drops AFTER OP_ENDIF, while
+            // reconciling the parent stackMap against the arms' results.
+            // Counted because the invariant at the end of lowerIf cannot compare
+            // the two depths directly: the post-ENDIF reconcile legitimately
+            // ROLL/DROPs stale slots out from under the results, so those drops
+            // have to be added back before comparing.
+            int postEndifDrops = 0;
+
             // Reconcile parent stackMap with consumed names in both branches.
             Set<String> postBranchNames = thenCtx.sm.namedSlots();
             List<String> toRemove = new ArrayList<>();
@@ -2305,7 +2560,41 @@ public final class StackLower {
             }
 
             // If expression may produce a result value on top
-            if (thenCtx.sm.depth() > sm.depth()
+            if (nDeclared >= 1) {
+                // DECLARED RESULTS. Both arms were normalised by
+                // appendBranchResults and the layout check above proved they
+                // hold exactly `results`, so the parent adopts them BY THE
+                // DECLARED ORDER — no counting of trailing `__merge$` bindings,
+                // no comparison of arm depths, no inference of which names are
+                // still live. results[0] is the deepest slot, matching the order
+                // pass 2 of the normalisation rebound them in.
+                //
+                // Then each parent slot the block shadows (the pre-`if` binding
+                // of a merged local, the stale value of a written property) is
+                // physically rolled out from under the results, exactly as the
+                // pre-existing N>=2 reconcile did — which is why the four
+                // `__merge$` goldens keep their bytes.
+                for (String name : results) {
+                    sm.push(name);
+                }
+                for (int i = nDeclared - 1; i >= 0; i--) {
+                    String name = results.get(i);
+                    for (int d = nDeclared; d < sm.depth(); d++) {
+                        if (name.equals(sm.peekAtDepth(d))) {
+                            emitOp(new PushOp(PushValue.of(d)));
+                            sm.push("");
+                            emitOp(new RollOp(d + 1));
+                            sm.pop();
+                            String rolled = sm.removeAtDepth(d);
+                            sm.push(rolled);
+                            emitOp(new DropOp());
+                            sm.pop();
+                            postEndifDrops++;
+                            break;
+                        }
+                    }
+                }
+            } else if (thenCtx.sm.depth() > sm.depth()
                 && nResults >= 2
                 && (elseB.isEmpty() || elseMatchesThenNResultLayout)) {
                 // #99 Bug 1: a conditional write of N>=2 state fields leaves N
@@ -2332,6 +2621,7 @@ public final class StackLower {
                             sm.push(rolled);
                             emitOp(new DropOp());
                             sm.pop();
+                            postEndifDrops++;
                             break;
                         }
                     }
@@ -2344,16 +2634,55 @@ public final class StackLower {
                 if (isProperty && thenTop != null && !thenTop.isEmpty() && thenTop.equals(elseTop)
                     && !thenTop.equals(bindingName) && sm.has(thenTop)) {
                     sm.push(thenTop);
-                    rebalanceDuplicate(thenTop);
+                    postEndifDrops += rebalanceDuplicate(thenTop);
                 } else if (thenTop != null && !thenTop.isEmpty() && !isProperty
                     && elseB.isEmpty() && !thenTop.equals(bindingName) && sm.has(thenTop)) {
                     sm.push(thenTop);
-                    rebalanceDuplicate(thenTop);
+                    postEndifDrops += rebalanceDuplicate(thenTop);
                 } else {
                     sm.push(bindingName);
                 }
             } else if (elseCtx.sm.depth() > sm.depth()) {
                 sm.push(bindingName);
+            } else {
+                // Otherwise a void if — don't push a phantom.
+            }
+
+            // Layer C — branch result-depth invariant.
+            //
+            // The stackMap is the compiler's ONLY model of the stack, so a
+            // stackMap that names FEWER slots than the arms physically left is
+            // not detectable anywhere downstream: every later operand silently
+            // resolves N slots off. That single failure mode produced the whole
+            // 2026-08 branch/loop miscompile family — wrong-but-accepted state
+            // continuations at best, and scripts the interpreter rejects
+            // outright (locked funds) at worst.
+            //
+            // What must hold when lowerIf returns: the parent stackMap describes
+            // exactly the physical stack. Both arms ended at armDepth (the
+            // branch-balance guard above proves they agree), OP_ENDIF changes
+            // nothing, and the only physical effect after it is the
+            // postEndifDrops stale-slot drops the reconcile emitted. So:
+            //
+            //     sm.depth() + postEndifDrops == armDepth
+            //
+            // The naive sm.depth() == armDepth is WRONG — the reconcile
+            // legitimately ROLL/DROPs stale slots out from under the results,
+            // which is exactly what postEndifDrops counts.
+            //
+            // A failure here is always a codegen bug, never a user error. Emits
+            // no opcodes: byte-neutral by construction. Same genre as the
+            // branch-balance guard (#99), added for the same reason.
+            int armDepth = thenCtx.sm.depth();
+            if (sm.depth() + postEndifDrops != armDepth) {
+                throw new IllegalStateException(
+                    "Internal codegen error: branch result depth mismatch — the parent stack "
+                    + "model does not describe the physical stack after OP_ENDIF (stackMap depth "
+                    + sm.depth() + " + " + postEndifDrops + " post-ENDIF drop(s) != arm depth "
+                    + armDepth + "). The arms leave " + (armDepth - sm.depth() - postEndifDrops)
+                    + " more physical slot(s) than the compiler recorded, so every later operand "
+                    + "would resolve to the wrong slot and the script would be wrong or "
+                    + "unspendable. binding='" + bindingName + "'.");
             }
 
             trackDepth();
@@ -2362,7 +2691,10 @@ public final class StackLower {
             if (elseCtx.maxDepth > maxDepth) maxDepth = elseCtx.maxDepth;
         }
 
-        private void rebalanceDuplicate(String name) {
+        /** Drops the stale duplicate of {@code name}; returns the number of
+         *  physical slots removed (0 or 1) so lowerIf can count post-ENDIF
+         *  drops for its result-depth invariant. */
+        private int rebalanceDuplicate(String name) {
             for (int d = 1; d < sm.depth(); d++) {
                 if (name.equals(sm.peekAtDepth(d))) {
                     if (d == 1) {
@@ -2378,9 +2710,10 @@ public final class StackLower {
                         emitOp(new DropOp());
                         sm.pop();
                     }
-                    break;
+                    return 1;
                 }
             }
+            return 0;
         }
 
         private static void dropAtDepth(LoweringContext ctx, int depth) {
@@ -2429,6 +2762,18 @@ public final class StackLower {
                     if (!ref.equals(iterVar) && !deepBodyBindingNames.contains(ref)) {
                         outerRefs.add(ref);
                     }
+                }
+            }
+
+            // A local the body REBINDS and then READS AGAIN in the same
+            // iteration is carried across iterations through the rebound slot,
+            // so it must survive the body exactly like an outer ref.
+            // deepBodyBindingNames above excludes it precisely because the body
+            // binds it — which is what made the updated value consumable. See
+            // collectLoopCarriedRebinds.
+            for (String ref : collectLoopCarriedRebinds(body)) {
+                if (!ref.equals(iterVar)) {
+                    outerRefs.add(ref);
                 }
             }
 

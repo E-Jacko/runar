@@ -5,7 +5,7 @@ Mirrors TestDeployCallLifecycle and related tests from packages/runar-go/sdk_tes
 
 import pytest
 from runar.sdk.contract import RunarContract
-from runar.sdk.types import RunarArtifact, Abi, AbiParam, AbiMethod, DeployOptions
+from runar.sdk.types import RunarArtifact, Abi, AbiParam, AbiMethod, DeployOptions, Utxo
 from runar.sdk.provider import MockProvider
 from runar.sdk.signer import MockSigner
 
@@ -32,7 +32,7 @@ def _simple_artifact() -> RunarArtifact:
 def _funded_provider(address: str, satoshis: int = 100_000) -> MockProvider:
     """Create a MockProvider with one UTXO for the given address."""
     from runar.sdk.types import Utxo
-    provider = MockProvider('testnet')
+    provider = MockProvider.always_ack('testnet')
     provider.add_utxo(address, Utxo(
         txid='aa' * 32,
         output_index=0,
@@ -239,19 +239,42 @@ class TestMockProvider:
         utxos = provider.get_utxos('unknown_address')
         assert utxos == []
 
+    # Testing-gap remediation Phase A5: MockProvider.broadcast is fail-closed by
+    # default, so these bookkeeping tests must hand it a REAL transaction whose
+    # spent outpoint the provider knows. They previously broadcast the byte
+    # strings '01000000000000000000' / '01000000' + '00'*16 — payloads a real
+    # node would reject outright — and asserted success. Using a genuine
+    # transaction proves the same properties while keeping the gate armed.
+    @staticmethod
+    def _seeded_provider_and_tx():
+        provider = MockProvider('testnet')
+        prev = 'aa' * 32
+        provider.add_utxo('addr', Utxo(txid=prev, output_index=0, satoshis=10_000, script='51'))
+        raw = ('01000000' + '01' + bytes.fromhex(prev)[::-1].hex() + '00000000'
+               + '00' + 'ffffffff' + '01'
+               + (9_000).to_bytes(8, 'little').hex() + '0151' + '00000000')
+        return provider, raw
+
     def test_broadcast_returns_64_char_txid(self):
         """broadcast() returns a 64-char hex txid (row 408)."""
-        provider = MockProvider('testnet')
-        txid = provider.broadcast('01000000000000000000')
+        provider, raw = self._seeded_provider_and_tx()
+        txid = provider.broadcast(raw)
         assert isinstance(txid, str)
         assert len(txid) == 64
         assert all(c in '0123456789abcdef' for c in txid)
 
     def test_broadcast_records_transaction(self):
         """broadcast() increments the broadcasted transactions count (row 409)."""
-        provider = MockProvider('testnet')
-        provider.broadcast('01000000' + '00' * 16)
+        provider, raw = self._seeded_provider_and_tx()
+        provider.broadcast(raw)
         assert len(provider.get_broadcasted_txs()) == 1
+
+    def test_broadcast_refuses_a_non_transaction_payload(self):
+        """Fail-closed: a payload that is not a Bitcoin transaction is rejected."""
+        from runar.sdk.errors import BroadcastRejected
+        provider = MockProvider('testnet')
+        with pytest.raises(BroadcastRejected):
+            provider.broadcast('01000000000000000000')
 
     def test_get_network_returns_configured_network(self):
         """get_network() returns the network passed to the constructor (row 410)."""
@@ -263,8 +286,7 @@ class TestMockProvider:
 
     def test_deterministic_txid_for_same_broadcast(self):
         """Broadcasting the same tx twice yields the same txid (row 411)."""
-        provider = MockProvider('testnet')
-        raw_tx = '01000000' + '00' * 20
+        provider, raw_tx = self._seeded_provider_and_tx()
         txid1 = provider.broadcast(raw_tx)
         txid2 = provider.broadcast(raw_tx)
         # Note: broadcast count differs so txid may differ — this just verifies

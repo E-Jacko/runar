@@ -45,6 +45,10 @@ class PreparedCallTest {
             "ab".repeat(32), 0, 10_000L, contract.lockingScript()
         );
         contract.setCurrentUtxo(contractUtxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(contractUtxo);
 
         // Prepare: pass nulls for Sig + PubKey — the SDK fills in the
         // pubkey (from the provided signer, so the unlocking script has
@@ -115,6 +119,10 @@ class PreparedCallTest {
             List.of(HexFormat.of().formatHex(Hash160.hash160(signer.pubKey())))
         );
         contract.setCurrentUtxo(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
 
         PreparedCall prepared = contract.prepareCall(
             "unlock", Arrays.asList(null, null), null, provider, signer
@@ -137,6 +145,10 @@ class PreparedCallTest {
             List.of(HexFormat.of().formatHex(Hash160.hash160(signer.pubKey())))
         );
         contract.setCurrentUtxo(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript()));
 
         PreparedCall prepared = contract.prepareCall(
             "unlock", Arrays.asList(null, null), null, provider, signer
@@ -189,6 +201,10 @@ class PreparedCallTest {
         RunarArtifact artifact = RunarArtifact.fromJson(json);
         RunarContract contract = new RunarContract(artifact, List.of());
         contract.setCurrentUtxo(new UTXO("cd".repeat(32), 0, 20_000L, contract.lockingScript()));
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(new UTXO("cd".repeat(32), 0, 20_000L, contract.lockingScript()));
 
         List<Object> args = Arrays.asList(null, null);
         PreparedCall prepared = contract.prepareCall(

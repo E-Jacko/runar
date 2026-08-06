@@ -1,0 +1,85 @@
+{
+  "case": "bytes-multi-2",
+  "contract": "SlotMatrix",
+  "valueClass": "ByteString 0x0011 → 2-byte push",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "7"
+    },
+    {
+      "type": "ByteString",
+      "value": "0011"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 83,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 3,
+      "headerBytes": 1,
+      "valueByteOffset": 1,
+      "valueByteLength": 2,
+      "encoding": "data",
+      "pushedHex": "0011"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 5,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 5,
+      "valueByteLength": 1,
+      "encoding": "scriptnum",
+      "pushedHex": "07"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 8,
+      "byteLength": 3,
+      "headerBytes": 1,
+      "valueByteOffset": 9,
+      "valueByteLength": 2,
+      "encoding": "data",
+      "pushedHex": "0011"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 11,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 12,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 48,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 49,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

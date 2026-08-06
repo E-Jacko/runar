@@ -100,7 +100,21 @@ describe('C13 — funding coin-selection uses an estimate; the real build never 
     });
 
     const signer = new LocalSigner(PRIV_KEY);
-    const provider = new MockProvider();
+    // This test's whole subject is a fee that undershoots the estimate (down
+    // to 0 in the worst case) while never going negative — opt out of
+    // P1-2's fee floor only; Spend + conservation still run via C8.
+    const provider = new MockProvider('testnet', { enforceFeeFloor: false });
+    // Register the primary contract UTXO (P1-1: `fromUtxo` doesn't broadcast
+    // a deploy through this provider, so without this the provider never
+    // learns the outpoint and the C8 broadcast-validation dry-run below
+    // would validate zero inputs instead of exercising the real fee
+    // arithmetic this test is about).
+    provider.addContractUtxo('c13-fee-bound', {
+      txid: FAKE_TXID,
+      outputIndex: 0,
+      satoshis: 1000,
+      script: deployedScript,
+    });
     // Deliberately NO funding UTXOs for the signer's address — isolates the
     // primary contract input's own value/fee arithmetic.
     contract.connect(provider, signer);

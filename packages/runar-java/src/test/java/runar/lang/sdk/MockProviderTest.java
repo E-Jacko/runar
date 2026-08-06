@@ -32,15 +32,34 @@ class MockProviderTest {
         assertNull(p.getUtxo("dd".repeat(32), 2));
     }
 
+    /**
+     * Testing-gap remediation Phase A5: broadcastRaw is fail-closed by default,
+     * so this bookkeeping test must hand it a REAL transaction whose spent
+     * outpoint the provider knows. It previously broadcast the literal string
+     * "deadbeef" — not a transaction at all — and asserted success.
+     */
     @Test
     void broadcastQueueRecordsHexAndReturnsDeterministicTxid() {
         MockProvider p = new MockProvider();
-        String t1 = p.broadcastRaw("deadbeef");
-        String t2 = p.broadcastRaw("deadbeef");
+        p.addKnownOutpoint("aa".repeat(32), 0, "51", 10_000L);
+        RawTx tx = new RawTx();
+        tx.addInput("aa".repeat(32), 0, "");
+        tx.addOutput(9_000L, "51");
+        String raw = tx.toHex();
+
+        String t1 = p.broadcastRaw(raw);
+        String t2 = p.broadcastRaw(raw);
         assertEquals(2, p.getBroadcastedTxs().size());
-        assertEquals("deadbeef", p.getBroadcastedTxs().get(0));
+        assertEquals(raw, p.getBroadcastedTxs().get(0));
         assertEquals(64, t1.length());
         assertNotEquals(t1, t2, "broadcast counter ensures distinct txids for identical hex");
+    }
+
+    /** Fail-closed: a payload that is not a Bitcoin transaction is refused. */
+    @Test
+    void broadcastRefusesANonTransactionPayload() {
+        MockProvider p = new MockProvider();
+        assertThrows(BroadcastRejectedException.class, () -> p.broadcastRaw("deadbeef"));
     }
 
     @Test

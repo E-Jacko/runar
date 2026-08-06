@@ -34,7 +34,9 @@ const PAYOUT = '76a914' + 'bb'.repeat(20) + '88ac';
 
 async function setup() {
   const methodSigner = new LocalSigner(METHOD_KEY);
-  const provider = new MockProvider();
+  // Shares #118's terminal-payout setup (fee 0 without feeUtxo) — opt out
+  // of P1-2's fee floor only; Spend + conservation still run.
+  const provider = new MockProvider('testnet', { enforceFeeFloor: false });
   const methodAddr = await methodSigner.getAddress();
   provider.addUtxo(methodAddr, {
     txid: 'cc'.repeat(32),

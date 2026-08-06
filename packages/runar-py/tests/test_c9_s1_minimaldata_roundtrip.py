@@ -1,4 +1,11 @@
-"""C9 + S1 — single-byte MINIMALDATA push data must round-trip.
+"""round-trip only — absolute pin: packages/runar-py/tests/test_sdk_state.py
+(class TestStatePushFraming, C9/state half). The S1 (constructor-arg) half has
+no Python-local literal-byte KAT; its only absolute evidence is indirect, via
+the deploy-time splice path (conformance/sdk-vertical) -- see the
+"unlocking-encodeArg-minimaldata" residual note in
+conformance/wire-primitives.json.
+
+C9 + S1 — single-byte MINIMALDATA push data must round-trip.
 
 C9 (state): ``serialize_state`` routes a variable-length (ByteString) field
 through ``encode_push_data``, which short-circuits single-byte payloads to

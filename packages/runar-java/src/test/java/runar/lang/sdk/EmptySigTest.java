@@ -68,6 +68,10 @@ class EmptySigTest {
         RunarContract contract = new RunarContract(artifact, List.of(pkA, pkB));
         UTXO utxo = new UTXO("ab".repeat(32), 0, 50_000L, contract.lockingScript());
         contract.setCurrentUtxo(utxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(utxo);
         return contract;
     }
 

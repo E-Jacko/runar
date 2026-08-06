@@ -7,6 +7,7 @@
 
 require_relative 'types'
 require_relative 'errors'
+require_relative 'bip143'
 
 module Runar
   module SDK
@@ -64,15 +65,65 @@ module Runar
     class MockProvider < Provider
       DEFAULT_FEE_RATE = 100
 
-      def initialize(network: 'testnet')
-        @transactions     = {}
-        @utxos            = {}
-        @contract_utxos   = {}
-        @broadcasted_txs  = []
-        @raw_transactions = {}
-        @broadcast_count  = 0
-        @network          = network
-        @fee_rate         = DEFAULT_FEE_RATE
+      # Shape of last_validation_report before any validating broadcast has run.
+      EMPTY_VALIDATION_REPORT = {
+        scripts_executed: 0,
+        known_inputs: 0,
+        total_inputs: 0,
+        value_conserved: false
+      }.freeze
+
+      def initialize(network: 'testnet', validate_broadcasts: true)
+        @transactions        = {}
+        @utxos               = {}
+        @contract_utxos      = {}
+        @broadcasted_txs     = []
+        @raw_transactions    = {}
+        @broadcast_count     = 0
+        @network             = network
+        @fee_rate            = DEFAULT_FEE_RATE
+        @validate_broadcasts = validate_broadcasts
+        @known_outpoints     = {}
+        @last_report         = EMPTY_VALIDATION_REPORT
+      end
+
+      # A MockProvider whose +broadcast+ never validates — the pre-Phase-A5
+      # behaviour.
+      #
+      # FOR ALLOWLISTED SPECS ONLY: every spec file that calls this (or the
+      # other opt-outs) must carry a matching entry in
+      # +always_ack_allowlist.json+, enforced by
+      # +spec/sdk/always_ack_allowlist_spec.rb+. Fund-path deploy/call specs
+      # must not use it.
+      def self.always_ack(network: 'testnet')
+        new(network: network, validate_broadcasts: false)
+      end
+
+      # Turn the fail-closed +broadcast+ check on or off. Passing +false+ is an
+      # allowlisted opt-out — see +MockProvider.always_ack+.
+      def enable_broadcast_validation(enabled = true)
+        @validate_broadcasts = enabled
+      end
+
+      # Restore the legacy always-ack +broadcast+. Allowlisted opt-out.
+      def disable_broadcast_validation
+        @validate_broadcasts = false
+      end
+
+      # Report from the most recent validating +broadcast+. Exposed so a spec
+      # can assert its gate is NOT vacuous.
+      #
+      # +:scripts_executed+ is ALWAYS 0 in this tier and is present precisely so
+      # that fact stays visible: Ruby ships no Bitcoin Script VM (see README,
+      # "How fund-path tests fail closed in the Ruby tier").
+      def last_validation_report
+        @last_report
+      end
+
+      # Shorthand for +last_validation_report[:known_inputs]+ — the number of
+      # spent outpoints this provider actually recognised and checked.
+      def last_validated_input_count
+        @last_report[:known_inputs]
       end
 
       # -- Mutation helpers ---------------------------------------------------
@@ -80,17 +131,22 @@ module Runar
       # Register a transaction for later retrieval.
       def add_transaction(tx)
         @transactions[tx.txid] = tx
+        Array(tx.outputs).each_with_index do |out, i|
+          remember_outpoint(tx.txid, i, out.script, out.satoshis)
+        end
       end
 
       # Register a UTXO under an address.
       def add_utxo(address, utxo)
         @utxos[address] ||= []
         @utxos[address] << utxo
+        remember_outpoint(utxo.txid, utxo.output_index, utxo.script, utxo.satoshis)
       end
 
       # Register a UTXO under a script hash for stateful contract lookup.
       def add_contract_utxo(script_hash, utxo)
         @contract_utxos[script_hash] = utxo
+        remember_outpoint(utxo.txid, utxo.output_index, utxo.script, utxo.satoshis)
       end
 
       # Override the fee rate (default: 100 sat/KB).
@@ -123,12 +179,25 @@ module Runar
         tx.raw
       end
 
+      # Validate the transaction (unless validation has been opted out of) and
+      # then record it, returning a deterministic fake txid.
+      #
+      # Fail-closed by default (testing-gap remediation Phase A5). This tier has
+      # NO Bitcoin Script VM, so it makes no script-validity claim — see
+      # +validate_broadcast!+ for exactly what it does and does not check.
       def broadcast(raw_tx)
+        parsed = validate_broadcast!(raw_tx) if @validate_broadcasts
+
         @broadcasted_txs << raw_tx
         @broadcast_count += 1
         fake_txid = mock_hash64("mock-broadcast-#{@broadcast_count}-#{raw_tx[0, 16]}")
         # Auto-store raw hex so get_raw_transaction works without an explicit add_transaction call.
         @raw_transactions[fake_txid] = raw_tx
+        # Register this tx's own outputs as known outpoints so a chained call
+        # (spending the continuation this broadcast just created) is checkable.
+        parsed&.fetch(:outputs)&.each_with_index do |out, i|
+          remember_outpoint(fake_txid, i, out[:script].unpack1('H*'), out[:satoshis])
+        end
         fake_txid
       end
 
@@ -166,6 +235,105 @@ module Runar
       end
 
       private
+
+      # Record an outpoint's script + value so broadcast validation can reason
+      # about it.
+      def remember_outpoint(txid, vout, script_hex, satoshis)
+        return if txid.nil? || script_hex.nil? || script_hex.to_s.empty?
+
+        @known_outpoints["#{txid}:#{vout}"] = { script: script_hex, satoshis: satoshis.to_i }
+      end
+
+      # Fail-closed broadcast validation (testing-gap remediation Phase A5).
+      #
+      # WHAT THIS CHECKS — and, just as importantly, what it does not.
+      #
+      # The Ruby tier ships no Bitcoin Script VM: there is no canonical upstream
+      # BSV Ruby SDK to wrap, and project policy forbids hand-rolling an
+      # interpreter (root CLAUDE.md, "Off-chain Script VM"). So this method
+      # makes NO claim about signature or covenant validity. It applies the
+      # checks that are genuinely available from the serialized bytes alone:
+      #
+      #   1. STRUCTURAL      — the payload must parse as a Bitcoin transaction.
+      #   2. NON-VACUITY     — at least one spent outpoint must be known here,
+      #                        so the gate can never pass by checking nothing.
+      #   3. VALUE CONSERVE  — when every input is known, outputs <= inputs.
+      #   4. SCRIPT-SIZE     — every output script stays under MAX_SCRIPT_BYTES.
+      #
+      # Script-level correctness for this tier is proven VERTICALLY instead:
+      # absolute-hex pins against the peer tiers' goldens plus the on-chain
+      # integration spends in integration/ruby.
+      #
+      # @raise [BroadcastRejected] when any check above fails
+      # @return [Hash] the parsed transaction (for the caller to reuse)
+      def validate_broadcast!(raw_tx)
+        parsed = parse_broadcast_tx(raw_tx)
+
+        known_inputs = 0
+        total_known_in = 0
+        all_inputs_known = true
+
+        parsed[:inputs].each do |input|
+          key = "#{input[:prev_txid].bytes.reverse.pack('C*').unpack1('H*')}:#{input[:prev_output_index]}"
+          known = @known_outpoints[key]
+          if known.nil?
+            all_inputs_known = false
+            next
+          end
+          known_inputs += 1
+          total_known_in += known[:satoshis]
+        end
+
+        total_out = 0
+        parsed[:outputs].each_with_index do |out, i|
+          script_hex = out[:script].unpack1('H*')
+          SDK.assert_script_hex_under_limit(
+            script_hex, SDK::MAX_SCRIPT_BYTES, "MockProvider.broadcast output #{i}"
+          )
+          total_out += out[:satoshis]
+        end
+
+        @last_report = {
+          scripts_executed: 0, # this tier has no Script VM — see the note above
+          known_inputs: known_inputs,
+          total_inputs: parsed[:inputs].length,
+          value_conserved: all_inputs_known
+        }.freeze
+
+        if known_inputs.zero?
+          raise BroadcastRejected,
+                'MockProvider: refusing to broadcast — checked 0 of ' \
+                "#{parsed[:inputs].length} input(s): no spent outpoint is known to this " \
+                'provider, so validation would pass vacuously. Seed the spent outpoints via ' \
+                'add_utxo/add_contract_utxo/add_transaction, or use MockProvider.always_ack ' \
+                '(allowlisted) if this spec genuinely needs always-ack'
+        end
+
+        if all_inputs_known && total_out > total_known_in
+          raise BroadcastRejected,
+                "MockProvider: refusing to broadcast invalid transaction: underfunded: outputs " \
+                "(#{total_out} sats) exceed known inputs (#{total_known_in} sats)"
+        end
+
+        parsed
+      end
+
+      def parse_broadcast_tx(raw_tx)
+        hex = raw_tx.to_s
+        raise BroadcastRejected, broadcast_parse_error(hex) unless hex.match?(/\A(?:[0-9a-fA-F]{2})+\z/)
+
+        parsed = BIP143.parse_raw_tx([hex].pack('H*'))
+        raise BroadcastRejected, broadcast_parse_error(hex) if parsed[:inputs].empty?
+
+        parsed
+      rescue ArgumentError, NoMethodError, TypeError
+        raise BroadcastRejected, broadcast_parse_error(raw_tx.to_s)
+      end
+
+      def broadcast_parse_error(hex)
+        'MockProvider: refusing to broadcast — payload is not a parseable Bitcoin transaction ' \
+        "(#{hex.length / 2} byte(s)). A real node would reject it outright."
+      end
 
       # Deterministic mock hash producing a 64-character hex string (like a txid).
       # Uses a simple FNV-inspired mix so the result is stable across Ruby versions.

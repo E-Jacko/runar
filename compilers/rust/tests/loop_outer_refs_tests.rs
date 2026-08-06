@@ -71,6 +71,178 @@ class ConstLoop extends SmartContract {
 }
 "#;
 
+/// A loop-carried local REASSIGNED and then READ AGAIN in the same iteration.
+/// The rebinding shadows the incoming slot under the same name; the later read
+/// was its last body use, so it consumed the UPDATED value and left the dead
+/// incoming one for the next iteration to resolve. `wacc` came out as `step*N`
+/// instead of `step*N*(N+1)/2` — silently in a stateless contract, and as a
+/// permanently unspendable UTXO in a stateful one. Real-VM proof:
+/// packages/runar-testing/src/__tests__/loop-carried-local-read-after-reassign-vm.test.ts
+const CARRIED_REBIND_SOURCE: &str = r#"import { SmartContract, assert } from 'runar-lang';
+
+class LoopCarriedRebind extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    let wacc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      acc = acc + step;
+      wacc = wacc + acc;
+    }
+    assert(wacc === this.expected);
+  }
+}
+"#;
+
+/// Control: the same loop with a single self-accumulating carrier — no read
+/// after the rebinding. Its bytes must NOT move, or the carried-rebind fix has
+/// been written too wide and every shipped `BoundedLoop`-shaped contract pays.
+const PLAIN_ACCUMULATOR_SOURCE: &str = r#"import { SmartContract, assert } from 'runar-lang';
+
+class LoopPlainAccumulator extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      acc = acc + step;
+    }
+    assert(acc === this.expected);
+  }
+}
+"#;
+
+/// The same cross-read one loop deeper. The predicate keys on the body's
+/// TOP-LEVEL binding names, and at the OUTER level `acc` is bound only inside
+/// the nested loop — so it was neither an outer ref nor a carried rebind, and
+/// every outer iteration restarted from the slot the previous one left behind.
+/// `wacc` came out 24 where the source says 30 (step = 3). Real-VM proof:
+/// packages/runar-testing/src/__tests__/nested-loop-carried-local-vm.test.ts
+const NESTED_CARRIED_REBIND_SOURCE: &str = r#"import { SmartContract, assert } from 'runar-lang';
+
+class LoopNestedCarriedRebind extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    let wacc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      for (let j = 0n; j < 2n; j++) {
+        acc = acc + step;
+        wacc = wacc + acc;
+      }
+    }
+    assert(wacc === this.expected);
+  }
+}
+"#;
+
+/// Control: NESTED loops with a single self-accumulating carrier. The flatten
+/// step fires here (the body does contain a nested loop) but the predicate
+/// still says "not carried", so the bytes must NOT move — that is what keeps
+/// nesting itself from costing anything.
+const NESTED_PLAIN_ACCUMULATOR_SOURCE: &str = r#"import { SmartContract, assert } from 'runar-lang';
+
+class LoopNestedPlainAccumulator extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      for (let j = 0n; j < 2n; j++) {
+        acc = acc + step;
+      }
+    }
+    assert(acc === this.expected);
+  }
+}
+"#;
+
+/// Byte-identical across all seven compiler tiers (fold-OFF).
+const CARRIED_REBIND_HEX: &str = "000000537953797c937b789351557a53797c937b7c93009c77777777";
+const PLAIN_ACCUMULATOR_HEX: &str = "000052797b7c9351537a7b7c93009c7777";
+const NESTED_CARRIED_REBIND_HEX: &str = "00000000547954797c93537a789351567953797c937b78935100597954797c93537a7893515b7a53797c937b7c93009c77777777777777777777";
+const NESTED_PLAIN_ACCUMULATOR_HEX: &str =
+    "0000005379537a7c935154797b7c9351005679537a7c9351577a7b7c93009c777777777777";
+
+fn compile_hex(source: &str, file_name: &str) -> String {
+    let opts = CompileOptions {
+        disable_constant_folding: true,
+        ..CompileOptions::default()
+    };
+    let result = compile_from_source_str_with_result(source, Some(file_name), &opts);
+    assert!(
+        result.success,
+        "{} should compile; diagnostics: {:?}",
+        file_name,
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+    result.script_hex.expect("compiled script hex")
+}
+
+#[test]
+fn a_local_reassigned_then_read_again_in_the_same_iteration_survives_it() {
+    assert_eq!(
+        compile_hex(CARRIED_REBIND_SOURCE, "LoopCarriedRebind.runar.ts"),
+        CARRIED_REBIND_HEX
+    );
+}
+
+#[test]
+fn a_plain_accumulator_loop_is_untouched_by_the_carried_rebind_fix() {
+    assert_eq!(
+        compile_hex(PLAIN_ACCUMULATOR_SOURCE, "LoopPlainAccumulator.runar.ts"),
+        PLAIN_ACCUMULATOR_HEX
+    );
+}
+
+#[test]
+fn the_same_cross_read_inside_a_nested_loop_survives_it_too() {
+    assert_eq!(
+        compile_hex(
+            NESTED_CARRIED_REBIND_SOURCE,
+            "LoopNestedCarriedRebind.runar.ts"
+        ),
+        NESTED_CARRIED_REBIND_HEX
+    );
+}
+
+#[test]
+fn a_nested_plain_accumulator_is_untouched_by_the_nested_fix() {
+    assert_eq!(
+        compile_hex(
+            NESTED_PLAIN_ACCUMULATOR_SOURCE,
+            "LoopNestedPlainAccumulator.runar.ts"
+        ),
+        NESTED_PLAIN_ACCUMULATOR_HEX
+    );
+}
+
 #[test]
 fn param_referenced_after_a_loop_is_not_lowered_to_an_empty_push() {
     let opts = CompileOptions::default();

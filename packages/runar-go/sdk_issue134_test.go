@@ -26,15 +26,20 @@ func TestDeploy_FundingSignerSignsFundingInputs_Issue134(t *testing.T) {
 	})
 
 	addr, _ := methodSigner.GetAddress()
-	newProvider := func() *MockProvider {
+	// The funding coin is DISCOVERED under the connected (method) signer's
+	// address but LOCKED to whichever key actually owns it — that is the
+	// real-world shape issue #134 is about. Locking it to a hash nobody holds
+	// (the old "76a914 <20 zero bytes> 88ac" fixture) built an unspendable
+	// funding input that only the pre-Phase-A5 always-ack MockProvider accepted.
+	newProvider := func(ownerPubKey string) *MockProvider {
 		p := NewMockProvider("testnet")
-		p.AddUtxo(addr, UTXO{Txid: strings.Repeat("a1", 32), OutputIndex: 0, Satoshis: 100000, Script: "76a914" + strings.Repeat("00", 20) + "88ac"})
+		p.AddUtxo(addr, UTXO{Txid: strings.Repeat("a1", 32), OutputIndex: 0, Satoshis: 100000, Script: BuildP2PKHScript(ownerPubKey)})
 		return p
 	}
 
 	// With FundingSigner: the deploy funding input's P2PKH unlock must push the
 	// FUNDING signer's pubkey, not the connected method signer's.
-	p := newProvider()
+	p := newProvider(fundingPub)
 	c := NewRunarContract(artifact, []interface{}{})
 	if _, _, err := c.Deploy(p, methodSigner, DeployOptions{Satoshis: 1000, FundingSigner: fundingSigner}); err != nil {
 		t.Fatalf("deploy with fundingSigner: %v", err)
@@ -48,7 +53,7 @@ func TestDeploy_FundingSignerSignsFundingInputs_Issue134(t *testing.T) {
 	}
 
 	// Back-compat: without FundingSigner, funding is signed by the connected signer.
-	p2 := newProvider()
+	p2 := newProvider(methodPub)
 	c2 := NewRunarContract(artifact, []interface{}{})
 	if _, _, err := c2.Deploy(p2, methodSigner, DeployOptions{Satoshis: 1000}); err != nil {
 		t.Fatalf("deploy without fundingSigner: %v", err)

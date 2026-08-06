@@ -1,10 +1,10 @@
 /**
  * Tri-modal source-vs-script differential-execution oracle (issue #124).
  *
- * Extends the bi-modal {@link runDifferentialExecution} (ANF `RunarInterpreter`
+ * Extends the bi-modal {@link runDifferentialExecution} (AST-walking `RunarInterpreter`
  * vs. `ScriptVM`) with a strict, full-consensus `Spend.validate()` leg:
  *
- *   1. interpreter — the ANF `RunarInterpreter` (source semantics, our code).
+ *   1. interpreter — the AST-walking `RunarInterpreter` (source semantics, our code).
  *   2. ScriptVM   — the upstream `@bsv/sdk` `Spend` engine driven opcode by
  *                   opcode, with `success` = "no evaluation error and a truthy
  *                   top of stack" and the consensus wrappers switched off (see

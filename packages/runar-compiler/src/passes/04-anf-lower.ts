@@ -78,10 +78,52 @@ function lowerProperties(contract: ContractNode): ANFProperty[] {
     // Extract literal value from property initializer
     if (prop.initializer) {
       anfProp.initialValue = extractLiteralValue(prop.initializer);
+      checkStateBigintMagnitude(anfProp);
     }
 
     return anfProp;
   });
+}
+
+/**
+ * Magnitude bits a bigint state field gets: `num2bin-le8` is a fixed 8-byte
+ * little-endian SIGN-MAGNITUDE word, so bytes 0..6 plus the low 7 bits of byte
+ * 7 carry the magnitude and 0x80 of byte 7 carries the sign.
+ */
+const STATE_BIGINT_MAGNITUDE_LIMIT = 1n << 63n;
+
+/**
+ * Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+ *
+ * The state section writes every bigint field with OP_NUM2BIN 8, which cannot
+ * represent a magnitude of 2^63 or more. Nothing used to check: the compiler
+ * stamped `encoding: "num2bin-le8"` on the field and carried the initializer
+ * verbatim, the SDK wrote the low 8 bytes of it into the deployed state
+ * section, and the covenant then rebuilt the continuation with its own
+ * OP_NUM2BIN 8 — which produces different bytes — so hash256(outputs) never
+ * matched and the UTXO was permanently unspendable. It deployed cleanly, with
+ * no diagnostic at compile time or deploy time.
+ *
+ * This catches the statically-known half. Values that only exist at call time
+ * are stopped by the SDK serializer (`encodeNum2Bin`, runar-sdk/src/state.ts).
+ *
+ * READONLY properties are deliberately exempt: they are baked into the locking
+ * script as script-number pushes, never into the state section, and BSV script
+ * numbers are arbitrary-precision after Genesis.
+ */
+function checkStateBigintMagnitude(prop: ANFProperty): void {
+  if (prop.readonly) return;
+  if (prop.type !== 'bigint' && prop.type !== 'int') return;
+  const v = prop.initialValue;
+  if (typeof v !== 'bigint') return;
+  if (v < STATE_BIGINT_MAGNITUDE_LIMIT && v > -STATE_BIGINT_MAGNITUDE_LIMIT) return;
+
+  throw new Error(
+    `Cannot compile state property '${prop.name}' initialised to ${v}: it does ` +
+    `not fit the fixed 8-byte sign-magnitude state word (magnitude must be ` +
+    `< 2^63). Reduce the value, or make the property readonly if it is a ` +
+    `constant rather than state.`,
+  );
 }
 
 /** Extract a literal value from an Expression for ANFProperty.initialValue. */
@@ -514,6 +556,20 @@ class LoweringContext {
   private readonly sideEffects: SideEffectSummary | null;
   /** Debug: source location to attach to emitted ANF bindings. */
   currentSourceLoc: { file: string; line: number; column: number } | undefined;
+  /**
+   * True in every context created by `subContext()` — i.e. inside an if arm,
+   * a loop body, or an inlined helper's block — and false only in the context
+   * a method's own body is lowered into.
+   *
+   * `liftBranchUpdateProps` walks `method.body` and does NOT recurse: a `loop`
+   * body or a surviving `if` arm is passed through untouched. So an `if` that
+   * the lift's recogniser accepts is only actually REWRITTEN when it sits at
+   * method top level. `lowerIfStatement` needs the same distinction before it
+   * defers to that pass, otherwise a dispatch chain one `for` deeper is
+   * recognised-but-not-rewritten AND excluded from declaring its results —
+   * which leaves it with no correct lowering at all.
+   */
+  nested = false;
 
   constructor(contract: ContractNode, sideEffects: SideEffectSummary | null = null) {
     this.contract = contract;
@@ -593,6 +649,11 @@ class LoweringContext {
 
   isProperty(name: string): boolean {
     return this.contract.properties.some(p => p.name === name);
+  }
+
+  /** Contract property names in declaration order. */
+  propertyNames(): string[] {
+    return this.contract.properties.map(p => p.name);
   }
 
   /** Check if name matches a private method on the contract. */
@@ -715,6 +776,7 @@ class LoweringContext {
     // Share the method scope so auto-injection from intrinsics called
     // inside the nested block bubbles up to the parent's ABI list.
     sub.methodScope = this.methodScope;
+    sub.nested = true;
     return sub;
   }
 
@@ -728,7 +790,14 @@ class LoweringContext {
 // Statement lowering
 // ---------------------------------------------------------------------------
 
-function lowerStatements(stmts: Statement[], ctx: LoweringContext): void {
+/** Shared empty read-set, so the common call sites allocate nothing. */
+const NO_READS: ReadonlySet<string> = new Set<string>();
+
+function lowerStatements(
+  stmts: Statement[],
+  ctx: LoweringContext,
+  readsAfterBlock: ReadonlySet<string> = NO_READS,
+): void {
   for (let i = 0; i < stmts.length; i++) {
     const stmt = stmts[i]!;
 
@@ -749,11 +818,120 @@ function lowerStatements(stmts: Statement[], ctx: LoweringContext): void {
         ...stmt,
         else: remaining,
       };
-      lowerStatement(modifiedIf, ctx);
+      lowerStatement(modifiedIf, ctx, readsAfterBlock);
       return; // remaining stmts are now inside the else branch
     }
 
-    lowerStatement(stmt, ctx);
+    // Only the block-forming statements need to know what the code after them
+    // still reads; computing it for every statement would be quadratic for no
+    // benefit.
+    const readsAfter =
+      stmt.kind === 'if_statement' || stmt.kind === 'for_statement'
+        ? readsAfterStatement(stmts, i, readsAfterBlock)
+        : NO_READS;
+    lowerStatement(stmt, ctx, readsAfter);
+  }
+}
+
+/**
+ * The identifiers still readable once statement `index` of this block has run:
+ * everything the following statements in this block read, plus whatever the
+ * enclosing blocks read after this block.
+ *
+ * Used by `lowerIfStatement` to tell a branch-merged local that is dead after
+ * the `if` (safe) from one that is still live (not representable alongside a
+ * branch output — see `branchOutputRejectionReason`).
+ */
+function readsAfterStatement(
+  stmts: Statement[],
+  index: number,
+  readsAfterBlock: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const reads = new Set(readsAfterBlock);
+  for (let j = index + 1; j < stmts.length; j++) {
+    collectStatementReads(stmts[j]!, reads);
+  }
+  return reads;
+}
+
+/**
+ * Collect every identifier a statement READS. The `x` in `x = expr` is a write,
+ * not a read, so a plain identifier assignment target is skipped; every other
+ * target form (index access, member access) can still read locals.
+ */
+function collectStatementReads(stmt: Statement, out: Set<string>): void {
+  switch (stmt.kind) {
+    case 'variable_decl':
+      collectExpressionReads(stmt.init, out);
+      break;
+
+    case 'assignment':
+      if (stmt.target.kind !== 'identifier') collectExpressionReads(stmt.target, out);
+      collectExpressionReads(stmt.value, out);
+      break;
+
+    case 'if_statement':
+      collectExpressionReads(stmt.condition, out);
+      for (const s of stmt.then) collectStatementReads(s, out);
+      if (stmt.else) for (const s of stmt.else) collectStatementReads(s, out);
+      break;
+
+    case 'for_statement':
+      collectExpressionReads(stmt.init.init, out);
+      collectExpressionReads(stmt.condition, out);
+      collectStatementReads(stmt.update, out);
+      for (const s of stmt.body) collectStatementReads(s, out);
+      break;
+
+    case 'return_statement':
+      if (stmt.value) collectExpressionReads(stmt.value, out);
+      break;
+
+    case 'expression_statement':
+      collectExpressionReads(stmt.expression, out);
+      break;
+  }
+}
+
+/** Collect every identifier an expression reads. */
+function collectExpressionReads(expr: Expression, out: Set<string>): void {
+  switch (expr.kind) {
+    case 'identifier':
+      out.add(expr.name);
+      break;
+    case 'binary_expr':
+      collectExpressionReads(expr.left, out);
+      collectExpressionReads(expr.right, out);
+      break;
+    case 'unary_expr':
+      collectExpressionReads(expr.operand, out);
+      break;
+    case 'call_expr':
+      collectExpressionReads(expr.callee, out);
+      for (const a of expr.args) collectExpressionReads(a, out);
+      break;
+    case 'member_expr':
+      collectExpressionReads(expr.object, out);
+      break;
+    case 'ternary_expr':
+      collectExpressionReads(expr.condition, out);
+      collectExpressionReads(expr.consequent, out);
+      collectExpressionReads(expr.alternate, out);
+      break;
+    case 'index_access':
+      collectExpressionReads(expr.object, out);
+      collectExpressionReads(expr.index, out);
+      break;
+    case 'increment_expr':
+    case 'decrement_expr':
+      collectExpressionReads(expr.operand, out);
+      break;
+    case 'array_literal':
+      for (const e of expr.elements) collectExpressionReads(e, out);
+      break;
+    default:
+      // Literals and `this.x` property access read no locals.
+      break;
   }
 }
 
@@ -770,7 +948,11 @@ function branchEndsWithReturn(stmts: Statement[]): boolean {
   return false;
 }
 
-function lowerStatement(stmt: Statement, ctx: LoweringContext): void {
+function lowerStatement(
+  stmt: Statement,
+  ctx: LoweringContext,
+  readsAfter: ReadonlySet<string> = NO_READS,
+): void {
   // Propagate source location to emitted ANF bindings
   ctx.currentSourceLoc = stmt.sourceLocation;
 
@@ -784,11 +966,11 @@ function lowerStatement(stmt: Statement, ctx: LoweringContext): void {
       break;
 
     case 'if_statement':
-      lowerIfStatement(stmt, ctx);
+      lowerIfStatement(stmt, ctx, readsAfter);
       break;
 
     case 'for_statement':
-      lowerForStatement(stmt, ctx);
+      lowerForStatement(stmt, ctx, readsAfter);
       break;
 
     case 'expression_statement':
@@ -846,18 +1028,19 @@ function lowerAssignment(
 function lowerIfStatement(
   stmt: Extract<Statement, { kind: 'if_statement' }>,
   ctx: LoweringContext,
+  readsAfter: ReadonlySet<string> = NO_READS,
 ): void {
   const condRef = lowerExprToRef(stmt.condition, ctx);
 
   // Lower then-block into sub-context
   const thenCtx = ctx.subContext();
-  lowerStatements(stmt.then, thenCtx);
+  lowerStatements(stmt.then, thenCtx, readsAfter);
   ctx.syncCounter(thenCtx);
 
   // Lower else-block into sub-context
   const elseCtx = ctx.subContext();
   if (stmt.else) {
-    lowerStatements(stmt.else, elseCtx);
+    lowerStatements(stmt.else, elseCtx, readsAfter);
   }
   ctx.syncCounter(elseCtx);
 
@@ -884,9 +1067,11 @@ function lowerIfStatement(
     thenOutputRefs.length > 0 || elseOutputRefs.length > 0
     || thenDataRefs.length > 0 || elseDataRefs.length > 0;
 
+  let thenOutputBytes = '';
+  let elseOutputBytes = '';
   if (branchHasOutputs) {
-    appendBranchOutputConcat(thenCtx);
-    appendBranchOutputConcat(elseCtx);
+    thenOutputBytes = appendBranchOutputConcat(thenCtx);
+    elseOutputBytes = appendBranchOutputConcat(elseCtx);
   }
 
   // Branch-merged locals (2 or more). An `if` expression carries exactly ONE
@@ -909,22 +1094,127 @@ function lowerIfStatement(
   // results, which `lowerIf`'s N>=2 reconcile adopts by name — so a reference
   // after the `if` resolves to the merged value whichever branch ran.
   const mergedLocals = collectBranchMergedLocals(thenCtx, elseCtx, ctx);
-  if (mergedLocals.length >= 2) {
-    if (branchHasOutputs) {
-      // The arms' single value is already spoken for: it is the output concat
-      // the continuation hash consumes. Normalising merged locals on top of
-      // that would need a multi-result `if` node. Refuse at compile time
-      // rather than emit the unspendable script this used to produce.
+
+  if (branchHasOutputs) {
+    const reason = branchOutputRejectionReason(
+      thenCtx, elseCtx, thenOutputBytes, elseOutputBytes, mergedLocals, readsAfter,
+    );
+    if (reason !== null) {
       throw new Error(
-        `Cannot compile conditional that both declares outputs and merges ` +
-        `${mergedLocals.length} local variables (${mergedLocals.join(', ')}). ` +
+        `Cannot compile conditional that both declares outputs and ${reason}. ` +
         `Move the addOutput/addRawOutput/addDataOutput call after the ` +
-        `if-statement, or give each branch its own complete addOutput.`,
+        `if-statement.`,
       );
     }
-    appendMergedLocalResults(thenCtx, mergedLocals);
+  }
+
+  // The `if`'s multi-result contract. Locals first, in the canonical merge
+  // order both arms agree on, then the properties either arm writes, in
+  // contract declaration order — so all seven tiers derive the same list from
+  // the same source. `results[0]` is the deepest slot of the block.
+  const armProps = new Set<string>();
+  collectUpdatedProps(thenCtx.bindings, armProps);
+  collectUpdatedProps(elseCtx.bindings, armProps);
+  const resultNames = [
+    ...mergedLocals,
+    ...ctx.propertyNames().filter((name) => armProps.has(name)),
+  ];
+
+  // The result list is keyed by NAME everywhere downstream: `appendBranchResults`
+  // picks the local path or the property path per entry with `props.has(name)`,
+  // and 05-stack-lower's layout assertion compares the arm's top-N slot names
+  // against this list. A local that shares a contract property's name therefore
+  // appears TWICE — once as a merged local, once as an arm-written property —
+  // and both entries take the PROPERTY path, so the local's value is silently
+  // replaced by the property's. The layout assertion cannot catch it: both
+  // slots are legitimately named `count`, so comparing names is satisfied by
+  // coincidence.
+  //
+  // Refuse instead. Only the exact collision is refused — a local shadowing a
+  // property is otherwise fine, and stays fine, as long as the two are not both
+  // results of the same `if`.
+  const shadowed = mergedLocals.filter((name) => armProps.has(name));
+  if (shadowed.length > 0) {
+    throw new Error(
+      `Local variable '${shadowed[0]}' shadows contract property ` +
+      `'this.${shadowed[0]}', and the conditional assigns both. The branch's ` +
+      `result slots are identified by name, so the two cannot be told apart ` +
+      `and the local's value would be silently replaced by the property's. ` +
+      `Rename the local.`,
+    );
+  }
+
+  // When to materialise the contract instead of leaving the arms to the
+  // stack-lowerer's inference:
+  //
+  //   - two or more merged locals — the pre-existing normalisation. Kept on
+  //     exactly its old trigger so the four `__merge$` goldens do not move.
+  //   - any result at all when the ELSE arm carries code. This is the new
+  //     case, and it is where every measured miscompile lives: one arm rebinds
+  //     its local IN PLACE (net depth 0) while the other pushes a fresh slot
+  //     (net +1), or an arm writes a property beside a rebound local, or the
+  //     two arms write the same properties in a different order. The arms then
+  //     leave different LAYOUTS, which no depth or liveness predicate can see.
+  //
+  // An `if` WITHOUT an else keeps the preserve-the-old-value path in `lowerIf`
+  // (phase 3 copies each missing slot's same-named parent value), which already
+  // produces exactly these results by construction — deliberately left intact.
+  // An arm that emits outputs is excluded: its single value is the serialised
+  // output bytes, and `branchOutputRejectionReason` above already refuses every
+  // combination that would need a second result.
+  //
+  // EXCLUDED: an `if` that `liftBranchUpdateProps` will rewrite. That pass
+  // (deep-review finding C20) turns a conditional-property-assignment chain —
+  // `if (p==0) { this.c0 = v } else if (p==1) { this.c1 = v } ... else
+  // { assert(false) }` — into one flat single-valued `if` per property plus a
+  // top-level `update_prop`, so the surviving `if`s carry no property result
+  // and need no declaration. Appending the normalisation block first would
+  // ALSO silently disable that pass: its recogniser requires the arm's last
+  // binding to be the `update_prop` with everything before it side-effect
+  // free, and the block adds a second `update_prop` behind it. TicTacToe's
+  // position dispatch is exactly that shape, and losing the lift there
+  // produced an unspendable `move` script.
+  //
+  // The exclusion must be exactly "the lift WILL rewrite this `if`", and that
+  // is narrower than "the lift's recogniser accepts this `if`" in TWO ways.
+  // Both gaps were live defects: the shape fell through the exclusion AND
+  // through the rewrite, so it declared no results and got no flattening, and
+  // stack lowering fell back to inference that puts the property's STALE slot
+  // on top. `lowerGetStateScript` resolves properties by name through
+  // `findDepth`, which returns the TOPMOST slot, so the continuation committed
+  // the pre-call value and the UTXO was permanently unspendable.
+  //
+  //   1. `liftBranchUpdateProps` only rewrites chains of TWO OR MORE branches.
+  //      `collectUpdateBranches` returns a ONE-element list for the
+  //      `isAssertFalseElse` path, so `if (n > 0n) { this.count = ... } else
+  //      { assert(false) }` — the idiomatic guard — was recognised, excluded,
+  //      and then left alone.
+  //   2. `liftBranchUpdateProps` only walks `method.body`, and passes `loop`
+  //      bodies and surviving `if` arms through untouched. The same chain one
+  //      `for` deeper, or nested in another arm, is recognised at every depth
+  //      by `lowerIfStatement` but rewritten at none.
+  //
+  // Gating on `!ctx.nested` closes (2) byte-neutrally: every `if` the lift
+  // actually rewrites today is a top-level binding of `method.body`, so no
+  // currently-lifted chain changes behaviour, and the nested ones that were
+  // silently broken now take the declared-results path like any other `if`.
+  //
+  // A chain's DEEPEST `if` is never at top level, so it now declares results
+  // and carries a normalisation block — which is why `collectUpdateBranches`
+  // strips a declared block before matching (see `stripDeclaredResults`). The
+  // enclosing chain is still recognised and still lifted, and the lift
+  // discards the inner node (block and all), so the chain's bytes do not move.
+  const lifted = collectUpdateBranches(condRef, thenCtx.bindings, elseCtx.bindings);
+  const willBeLifted = !ctx.nested && lifted !== null && lifted.length >= 2;
+  const declaresResults =
+    !branchHasOutputs &&
+    !willBeLifted &&
+    (mergedLocals.length >= 2 || (resultNames.length >= 1 && elseCtx.bindings.length > 0));
+
+  if (declaresResults) {
+    appendBranchResults(thenCtx, resultNames, armProps);
     ctx.syncCounter(thenCtx);
-    appendMergedLocalResults(elseCtx, mergedLocals);
+    appendBranchResults(elseCtx, resultNames, armProps);
     ctx.syncCounter(elseCtx);
   }
 
@@ -933,6 +1223,7 @@ function lowerIfStatement(
     cond: condRef,
     then: thenCtx.bindings,
     else: elseCtx.bindings,
+    ...(declaresResults ? { results: resultNames } : {}),
   });
 
   if (branchHasOutputs) {
@@ -966,12 +1257,12 @@ function lowerIfStatement(
   // alias that variable to the if-expression result so that subsequent
   // references resolve to the branch output, not the dead initial value.
   //
-  // Skipped when the arms were normalised above: there the `if` has N results,
-  // not one, and each merged local keeps its OWN name through the reconcile in
+  // Skipped when the arms were normalised above: there the `if` DECLARES its
+  // results, and each one keeps its OWN name through the reconcile in
   // `lowerIf`. Aliasing here would point every merged local at the single
   // if-binding name — the last result slot — so N-1 of them would silently
   // read the wrong value.
-  if (mergedLocals.length < 2) {
+  if (!declaresResults) {
     const thenLast = thenCtx.bindings[thenCtx.bindings.length - 1];
     const elseLast = elseCtx.bindings[elseCtx.bindings.length - 1];
     if (thenLast && elseLast &&
@@ -983,37 +1274,59 @@ function lowerIfStatement(
 }
 
 /**
- * Append the canonical merged-local result block to one arm of an
- * if-statement: a copy of every merged local, in canonical order, rebound
- * under the local's own name.
+ * Append the canonical result block to one arm of an if-statement: a copy of
+ * every declared result, in the declared order, rebound under its own name.
+ *
+ * This is what makes the `if` node's `results` contract true rather than
+ * hoped-for. After it, the arm's top `results.length` slots ARE the results,
+ * in `results` order, whichever arm ran and whichever of them this arm
+ * actually assigned.
  *
  * Done in two passes on purpose. The first pass copies each live value to a
- * fresh branch-local temp; the second rebinds each local from its temp. That
- * makes the arm's stack effect exactly +K regardless of which of the K locals
- * this particular arm reassigned:
+ * fresh branch-local temp; the second rebinds each result from its temp. That
+ * makes the arm's stack effect exactly +N regardless of which results this
+ * particular arm reassigned:
  *
- *   - pass 1 always COPIES. `@ref:<local>` resolves to the arm's own new value
- *     if it rebound one, else to the enclosing scope's value, and either way
- *     stack lowering picks (never rolls) it, because a local live after the
- *     `if` is in `outerProtectedRefs`.
+ *   - pass 1 always COPIES. For a LOCAL, `@ref:<local>` resolves to the arm's
+ *     own new value if it rebound one, else to the enclosing scope's value,
+ *     and either way stack lowering picks (never rolls) it, because a declared
+ *     result is in `outerProtectedRefs`. For a PROPERTY, `load_prop` picks the
+ *     arm's updated slot when the arm wrote it, and otherwise the enclosing
+ *     value (or the deploy-time placeholder when the property has never been
+ *     on the stack).
  *   - pass 2 always CONSUMES, because the temps are bound in this arm and this
  *     is their last use, so each rolls into place.
  *
- * A single-pass `<local> = @ref:<local>` cannot do this: the same protection
+ * A single-pass `<result> = @ref:<result>` cannot do this: the same protection
  * that stops an arm from rolling away a still-needed parent slot also forces a
- * copy when the arm is rebinding its OWN value, so arms that reassigned
- * different locals ended up at different depths with the results in different
- * orders — which is what `lowerIf`'s reconcile compares.
+ * copy when the arm is rebinding its OWN value, so arms that assigned
+ * different results ended up at different depths with the results in different
+ * orders — which is exactly what `lowerIf`'s reconcile compares.
+ *
+ * Semantically a no-op for the off-chain ANF interpreters in all seven SDKs:
+ * every binding is an ordinary read-then-write of a value the arm already
+ * holds, so they need no knowledge of `results` at all.
  */
-function appendMergedLocalResults(branchCtx: LoweringContext, mergedLocals: string[]): void {
-  mergedLocals.forEach((name, i) => {
-    branchCtx.emitNamed(`${MERGED_LOCAL_TEMP_PREFIX}${i}`, { kind: 'load_const', value: `@ref:${name}` });
+function appendBranchResults(
+  branchCtx: LoweringContext,
+  resultNames: string[],
+  props: ReadonlySet<string>,
+): void {
+  resultNames.forEach((name, i) => {
+    branchCtx.emitNamed(
+      `${MERGED_LOCAL_TEMP_PREFIX}${i}`,
+      props.has(name)
+        ? { kind: 'load_prop', name }
+        : { kind: 'load_const', value: `@ref:${name}` },
+    );
   });
-  mergedLocals.forEach((name, i) => {
-    branchCtx.emitNamed(name, {
-      kind: 'load_const',
-      value: `@ref:${MERGED_LOCAL_TEMP_PREFIX}${i}`,
-    });
+  resultNames.forEach((name, i) => {
+    const temp = `${MERGED_LOCAL_TEMP_PREFIX}${i}`;
+    if (props.has(name)) {
+      branchCtx.emit({ kind: 'update_prop', name, value: temp });
+    } else {
+      branchCtx.emitNamed(name, { kind: 'load_const', value: `@ref:${temp}` });
+    }
   });
 }
 
@@ -1048,6 +1361,110 @@ function collectBranchMergedLocals(
 }
 
 /**
+ * Why an `if` whose arms declare outputs cannot be represented — or `null` when
+ * it can. Returns the reason clause the diagnostic embeds.
+ *
+ * An `if` expression carries exactly ONE value, and when an arm emits an output
+ * that value is already spoken for: it is the output bytes the continuation
+ * hash consumes (`appendBranchOutputConcat`). Anything ELSE the arm leaves
+ * behind breaks one of two invariants that nothing downstream enforces:
+ *
+ *   INV-A  the parent registers the if-expression's value as the branch's
+ *          contribution to the continuation hash, so "the branch's output
+ *          bytes" really means "whatever the arm's LAST binding is". A binding
+ *          that lands after the output — a rebound local, a property write —
+ *          silently replaces the serialized output with an unrelated value,
+ *          and `drainBranchPrivateResidue` then physically drops the real
+ *          output because it is no longer on top.
+ *   INV-B  an arm that emits an output AND leaves any other slot the parent
+ *          can still name — a property write anywhere in the arm, or a rebound
+ *          local that is still read after the `if` — leaves 2+ results against
+ *          the ONE stackMap name `lowerIf` registers, desyncing the parent
+ *          stack by a slot from there on. `drainBranchPrivateResidue` cannot
+ *          save it: it filters BY NAME and those names are all pre-`if` names.
+ *
+ * Neither is visible off-chain — the ANF interpreter copies branch bindings
+ * back into the parent env and skips the auto-injected continuation assert
+ * outright — so both shipped as permanently unspendable locking scripts.
+ * Refuse at compile time rather than emit one. See
+ * packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+ * for the real-Script-VM proof of each shape.
+ *
+ * The clauses are checked in a fixed order so all seven tiers report the same
+ * reason for a source that trips more than one.
+ */
+function branchOutputRejectionReason(
+  thenCtx: LoweringContext,
+  elseCtx: LoweringContext,
+  thenOutputBytes: string,
+  elseOutputBytes: string,
+  mergedLocals: string[],
+  readsAfter: ReadonlySet<string>,
+): string | null {
+  // 1. Two or more merged locals: normalising them would need a multi-result
+  //    `if` node, and the arms' single value is already the output concat.
+  if (mergedLocals.length >= 2) {
+    return `merges ${mergedLocals.length} local variables (${mergedLocals.join(', ')})`;
+  }
+
+  // 2. INV-A: the arm's terminal binding must BE its output bytes.
+  const arms: Array<[string, LoweringContext, string]> = [
+    ['then', thenCtx, thenOutputBytes],
+    ['else', elseCtx, elseOutputBytes],
+  ];
+  for (const [label, branchCtx, outputBytes] of arms) {
+    const last = branchCtx.bindings[branchCtx.bindings.length - 1];
+    if (!last || last.name !== outputBytes) {
+      return `continues past its output in the ${label}-branch`;
+    }
+  }
+
+  // 3. INV-B: a property write leaves a slot the parent can still name,
+  //    wherever in the arm it sits.
+  const writtenProps = new Set<string>();
+  for (const [, branchCtx] of arms) {
+    collectUpdatedProps(branchCtx.bindings, writtenProps);
+  }
+  if (writtenProps.size > 0) {
+    return `assigns contract properties (${[...writtenProps].join(', ')}) inside the branch`;
+  }
+
+  // 4. INV-B: a rebound local that survives the `if` is protected from being
+  //    rolled away, so the arm ends one slot deeper than lowerIf accounts for.
+  const liveMerged = mergedLocals.filter((name) => readsAfter.has(name));
+  if (liveMerged.length > 0) {
+    return `reassigns local variables read after it (${liveMerged.join(', ')})`;
+  }
+
+  return null;
+}
+
+/**
+ * Every property name an ANF binding list assigns, including the ones nested
+ * inside an `if` arm or a `loop` body — a nested write is just as much a named
+ * slot the enclosing arm leaves behind.
+ */
+function collectUpdatedProps(bindings: ANFBinding[], out: Set<string>): void {
+  for (const binding of bindings) {
+    const value = binding.value;
+    switch (value.kind) {
+      case 'update_prop':
+        out.add(value.name);
+        break;
+      case 'if':
+        collectUpdatedProps(value.then, out);
+        collectUpdatedProps(value.else, out);
+        break;
+      case 'loop':
+        collectUpdatedProps(value.body, out);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+/**
  * Concatenate a branch's collected output refs (state then data, in
  * declaration order) into a single bytes-ref appended to the
  * branch's bindings. If the branch has no outputs, emits an empty
@@ -1078,15 +1495,20 @@ function appendBranchOutputConcat(branchCtx: LoweringContext): string {
 function lowerForStatement(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
   ctx: LoweringContext,
+  readsAfter: ReadonlySet<string> = NO_READS,
 ): void {
   // Resolve the loop's compile-time shape: start value, step direction, and
   // iteration count. Rúnar requires bounded loops, so all three must be
   // statically determinable (issue #121).
   const { start, step, count } = extractLoopShape(stmt);
 
-  // Lower body into sub-context
+  // Lower body into sub-context. The body repeats, so every read anywhere in
+  // it is a read that happens after any given statement inside it.
+  const bodyReads = new Set(readsAfter);
+  for (const s of stmt.body) collectStatementReads(s, bodyReads);
+
   const bodyCtx = ctx.subContext();
-  lowerStatements(stmt.body, bodyCtx);
+  lowerStatements(stmt.body, bodyCtx, bodyReads);
   ctx.syncCounter(bodyCtx);
 
   ctx.emit({
@@ -2022,6 +2444,33 @@ interface UpdateBranch {
 }
 
 /**
+ * An arm with its declared-results block removed.
+ *
+ * `appendBranchResults` adds exactly `2 * results.length` trailing bindings to
+ * each arm of an `if` that declares results: K copies to `__merge$i` temps,
+ * then K rebinds off those temps. Those bindings are a materialisation
+ * mechanism, not program logic, and they hide the arm's real shape from this
+ * pass — the second `update_prop` becomes the arm's last binding and the
+ * original one lands in the "everything before must be side-effect free"
+ * prefix, so the recogniser rejects the arm.
+ *
+ * That matters because a dispatch chain's DEEPEST `if` is nested by
+ * definition, so it declares results, so its arms carry a block — and without
+ * this the enclosing chain stops being recognised and TicTacToe's position
+ * dispatch loses the C20 lift (an unspendable `move` script). Stripping by the
+ * declared count is exact: the block's length is `results.length * 2` and it is
+ * always the arm's tail.
+ */
+function stripDeclaredResults(
+  bindings: ANFBinding[],
+  results: string[] | undefined,
+): ANFBinding[] {
+  const n = results?.length ?? 0;
+  if (n === 0) return bindings;
+  return bindings.slice(0, Math.max(0, bindings.length - 2 * n));
+}
+
+/**
  * Recursively collect branches from a nested if-else chain where every
  * branch ends with exactly one update_prop.
  */
@@ -2049,7 +2498,9 @@ function collectUpdateBranches(
     if (!allBindingsSideEffectFree(condSetup)) return null;
 
     const innerBranches = collectUpdateBranches(
-      innerIf.cond, innerIf.then, innerIf.else,
+      innerIf.cond,
+      stripDeclaredResults(innerIf.then, innerIf.results),
+      stripDeclaredResults(innerIf.else, innerIf.results),
     );
     if (!innerBranches) return null;
 
@@ -2219,7 +2670,11 @@ function liftBranchUpdateProps(bindings: ANFBinding[]): ANFBinding[] {
     }
 
     const ifVal = binding.value;
-    const branches = collectUpdateBranches(ifVal.cond, ifVal.then, ifVal.else);
+    const branches = collectUpdateBranches(
+      ifVal.cond,
+      stripDeclaredResults(ifVal.then, ifVal.results),
+      stripDeclaredResults(ifVal.else, ifVal.results),
+    );
 
     if (!branches || branches.length < 2) {
       result.push(binding);

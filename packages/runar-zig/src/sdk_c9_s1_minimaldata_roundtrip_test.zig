@@ -1,3 +1,10 @@
+//! round-trip only — absolute pin: packages/runar-zig/src/sdk_state.zig
+//! (inline `test "state ByteString: ..."` blocks, C9/state half). The S1
+//! (constructor-arg) half has no Zig-local literal-byte KAT; its only
+//! absolute evidence is indirect, via the deploy-time splice path
+//! (conformance/sdk-vertical) -- see the "unlocking-encodeArg-minimaldata"
+//! residual note in conformance/wire-primitives.json.
+//!
 //! C9 + S1 — single-byte MINIMALDATA push data must round-trip (Zig SDK).
 //!
 //! C9 (state): `serializeState` routes a variable-length (ByteString) field

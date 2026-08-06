@@ -22,6 +22,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import type { RunarArtifact } from 'runar-ir-schema';
 import { extractStateFromScript } from '../state.js';
 
@@ -56,7 +57,7 @@ describe('TicTacToe v2 — FixedArray SDK round-trip', () => {
 
   it('initializes `state.board` to a 9-element bigint array', async () => {
     const artifact = compileContract('examples/ts/tic-tac-toe/TicTacToe.v2.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const signer = new LocalSigner(PLAYER_X_KEY);
     const pubKeyHex = await signer.getPublicKey();
     const address = await signer.getAddress();
@@ -64,7 +65,7 @@ describe('TicTacToe v2 — FixedArray SDK round-trip', () => {
       txid: PLAYER_X_KEY.slice(0, 64),
       outputIndex: 0,
       satoshis: 500_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: buildP2PKHScript(pubKeyHex),
     });
 
     const contract = new RunarContract(artifact, [pubKeyHex, 5000n]);
@@ -80,7 +81,7 @@ describe('TicTacToe v2 — FixedArray SDK round-trip', () => {
 
   it('deploys to MockProvider and round-trips state.board from on-chain script', async () => {
     const artifact = compileContract('examples/ts/tic-tac-toe/TicTacToe.v2.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const signer = new LocalSigner(PLAYER_X_KEY);
     const pubKeyHex = await signer.getPublicKey();
     const address = await signer.getAddress();
@@ -88,7 +89,7 @@ describe('TicTacToe v2 — FixedArray SDK round-trip', () => {
       txid: PLAYER_X_KEY.slice(0, 64),
       outputIndex: 0,
       satoshis: 500_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: buildP2PKHScript(pubKeyHex),
     });
 
     const contract = new RunarContract(artifact, [pubKeyHex, 5000n]);

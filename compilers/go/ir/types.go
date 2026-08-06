@@ -144,6 +144,13 @@ type ANFValue struct {
 	Cond string       `json:"cond,omitempty"`
 	Then []ANFBinding `json:"then,omitempty"`
 	Else []ANFBinding `json:"else,omitempty"`
+	// Ordered named result slots both arms leave (Results[0] deepest). Entries
+	// name a branch-merged local or an arm-written contract property; stack
+	// lowering tells the two apart from the contract's property list, so the
+	// wire format stays a plain array of strings. Absent (not empty) when the
+	// `if` carries at most one result — see the TypeScript reference in
+	// packages/runar-compiler/src/ir/anf-ir.ts for the full contract.
+	Results []string `json:"results,omitempty"`
 
 	// loop
 	Count   int    `json:"count,omitempty"`
@@ -263,6 +270,9 @@ func (v ANFValue) MarshalJSON() ([]byte, error) {
 			out["else"] = []ANFBinding{}
 		} else {
 			out["else"] = v.Else
+		}
+		if len(v.Results) > 0 {
+			out["results"] = v.Results
 		}
 	case "loop":
 		out["count"] = v.Count

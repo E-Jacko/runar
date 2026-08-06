@@ -16,6 +16,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, UnlockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -40,7 +41,7 @@ async function fundedSigner(provider: MockProvider, privKey: string, satoshis: n
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   return signer;
 }
@@ -134,7 +135,10 @@ describe('#123 — ANYONECANPAY (crowdfund-style) method validates through Spend
     const artifact = compileSource(SRC, 'Fund.runar.ts');
     expect(artifact.abi.methods.find((m) => m.name === 'pledge')!.sigHashType).toBe(0xc1);
 
-    const provider = new MockProvider();
+    // #116 exact-cover trick deliberately drives change (and therefore fee)
+    // to 0 — opt out of P1-2's fee floor, not broadcast validation itself
+    // (Spend + conservation still run below via validateSpend()).
+    const provider = new MockProvider('testnet', { enforceFeeFloor: false });
     const deployer = await fundedSigner(provider, DEPLOYER_KEY, 500_000);
     const caller = new LocalSigner(CALLER_KEY);
 
@@ -164,7 +168,10 @@ describe('#123 — default (no directive) still validates and uses 0x41', () => 
     const artifact = compileSource(SRC, 'Plain.runar.ts');
     expect(artifact.abi.methods.find((m) => m.name === 'bump')!.sigHashType).toBeUndefined();
 
-    const provider = new MockProvider();
+    // #116 exact-cover trick deliberately drives change (and therefore fee)
+    // to 0 — opt out of P1-2's fee floor, not broadcast validation itself
+    // (Spend + conservation still run below via validateSpend()).
+    const provider = new MockProvider('testnet', { enforceFeeFloor: false });
     const deployer = await fundedSigner(provider, DEPLOYER_KEY, 500_000);
     const caller = new LocalSigner(CALLER_KEY);
     const contract = new RunarContract(artifact, [0n]);

@@ -2,6 +2,7 @@ package runar
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
 	"strconv"
@@ -50,11 +51,11 @@ func SerializeState(fields []StateField, values map[string]interface{}) string {
 				} else if flatFromArr != nil && i < len(flatFromArr) {
 					elem = flatFromArr[i]
 				}
-				hex.WriteString(encodeStateValue(elem, leafType))
+				hex.WriteString(encodeStateValue(elem, leafType, names[i]))
 			}
 		} else {
 			value := values[field.Name]
-			hex.WriteString(encodeStateValue(value, field.Type))
+			hex.WriteString(encodeStateValue(value, field.Type, field.Name))
 		}
 	}
 	return hex.String()
@@ -366,10 +367,10 @@ func hexByteValAt(hex string, pos int) uint64 {
 // encodeStateValue encodes a state field as raw bytes (no push opcode wrapper)
 // matching the compiler's OP_NUM2BIN-based fixed-width serialization.
 // The result is raw hex bytes that are concatenated after OP_RETURN.
-func encodeStateValue(value interface{}, fieldType string) string {
+func encodeStateValue(value interface{}, fieldType string, label string) string {
 	switch fieldType {
 	case "int", "bigint":
-		n := toInt64(value)
+		n := stateFieldInt64(value, label, 8)
 		return encodeNum2Bin(n, 8)
 	case "bool":
 		b, _ := value.(bool)
@@ -676,6 +677,78 @@ func hexToBytes(hex string) []byte {
 		bytes[i/2] = byte(v)
 	}
 	return bytes
+}
+
+// stateFieldInt64 coerces a bigint state value to int64 for OP_NUM2BIN
+// encoding, PANICKING if its magnitude does not fit the fixed width-byte
+// sign-magnitude state word.
+//
+// The check has to run HERE, not inside encodeNum2Bin: toInt64 destroys an
+// oversized value before any encoder can see it — big.Int.Int64() sign-flips
+// on overflow and strconv.ParseInt returns 0 on ErrRange — so by the time the
+// bytes are written the wide value is already gone.
+//
+// width bytes of sign-magnitude hold 8*width-1 magnitude bits; the top bit of
+// the last byte is the sign. encodeNum2Bin writes the low width bytes, drops
+// everything above, then ORs the sign bit in on top of whatever landed there,
+// so an oversized value used to serialise to a plausible but WRONG word:
+//
+//	2^63      -> 0000000000000080   reads back as 0   (negative zero)
+//	2^63 + 5  -> 0500000000000080   reads back as -5  (sign flip)
+//	2^64      -> 0000000000000000   reads back as 0
+//
+// The deploy then succeeded and the UTXO was unspendable: the covenant
+// rebuilds the continuation with the compiler's own OP_NUM2BIN width, which
+// cannot produce those bytes from that number, so hash256(outputs) never
+// matches. ±(2^(8*width-1) - 1) stays representable and is unaffected.
+//
+// Panics rather than returning an error so SerializeState / GetLockingScript
+// keep their signatures; this is the same "the value cannot be represented, so
+// every result would be wrong" contract as checkedMul / checkedAdd in
+// overflow.go.
+func stateFieldInt64(value interface{}, label string, width int) int64 {
+	limit := new(big.Int).Lsh(big.NewInt(1), uint(8*width-1))
+	reject := func(n string) {
+		panic(fmt.Sprintf(
+			"runar: SerializeState: bigint state field %q = %s does not fit the fixed %d-byte "+
+				"sign-magnitude state word (magnitude must be < 2^%d). Serializing it would write a "+
+				"different number into the state section than the contract's on-chain OP_NUM2BIN %d "+
+				"rebuilds, leaving the output unspendable",
+			label, n, width, 8*width-1, width))
+	}
+	tooWide := func(n *big.Int) bool {
+		return new(big.Int).Abs(n).Cmp(limit) >= 0
+	}
+
+	// Range-check the WIDE value first, while it is still intact.
+	switch v := value.(type) {
+	case *big.Int:
+		if v != nil && tooWide(v) {
+			reject(v.String())
+		}
+	case uint64:
+		if n := new(big.Int).SetUint64(v); tooWide(n) {
+			reject(n.String())
+		}
+	case float64:
+		// JSON numbers decode to float64; 2^63 is exactly representable.
+		if math.Abs(v) >= 9223372036854775808.0 {
+			reject(strconv.FormatFloat(v, 'f', -1, 64))
+		}
+	case string:
+		s := strings.TrimSuffix(v, "n")
+		if n, ok := new(big.Int).SetString(s, 10); ok && tooWide(n) {
+			reject(n.String())
+		}
+	}
+
+	n := toInt64(value)
+	// -2^63 IS a valid int64, but its MAGNITUDE is 2^63 — one past the 63
+	// magnitude bits — and it encoded as negative zero (0000000000000080).
+	if tooWide(big.NewInt(n)) {
+		reject(strconv.FormatInt(n, 10))
+	}
+	return n
 }
 
 func toInt64(value interface{}) int64 {

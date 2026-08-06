@@ -1,0 +1,40 @@
+{
+  "$comment": "Go tier. Test files permitted to disable MockProvider broadcast validation (NewAlwaysAckMockProvider / DisableBroadcastValidation / EnableBroadcastValidation(false)). See docs/audit/2026-08-testing-gap-remediation-plan.md Phase A5 and packages/runar-go/README.md 'How fund-path tests fail closed in the Go tier'. Fund-path deploy/call tests with a real LocalSigner and a real compiled contract MUST NOT appear here.",
+  "entries": [
+    {
+      "file": "sdk_mock_broadcast_validation_test.go",
+      "reason": "Directly tests the opt-out surface itself (NewAlwaysAckMockProvider, DisableBroadcastValidation, EnableBroadcastValidation(false)) so those escape hatches keep working. Every other test in this file uses the default validating provider, including a real LocalSigner deploy+call fund path.",
+      "category": "negative-api"
+    },
+    {
+      "file": "sdk_test.go",
+      "reason": "10 of ~250 tests (TestDeployCallLifecycle, TestCallThrowsUnknownMethod, TestCallThrowsWrongArgCount, TestStatefulDeployCallLifecycle, the two Issue133 funding-selection tests, and the four TerminalCall tests) drive a synthetic makeArtifact(\"51\", ...) OP_TRUE artifact with NewMockSigner, whose signatures are placeholders that no OP_CHECKSIG can verify and whose locking script leaves the witness pushes on the stack (clean-stack violation). They assert SDK wiring — state tracking, arg validation, funding-input selection, terminal-call output shape — not spendability. All other tests in the file, including the MockProvider broadcast unit tests, run on the default validating provider.",
+      "category": "structure-only"
+    },
+    {
+      "file": "sdk_intent_witness_test.go",
+      "reason": "setupContractAndDeploy builds a synthetic OP_TRUE artifact and signs with NewMockSigner; the tests assert unlocking-script WIRE BYTES (auto-injected witness param filtering, prevOutScript/serialisedOutputs ordering) rather than spendability. Shared by sdk_null_bytestring_arg_test.go, which asserts PrepareCall argument-validation errors.",
+      "category": "structure-only"
+    },
+    {
+      "file": "sdk_issue118_test.go",
+      "reason": "Terminal-call fee-input regression (#118) on a synthetic OP_TRUE artifact signed by NewMockSigner. Asserts input/output counts and fee arithmetic in the built transaction, not script validity.",
+      "category": "structure-only"
+    },
+    {
+      "file": "sdk_script_size_test.go",
+      "reason": "Only TestCall_RejectsOversizedScript opts out: it deploys a synthetic OP_TRUE artifact with NewMockSigner and then asserts the SDK's own MAX_SCRIPT_BYTES guard fires on the call. The deploy step is setup, not the assertion under test. The other tests in the file (including the oversized-deploy rejection) use the default validating provider.",
+      "category": "structure-only"
+    },
+    {
+      "file": "sdk_groth16_test.go",
+      "reason": "Groth16 verifier end-to-end mock: NewMockSigner(\"\", \"\") plus a hand-built witness artifact. The assertion is that the SDK threads a Groth16 proof witness into the unlocking script in the right order; the on-chain proof itself is exercised by the compiler-side script-correctness tests, not here.",
+      "category": "structure-only"
+    },
+    {
+      "file": "sdk_groth16_forged_test.go",
+      "reason": "Forged-proof negatives: the test deliberately builds a call carrying an invalid Groth16 proof and verifies rejection ITSELF by replaying the script through interpreter.NewEngine() (sdk_groth16_forged_test.go: WithScripts/WithAfterGenesis/WithForkID). A validating provider would refuse the deliberately-invalid broadcast before the test's own replay assertion could run.",
+      "category": "negative-api"
+    }
+  ]
+}

@@ -39,6 +39,7 @@ from runar.ecdsa import ecdsa_sign, ecdsa_verify
 from runar.sdk.contract import RunarContract
 from runar.sdk.local_signer import LocalSigner
 from runar.sdk.provider import MockProvider
+from runar.sdk.deployment import build_p2pkh_script
 from runar.sdk.types import DeployOptions, RunarArtifact, Utxo
 
 compiler = pytest.importorskip("runar_compiler.compiler")
@@ -76,11 +77,15 @@ def _artifact() -> RunarArtifact:
 
 def _funded_signer(provider: MockProvider, key_hex: str, satoshis: int) -> LocalSigner:
     signer = LocalSigner(key_hex)
+    # A REAL P2PKH script for this signer. The old fixture
+    # ("76a914" + "00"*20 + "88ac") is not spendable by ANY key, so the funding
+    # input it produced would be rejected by a node — visible only once
+    # MockProvider stopped always-acking (testing-gap remediation Phase A5).
     provider.add_utxo(signer.get_address(), Utxo(
         txid=key_hex[:64],
         output_index=0,
         satoshis=satoshis,
-        script="76a914" + "00" * 20 + "88ac",
+        script=build_p2pkh_script(signer.get_public_key()),
     ))
     return signer
 

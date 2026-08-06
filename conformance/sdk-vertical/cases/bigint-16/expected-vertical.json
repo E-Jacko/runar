@@ -1,0 +1,85 @@
+{
+  "case": "bigint-16",
+  "contract": "SlotMatrix",
+  "valueClass": "bigint 16 → OP_16, the top of the single-opcode range",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "16"
+    },
+    {
+      "type": "ByteString",
+      "value": "11"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 81,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 2,
+      "headerBytes": 1,
+      "valueByteOffset": 1,
+      "valueByteLength": 1,
+      "encoding": "data",
+      "pushedHex": "11"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 4,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 4,
+      "valueByteLength": 1,
+      "encoding": "scriptnum",
+      "pushedHex": "10"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 7,
+      "byteLength": 2,
+      "headerBytes": 1,
+      "valueByteOffset": 8,
+      "valueByteLength": 1,
+      "encoding": "data",
+      "pushedHex": "11"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 9,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 10,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 46,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 47,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

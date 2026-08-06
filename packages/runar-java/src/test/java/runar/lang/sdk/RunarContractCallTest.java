@@ -61,6 +61,10 @@ class RunarContractCallTest {
         RunarContract contract = new RunarContract(artifact, List.of(pkhHex));
         UTXO contractUtxo = new UTXO("ab".repeat(32), 0, 10_000L, contract.lockingScript());
         contract.setCurrentUtxo(contractUtxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(contractUtxo);
 
         java.util.ArrayList<Object> args = new java.util.ArrayList<>();
         args.add(null); args.add(null);
@@ -147,6 +151,10 @@ class RunarContractCallTest {
         );
         UTXO contractUtxo = new UTXO("cc".repeat(32), 0, 5_000L, contract.lockingScript());
         contract.setCurrentUtxo(contractUtxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(contractUtxo);
 
         // Caller-supplied stateUpdates win over the AnfInterpreter
         // fallback. Set count=1 explicitly.
@@ -227,6 +235,10 @@ class RunarContractCallTest {
             "constructor must seed count=5 from the constructor arg");
         UTXO contractUtxo = new UTXO("dd".repeat(32), 0, 6_000L, contract.lockingScript());
         contract.setCurrentUtxo(contractUtxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(contractUtxo);
 
         // Independent reference: what the interpreter would compute.
         Map<String, Object> referenceState = AnfInterpreter.computeNewState(
@@ -275,6 +287,10 @@ class RunarContractCallTest {
         RunarContract contract = new RunarContract(artifact, List.of(pkhHex));
         UTXO contractUtxo = new UTXO("ee".repeat(32), 0, 10_000L, contract.lockingScript());
         contract.setCurrentUtxo(contractUtxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(contractUtxo);
 
         // Two terminal outputs: 4000 + 5000 sats. The remaining 1000 sats
         // becomes the (implicit) miner fee.

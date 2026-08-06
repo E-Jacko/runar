@@ -97,30 +97,50 @@ pnpm integration:all:run
 | CovenantVault | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Covenant rules (SigHashPreimage) |
 | OraclePriceFeed | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Rabin signatures |
 | FunctionPatterns | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Private methods, composition |
-| PostQuantumWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | WOTS+ (19KB script) |
-| SPHINCSWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | SLH-DSA (188KB script) |
+| PostQuantumWallet | Stateless | Deploy + Spend | Deploy [†] | Deploy [†] | Deploy [†] | Deploy [†] | Deploy [†] | Compile + Deploy [†] | WOTS+ (19KB script) |
+| SPHINCSWallet | Stateless | Deploy + Spend | Deploy [†] | Deploy [†] | Deploy [†] | Deploy [†] | Deploy [†] | Compile + Deploy [†] | SLH-DSA (188KB script) |
 | SchnorrZKP | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC operations, ZKP (877KB) |
 | ConvergenceProof | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC point arithmetic |
 | EC Isolation | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ecOnCurve, ecMulGen, ecAdd, ecNegate |
 
-[†] **Java post-quantum spend coverage is intentionally
-deferred.** The compile + deploy + Java-surface parity tests are
-exhaustive for what they cover (the contract artifact itself, including
-the 188 KB SLH-DSA script, is bit-for-bit
-identical to the TS-sourced artifact). The on-chain Bitcoin Script
-verification of these post-quantum primitives is fully exercised by the **Go / Python
-/ Ruby / Zig / Rust / TS** spend tests in the same row — those SDKs ship
-their own SLH-DSA / WOTS+ keygen + sign and round-trip an
-actual spend through the regtest VM. A Java spend would require either
-(a) a Java-side SLH-DSA / WOTS+ keygen+sign implementation (BouncyCastle
-ships SPHINCS+, but its parameter sets are the round-3 candidate, not
-FIPS 205 SLH-DSA — direct substitution would diverge from the Bitcoin
-Script verifier the Rúnar codegen targets), or (b) shelling out to one
-of the other SDKs to generate signature bytes the Java test then embeds
-into a tx. Both are real options; neither is on the roadmap until a
-clearer Java post-quantum signing story lands. Track this against the
-Java SDK rather than the integration suite — the suite's existing
-deploy-only rows truthfully describe the current scope.
+[†] **Go is the only tier that SPENDS the two post-quantum wallets.**
+These two rows used to read "Deploy + Spend" for TS / Rust / Python /
+Ruby / Zig as well. That was wrong, and it was wrong in the most
+dangerous direction: it claimed on-chain verification of a 19 KB WOTS+
+and a 188 KB SLH-DSA locking script from six tiers that never executed
+one. Only `integration/go/wots_test.go` (`TestWOTS_ValidSpend`) and
+`integration/go/slhdsa_test.go` build the two-pass unlocking script —
+a real ECDSA signature over the real spending input, then a real WOTS+ /
+SLH-DSA signature over those signature bytes — and broadcast it to the
+node (`AssertTxAccepted`, plus `AssertTxRejected` legs). The peer suites
+say so themselves in their own comments ("full spend requires raw tx
+construction … covered by the Go integration test"); the table simply
+did not.
+
+**Deploying is not executing.** A deploy broadcasts a tx whose OUTPUT
+carries the locking script; the node never runs those bytes. Only a
+spend does. So for these two contracts the six non-Go rows prove the
+artifact compiles, funds, and confirms — not that the post-quantum
+verifier accepts a valid signature or rejects a forged one.
+
+What each non-Go tier does cover: deploy + UTXO confirmation, and (Java)
+that the artifact is bit-for-bit identical to the TS-sourced one,
+including the 188 KB SLH-DSA script. Raising any of these rows to
+"Deploy + Spend" needs a tier-side SLH-DSA / WOTS+ keygen + sign plus
+raw two-pass unlocking-script construction, mirroring the Go tests. For
+Java specifically that means either (a) a Java-side FIPS 205
+implementation (BouncyCastle ships SPHINCS+, but its parameter sets are
+the round-3 candidate, not FIPS 205 SLH-DSA — direct substitution would
+diverge from the Bitcoin Script verifier the Rúnar codegen targets), or
+(b) shelling out to one of the other SDKs to generate signature bytes
+the Java test then embeds into a tx.
+
+The fixture-level record of this is
+`conformance/witnesses/coverage-ledger.json`, where `post-quantum-wallet`
+and `sphincs-wallet` carry `kind: "integration"` pointing at the two **Go**
+test paths — with the byte-identity check that makes the claim mean
+something (both fixtures' `expected-script.hex` reproduced exactly by the
+source those tests compile, 19,594 and 188,609 bytes, in both fold modes).
 
 ## Node Setup Details
 

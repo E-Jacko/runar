@@ -379,7 +379,17 @@ class TestConstantPropagation:
 # ---------------------------------------------------------------------------
 
 class TestIfBranchFolding:
-    def test_fold_true_branch(self):
+    # A statically-known condition must NOT blank the untaken arm.
+    #
+    # The folder used to return an empty arm while leaving the `if` node itself
+    # in place.  An arm is not a free-floating binding list -- it carries the
+    # stack-shape contract ANF lowering builds (the __merge$<i> result block for
+    # K>=2 merged locals) and stack lowering consumes.  Erasing one arm made
+    # _lower_if register ONE stack slot for K physical results, which at K=2
+    # silently miscompiled the guard (the deployed script accepted spends the
+    # source rejects) and at K=1 rejected source that compiles with folding
+    # disabled.
+    def test_keeps_both_arms_when_condition_known_true(self):
         p = _make_program([_make_method("m", [
             _b("t0", _mk_bool(True)),
             _b("t1", ANFValue(
@@ -393,9 +403,9 @@ class TestIfBranchFolding:
         v = r.methods[0].body[1].value
         assert v.kind == "if"
         assert len(v.then) == 1
-        assert len(v.else_) == 0
+        assert len(v.else_) == 1
 
-    def test_fold_false_branch(self):
+    def test_keeps_both_arms_when_condition_known_false(self):
         p = _make_program([_make_method("m", [
             _b("t0", _mk_bool(False)),
             _b("t1", ANFValue(
@@ -408,8 +418,25 @@ class TestIfBranchFolding:
         r = fold_constants(p)
         v = r.methods[0].body[1].value
         assert v.kind == "if"
-        assert len(v.then) == 0
+        assert len(v.then) == 1
         assert len(v.else_) == 1
+
+    # A statically-known condition must not leak an arm's constants into the
+    # enclosing environment either: the `if` survives the pass, so both arms are
+    # still emitted and either can run.
+    def test_does_not_propagate_taken_arm_constants(self):
+        p = _make_program([_make_method("m", [
+            _b("t0", _mk_bool(True)),
+            _b("t1", ANFValue(
+                kind="if",
+                cond="t0",
+                then=[_b("x", _mk_int(42))],
+                else_=[_b("x", _mk_int(99))],
+            )),
+            _b("t2", _bin_op("+", "x", "t0")),
+        ])])
+        r = fold_constants(p)
+        assert r.methods[0].body[2].value.kind == "bin_op"
 
     def test_fold_constants_in_branches(self):
         p = _make_program([_make_method("m", [

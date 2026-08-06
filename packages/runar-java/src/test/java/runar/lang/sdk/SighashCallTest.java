@@ -73,6 +73,10 @@ class SighashCallTest {
         RunarContract contract = new RunarContract(artifact, List.of(BigInteger.ZERO));
         UTXO utxo = new UTXO("cc".repeat(32), 0, 5_000L, contract.lockingScript());
         contract.setCurrentUtxo(utxo);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(utxo);
         Map<String, Object> updates = new HashMap<>();
         updates.put("raised", BigInteger.valueOf(7));
         RunarContract.CallOutcome out = contract.call(

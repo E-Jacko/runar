@@ -7,6 +7,7 @@ import { compileContract } from './helpers/compile.js';
 import { RunarContract } from 'runar-sdk';
 import { createFundedWallet } from './helpers/wallet.js';
 import { createProvider } from './helpers/node.js';
+import { readOnChainState } from './helpers/on-chain-state.js';
 
 describe('Counter', () => {
   it('should increment count from 0 to 1 (auto-computed state)', async () => {
@@ -23,6 +24,11 @@ describe('Counter', () => {
     const { txid: callTxid } = await contract.call('increment', [], provider, signer);
     expect(callTxid).toBeTruthy();
     expect(contract.state.count).toBe(1n);
+
+    // Read the value back out of the ACTUAL output script the node accepted,
+    // not the SDK's predicted next state (contract.state above).
+    const onChain = await readOnChainState(provider, artifact, contract.getUtxo()!);
+    expect(onChain.count).toBe(1n);
   });
 
   it('should chain increments 0 -> 1 -> 2 (auto-computed state)', async () => {
@@ -36,9 +42,11 @@ describe('Counter', () => {
 
     await contract.call('increment', [], provider, signer);
     expect(contract.state.count).toBe(1n);
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).count).toBe(1n);
 
     await contract.call('increment', [], provider, signer);
     expect(contract.state.count).toBe(2n);
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).count).toBe(2n);
   });
 
   it('should increment then decrement 0 -> 1 -> 0 (auto-computed state)', async () => {
@@ -52,9 +60,11 @@ describe('Counter', () => {
 
     await contract.call('increment', [], provider, signer);
     expect(contract.state.count).toBe(1n);
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).count).toBe(1n);
 
     await contract.call('decrement', [], provider, signer);
     expect(contract.state.count).toBe(0n);
+    expect((await readOnChainState(provider, artifact, contract.getUtxo()!)).count).toBe(0n);
   });
 
   it('should reject wrong state hash', async () => {

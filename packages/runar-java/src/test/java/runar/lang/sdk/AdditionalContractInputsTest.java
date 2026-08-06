@@ -275,7 +275,15 @@ class AdditionalContractInputsTest {
         UTXO other = new UTXO("dd".repeat(32), 0, 1L,
             ContractScript.renderLockingScript(artifact, args2, null));
         first.setCurrentUtxo(primary);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(primary);
         second.setCurrentUtxo(other);
+        // Phase A5 non-vacuity: the fail-closed MockProvider must also know the
+        // outpoint this call spends — injecting it straight into the contract
+        // bypasses the provider, which would then have nothing to check.
+        provider.addKnownOutpoint(other);
         CallOptions opts = new CallOptions(null, null, null)
             .withAdditionalContractInputs(List.of(other))
             .withAdditionalContractInputArgs(List.of(
