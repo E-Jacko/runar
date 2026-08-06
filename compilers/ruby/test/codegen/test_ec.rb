@@ -94,20 +94,20 @@ class TestEcCodegen < Minitest::Test
   # The ASM-substring tests above (`assert_includes asm, 'OP_ADD'`) catch a
   # gross regression but not byte-level codegen drift. These goldens —
   # copied from the Python peer (compilers/python/tests/codegen/test_ec.py)
-  # and the Java reference EcTest at the same commit — lock the exact op
-  # count for each Ruby emitter. Final hex is byte-identical across all 7
+  # and the Java reference EcTest at the same commit — lock the exact size of
+  # each Ruby emitter's op TREE (`if` bodies included, see count_op_tree). Final hex is byte-identical across all 7
   # tiers (enforced by the conformance harness); the goldens here are an
   # in-process localized-regression gate.
   # ---------------------------------------------------------------------------
 
   EC_OP_COUNT_GOLDENS = {
-    "ecAdd"              =>  8202,
-    "ecMul"              => 62304,
-    "ecMulGen"           => 62306,
+    "ecAdd"              =>  8223,
+    "ecMul"              => 130515,
+    "ecMulGen"           => 130517,
     "ecNegate"           =>   945,
     "ecOnCurve"          =>   533,
     "ecModReduce"        =>     8,
-    "ecEncodeCompressed" =>    14,
+    "ecEncodeCompressed" =>     16,
     "ecMakePoint"        =>   467,
     "ecPointX"           =>   233,
     "ecPointY"           =>   234,
@@ -126,13 +126,32 @@ class TestEcCodegen < Minitest::Test
     "ecPointY"           => RunarCompiler::Codegen::EC.method(:emit_ec_point_y),
   }.freeze
 
+  # Total StackOps in `ops`, INCLUDING the bodies of `if` ops.
+  #
+  # A flat `ops.length` cannot see inside a branch, so any emitter whose work
+  # sits in an `if` body -- the scalar ladders emit 257 / 385 conditional
+  # additions, WOTS+ and SLH-DSA are almost entirely conditional -- reports a
+  # count that barely moves no matter what the branch contains. Adding +1.3 KB
+  # of script inside the ladder's last step left the `p256Mul` / `p384Mul`
+  # goldens byte-identical. Recursing is what makes the golden a gate.
+  def count_op_tree(ops)
+    ops.sum do |op|
+      if op[:op] == "if"
+        1 + count_op_tree(op[:then] || []) + count_op_tree(op[:else_ops] || [])
+      else
+        1
+      end
+    end
+  end
+
   def test_ec_emitter_op_count_goldens
     EC_EMITTERS.each do |name, emitter|
       ops = []
       emitter.call(->(op) { ops << op })
       expected = EC_OP_COUNT_GOLDENS.fetch(name)
-      assert_equal expected, ops.length,
-                   "#{name} op count drift: got #{ops.length}, want #{expected}"
+      got = count_op_tree(ops)
+      assert_equal expected, got,
+                   "#{name} op count drift: got #{got}, want #{expected}"
     end
   end
 

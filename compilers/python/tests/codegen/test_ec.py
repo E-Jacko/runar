@@ -24,18 +24,39 @@ from runar_compiler.codegen.ec import (
 from runar_compiler.codegen.stack import StackOp
 
 
+
+def _count_op_tree(ops: list[StackOp]) -> int:
+    """Total StackOps in ``ops``, INCLUDING the bodies of ``if`` ops.
+
+    A flat ``len(ops)`` cannot see inside a branch, so any emitter whose work
+    sits in an ``if`` body -- the scalar ladders emit 257 / 385 conditional
+    additions, WOTS+ and SLH-DSA are almost entirely conditional -- reports a
+    count that barely moves no matter what the branch contains. Adding +1.3 KB
+    of script inside the ladder's last step left the ``p256Mul`` / ``p384Mul``
+    goldens byte-identical. Recursing is what makes the golden a gate.
+    """
+    total = 0
+    for op in ops:
+        total += 1
+        if op.op == "if":
+            total += _count_op_tree(op.then)
+            total += _count_op_tree(op.else_ops)
+    return total
+
+
 # ---------------------------------------------------------------------------
-# Op-count goldens (matched against Java/Go reference at the same commit)
+# Op-count goldens (matched against Java/Go reference at the same commit).
+# Counts are op-TREE sizes: ``if`` bodies included, see ``_count_op_tree``.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("ecAdd",              emit_ec_add,               8202),
-    ("ecMul",              emit_ec_mul,              62304),
-    ("ecMulGen",           emit_ec_mul_gen,          62306),
+    ("ecAdd",              emit_ec_add,               8223),
+    ("ecMul",              emit_ec_mul,             130515),
+    ("ecMulGen",           emit_ec_mul_gen,         130517),
     ("ecNegate",           emit_ec_negate,             945),
     ("ecOnCurve",          emit_ec_on_curve,           533),
     ("ecModReduce",        emit_ec_mod_reduce,           8),
-    ("ecEncodeCompressed", emit_ec_encode_compressed,   14),
+    ("ecEncodeCompressed", emit_ec_encode_compressed,   16),
     ("ecMakePoint",        emit_ec_make_point,         467),
     ("ecPointX",           emit_ec_point_x,            233),
     ("ecPointY",           emit_ec_point_y,            234),
@@ -43,7 +64,8 @@ from runar_compiler.codegen.stack import StackOp
 def test_op_count(name, fn, expected):
     ops: list[StackOp] = []
     fn(ops.append)
-    assert len(ops) == expected, f"{name} op count drift: got {len(ops)} want {expected}"
+    got = _count_op_tree(ops)
+    assert got == expected, f"{name} op count drift: got {got} want {expected}"
 
 
 # ---------------------------------------------------------------------------

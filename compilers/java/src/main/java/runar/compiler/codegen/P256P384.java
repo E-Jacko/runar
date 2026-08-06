@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.function.Consumer;
 import runar.compiler.codegen.Ec.ECTracker;
 import runar.compiler.ir.stack.DropOp;
+import runar.compiler.ir.stack.DupOp;
 import runar.compiler.ir.stack.IfOp;
 import runar.compiler.ir.stack.NipOp;
 import runar.compiler.ir.stack.OpcodeOp;
@@ -177,19 +178,6 @@ public final class P256P384 {
         cFieldMod(t, "_fmc_prod", resultName, fieldP);
     }
 
-    /**
-     * (a * cv) mod p for a FULL-WIDTH constant such as the curve b coefficient,
-     * which does not fit the long taken by cFieldMulConst.
-     */
-    private static void cFieldMulBig(ECTracker t, String aName, BigInteger cv, String resultName, BigInteger fieldP) {
-        t.toTop(aName);
-        t.rawBlock(List.of(aName), "_fmc_prod", e -> {
-            e.accept(new PushOp(PushValue.of(cv)));
-            e.accept(new OpcodeOp("OP_MUL"));
-        });
-        cFieldMod(t, "_fmc_prod", resultName, fieldP);
-    }
-
     private static void cFieldSqr(ECTracker t, String aName, String resultName, BigInteger fieldP) {
         t.copyToTop(aName, "_fsqr_copy");
         cFieldMul(t, aName, "_fsqr_copy", resultName, fieldP);
@@ -231,6 +219,35 @@ public final class P256P384 {
         t.toTop(aName);
         cPushGroupN(t, "_gmod_n", n);
         t.rawBlock(List.of(aName, "_gmod_n"), resultName, e -> {
+            e.accept(new OpcodeOp("OP_2DUP"));
+            e.accept(new OpcodeOp("OP_MOD"));
+            e.accept(new RotOp());
+            e.accept(new DropOp());
+            e.accept(new OverOp());
+            e.accept(new OpcodeOp("OP_ADD"));
+            e.accept(new SwapOp());
+            e.accept(new OpcodeOp("OP_MOD"));
+        });
+    }
+
+    /**
+     * Reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+     *
+     * <p>OP_MOD takes the sign of the DIVIDEND, so {@code k mod n} alone lands in
+     * (-n, n); the {@code + n, mod n} normalises the negative half. One push of n
+     * covers both reductions — the same shape as {@code emitEcModReduce}.
+     *
+     * <p>Without it, {@code cEmitMul}'s ladder is only correct while
+     * 2^b &lt;= k + 3n &lt; 2^(b+1) for the fixed b it unrolls: a scalar &gt;= ~n
+     * sets a bit above the loop's top, the loop never sees it, and the ladder
+     * returns a DIFFERENT multiple of P rather than failing. Scalars are contract
+     * input, so that is attacker-chosen. Reducing costs 1 push + 8 opcodes
+     * (42 / 58 bytes) against a ~460 KB / 1.6 MB script, and makes k &gt;= n,
+     * k &lt; 0 and k = 0 all well defined.
+     */
+    private static void cEmitScalarReduce(ECTracker t, String kName, String resultName, BigInteger n) {
+        cPushGroupN(t, "_n_red", n);
+        t.rawBlock(List.of(kName, "_n_red"), resultName, e -> {
             e.accept(new OpcodeOp("OP_2DUP"));
             e.accept(new OpcodeOp("OP_MOD"));
             e.accept(new RotOp());
@@ -349,21 +366,111 @@ public final class P256P384 {
     // Affine point addition
     // ===================================================================
 
+    /**
+     * Affine point addition.
+     *
+     * <p>The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+     * denominator is zero and the correct slope is the TANGENT, (3px^2 + a)/(2py) — and
+     * a = -3 on both NIST curves, so the numerator is 3px^2 - 3. The secp256k1 fix
+     * (a = 0) was never ported here, so {@code p256Add(P, P)} and {@code p384Add(P, P)}
+     * produced a wrong point and every contract that doubled deployed an unspendable
+     * script.
+     *
+     * <p>Both cases are {@code s = num / den}, so only the NUMERATOR and DENOMINATOR are
+     * selected and the single expensive cFieldInv still runs exactly once. rx and ry
+     * below are already correct for doubling.
+     *
+     * <pre>
+     *   cond = (px == qx)
+     *   num  = cond ? 3*px^2 - 3 : (qy - py)
+     *   den  = cond ? 2*py       : (qx - px)
+     * </pre>
+     *
+     * <p>selected as {@code b + cond*(a - b)}, which needs no branch and keeps the
+     * emitted op sequence identical on both paths.
+     *
+     * <p>NOT handled: P == -Q, whose true result is the point at infinity, which affine
+     * coordinates cannot represent.
+     */
+    /**
+     * GAP-301: coordinate canonicity, leaving {@code _canon} on the tracker.
+     *
+     * <p>{@code cDecomposePoint} BIN2NUMs each coordinate as an unsigned value
+     * that may be &gt;= p; the curve equation reduces it mod p, so (x + p)||y
+     * would pass as a point it is not the canonical encoding of. Reject it:
+     * require x &lt; p AND y &lt; p (coordinates are unsigned, so the 0 &lt;=
+     * bound holds by construction). The caller ANDs {@code _canon} into its
+     * result so the check still returns a boolean. This mirrors secp256k1's
+     * {@code emitEcOnCurve}, whose guard the a = -3 curves never received —
+     * leaving {@code pNNNOnCurve} accepting inputs {@code ecOnCurve} rejects
+     * even though both are documented as THE gate for untrusted points.
+     */
+    private static void cEmitCanonicityGuard(ECTracker t, String xName, String yName, BigInteger fieldP) {
+        t.copyToTop(xName, "_x_lt");
+        cPushFieldP(t, "_p_for_x", fieldP);
+        t.rawBlock(List.of("_x_lt", "_p_for_x"), "_x_canon",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.copyToTop(yName, "_y_lt");
+        cPushFieldP(t, "_p_for_y", fieldP);
+        t.rawBlock(List.of("_y_lt", "_p_for_y"), "_y_canon",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.toTop("_x_canon");
+        t.toTop("_y_canon");
+        t.rawBlock(List.of("_x_canon", "_y_canon"), "_canon",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+    }
+
     private static void cAffineAdd(ECTracker t, BigInteger fieldP, BigInteger pMinus2) {
-        // The chord slope (qy-py)/(qx-px) divides by zero when P == Q, so
-        // doubling needs the tangent (3*px^2 + a)/(2*py) — and a = -3 on both
-        // NIST curves, giving (3*px^2 - 3)/(2*py). Pick numerator and
-        // denominator BEFORE the one cFieldInv, selected as b + cond*(a - b)
-        // with cond = (px == qx): no branch, so the emitted op sequence and the
-        // tracker's static stack model stay identical on both paths. Mirrors
-        // the secp256k1 fix in Ec.java.
+        // The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+        // denominator is zero and the correct slope is the TANGENT,
+        // (3px^2 - 3) / (2py). Both cases are the same shape, `s = num / den`, so
+        // only the NUMERATOR and DENOMINATOR are selected; the single expensive
+        // cFieldInv still runs once.
         //
-        // NOT handled: P == -Q, whose true result is the point at infinity,
-        // which affine coordinates cannot represent.
+        //   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+        //   num    = cond ? 3*px^2 - 3 : (qy - py)
+        //   den    = cond ? 2*py       : (qx - px)
+        //
+        // selected as `b + cond*(a - b)` over the field, which needs no branch and
+        // so keeps the emitted op sequence — and the tracker's static stack model —
+        // identical on both paths.
+        //
+        // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+        // sends it down the tangent path and returns 2P — an on-curve, entirely
+        // plausible, WRONG point, which is strictly worse than the pre-fix chord
+        // path: that one divided by zero (cFieldInv is Fermat, inv(0) = 0) and
+        // produced an OFF-curve blob, so `assert(pNNNOnCurve(pNNNAdd(a, b)))` — the
+        // idiom examples/ts/p384-primitives writes verbatim — rejected it.
+        //
+        // P + (-P) is the point at infinity, which affine x||y cannot represent.
+        // This codegen already has a representation for O: the ALL-ZERO blob, which
+        // is what `pNNNMul(P, 0n)` returns. So return that, by masking the result
+        // with `notinf = NOT(px == qx AND NOT cond)`. O is not on the curve
+        // (0^2 != b), so the on-curve gate rejects it and the idiom works again; and
+        // it adds no failure channel to a pure value-producing expression, the same
+        // reason cEmitScalarReduce reduces instead of rejecting.
+        //
+        // The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+        // and notinf is 0 or 1, so the product is canonical either way.
         t.copyToTop("px", "_px_eq");
         t.copyToTop("qx", "_qx_eq");
-        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_cond",
-            e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_xeq",
+                e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("py", "_py_eq");
+        t.copyToTop("qy", "_qy_eq");
+        t.rawBlock(List.of("_py_eq", "_qy_eq"), "_yeq",
+                e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("_xeq", "_xeq_c");
+        t.toTop("_yeq");
+        t.rawBlock(List.of("_xeq_c", "_yeq"), "_cond",
+                e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        // notinf = NOT(xeq - cond): 1 exactly when px == qx and the points differ.
+        t.toTop("_xeq");
+        t.copyToTop("_cond", "_cond_c");
+        t.rawBlock(List.of("_xeq", "_cond_c"), "_notinf", e -> {
+            e.accept(new OpcodeOp("OP_SUB"));
+            e.accept(new OpcodeOp("OP_NOT"));
+        });
 
         // chord numerator / denominator
         t.copyToTop("qy", "_qy1");
@@ -373,14 +480,14 @@ public final class P256P384 {
         t.copyToTop("px", "_px1");
         cFieldSub(t, "_qx1", "_px1", "_den_chord", fieldP);
 
-        // tangent numerator / denominator: 3*px^2 - 3 and 2*py
+        // tangent numerator / denominator: 3*px^2 + a (a = -3) and 2*py
         t.copyToTop("px", "_px_t");
         cFieldSqr(t, "_px_t", "_px_sq", fieldP);
-        cFieldMulConst(t, "_px_sq", 3L, "_3x2", fieldP);
-        t.pushInt("_three", 3L);
-        cFieldSub(t, "_3x2", "_three", "_num_tan", fieldP);
+        cFieldMulConst(t, "_px_sq", 3, "_3px_sq", fieldP);
+        t.pushInt("_a_neg", 3);
+        cFieldSub(t, "_3px_sq", "_a_neg", "_num_tan", fieldP);
         t.copyToTop("py", "_py_t");
-        cFieldMulConst(t, "_py_t", 2L, "_den_tan", fieldP);
+        cFieldMulConst(t, "_py_t", 2, "_den_tan", fieldP);
 
         // num = num_chord + cond*(num_tan - num_chord)
         t.copyToTop("_num_chord", "_num_chord_c");
@@ -422,219 +529,339 @@ public final class P256P384 {
         t.toTop("py"); t.drop();
         t.toTop("qx"); t.drop();
         t.toTop("qy"); t.drop();
+
+        // P == -Q -> force the all-zero point (see the header comment).
+        t.toTop("rx");
+        t.copyToTop("_notinf", "_notinf_x");
+        t.rawBlock(List.of("rx", "_notinf_x"), "rx",
+                e -> e.accept(new OpcodeOp("OP_MUL")));
+        t.toTop("ry");
+        t.toTop("_notinf");
+        t.rawBlock(List.of("ry", "_notinf"), "ry",
+                e -> e.accept(new OpcodeOp("OP_MUL")));
     }
 
     // ===================================================================
     // Jacobian point doubling (a = -3 optimization)
     // ===================================================================
 
-    /**
-     * Projective point doubling — RCB Algorithm 6 (a = -3), 8M + 3S + 2 m_b.
-     * Expects jx, jy, jz on the tracker; replaces them with the doubled point.
-     *
-     * <p>Complete: doubling the point at infinity (0 : 1 : 0) yields
-     * (0 : 1 : 0).
-     *
-     * <p>P-256 and P-384 have a = -3, so these are the a = -3 algorithms
-     * (5 and 6), NOT the a = 0 pair used for secp256k1 in Ec.java.
-     */
-    private static void cProjectiveDouble(ECTracker t, BigInteger fieldP, BigInteger curveB) {
-        t.copyToTop("jx", "_d_x_xy");
-        t.copyToTop("jx", "_d_x_xz");
-        t.copyToTop("jy", "_d_y_xy");
-        t.copyToTop("jy", "_d_y_yz");
-        t.copyToTop("jz", "_d_z_xz");
-        t.copyToTop("jz", "_d_z_yz");
+    private static void cJacobianDouble(ECTracker t, BigInteger fieldP, BigInteger pMinus2) {
+        // Z^2
+        t.copyToTop("jz", "_jz_sq_tmp");
+        cFieldSqr(t, "_jz_sq_tmp", "_Z2", fieldP);
 
-        cFieldSqr(t, "jx", "_d_t0", fieldP); // t0 = X^2
-        cFieldSqr(t, "jy", "_d_t1", fieldP); // t1 = Y^2
-        cFieldSqr(t, "jz", "_d_t2", fieldP); // t2 = Z^2
+        // X - Z^2 and X + Z^2
+        t.copyToTop("jx", "_jx_c1");
+        t.copyToTop("_Z2", "_Z2_c1");
+        cFieldSub(t, "_jx_c1", "_Z2_c1", "_X_minus_Z2", fieldP);
+        t.copyToTop("jx", "_jx_c2");
+        cFieldAdd(t, "_jx_c2", "_Z2", "_X_plus_Z2", fieldP);
 
-        cFieldMul(t, "_d_x_xy", "_d_y_xy", "_d_xy", fieldP);
-        cFieldMulConst(t, "_d_xy", 2L, "_d_t3", fieldP);   // t3 = 2*X*Y
-        cFieldMul(t, "_d_x_xz", "_d_z_xz", "_d_xz", fieldP);
-        cFieldMulConst(t, "_d_xz", 2L, "_d_Z3", fieldP);   // Z3 = 2*X*Z
+        // A = 3 * (X - Z^2) * (X + Z^2)
+        cFieldMul(t, "_X_minus_Z2", "_X_plus_Z2", "_prod", fieldP);
+        t.pushInt("_three", 3);
+        cFieldMul(t, "_prod", "_three", "_A", fieldP);
 
-        t.copyToTop("_d_t2", "_d_t2_b");
-        cFieldMulBig(t, "_d_t2_b", curveB, "_d_bt2", fieldP);
-        t.copyToTop("_d_Z3", "_d_Z3_a");
-        cFieldSub(t, "_d_bt2", "_d_Z3_a", "_d_Y3", fieldP);
-        cFieldMulConst(t, "_d_Y3", 3L, "_d_Y3b", fieldP);
+        // B = 4 * X * Y^2
+        t.copyToTop("jy", "_jy_sq_tmp");
+        cFieldSqr(t, "_jy_sq_tmp", "_Y2", fieldP);
+        t.copyToTop("_Y2", "_Y2_c1");
+        t.copyToTop("jx", "_jx_c3");
+        cFieldMul(t, "_jx_c3", "_Y2", "_xY2", fieldP);
+        t.pushInt("_four", 4);
+        cFieldMul(t, "_xY2", "_four", "_B", fieldP);
 
-        t.copyToTop("_d_t1", "_d_t1_a");
-        t.copyToTop("_d_t1", "_d_t1_b");
-        t.copyToTop("_d_Y3b", "_d_Y3b_a");
-        cFieldSub(t, "_d_t1_a", "_d_Y3b_a", "_d_X3", fieldP);
-        cFieldAdd(t, "_d_t1", "_d_Y3b", "_d_Y3c", fieldP);
+        // C = 8 * Y^4
+        cFieldSqr(t, "_Y2_c1", "_Y4", fieldP);
+        t.pushInt("_eight", 8);
+        cFieldMul(t, "_Y4", "_eight", "_C", fieldP);
 
-        t.copyToTop("_d_X3", "_d_X3_a");
-        cFieldMul(t, "_d_X3_a", "_d_Y3c", "_d_Y3d", fieldP);
-        cFieldMul(t, "_d_X3", "_d_t3", "_d_X3b", fieldP);
+        // X3 = A^2 - 2*B
+        t.copyToTop("_A", "_A_save");
+        t.copyToTop("_B", "_B_save");
+        cFieldSqr(t, "_A", "_A2", fieldP);
+        t.copyToTop("_B", "_B_c1");
+        cFieldMulConst(t, "_B_c1", 2, "_2B", fieldP);
+        cFieldSub(t, "_A2", "_2B", "_X3", fieldP);
 
-        cFieldMulConst(t, "_d_t2", 3L, "_d_t2c", fieldP);
+        // Y3 = A*(B - X3) - C
+        t.copyToTop("_X3", "_X3_c");
+        cFieldSub(t, "_B_save", "_X3_c", "_B_minus_X3", fieldP);
+        cFieldMul(t, "_A_save", "_B_minus_X3", "_A_tmp", fieldP);
+        cFieldSub(t, "_A_tmp", "_C", "_Y3", fieldP);
 
-        cFieldMulBig(t, "_d_Z3", curveB, "_d_Z3b", fieldP);
-        t.copyToTop("_d_t2c", "_d_t2c_a");
-        cFieldSub(t, "_d_Z3b", "_d_t2c_a", "_d_Z3c", fieldP);
-        t.copyToTop("_d_t0", "_d_t0_a");
-        cFieldSub(t, "_d_Z3c", "_d_t0_a", "_d_Z3d", fieldP);
-        cFieldMulConst(t, "_d_Z3d", 3L, "_d_Z3e", fieldP);
+        // Z3 = 2*Y*Z
+        t.copyToTop("jy", "_jy_c");
+        t.copyToTop("jz", "_jz_c");
+        cFieldMul(t, "_jy_c", "_jz_c", "_yz", fieldP);
+        cFieldMulConst(t, "_yz", 2, "_Z3", fieldP);
 
-        cFieldMulConst(t, "_d_t0", 3L, "_d_t0b", fieldP);
-        cFieldSub(t, "_d_t0b", "_d_t2c", "_d_t0c", fieldP);
-
-        t.copyToTop("_d_Z3e", "_d_Z3e_a");
-        cFieldMul(t, "_d_t0c", "_d_Z3e_a", "_d_t0d", fieldP);
-        cFieldAdd(t, "_d_Y3d", "_d_t0d", "_d_Y3e", fieldP);
-
-        cFieldMul(t, "_d_y_yz", "_d_z_yz", "_d_yz", fieldP);
-        cFieldMulConst(t, "_d_yz", 2L, "_d_t0e", fieldP);
-
-        t.copyToTop("_d_t0e", "_d_t0e_a");
-        cFieldMul(t, "_d_t0e_a", "_d_Z3e", "_d_Z3f", fieldP);
-        cFieldSub(t, "_d_X3b", "_d_Z3f", "_d_X3c", fieldP);
-
-        cFieldMul(t, "_d_t0e", "_d_t1_b", "_d_Z3g", fieldP);
-        cFieldMulConst(t, "_d_Z3g", 4L, "_d_Z3h", fieldP);
-
-        t.toTop("_d_X3c"); t.rename("jx");
-        t.toTop("_d_Y3e"); t.rename("jy");
-        t.toTop("_d_Z3h"); t.rename("jz");
+        // Clean up and rename
+        t.toTop("_B"); t.drop();
+        t.toTop("jz"); t.drop();
+        t.toTop("jx"); t.drop();
+        t.toTop("jy"); t.drop();
+        t.toTop("_X3"); t.rename("jx");
+        t.toTop("_Y3"); t.rename("jy");
+        t.toTop("_Z3"); t.rename("jz");
     }
 
-    /**
-     * Consumes jx, jy, jz; produces rxName, ryName.
-     *
-     * <p>cFieldInv is Fermat exponentiation, so inv(0) = 0: the point at
-     * infinity (Z = 0) converts to (0, 0), the all-zero point blob.
-     */
-    private static void cProjectiveToAffine(ECTracker t, String rxName, String ryName,
-                                            BigInteger fieldP, BigInteger pMinus2) {
+    // ===================================================================
+    // Jacobian to affine
+    // ===================================================================
+
+    private static void cJacobianToAffine(ECTracker t, String rxName, String ryName,
+                                          BigInteger fieldP, BigInteger pMinus2) {
         cFieldInv(t, "jz", "_zinv", fieldP, pMinus2);
-        t.copyToTop("_zinv", "_zinv_b");
-        cFieldMul(t, "jx", "_zinv", rxName, fieldP);
-        cFieldMul(t, "jy", "_zinv_b", ryName, fieldP);
+        t.copyToTop("_zinv", "_zinv_keep");
+        cFieldSqr(t, "_zinv", "_zinv2", fieldP);
+        t.copyToTop("_zinv2", "_zinv2_keep");
+        cFieldMul(t, "_zinv_keep", "_zinv2", "_zinv3", fieldP);
+        cFieldMul(t, "jx", "_zinv2_keep", rxName, fieldP);
+        cFieldMul(t, "jy", "_zinv3", ryName, fieldP);
+    }
+
+    // ===================================================================
+    // Jacobian mixed addition (P_jacobian + Q_affine), inline for OP_IF
+    // ===================================================================
+
+    private static void cBuildJacobianAddAffineInline(Consumer<StackOp> e, ECTracker t,
+                                                       BigInteger fieldP, BigInteger pMinus2) {
+        cJacobianAddAffineBody(new ECTracker(t.nm, e), false, fieldP, pMinus2);
     }
 
     /**
-     * Complete mixed-add ops for use inside OP_IF — RCB Algorithm 5 (a = -3),
-     * 11M + 2 m_b.
+     * The mixed-add itself, emitting through an ECTracker the caller owns.
      *
-     * <p>Complete: accumulator == Q doubles correctly (the case that returned
-     * the zero point for k = 2), accumulator == -Q yields infinity, and an
-     * infinity accumulator yields Q.
+     * <p>{@code keepHR} additionally leaves copies of H and R on the stack: both are zero
+     * exactly when the Jacobian accumulator is the same curve point as the affine
+     * operand, the one case these formulas cannot compute. See
+     * cBuildJacobianAddOrDoubleInline.
      */
-    private static void cBuildProjectiveAddMixedInline(Consumer<StackOp> e, ECTracker t,
-                                                       BigInteger fieldP, BigInteger curveB) {
+    private static void cJacobianAddAffineBody(ECTracker it, boolean keepHR,
+                                               BigInteger fieldP, BigInteger pMinus2) {
+        it.copyToTop("jz", "_jz_for_z1cu");
+        it.copyToTop("jz", "_jz_for_z3");
+        it.copyToTop("jy", "_jy_for_y3");
+        it.copyToTop("jx", "_jx_for_u1h2");
+
+        // Z1sq = jz^2
+        cFieldSqr(it, "jz", "_Z1sq", fieldP);
+
+        // Z1cu = _jz_for_z1cu * Z1sq
+        it.copyToTop("_Z1sq", "_Z1sq_for_u2");
+        cFieldMul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu", fieldP);
+
+        // U2 = ax * Z1sq_for_u2
+        it.copyToTop("ax", "_ax_c");
+        cFieldMul(it, "_ax_c", "_Z1sq_for_u2", "_U2", fieldP);
+
+        // S2 = ay * Z1cu
+        it.copyToTop("ay", "_ay_c");
+        cFieldMul(it, "_ay_c", "_Z1cu", "_S2", fieldP);
+
+        // H = U2 - jx
+        cFieldSub(it, "_U2", "jx", "_H", fieldP);
+
+        // R = S2 - jy
+        cFieldSub(it, "_S2", "jy", "_R", fieldP);
+
+        if (keepHR) {
+            it.copyToTop("_H", "_H_keep");
+            it.copyToTop("_R", "_R_keep");
+        }
+
+        it.copyToTop("_H", "_H_for_h3");
+        it.copyToTop("_H", "_H_for_z3");
+
+        // H2 = H^2
+        cFieldSqr(it, "_H", "_H2", fieldP);
+
+        it.copyToTop("_H2", "_H2_for_u1h2");
+
+        // H3 = H_for_h3 * H2
+        cFieldMul(it, "_H_for_h3", "_H2", "_H3", fieldP);
+
+        // U1H2 = _jx_for_u1h2 * H2_for_u1h2
+        cFieldMul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2", fieldP);
+
+        it.copyToTop("_R", "_R_for_y3");
+        it.copyToTop("_U1H2", "_U1H2_for_y3");
+        it.copyToTop("_H3", "_H3_for_y3");
+
+        // X3 = R^2 - H3 - 2*U1H2
+        cFieldSqr(it, "_R", "_R2", fieldP);
+        cFieldSub(it, "_R2", "_H3", "_x3_tmp", fieldP);
+        cFieldMulConst(it, "_U1H2", 2, "_2U1H2", fieldP);
+        cFieldSub(it, "_x3_tmp", "_2U1H2", "_X3", fieldP);
+
+        // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
+        it.copyToTop("_X3", "_X3_c");
+        cFieldSub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x", fieldP);
+        cFieldMul(it, "_R_for_y3", "_u_minus_x", "_r_tmp", fieldP);
+        cFieldMul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3", fieldP);
+        cFieldSub(it, "_r_tmp", "_jy_h3", "_Y3", fieldP);
+
+        // Z3 = _jz_for_z3 * _H_for_z3
+        cFieldMul(it, "_jz_for_z3", "_H_for_z3", "_Z3", fieldP);
+
+        it.toTop("_X3"); it.rename("jx");
+        it.toTop("_Y3"); it.rename("jy");
+        it.toTop("_Z3"); it.rename("jz");
+    }
+
+    /**
+     * Branchless select of one Jacobian coordinate: {@code add + cond*(dbl - add)}.
+     * Consumes addName, dblName and condName.
+     */
+    private static void cSelectCoord(ECTracker t, String addName, String dblName,
+                                     String condName, String resultName, BigInteger fieldP) {
+        t.copyToTop(addName, "_sel_add_c");
+        cFieldSub(t, dblName, "_sel_add_c", "_sel_diff", fieldP);
+        cFieldMul(t, "_sel_diff", condName, "_sel_scaled", fieldP);
+        cFieldAdd(t, addName, "_sel_scaled", resultName, fieldP);
+    }
+
+    /**
+     * The ladder's LAST conditional step: mixed-add, but correct when the accumulator
+     * already equals the point being added.
+     *
+     * <p>The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the two
+     * operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at infinity —
+     * and since cFieldInv is Fermat (inv(0) = 0), cJacobianToAffine turns that into the
+     * ALL-ZERO point instead of 2P. {@code p256Mul(P, 2n)} and {@code p384Mul(P, 2n)}
+     * returned 64 / 96 zero bytes.
+     *
+     * <p>WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+     * c_i = k' &gt;&gt; i and k' = k + 3n, so the conditional step adds P to (c_i - 1)*P.
+     * P-256 and P-384 both have cofactor 1, so P has order n and the degenerate cases are
+     * exactly c_i == 2 (mod n) — accumulator == P — and c_i == 0 or 1 (mod n) —
+     * accumulator == -P or O. c_i ranges over a CONTIGUOUS interval determined only by i,
+     * so this is decidable by interval arithmetic rather than by sampling, and over the
+     * whole domain k in [0, n-1] only two steps qualify, both at i = 0:
+     *
+     * <pre>
+     *   k = 2  -&gt;  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P.  &lt;- bug
+     *   k = 0  -&gt;  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+     *              true result the point at infinity, which affine coordinates
+     *              cannot represent; it stays the all-zero point, as before.
+     * </pre>
+     *
+     * <p>At i &gt;= 1, c_i lies in [3n&gt;&gt;i, (4n-1)&gt;&gt;i] — the lower bound is 3n,
+     * not 3n+1, because the reduce puts k = 0 in the domain.
+     *
+     * <p>Handling H == 0 at every step would cost ~75% more script bytes — on P-384 that
+     * is another 600 KB; handling it here costs ~0.2%. The operand P is caller-supplied
+     * but cannot move the exception, because the condition depends only on
+     * c_i mod ord(P) and ord(P) = n for every point on these curves. Points that are NOT
+     * on the curve carry no such guarantee — gate untrusted input on
+     * {@code p256OnCurve} / {@code p384OnCurve} first. {@code cDecompressPubKey} now
+     * enforces that itself for the one in-tree caller that takes a pubkey as input.
+     *
+     * <p>THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true because
+     * {@code cEmitMul} reduces k mod n before adding 3n. That reduce landed one commit
+     * AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS UNSOUND: a
+     * last-step-only select while the scalar is still unbounded leaves c_i free to hit
+     * 0, 1 or 2 (mod n) at other steps. The two commits must land together and must never
+     * be bisected, cherry-picked or reverted apart.
+     *
+     * <p>The interval argument does 100% of the work; there is no defence in depth here.
+     * In particular c_i == 1 (mod n) — a pre-add accumulator of O — is UNREACHABLE, not
+     * handled: were it reachable the select would still take the ADD path, because O is
+     * carried as Z1 = 0, which makes U2 = 0 and H = -X1 != 0. Anything that changes the
+     * +3n offset, the iteration count or the reduce must redo the interval check, not
+     * assume this still holds.
+     *
+     * <p>Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+     */
+    private static void cBuildJacobianAddOrDoubleInline(Consumer<StackOp> e, ECTracker t,
+                                                        BigInteger fieldP, BigInteger pMinus2) {
         ECTracker it = new ECTracker(t.nm, e);
 
-        it.copyToTop("ax", "_m_x2a");
-        it.copyToTop("ax", "_m_x2b");
-        it.copyToTop("ax", "_m_x2c");
-        it.copyToTop("ay", "_m_y2a");
-        it.copyToTop("ay", "_m_y2b");
-        it.copyToTop("ay", "_m_y2c");
-        it.copyToTop("jx", "_m_x1a");
-        it.copyToTop("jx", "_m_x1b");
-        it.copyToTop("jy", "_m_y1a");
-        it.copyToTop("jy", "_m_y1b");
-        it.copyToTop("jz", "_m_z1a");
-        it.copyToTop("jz", "_m_z1b");
-        it.copyToTop("jz", "_m_z1c");
+        // Keep the pre-add accumulator: it is what must be DOUBLED in the
+        // exceptional case, and the add below consumes jx/jy/jz.
+        it.copyToTop("jx", "_sx");
+        it.copyToTop("jy", "_sy");
+        it.copyToTop("jz", "_sz");
 
-        cFieldMul(it, "jx", "_m_x2a", "_m_t0", fieldP);
-        cFieldMul(it, "jy", "_m_y2a", "_m_t1", fieldP);
-        cFieldAdd(it, "_m_x2b", "_m_y2b", "_m_s1", fieldP);
-        cFieldAdd(it, "_m_x1a", "_m_y1a", "_m_s2", fieldP);
-        cFieldMul(it, "_m_s1", "_m_s2", "_m_t3", fieldP);
+        cJacobianAddAffineBody(it, true, fieldP, pMinus2);
 
-        it.copyToTop("_m_t0", "_m_t0a");
-        it.copyToTop("_m_t1", "_m_t1a");
-        cFieldAdd(it, "_m_t0a", "_m_t1a", "_m_s3", fieldP);
-        cFieldSub(it, "_m_t3", "_m_s3", "_m_t3b", fieldP);
+        // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+        // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+        // signals the point at infinity.
+        it.toTop("_H_keep");
+        it.pushInt("_zero_h", 0);
+        it.rawBlock(List.of("_H_keep", "_zero_h"), "_h_is0",
+                e2 -> e2.accept(new OpcodeOp("OP_NUMEQUAL")));
+        it.toTop("_R_keep");
+        it.pushInt("_zero_r", 0);
+        it.rawBlock(List.of("_R_keep", "_zero_r"), "_r_is0",
+                e2 -> e2.accept(new OpcodeOp("OP_NUMEQUAL")));
+        it.toTop("_h_is0");
+        it.toTop("_r_is0");
+        it.rawBlock(List.of("_h_is0", "_r_is0"), "_cond",
+                e2 -> e2.accept(new OpcodeOp("OP_BOOLAND")));
 
-        cFieldMul(it, "_m_y2c", "jz", "_m_t4", fieldP);
-        cFieldAdd(it, "_m_t4", "_m_y1b", "_m_t4b", fieldP);
-        cFieldMul(it, "_m_x2c", "_m_z1a", "_m_Y3", fieldP);
-        cFieldAdd(it, "_m_Y3", "_m_x1b", "_m_Y3b", fieldP);
+        // Move the add result aside so cJacobianDouble can work on jx/jy/jz again,
+        // this time holding the saved accumulator.
+        it.toTop("jx"); it.rename("_add_x");
+        it.toTop("jy"); it.rename("_add_y");
+        it.toTop("jz"); it.rename("_add_z");
+        it.toTop("_sx"); it.rename("jx");
+        it.toTop("_sy"); it.rename("jy");
+        it.toTop("_sz"); it.rename("jz");
+        cJacobianDouble(it, fieldP, pMinus2);
+        it.toTop("jx"); it.rename("_dbl_x");
+        it.toTop("jy"); it.rename("_dbl_y");
+        it.toTop("jz"); it.rename("_dbl_z");
 
-        cFieldMulBig(it, "_m_z1b", curveB, "_m_Z3", fieldP);
-        it.copyToTop("_m_Y3b", "_m_Y3b_a");
-        cFieldSub(it, "_m_Y3b_a", "_m_Z3", "_m_X3", fieldP);
-        cFieldMulConst(it, "_m_X3", 3L, "_m_X3b", fieldP);
-
-        it.copyToTop("_m_t1", "_m_t1b");
-        it.copyToTop("_m_X3b", "_m_X3b_a");
-        cFieldSub(it, "_m_t1b", "_m_X3b_a", "_m_Z3b", fieldP);
-        cFieldAdd(it, "_m_t1", "_m_X3b", "_m_X3c", fieldP);
-
-        cFieldMulBig(it, "_m_Y3b", curveB, "_m_Y3c", fieldP);
-        cFieldMulConst(it, "_m_z1c", 3L, "_m_t2", fieldP);
-
-        it.copyToTop("_m_t2", "_m_t2a");
-        cFieldSub(it, "_m_Y3c", "_m_t2a", "_m_Y3d", fieldP);
-        it.copyToTop("_m_t0", "_m_t0b");
-        cFieldSub(it, "_m_Y3d", "_m_t0b", "_m_Y3e", fieldP);
-        cFieldMulConst(it, "_m_Y3e", 3L, "_m_Y3f", fieldP);
-
-        cFieldMulConst(it, "_m_t0", 3L, "_m_t0c", fieldP);
-        cFieldSub(it, "_m_t0c", "_m_t2", "_m_t0d", fieldP);
-
-        it.copyToTop("_m_t4b", "_m_t4b_a");
-        it.copyToTop("_m_Y3f", "_m_Y3f_a");
-        cFieldMul(it, "_m_t4b_a", "_m_Y3f_a", "_m_t1c", fieldP);
-        it.copyToTop("_m_t0d", "_m_t0d_a");
-        cFieldMul(it, "_m_t0d_a", "_m_Y3f", "_m_t2b", fieldP);
-
-        it.copyToTop("_m_X3c", "_m_X3c_a");
-        it.copyToTop("_m_Z3b", "_m_Z3b_a");
-        cFieldMul(it, "_m_X3c_a", "_m_Z3b_a", "_m_Y3g", fieldP);
-        cFieldAdd(it, "_m_Y3g", "_m_t2b", "_m_Y3h", fieldP);
-
-        it.copyToTop("_m_t3b", "_m_t3b_a");
-        cFieldMul(it, "_m_t3b_a", "_m_X3c", "_m_X3d", fieldP);
-        cFieldSub(it, "_m_X3d", "_m_t1c", "_m_X3e", fieldP);
-
-        cFieldMul(it, "_m_t4b", "_m_Z3b", "_m_Z3c", fieldP);
-        cFieldMul(it, "_m_t3b", "_m_t0d", "_m_t1d", fieldP);
-        cFieldAdd(it, "_m_Z3c", "_m_t1d", "_m_Z3d", fieldP);
-
-        it.toTop("_m_X3e"); it.rename("jx");
-        it.toTop("_m_Y3h"); it.rename("jy");
-        it.toTop("_m_Z3d"); it.rename("jz");
+        it.copyToTop("_cond", "_cond_x");
+        cSelectCoord(it, "_add_x", "_dbl_x", "_cond_x", "jx", fieldP);
+        it.copyToTop("_cond", "_cond_y");
+        cSelectCoord(it, "_add_y", "_dbl_y", "_cond_y", "jy", fieldP);
+        it.toTop("_cond"); it.rename("_cond_z");
+        cSelectCoord(it, "_add_z", "_dbl_z", "_cond_z", "jz", fieldP);
     }
 
-    /**
-     * Scalar multiplication over homogeneous projective coordinates using the
-     * RCB COMPLETE formulas for a = -3, one iteration per bit of n.
-     *
-     * <p>The previous version added 3n to the scalar and seeded the accumulator
-     * at P. That relied on the INCOMPLETE Jacobian mixed-add never being handed
-     * two equal points — which it was, for k = 2, on the final iteration,
-     * yielding an all-zero point.
-     */
+    // ===================================================================
+    // Scalar multiplication (generic for both P-256 and P-384)
+    // ===================================================================
+
     private static void cEmitMul(Consumer<StackOp> emit, int coordBytes,
                                   ReverseBytesFn revFn, BigInteger fieldP,
-                                  BigInteger pMinus2, BigInteger curveN, BigInteger nMinus2,
-                                  BigInteger curveB) {
+                                  BigInteger pMinus2, BigInteger curveN, BigInteger nMinus2) {
         ECTracker t = new ECTracker(List.of("_pt", "_k"), emit);
         cDecomposePoint(t, "_pt", "ax", "ay", coordBytes, revFn);
 
-        // Reduce the scalar into [0, n-1] so the ladder covers the whole
-        // domain: negative k and k >= n are now defined rather than undefined.
-        cGroupMod(t, "_k", "_k", curveN);
+        // k' = k + 3n (three separate adds, matches Go reference)
+        //
+        // The "k in [1, n-1]" precondition is one the caller cannot enforce — the
+        // scalar is usually an unlock argument — so reduce it first.
+        t.toTop("_k");
+        cEmitScalarReduce(t, "_k", "_kr", curveN);
+        t.pushBigInt("_n", curveN);
+        t.rawBlock(List.of("_kr", "_n"), "_kn",
+            e -> e.accept(new OpcodeOp("OP_ADD")));
+        t.pushBigInt("_n2", curveN);
+        t.rawBlock(List.of("_kn", "_n2"), "_kn2",
+            e -> e.accept(new OpcodeOp("OP_ADD")));
+        t.pushBigInt("_n3", curveN);
+        t.rawBlock(List.of("_kn2", "_n3"), "_kn3",
+            e -> e.accept(new OpcodeOp("OP_ADD")));
+        t.rename("_k");
 
-        // Accumulator := point at infinity (0 : 1 : 0), a legal input to both
-        // complete formulas — which is why no leading-bit special case is needed.
-        t.pushInt("jx", 0L);
-        t.pushInt("jy", 1L);
-        t.pushInt("jz", 0L);
+        // Iteration count: bits of (4n - 1), highest bit always 1 → start one below.
+        BigInteger fourNMinus1 = curveN.multiply(BigInteger.valueOf(4)).subtract(BigInteger.ONE);
+        int topBit = bitLen(fourNMinus1);
+        int startBit = topBit - 2;
 
-        // One iteration per bit of n: 256 for P-256, 384 for P-384.
-        int startBit = curveN.bitLength() - 1;
+        // Init accumulator = P
+        t.copyToTop("ax", "jx");
+        t.copyToTop("ay", "jy");
+        t.pushInt("jz", 1);
 
         for (int bit = startBit; bit >= 0; bit--) {
-            cProjectiveDouble(t, fieldP, curveB);
+            cJacobianDouble(t, fieldP, pMinus2);
 
             // Extract bit: (k >> bit) & 1
             t.copyToTop("_k", "_k_copy");
@@ -648,7 +875,7 @@ public final class P256P384 {
             } else {
                 t.rename("_shifted");
             }
-            t.pushInt("_two", 2L);
+            t.pushInt("_two", 2);
             t.rawBlock(List.of("_shifted", "_two"), "_bit",
                 e -> e.accept(new OpcodeOp("OP_MOD")));
 
@@ -656,13 +883,19 @@ public final class P256P384 {
             t.toTop("_bit");
             t.nm.remove(t.nm.size() - 1); // _bit consumed by IF
             List<StackOp> addOps = new ArrayList<>();
-            cBuildProjectiveAddMixedInline(addOps::add, t, fieldP, curveB);
+            // Only the final step can be handed two equal operands — see
+            // cBuildJacobianAddOrDoubleInline for why, and for what it costs not to.
+            if (bit == 0) {
+                cBuildJacobianAddOrDoubleInline(addOps::add, t, fieldP, pMinus2);
+            } else {
+                cBuildJacobianAddAffineInline(addOps::add, t, fieldP, pMinus2);
+            }
             emit.accept(new IfOp(addOps, List.of()));
         }
 
-        cProjectiveToAffine(t, "_rx", "_ry", fieldP, pMinus2);
+        cJacobianToAffine(t, "_rx", "_ry", fieldP, pMinus2);
 
-        // Clean up
+        // Clean up base point + scalar
         t.toTop("ax"); t.drop();
         t.toTop("ay"); t.drop();
         t.toTop("_k"); t.drop();
@@ -700,6 +933,36 @@ public final class P256P384 {
     // Pubkey decompression (prefix byte + x → (x, y))
     // ===================================================================
 
+    /**
+     * Decompress a compressed pubkey: [prefix||x] → (x_num, y_num, valid).
+     *
+     * <p>For P-256/P-384 where a = -3:
+     * <pre>
+     *   y^2 = x^3 - 3x + b mod p
+     *   y   = (y^2)^((p+1)/4) mod p
+     * </pre>
+     * then select y or p-y based on prefix parity.
+     *
+     * <p>{@code (y^2)^((p+1)/4)} is a square root ONLY when y^2 is a quadratic
+     * residue; both primes are == 3 (mod 4), so for a non-residue it returns a square
+     * root of -y^2 instead and the recovered point is NOT on the curve. Nor is x
+     * checked against p: the BIN2NUM decode accepts any width-fitting value and every
+     * field op silently reduces it, so a non-canonical x decompresses happily too.
+     *
+     * <p>Both matter because the only consumer is {@code cEmitVerifyECDSA}, which feeds
+     * the result straight into {@code cEmitMul}. That ladder's exception analysis (see
+     * {@code cBuildJacobianAddOrDoubleInline}) is stated for points ON the curve, where
+     * cofactor 1 pins ord(P) = n; an off-curve point lands on the twist, whose order is
+     * composite, so the degenerate steps the interval argument rules out become
+     * reachable. The pubkey is a caller-supplied unlock argument.
+     *
+     * <p>So this emits a third output, {@code _dk_valid} = (x &lt; p) AND
+     * (y_cand^2 == y^2) AND (prefix in {0x02, 0x03}), which the caller ANDs into the
+     * verifier's boolean result. A flag, not an OP_VERIFY: {@code verifyECDSA_*} is a
+     * total boolean-valued builtin and turning attacker-chosen bytes into a script
+     * abort would be a liveness regression — the same argument
+     * {@code cEmitScalarReduce} makes for reducing rather than rejecting.
+     */
     private static void cDecompressPubKey(ECTracker t, String pkName, String qxName,
                                            String qyName, int coordBytes,
                                            ReverseBytesFn revFn, BigInteger fieldP,
@@ -714,6 +977,23 @@ public final class P256P384 {
         });
         t.nm.add("_dk_prefix");
         t.nm.add("_dk_xbytes");
+
+        // SEC1 §2.3.4 requires the prefix to be exactly 0x02 or 0x03. The parity
+        // reduction below is `BIN2NUM, 2 MOD`, which accepts far more than that:
+        // 0x00 / 0x04 / 0x82 all alias to "even", and 0x83 is worse than an alias —
+        // BIN2NUM(0x83) = -3 (sign-magnitude), -3 mod 2 = -1, which encodes as 0x81
+        // and can never equal `_dk_y_par` in {<>, 0x01}, so the select silently
+        // returns the OTHER square root. Test the byte itself.
+        t.copyToTop("_dk_prefix", "_dk_pfx_in");
+        t.rawBlock(List.of("_dk_pfx_in"), "_dk_pfx_ok", e -> {
+            e.accept(new DupOp());
+            e.accept(new PushOp(PushValue.ofHex("02")));
+            e.accept(new OpcodeOp("OP_EQUAL"));
+            e.accept(new SwapOp());
+            e.accept(new PushOp(PushValue.ofHex("03")));
+            e.accept(new OpcodeOp("OP_EQUAL"));
+            e.accept(new OpcodeOp("OP_BOOLOR"));
+        });
 
         // Convert prefix to parity: 0x02 → 0, 0x03 → 1
         t.toTop("_dk_prefix");
@@ -749,7 +1029,11 @@ public final class P256P384 {
         t.pushBigInt("_dk_b", curveB);
         cFieldAdd(t, "_dk_x3m3x", "_dk_b", "_dk_y2", fieldP);
 
-        // y = (y^2)^sqrtExp mod p
+        // y = (y^2)^sqrtExp mod p. cFieldPow CONSUMES its base, so keep a copy of
+        // y^2 for the residue check at the end. It has to sit BELOW _dk_y_cand: the
+        // parity select below is an OP_IF whose branches are a bare drop / nip, so
+        // nothing may come between _dk_y_cand and the negated candidate.
+        t.copyToTop("_dk_y2", "_dk_y2_keep");
         cFieldPow(t, "_dk_y2", sqrtExp, "_dk_y_cand", fieldP, pMinus2);
 
         // Check candidate y parity
@@ -804,11 +1088,140 @@ public final class P256P384 {
                 break;
             }
         }
+
+        // valid = (qy^2 == y^2) AND (qx < p) AND (prefix in {0x02, 0x03}).
+        // The selected qy is y_cand or p - y_cand, so squaring it tests the same
+        // residue property either way. The first conjunct rejects an x whose RHS is
+        // a quadratic non-residue — the recovered point is then off the curve; the
+        // second rejects a non-canonical encoding of an otherwise fine x; the third
+        // rejects a prefix byte the parity reduction would otherwise alias or, for
+        // 0x83, silently invert.
+        t.copyToTop(qyName, "_dk_y_sq_in");
+        cFieldSqr(t, "_dk_y_sq_in", "_dk_y_sq", fieldP);
+        t.toTop("_dk_y_sq");
+        t.toTop("_dk_y2_keep");
+        t.rawBlock(List.of("_dk_y_sq", "_dk_y2_keep"), "_dk_res_ok",
+            e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop(qxName, "_dk_x_lt");
+        cPushFieldP(t, "_dk_p_lt", fieldP);
+        t.rawBlock(List.of("_dk_x_lt", "_dk_p_lt"), "_dk_x_ok",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.toTop("_dk_res_ok");
+        t.toTop("_dk_x_ok");
+        t.rawBlock(List.of("_dk_res_ok", "_dk_x_ok"), "_dk_curve_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        t.toTop("_dk_pfx_ok");
+        t.rawBlock(List.of("_dk_curve_ok", "_dk_pfx_ok"), "_dk_valid",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     // ===================================================================
     // ECDSA verification (generic)
     // ===================================================================
+
+    /**
+     * Length gate for an untrusted byte argument: leaves {@code [flag, clamped]}.
+     *
+     * <p>{@code flag} is {@code OP_SIZE(v) == want}; {@code clamped} is {@code v}
+     * forced to exactly {@code want} bytes by {@code v || 00*want}, split at
+     * {@code want}, tail dropped — truncating a long value and zero-extending a
+     * short one.
+     *
+     * <p>The clamp exists so the gate can stay a FLAG. Everything downstream peels a
+     * fixed number of bytes ({@code OP_SPLIT coordBytes}, then 32/48 single-byte
+     * splits inside emitReverse32/48); handed 32 &lt;= len(sig) &lt; 64 the reversal
+     * runs out of bytes mid-loop and the SCRIPT ABORTS, which would make
+     * {@code verifyECDSA_P256(...) || fallback} unwritable and contradict this
+     * module's own totality rule (see {@code cDecompressPubKey}). Clamping first
+     * makes every path total; the caller ANDs {@code flag} into the result so a
+     * wrong-length argument can never verify whatever the clamped bytes computed.
+     *
+     * <p>Branch-free on purpose: the tracker's static stack model, and the emitted op
+     * sequence, are the same for every input length — the argument {@code cAffineAdd}
+     * makes for selecting operands instead of branching.
+     */
+    private static void cEmitLengthGate(ECTracker t, String name, int want, String flagName) {
+        t.toTop(name);
+        t.rawBlock(List.of(name), "", e -> {
+            e.accept(new OpcodeOp("OP_SIZE"));
+            e.accept(new PushOp(PushValue.of(want)));
+            e.accept(new OpcodeOp("OP_NUMEQUAL"));
+            e.accept(new SwapOp());
+            e.accept(new PushOp(PushValue.ofHex(Ec.hexOf(new byte[want]))));
+            e.accept(new OpcodeOp("OP_CAT"));
+            e.accept(new PushOp(PushValue.of(want)));
+            e.accept(new OpcodeOp("OP_SPLIT"));
+            e.accept(new DropOp());
+        });
+        t.nm.add(flagName);
+        t.nm.add(name);
+    }
+
+    /**
+     * SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2: verify 1 &lt;= r &lt;= n-1 and
+     * 1 &lt;= s &lt;= n-1. Consumes nothing, leaves {@code _range_ok} above
+     * {@code _r} and {@code _s}.
+     *
+     * <p>==&gt; THIS IS A UNIVERSAL FORGERY GUARD, NOT A HYGIENE CHECK. &lt;==
+     *
+     * <p>Nothing checked r or s at all, and {@code cGroupInv} is Fermat
+     * (a^(n-2) mod n), so inv(0) = 0 instead of an error. With {@code sig = 0x00…}
+     * and the contract's own genuine, PUBLIC key:
+     *
+     * <pre>
+     *   r = s = 0            (BIN2NUM of coordBytes zero bytes -&gt; empty vector)
+     *   w = s^(n-2) = 0      Fermat, no failure channel
+     *   u1 = u2 = 0          every cGroupMul in the ladder is 0*0 mod n
+     *   R1 = R2 = O          cEmitMul reduces 0, k' = 3n = 0 mod n, so Z3 = 0 and
+     *                        cJacobianToAffine's Fermat inverse turns it all-zero
+     *   R1 + R2              cAffineAdd sees xeq = yeq = 1, takes the tangent with
+     *                        den = 2*0 = 0, so s = 0 and rx = ry = 0
+     *   (R.x mod n) == r     OP_EQUAL(&lt;&gt;, &lt;&gt;) = 1
+     * </pre>
+     *
+     * <p>...and {@code _dk_valid} is 1 because the pubkey is genuine. TRUE. No
+     * secret, no off-curve point, not bound to the message: an all-zero signature
+     * verified for ANY message under ANY public key. {@code examples/ts/p256-wallet}
+     * made exactly that call its second authentication factor.
+     *
+     * <p>BOTH conjuncts are load-bearing and neither is redundant:
+     * <ul>
+     *   <li>s = 0 (or s = n, which Fermat also inverts to 0) is what collapses both
+     *       ladders to O;</li>
+     *   <li>r = 0 is what makes the final OP_EQUAL compare the resulting 0 against
+     *       something that is also 0.</li>
+     * </ul>
+     * {@code r = 0, s = n} is a second spelling of the same forgery that an
+     * {@code s != 0} check alone would miss, which is why the bound is {@code < n}
+     * and not {@code != 0}.
+     *
+     * <p>A flag rather than an OP_VERIFY, for the reason
+     * {@code cDecompressPubKey} gives.
+     */
+    private static void cEmitSigRangeGate(ECTracker t, BigInteger curveN) {
+        t.copyToTop("_r", "_r_nz_in");
+        t.rawBlock(List.of("_r_nz_in"), "_r_nz",
+            e -> e.accept(new OpcodeOp("OP_0NOTEQUAL")));
+        t.copyToTop("_r", "_r_lt_in");
+        cPushGroupN(t, "_n_for_r", curveN);
+        t.rawBlock(List.of("_r_lt_in", "_n_for_r"), "_r_lt",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.rawBlock(List.of("_r_nz", "_r_lt"), "_r_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+
+        t.copyToTop("_s", "_s_nz_in");
+        t.rawBlock(List.of("_s_nz_in"), "_s_nz",
+            e -> e.accept(new OpcodeOp("OP_0NOTEQUAL")));
+        t.copyToTop("_s", "_s_lt_in");
+        cPushGroupN(t, "_n_for_s", curveN);
+        t.rawBlock(List.of("_s_lt_in", "_n_for_s"), "_s_lt",
+            e -> e.accept(new OpcodeOp("OP_LESSTHAN")));
+        t.rawBlock(List.of("_s_nz", "_s_lt"), "_s_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+
+        t.rawBlock(List.of("_r_ok", "_s_ok"), "_range_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+    }
 
     private static void cEmitVerifyECDSA(Consumer<StackOp> emit, int coordBytes,
                                          ReverseBytesFn revFn, BigInteger fieldP,
@@ -816,6 +1229,19 @@ public final class P256P384 {
                                          BigInteger nMinus2, BigInteger curveB,
                                          BigInteger sqrtExp, BigInteger gx, BigInteger gy) {
         ECTracker t = new ECTracker(List.of("_msg", "_sig", "_pk"), emit);
+
+        // Step 0: length gate. `_sig` and `_pk` are bare ByteString in the builtin
+        // table and the type checker imposes no width, so both arrive attacker-sized.
+        // Clamp them and remember whether they were the right size — see
+        // cEmitLengthGate for why a clamp and not an abort. Without it `sig || junk`
+        // verified identically to `sig` (fatal for any contract using signature bytes
+        // as a nullifier), and a short `sig` aborted the script outright.
+        cEmitLengthGate(t, "_pk", coordBytes + 1, "_pk_len_ok");
+        cEmitLengthGate(t, "_sig", coordBytes * 2, "_sig_len_ok");
+        t.toTop("_pk_len_ok");
+        t.toTop("_sig_len_ok");
+        t.rawBlock(List.of("_pk_len_ok", "_sig_len_ok"), "_len_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
 
         // Step 1: e = SHA-256(msg) as integer
         t.toTop("_msg");
@@ -854,9 +1280,25 @@ public final class P256P384 {
             e.accept(new OpcodeOp("OP_BIN2NUM"));
         });
 
-        // Step 3: Decompress pubkey
+        // Step 2b: 1 <= r, s <= n-1. Without this an all-zero signature verifies for
+        // any message under any pubkey — see cEmitSigRangeGate.
+        cEmitSigRangeGate(t, curveN);
+
+        // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
+        // bytes do not decompress to a canonical on-curve point, which is ANDed into
+        // the result below so such a key can never verify.
         cDecompressPubKey(t, "_pk", "_qx", "_qy",
             coordBytes, revFn, fieldP, pMinus2, curveB, sqrtExp);
+
+        // Collapse the three argument verdicts into one flag. Everything below then
+        // carries a single item, as it did when `_dk_valid` was the only one.
+        t.toTop("_len_ok");
+        t.toTop("_range_ok");
+        t.rawBlock(List.of("_len_ok", "_range_ok"), "_arg_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        t.toTop("_dk_valid");
+        t.rawBlock(List.of("_arg_ok", "_dk_valid"), "_input_ok",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
 
         // Step 4: w = s^{-1} mod n
         cGroupInv(t, "_s", "_w", curveN, nMinus2);
@@ -877,7 +1319,9 @@ public final class P256P384 {
         t.pushBytes("_G", gPointData);
         t.toTop("_u1");
 
-        // Stash items on altstack
+        // Stash items on altstack. _input_ok goes DEEPEST — the altstack is LIFO
+        // and it is popped last.
+        t.toTop("_input_ok"); t.toAlt();
         t.toTop("_r_save"); t.toAlt();
         t.toTop("_u2");     t.toAlt();
         t.toTop("_qy");     t.toAlt();
@@ -887,7 +1331,7 @@ public final class P256P384 {
         t.nm.remove(t.nm.size() - 1); // _u1
         t.nm.remove(t.nm.size() - 1); // _G
 
-        cEmitMul(emit, coordBytes, revFn, fieldP, pMinus2, curveN, nMinus2, curveB);
+        cEmitMul(emit, coordBytes, revFn, fieldP, pMinus2, curveN, nMinus2);
 
         // After mul, one result point is on the stack
         t.nm.add("_R1_point");
@@ -908,7 +1352,7 @@ public final class P256P384 {
         // Remove from tracker, emit mul, push result
         t.nm.remove(t.nm.size() - 1); // _u2
         t.nm.remove(t.nm.size() - 1); // _Q_point
-        cEmitMul(emit, coordBytes, revFn, fieldP, pMinus2, curveN, nMinus2, curveB);
+        cEmitMul(emit, coordBytes, revFn, fieldP, pMinus2, curveN, nMinus2);
         t.nm.add("_R2_point");
 
         // Restore R1 point
@@ -942,14 +1386,23 @@ public final class P256P384 {
 
         cGroupMod(t, "rx", "_rx_mod_n", curveN);
 
-        // Restore r
+        // Restore r, then the argument verdict beneath it
         t.fromAlt("_r_save");
+        t.fromAlt("_input_ok");
 
         // Compare
         t.toTop("_rx_mod_n");
         t.toTop("_r_save");
-        t.rawBlock(List.of("_rx_mod_n", "_r_save"), "_result",
+        t.rawBlock(List.of("_rx_mod_n", "_r_save"), "_sig_ok",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
+
+        // Arguments that were the wrong length, out of range, or did not decompress
+        // to a canonical on-curve point can never verify, whatever the ladder made
+        // of them.
+        t.toTop("_input_ok");
+        t.toTop("_sig_ok");
+        t.rawBlock(List.of("_input_ok", "_sig_ok"), "_result",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     // ===================================================================
@@ -965,7 +1418,7 @@ public final class P256P384 {
     }
 
     public static void emitP256Mul(Consumer<StackOp> emit) {
-        cEmitMul(emit, 32, REV32, P256_P, P256_P_MINUS_2, P256_N, P256_N_MINUS_2, P256_B);
+        cEmitMul(emit, 32, REV32, P256_P, P256_P_MINUS_2, P256_N, P256_N_MINUS_2);
     }
 
     public static void emitP256MulGen(Consumer<StackOp> emit) {
@@ -988,6 +1441,7 @@ public final class P256P384 {
     public static void emitP256OnCurve(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt"), emit);
         cDecomposePoint(t, "_pt", "_x", "_y", 32, REV32);
+        cEmitCanonicityGuard(t, "_x", "_y", P256_P);
 
         // lhs = y^2
         cFieldSqr(t, "_y", "_y2", P256_P);
@@ -1004,8 +1458,14 @@ public final class P256P384 {
 
         t.toTop("_y2");
         t.toTop("_rhs");
-        t.rawBlock(List.of("_y2", "_rhs"), "_result",
+        t.rawBlock(List.of("_y2", "_rhs"), "_curve_eq",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
+
+        // on-curve = canonical AND curve-equation
+        t.toTop("_canon");
+        t.toTop("_curve_eq");
+        t.rawBlock(List.of("_canon", "_curve_eq"), "_result",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     public static void emitP256EncodeCompressed(Consumer<StackOp> emit) {
@@ -1051,7 +1511,7 @@ public final class P256P384 {
     }
 
     public static void emitP384Mul(Consumer<StackOp> emit) {
-        cEmitMul(emit, 48, REV48, P384_P, P384_P_MINUS_2, P384_N, P384_N_MINUS_2, P384_B);
+        cEmitMul(emit, 48, REV48, P384_P, P384_P_MINUS_2, P384_N, P384_N_MINUS_2);
     }
 
     public static void emitP384MulGen(Consumer<StackOp> emit) {
@@ -1074,6 +1534,7 @@ public final class P256P384 {
     public static void emitP384OnCurve(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt"), emit);
         cDecomposePoint(t, "_pt", "_x", "_y", 48, REV48);
+        cEmitCanonicityGuard(t, "_x", "_y", P384_P);
 
         cFieldSqr(t, "_y", "_y2", P384_P);
 
@@ -1088,8 +1549,14 @@ public final class P256P384 {
 
         t.toTop("_y2");
         t.toTop("_rhs");
-        t.rawBlock(List.of("_y2", "_rhs"), "_result",
+        t.rawBlock(List.of("_y2", "_rhs"), "_curve_eq",
             e -> e.accept(new OpcodeOp("OP_EQUAL")));
+
+        // on-curve = canonical AND curve-equation
+        t.toTop("_canon");
+        t.toTop("_curve_eq");
+        t.rawBlock(List.of("_canon", "_curve_eq"), "_result",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
     }
 
     public static void emitP384EncodeCompressed(Consumer<StackOp> emit) {

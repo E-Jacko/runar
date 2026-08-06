@@ -26,6 +26,27 @@ fn collect<F: FnOnce(&mut dyn FnMut(StackOp))>(f: F) -> Vec<StackOp> {
     ops
 }
 
+/// Total number of `StackOp`s in `ops`, INCLUDING the bodies of `if` ops.
+///
+/// A flat `ops.len()` cannot see inside a branch, so any emitter whose work
+/// sits in an `if` body — the scalar ladders emit 257 / 385 conditional
+/// additions, WOTS+ and SLH-DSA are almost entirely conditional — reports a
+/// count that barely moves no matter what the branch contains. Adding +1.3 KB
+/// of script inside the ladder's last step left the `p256_mul` / `p384_mul`
+/// goldens byte-identical. Recursing is what makes the golden a gate.
+fn count_op_tree(ops: &[StackOp]) -> usize {
+    let mut total = 0usize;
+    for op in ops {
+        total += 1;
+        if let StackOp::If { then_ops, else_ops } = op {
+            total += count_op_tree(then_ops);
+            total += count_op_tree(else_ops);
+        }
+    }
+    total
+}
+
+
 // ---------------------------------------------------------------------------
 // Blake3 codegen
 // ---------------------------------------------------------------------------
@@ -300,13 +321,13 @@ fn test_emit_verify_slh_dsa_all_param_sets() {
 #[test]
 fn test_blake3_compress_op_count_golden() {
     let ops = collect(|s| emit_blake3_compress(s));
-    assert_eq!(ops.len(), 10373, "blake3_compress op count drift");
+    assert_eq!(count_op_tree(&ops), 10373, "blake3_compress op count drift");
 }
 
 #[test]
 fn test_blake3_hash_op_count_golden() {
     let ops = collect(|s| emit_blake3_hash(s));
-    assert_eq!(ops.len(), 10387, "blake3_hash op count drift");
+    assert_eq!(count_op_tree(&ops), 10387, "blake3_hash op count drift");
 }
 
 // -- P-256 -----------------------------------------------------------------
@@ -314,7 +335,12 @@ fn test_blake3_hash_op_count_golden() {
 #[test]
 fn test_p256_add_op_count_golden() {
     let ops = collect(|s| emit_p256_add(s));
-    assert_eq!(ops.len(), 6642, "p256_add op count drift");
+    // 6642 -> 6663 (+21 ops / +21 bytes) — the same delta ecAdd and p384Add
+    // take, since all three share the affine-add structure: a second
+    // OP_NUMEQUAL on y, the OP_BOOLAND folding it into `cond`, OP_SUB/OP_NOT
+    // for `notinf`, two OP_MULs masking rx/ry, plus the picks/rolls feeding
+    // them. Every one is a 1-byte op, so op count and byte count move together.
+    assert_eq!(count_op_tree(&ops), 6663, "p256_add op count drift");
 }
 
 #[test]
@@ -323,32 +349,32 @@ fn test_p256_mul_op_count_golden() {
     // Rust emits 4 fewer raw StackOps than Python/Java peers; same pattern
     // as ecMul (see ec_codegen_tests.rs module comment). Final hex is
     // byte-identical (enforced by the conformance harness).
-    assert_eq!(ops.len(), 107579, "p256_mul op count drift");
+    assert_eq!(count_op_tree(&ops), 140032, "p256_mul op count drift");
 }
 
 #[test]
 fn test_p256_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_p256_mul_gen(s));
     // See p256_mul_op_count_golden comment.
-    assert_eq!(ops.len(), 107581, "p256_mul_gen op count drift");
+    assert_eq!(count_op_tree(&ops), 140034, "p256_mul_gen op count drift");
 }
 
 #[test]
 fn test_p256_negate_op_count_golden() {
     let ops = collect(|s| emit_p256_negate(s));
-    assert_eq!(ops.len(), 945, "p256_negate op count drift");
+    assert_eq!(count_op_tree(&ops), 945, "p256_negate op count drift");
 }
 
 #[test]
 fn test_p256_on_curve_op_count_golden() {
     let ops = collect(|s| emit_p256_on_curve(s));
-    assert_eq!(ops.len(), 546, "p256_on_curve op count drift");
+    assert_eq!(count_op_tree(&ops), 559, "p256_on_curve op count drift");
 }
 
 #[test]
 fn test_p256_encode_compressed_op_count_golden() {
     let ops = collect(|s| emit_p256_encode_compressed(s));
-    assert_eq!(ops.len(), 14, "p256_encode_compressed op count drift");
+    assert_eq!(count_op_tree(&ops), 16, "p256_encode_compressed op count drift");
 }
 
 #[test]
@@ -356,7 +382,44 @@ fn test_verify_ecdsa_p256_op_count_golden() {
     let ops = collect(|s| emit_verify_ecdsa_p256(s));
     // Rust emits 8 fewer raw StackOps than Python/Java peers (a verify
     // computes two mul/mul_gen invocations × the 4-op divergence).
-    assert_eq!(ops.len(), 232272, "verify_ecdsa_p256 op count drift");
+    //
+    // 297180 -> 297265 (+85 ops / +151 script bytes) for the `_dk_valid`
+    // pubkey-validity gate, which decomposes as:
+    //   * 52 curve-independent 1-byte ops — 21 for the affine-add P == -Q mask
+    //     (see test_p256_add_op_count_golden), the rest for the residue +
+    //     canonicity check in c_decompress_pub_key, its altstack stash, and the
+    //     closing OP_BOOLAND in c_emit_verify_ecdsa. P-384 pays the same 52.
+    //   * +1 op per set bit of the sqrt exponent — 33 here, 287 on P-384.
+    //     `_dk_y2_keep` now sits under `_dk_y2` for the whole of c_field_pow, so
+    //     the loop's copy_to_top(base) moves from depth 1 (OP_OVER) to depth 2
+    //     (OP_2 + OP_PICK). (p+1)/4 has 34 set bits on P-256, 288 on P-384; the
+    //     MSB is the loop's seed, not a step.
+    //   * +66 bytes beyond the op count — the two full-width pushes of p the
+    //     check adds (one in c_field_sqr's reduce, one for the OP_LESSTHAN):
+    //     33 extra bytes each on P-256, 49 each on P-384.
+    // 52 + 33 = 85 ops; 85 + 66 = 151 bytes. Both match the TS reference.
+    //
+    // 297265 -> 297323 (+58 ops / +225 script bytes) for the argument-validity
+    // gates — the length clamp on `_sig` / `_pk`, the 1 <= r,s <= n-1 range gate
+    // (a universal-forgery fix: an all-zero signature used to verify under any
+    // key), and the SEC1 prefix test in c_decompress_pub_key. Decomposes as:
+    //   * 23 ops / 124 bytes — the two length gates: 9 emitted ops each, plus
+    //     the rot/roll bringing the two flags together and the OP_BOOLAND that
+    //     joins them. Byte-heavy because each gate pushes `want` zero bytes
+    //     (33 and 64 here) for the OP_CAT clamp.
+    //   * 15 ops / 81 bytes — the range gate: OP_0NOTEQUAL, OP_LESSTHAN and
+    //     OP_BOOLAND per scalar over a picked copy, plus the closing OP_BOOLAND.
+    //     Two full-width pushes of n (34 bytes each on P-256) dominate.
+    //   * 8 ops / 8 bytes — the prefix test; OP_2 / OP_3 are single-byte pushes.
+    //   * 12 ops / 12 bytes — the two new AND chains (`_dk_curve_ok` ->
+    //     `_dk_valid`, `_len_ok` -> `_arg_ok` -> `_input_ok`) and the rolls
+    //     feeding them, including the extra OP_SWAP `_dk_pfx_ok` costs by
+    //     sitting under `_dk_xbytes`. All 1-byte ops.
+    // Every one of the 58 ops is curve-independent, so P-384 pays the same 58;
+    // it pays 306 bytes rather than 225 purely on wider constants — +49 in the
+    // length gates (49/96-byte pads) and +32 in the range gate (two 50-byte
+    // pushes of n). Both totals match the TS reference.
+    assert_eq!(count_op_tree(&ops), 297323, "verify_ecdsa_p256 op count drift");
 }
 
 // -- P-384 -----------------------------------------------------------------
@@ -364,25 +427,27 @@ fn test_verify_ecdsa_p256_op_count_golden() {
 #[test]
 fn test_p384_add_op_count_golden() {
     let ops = collect(|s| emit_p384_add(s));
-    assert_eq!(ops.len(), 11448, "p384_add op count drift");
+    // 11448 -> 11469 (+21 ops / +21 bytes): same affine-add P == -Q -> O mask
+    // as ecAdd / p256Add, see test_p256_add_op_count_golden.
+    assert_eq!(count_op_tree(&ops), 11469, "p384_add op count drift");
 }
 
 #[test]
 fn test_p384_mul_op_count_golden() {
     let ops = collect(|s| emit_p384_mul(s));
     // See ec_codegen_tests.rs module comment for the 4-op divergence pattern.
-    assert_eq!(ops.len(), 162977, "p384_mul op count drift");
+    assert_eq!(count_op_tree(&ops), 211174, "p384_mul op count drift");
 }
 
 #[test]
 fn test_p384_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_p384_mul_gen(s));
     // See p384_mul_op_count_golden comment.
-    assert_eq!(ops.len(), 162979, "p384_mul_gen op count drift");
+    assert_eq!(count_op_tree(&ops), 211176, "p384_mul_gen op count drift");
 }
 
 #[test]
 fn test_p384_negate_op_count_golden() {
     let ops = collect(|s| emit_p384_negate(s));
-    assert_eq!(ops.len(), 1393, "p384_negate op count drift");
+    assert_eq!(count_op_tree(&ops), 1393, "p384_negate op count drift");
 }

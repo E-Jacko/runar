@@ -143,7 +143,8 @@ class TestP256P384Codegen < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
-  # T-11: Op-count goldens for every P-256 / P-384 emitter.
+  # T-11: Op-TREE-size goldens for every P-256 / P-384 emitter (`if` bodies
+  # included, see count_op_tree).
   #
   # The ASM-substring tests above catch a gross regression but not byte-level
   # codegen drift. Numbers mirror the Python peer
@@ -151,16 +152,24 @@ class TestP256P384Codegen < Minitest::Test
   # reference at the same commit. Final hex is byte-identical across all
   # 7 tiers (enforced by the conformance harness); these goldens are an
   # in-process localized-regression gate.
+  #
+  # `verifyECDSA_P256` moved 297273 -> 297331 (+58) when the verifier grew its
+  # input-validation gates: the two length clamps on `_pk` / `_sig`, the
+  # 1 <= r,s <= n-1 range gate, the SEC1 prefix test inside pubkey
+  # decompression, and the BOOLAND chain that folds all three verdicts into
+  # `_input_ok`. `verifyECDSA_P384` gains the same +58 but carries no golden
+  # here. Both are input validation, not a formula change, so the ladder
+  # emitters (`p256Mul` / `p384Mul`) are untouched.
   # ---------------------------------------------------------------------------
 
   P256_GOLDENS = {
-    "p256Add"              =>   6642,
-    "p256Mul"              =>  107579,
-    "p256MulGen"           =>  107581,
+    "p256Add"              =>   6663,
+    "p256Mul"              => 140036,
+    "p256MulGen"           => 140038,
     "p256Negate"           =>    945,
-    "p256OnCurve"          =>    546,
-    "p256EncodeCompressed" =>     14,
-    "verifyECDSA_P256"     => 232272,
+    "p256OnCurve"          =>    559,
+    "p256EncodeCompressed" =>     16,
+    "verifyECDSA_P256"     => 297331,
   }.freeze
 
   P256_EMITTERS = {
@@ -174,9 +183,9 @@ class TestP256P384Codegen < Minitest::Test
   }.freeze
 
   P384_GOLDENS = {
-    "p384Add"    =>  11448,
-    "p384Mul"    => 162977,
-    "p384MulGen" => 162979,
+    "p384Add"    =>  11469,
+    "p384Mul"    => 211178,
+    "p384MulGen" => 211180,
     "p384Negate" =>   1393,
   }.freeze
 
@@ -187,13 +196,31 @@ class TestP256P384Codegen < Minitest::Test
     "p384Negate" => RunarCompiler::Codegen::NISTEC.method(:emit_p384_negate),
   }.freeze
 
+  # Total StackOps in `ops`, INCLUDING the bodies of `if` ops.
+  #
+  # A flat `ops.length` cannot see inside a branch, so any emitter whose work
+  # sits in an `if` body -- the scalar ladders emit 257 / 385 conditional
+  # additions -- reports a count that barely moves no matter what the branch
+  # contains. Adding +1.3 KB of script inside the ladder's last step left the
+  # `p256Mul` / `p384Mul` goldens byte-identical. Recursing makes it a gate.
+  def count_op_tree(ops)
+    ops.sum do |op|
+      if op[:op] == "if"
+        1 + count_op_tree(op[:then] || []) + count_op_tree(op[:else_ops] || [])
+      else
+        1
+      end
+    end
+  end
+
   def test_p256_emitter_op_count_goldens
     P256_EMITTERS.each do |name, emitter|
       ops = []
       emitter.call(->(op) { ops << op })
       expected = P256_GOLDENS.fetch(name)
-      assert_equal expected, ops.length,
-                   "#{name} op count drift: got #{ops.length}, want #{expected}"
+      got = count_op_tree(ops)
+      assert_equal expected, got,
+                   "#{name} op count drift: got #{got}, want #{expected}"
     end
   end
 
@@ -202,8 +229,9 @@ class TestP256P384Codegen < Minitest::Test
       ops = []
       emitter.call(->(op) { ops << op })
       expected = P384_GOLDENS.fetch(name)
-      assert_equal expected, ops.length,
-                   "#{name} op count drift: got #{ops.length}, want #{expected}"
+      got = count_op_tree(ops)
+      assert_equal expected, got,
+                   "#{name} op count drift: got #{got}, want #{expected}"
     end
   end
 end

@@ -42,13 +42,18 @@ export {
   emitEcModReduce, emitEcEncodeCompressed, emitEcMakePoint,
   emitEcPointX, emitEcPointY,
 } from './passes/ec-codegen.js';
-// NIST P-256 / P-384 emitters, exported for the same reason: these carried the
-// SAME two defects as their secp256k1 peers (an affine add that could not
-// double, and a scalar ladder that returned the zero point for k = 2) and
-// nothing executed them.
+// NIST P-256 / P-384 emitters, exported for the same reason: the interpreter
+// MOCKED these primitives, so nothing ever executed their emitted script and
+// both `pNNNAdd(P, P)` and `pNNNMul(P, 2)` were wrong.
 export {
-  emitP256Add, emitP256Mul, emitP256MulGen, emitVerifyECDSA_P256,
-  emitP384Add, emitP384Mul, emitP384MulGen, emitVerifyECDSA_P384,
+  emitP256Add, emitP256Mul, emitP256MulGen, emitP256Negate, emitP256OnCurve,
+  emitP256EncodeCompressed,
+  emitP384Add, emitP384Mul, emitP384MulGen, emitP384Negate, emitP384OnCurve,
+  emitP384EncodeCompressed,
+  // The ECDSA verifiers were the only EC emitters NOT exported here, and
+  // consequently the only ones no test had ever executed — which is how
+  // `decompressPubKey` shipped without a square-check on the recovered y.
+  emitVerifyECDSA_P256, emitVerifyECDSA_P384,
 } from './passes/p256-p384-codegen.js';
 export {
   emitCheckPreimageBinding,

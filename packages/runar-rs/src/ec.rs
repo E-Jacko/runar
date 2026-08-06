@@ -80,10 +80,13 @@ pub fn ec_on_curve(p: &[u8]) -> bool {
     if p.len() != 64 {
         return false;
     }
-    // All zeros = point at infinity, consider it "on curve"
-    if p.iter().all(|&b| b == 0) {
-        return true;
-    }
+    // The all-zero blob is this codegen's encoding of the point at infinity,
+    // and it is NOT on the curve: the emitted ec_on_curve is exactly
+    // x < p AND y < p AND y^2 == x^3 + 7, and 0 != 7. Returning true here (the
+    // projective convention) made this mock disagree with the script it stands
+    // in for, so `assert(ec_on_curve(r))` passed off-chain and failed on-chain
+    // for r = O — an unspendable output found only after deploy. O is now
+    // reachable from ec_add(P, -P), so this matters in practice.
     let mut sec1 = vec![0x04u8];
     sec1.extend_from_slice(p);
     let Ok(enc) = k256::EncodedPoint::from_bytes(&sec1) else { return false };
@@ -237,8 +240,14 @@ mod tests {
     }
 
     #[test]
-    fn ec_on_curve_accepts_identity() {
-        assert!(ec_on_curve(&vec![0u8; 64]));
+    fn ec_on_curve_rejects_identity() {
+        // The all-zero blob is the point at infinity, and it is NOT on the
+        // curve — 0^2 != 0^3 + 7. That is the ONLY way a contract can detect O,
+        // and the compiled script agrees. This used to assert the opposite, so
+        // an `assert(ec_on_curve(r))` that was green off-chain deployed an
+        // unspendable output whenever r was O. O is reachable from
+        // ec_add(P, -P) and from ec_mul(P, 0).
+        assert!(!ec_on_curve(&vec![0u8; 64]));
     }
 
     #[test]

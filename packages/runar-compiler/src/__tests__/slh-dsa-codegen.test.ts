@@ -9,17 +9,40 @@ import type { StackOp } from '../ir/index.js';
 // The post-quantum-slhdsa{,-128f,-192f,-192s,-256f,-256s} conformance
 // fixtures exercise this end-to-end across all 7 tiers, but the TS tier had
 // no localized unit test pinning the emit output. These goldens lock the
-// exact op count for a fast (128f) and a small (192s) parameter set so a
+// exact op-TREE size (`if` bodies included, see countOpTree) for a fast (128f)
+// and a small (192s) parameter set so a
 // TS-side codegen regression fails here instead of only as a conformance hex
 // mismatch. They match the Go peer goldens in
 // compilers/go/codegen/crypto_codegen_test.go. Update only alongside a
 // deliberate codegen change.
 // ---------------------------------------------------------------------------
 
+/**
+ * Total number of StackOps in `ops`, INCLUDING the bodies of `if` ops.
+ *
+ * A flat `ops.length` cannot see inside a branch, so any emitter whose work
+ * sits in an `if` body — the scalar ladders emit 257 / 385 conditional
+ * additions, WOTS+ and SLH-DSA are almost entirely conditional — reports a
+ * count that barely moves no matter what the branch contains. Adding +1.3 KB
+ * of script inside the ladder's last step left the `p256Mul` / `p384Mul`
+ * goldens byte-identical. Recursing is what makes the golden a gate.
+ */
+function countOpTree(ops: StackOp[]): number {
+  let total = 0;
+  for (const op of ops) {
+    total++;
+    if (op.op === 'if') {
+      total += countOpTree(op.then);
+      total += countOpTree(op.else ?? []);
+    }
+  }
+  return total;
+}
+
 function countSlhdsaOps(paramKey: string): number {
   const ops: StackOp[] = [];
   emitVerifySLHDSA((op: StackOp) => ops.push(op), paramKey);
-  return ops.length;
+  return countOpTree(ops);
 }
 
 describe('SLH-DSA codegen — op-count goldens (T-006)', () => {
@@ -31,8 +54,8 @@ describe('SLH-DSA codegen — op-count goldens (T-006)', () => {
     // bytes — so a=14 sets (192s/256s) emit a 3-byte window (an extra reverse
     // pair + the previously-skipped right-shift) on unlucky alignments. 128f
     // (a=6) sees only the Hmsg -1; 192s sees -1 + 48.
-    ['SHA2_128f', 85765],
-    ['SHA2_192s', 41951],
+    ['SHA2_128f', 514147],
+    ['SHA2_192s', 256935],
   ];
 
   for (const [paramKey, expected] of goldens) {

@@ -90,8 +90,6 @@ static P384_SQRT_EXP: LazyLock<BigInt> = LazyLock::new(|| (&*P384_P + 1) >> 2);
 struct NistCurveParams {
     field_p: &'static LazyLock<BigInt>,
     field_p_minus_2: &'static LazyLock<BigInt>,
-    /// Curve b coefficient, needed by the RCB complete formulas (a = -3).
-    curve_b: &'static LazyLock<BigInt>,
     coord_bytes: usize, // 32 for P-256, 48 for P-384
     reverse_bytes: fn(&mut dyn FnMut(StackOp)),
 }
@@ -104,7 +102,6 @@ struct NistGroupParams {
 static P256_CURVE: NistCurveParams = NistCurveParams {
     field_p: &P256_P,
     field_p_minus_2: &P256_P_MINUS_2,
-    curve_b: &P256_B,
     coord_bytes: 32,
     reverse_bytes: emit_reverse_32,
 };
@@ -112,7 +109,6 @@ static P256_CURVE: NistCurveParams = NistCurveParams {
 static P384_CURVE: NistCurveParams = NistCurveParams {
     field_p: &P384_P,
     field_p_minus_2: &P384_P_MINUS_2,
-    curve_b: &P384_B,
     coord_bytes: 48,
     reverse_bytes: emit_reverse_48,
 };
@@ -369,17 +365,6 @@ fn c_field_mul_const(t: &mut ECTracker, a_name: &str, cv: i128, result_name: &st
     c_field_mod(t, "_fmc_prod", result_name, c);
 }
 
-/// (a * cv) mod p for a FULL-WIDTH constant such as the curve b coefficient,
-/// which does not fit the i128 taken by `c_field_mul_const`.
-fn c_field_mul_big(t: &mut ECTracker, a_name: &str, cv: &BigInt, result_name: &str, c: &NistCurveParams) {
-    t.to_top(a_name);
-    t.raw_block(&[a_name], Some("_fmc_prod"), |e| {
-        e(StackOp::Push(PushValue::Int(cv.clone())));
-        e(StackOp::Opcode("OP_MUL".into()));
-    });
-    c_field_mod(t, "_fmc_prod", result_name, c);
-}
-
 fn c_field_sqr(t: &mut ECTracker, a_name: &str, result_name: &str, c: &NistCurveParams) {
     t.copy_to_top(a_name, "_fsqr_copy");
     c_field_mul(t, a_name, "_fsqr_copy", result_name, c);
@@ -421,6 +406,33 @@ fn c_group_mod(t: &mut ECTracker, a_name: &str, result_name: &str, g: &NistGroup
     t.to_top(a_name);
     c_push_group_n(t, "_gmod_n", g);
     t.raw_block(&[a_name, "_gmod_n"], Some(result_name), |e| {
+        e(StackOp::Opcode("OP_2DUP".into()));
+        e(StackOp::Opcode("OP_MOD".into()));
+        e(StackOp::Rot);
+        e(StackOp::Drop);
+        e(StackOp::Over);
+        e(StackOp::Opcode("OP_ADD".into()));
+        e(StackOp::Swap);
+        e(StackOp::Opcode("OP_MOD".into()));
+    });
+}
+
+/// Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+///
+/// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+/// the `+ n, mod n` normalises the negative half. One push of n covers both
+/// reductions — the same shape as `emit_ec_mod_reduce`.
+///
+/// Without it, `c_emit_mul`'s ladder is only correct while
+/// 2^b <= k + 3n < 2^(b+1) for the fixed b it unrolls: a scalar >= ~n sets a bit
+/// above the loop's top, the loop never sees it, and the ladder returns a
+/// DIFFERENT multiple of P rather than failing. Scalars are contract input, so
+/// that is attacker-chosen. Reducing costs 1 push + 8 opcodes (42 / 58 bytes)
+/// against a ~460 KB / 1.6 MB script, and makes k >= n, k < 0 and k = 0 all
+/// well defined.
+fn c_emit_scalar_reduce(t: &mut ECTracker, k_name: &str, result_name: &str, g: &NistGroupParams) {
+    c_push_group_n(t, "_n_red", g);
+    t.raw_block(&[k_name, "_n_red"], Some(result_name), |e| {
         e(StackOp::Opcode("OP_2DUP".into()));
         e(StackOp::Opcode("OP_MOD".into()));
         e(StackOp::Rot);
@@ -539,21 +551,91 @@ fn c_compose_point(t: &mut ECTracker, x_name: &str, y_name: &str, result_name: &
 // Affine point addition
 // ===========================================================================
 
+/// GAP-301: coordinate canonicity, leaving `_canon` on the tracker.
+///
+/// `c_decompose_point` BIN2NUMs each coordinate as an unsigned value that may
+/// be >= p; the curve equation reduces it mod p, so (x + p)||y would pass as a
+/// point it is not the canonical encoding of. Reject it: require x < p AND
+/// y < p (coordinates are unsigned, so the 0 <= bound holds by construction).
+/// The caller ANDs `_canon` into its result so the check still returns a
+/// boolean. This mirrors secp256k1's `emit_ec_on_curve`, whose guard the a = -3
+/// curves never received — leaving `pNNNOnCurve` accepting inputs `ecOnCurve`
+/// rejects even though both are documented as THE gate for untrusted points.
+fn c_emit_canonicity_guard(t: &mut ECTracker, x_name: &str, y_name: &str, c: &NistCurveParams) {
+    t.copy_to_top(x_name, "_x_lt");
+    c_push_field_p(t, "_p_for_x", c);
+    t.raw_block(&["_x_lt", "_p_for_x"], Some("_x_canon"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.copy_to_top(y_name, "_y_lt");
+    c_push_field_p(t, "_p_for_y", c);
+    t.raw_block(&["_y_lt", "_p_for_y"], Some("_y_canon"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.to_top("_x_canon");
+    t.to_top("_y_canon");
+    t.raw_block(&["_x_canon", "_y_canon"], Some("_canon"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+}
+
 fn c_affine_add(t: &mut ECTracker, c: &NistCurveParams) {
-    // The chord slope (qy-py)/(qx-px) divides by zero when P == Q, so doubling
-    // needs the tangent (3*px^2 + a)/(2*py) — and a = -3 on both NIST curves,
-    // giving (3*px^2 - 3)/(2*py). Pick numerator and denominator BEFORE the one
-    // c_field_inv, selected as `b + cond*(a - b)` with cond = (px == qx), which
-    // needs no branch and so keeps the emitted op sequence — and the tracker's
-    // static stack model — identical on both paths. Mirrors the secp256k1 fix
-    // in ec.rs.
+    // The chord slope s = (qy - py) / (qx - px) is undefined when P == Q: the
+    // denominator is zero and the correct slope is the TANGENT,
+    // (3px^2 + a)/(2py) — and a = -3 on both NIST curves, so the numerator is
+    // 3px^2 - 3. The secp256k1 fix (a = 0) was never ported here, so
+    // p256Add(P, P) and p384Add(P, P) produced a wrong point and every contract
+    // that doubled deployed an unspendable script.
     //
-    // NOT handled: P == -Q, whose true result is the point at infinity, which
-    // affine coordinates cannot represent.
+    // Both cases are `s = num / den`, so only the NUMERATOR and DENOMINATOR are
+    // selected and the single expensive c_field_inv still runs exactly once.
+    // rx and ry below are already correct for doubling.
+    //
+    //   cond = (px == qx) AND (py == qy)
+    //   num  = cond ? 3*px^2 - 3 : (qy - py)
+    //   den  = cond ? 2*py       : (qx - px)
+    //
+    // selected as `b + cond*(a - b)`, which needs no branch and keeps the
+    // emitted op sequence identical on both paths.
+    //
+    // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+    // sends it down the tangent path and returns 2P — an on-curve, entirely
+    // plausible, WRONG point, which is strictly worse than the pre-fix chord
+    // path: that one divided by zero (c_field_inv is Fermat, inv(0) = 0) and
+    // produced an OFF-curve blob, so `assert(pNNNOnCurve(pNNNAdd(a, b)))` — the
+    // idiom examples/ts/p384-primitives writes verbatim — rejected it.
+    //
+    // P + (-P) is the point at infinity, which affine x||y cannot represent.
+    // This codegen already has a representation for O: the ALL-ZERO blob, which
+    // is what `pNNNMul(P, 0n)` returns. So return that, by masking the result
+    // with `notinf = NOT(px == qx AND NOT cond)`. O is not on the curve
+    // (0^2 != b), so the on-curve gate rejects it and the idiom works again;
+    // and it adds no failure channel to a pure value-producing expression, the
+    // same reason c_emit_scalar_reduce reduces instead of rejecting.
+    //
+    // The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+    // and notinf is 0 or 1, so the product is canonical either way.
     t.copy_to_top("px", "_px_eq");
     t.copy_to_top("qx", "_qx_eq");
-    t.raw_block(&["_px_eq", "_qx_eq"], Some("_cond"), |e| {
+    t.raw_block(&["_px_eq", "_qx_eq"], Some("_xeq"), |e| {
         e(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    t.copy_to_top("py", "_py_eq");
+    t.copy_to_top("qy", "_qy_eq");
+    t.raw_block(&["_py_eq", "_qy_eq"], Some("_yeq"), |e| {
+        e(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    t.copy_to_top("_xeq", "_xeq_c");
+    t.to_top("_yeq");
+    t.raw_block(&["_xeq_c", "_yeq"], Some("_cond"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+    // notinf = NOT(xeq - cond): 1 exactly when px == qx and the points differ.
+    t.to_top("_xeq");
+    t.copy_to_top("_cond", "_cond_c");
+    t.raw_block(&["_xeq", "_cond_c"], Some("_notinf"), |e| {
+        e(StackOp::Opcode("OP_SUB".into()));
+        e(StackOp::Opcode("OP_NOT".into()));
     });
 
     // chord numerator / denominator
@@ -564,12 +646,12 @@ fn c_affine_add(t: &mut ECTracker, c: &NistCurveParams) {
     t.copy_to_top("px", "_px1");
     c_field_sub(t, "_qx1", "_px1", "_den_chord", c);
 
-    // tangent numerator / denominator: 3*px^2 - 3 and 2*py
+    // tangent numerator / denominator: 3*px^2 + a (a = -3) and 2*py
     t.copy_to_top("px", "_px_t");
     c_field_sqr(t, "_px_t", "_px_sq", c);
-    c_field_mul_const(t, "_px_sq", 3, "_3x2", c);
-    t.push_int("_three", 3);
-    c_field_sub(t, "_3x2", "_three", "_num_tan", c);
+    c_field_mul_const(t, "_px_sq", 3, "_3px_sq", c);
+    t.push_int("_a_neg", 3);
+    c_field_sub(t, "_3px_sq", "_a_neg", "_num_tan", c);
     t.copy_to_top("py", "_py_t");
     c_field_mul_const(t, "_py_t", 2, "_den_tan", c);
 
@@ -613,203 +695,340 @@ fn c_affine_add(t: &mut ECTracker, c: &NistCurveParams) {
     t.to_top("py"); t.drop();
     t.to_top("qx"); t.drop();
     t.to_top("qy"); t.drop();
+
+    // P == -Q -> force the all-zero point (see the header comment).
+    t.to_top("rx");
+    t.copy_to_top("_notinf", "_notinf_x");
+    t.raw_block(&["rx", "_notinf_x"], Some("rx"), |e| {
+        e(StackOp::Opcode("OP_MUL".into()));
+    });
+    t.to_top("ry");
+    t.to_top("_notinf");
+    t.raw_block(&["ry", "_notinf"], Some("ry"), |e| {
+        e(StackOp::Opcode("OP_MUL".into()));
+    });
 }
 
 // ===========================================================================
 // Jacobian point doubling with a=-3 optimization
 // ===========================================================================
 
-/// Projective point doubling — RCB Algorithm 6 (a = -3), 8M + 3S + 2 m_b.
-/// Expects jx, jy, jz on the tracker; replaces them with the doubled point.
-///
-/// Complete: doubling the point at infinity (0 : 1 : 0) yields (0 : 1 : 0).
-///
-/// P-256 and P-384 have a = -3, so these are the a = -3 algorithms (5 and 6),
-/// NOT the a = 0 pair used for secp256k1 in ec.rs.
-fn c_projective_double(t: &mut ECTracker, c: &NistCurveParams) {
-    let b: BigInt = (**c.curve_b).clone();
+fn c_jacobian_double(t: &mut ECTracker, c: &NistCurveParams) {
+    // Z^2
+    t.copy_to_top("jz", "_jz_sq_tmp");
+    c_field_sqr(t, "_jz_sq_tmp", "_Z2", c);
 
-    t.copy_to_top("jx", "_d_x_xy");
-    t.copy_to_top("jx", "_d_x_xz");
-    t.copy_to_top("jy", "_d_y_xy");
-    t.copy_to_top("jy", "_d_y_yz");
-    t.copy_to_top("jz", "_d_z_xz");
-    t.copy_to_top("jz", "_d_z_yz");
+    // X - Z^2 and X + Z^2
+    t.copy_to_top("jx", "_jx_c1");
+    t.copy_to_top("_Z2", "_Z2_c1");
+    c_field_sub(t, "_jx_c1", "_Z2_c1", "_X_minus_Z2", c);
+    t.copy_to_top("jx", "_jx_c2");
+    c_field_add(t, "_jx_c2", "_Z2", "_X_plus_Z2", c);
 
-    c_field_sqr(t, "jx", "_d_t0", c); // t0 = X^2
-    c_field_sqr(t, "jy", "_d_t1", c); // t1 = Y^2
-    c_field_sqr(t, "jz", "_d_t2", c); // t2 = Z^2
+    // A = 3*(X-Z^2)*(X+Z^2)
+    c_field_mul(t, "_X_minus_Z2", "_X_plus_Z2", "_prod", c);
+    t.push_int("_three", 3);
+    c_field_mul(t, "_prod", "_three", "_A", c);
 
-    c_field_mul(t, "_d_x_xy", "_d_y_xy", "_d_xy", c);
-    c_field_mul_const(t, "_d_xy", 2, "_d_t3", c); // t3 = 2*X*Y
-    c_field_mul(t, "_d_x_xz", "_d_z_xz", "_d_xz", c);
-    c_field_mul_const(t, "_d_xz", 2, "_d_Z3", c); // Z3 = 2*X*Z
+    // B = 4*X*Y^2
+    t.copy_to_top("jy", "_jy_sq_tmp");
+    c_field_sqr(t, "_jy_sq_tmp", "_Y2", c);
+    t.copy_to_top("_Y2", "_Y2_c1");
+    t.copy_to_top("jx", "_jx_c3");
+    c_field_mul(t, "_jx_c3", "_Y2", "_xY2", c);
+    t.push_int("_four", 4);
+    c_field_mul(t, "_xY2", "_four", "_B", c);
 
-    t.copy_to_top("_d_t2", "_d_t2_b");
-    c_field_mul_big(t, "_d_t2_b", &b, "_d_bt2", c);
-    t.copy_to_top("_d_Z3", "_d_Z3_a");
-    c_field_sub(t, "_d_bt2", "_d_Z3_a", "_d_Y3", c);
-    c_field_mul_const(t, "_d_Y3", 3, "_d_Y3b", c);
+    // C = 8*Y^4
+    c_field_sqr(t, "_Y2_c1", "_Y4", c);
+    t.push_int("_eight", 8);
+    c_field_mul(t, "_Y4", "_eight", "_C", c);
 
-    t.copy_to_top("_d_t1", "_d_t1_a");
-    t.copy_to_top("_d_t1", "_d_t1_b");
-    t.copy_to_top("_d_Y3b", "_d_Y3b_a");
-    c_field_sub(t, "_d_t1_a", "_d_Y3b_a", "_d_X3", c);
-    c_field_add(t, "_d_t1", "_d_Y3b", "_d_Y3c", c);
+    // X3 = A^2 - 2*B
+    t.copy_to_top("_A", "_A_save");
+    t.copy_to_top("_B", "_B_save");
+    c_field_sqr(t, "_A", "_A2", c);
+    t.copy_to_top("_B", "_B_c1");
+    c_field_mul_const(t, "_B_c1", 2, "_2B", c);
+    c_field_sub(t, "_A2", "_2B", "_X3", c);
 
-    t.copy_to_top("_d_X3", "_d_X3_a");
-    c_field_mul(t, "_d_X3_a", "_d_Y3c", "_d_Y3d", c);
-    c_field_mul(t, "_d_X3", "_d_t3", "_d_X3b", c);
+    // Y3 = A*(B - X3) - C
+    t.copy_to_top("_X3", "_X3_c");
+    c_field_sub(t, "_B_save", "_X3_c", "_B_minus_X3", c);
+    c_field_mul(t, "_A_save", "_B_minus_X3", "_A_tmp", c);
+    c_field_sub(t, "_A_tmp", "_C", "_Y3", c);
 
-    c_field_mul_const(t, "_d_t2", 3, "_d_t2c", c);
+    // Z3 = 2*Y*Z
+    t.copy_to_top("jy", "_jy_c");
+    t.copy_to_top("jz", "_jz_c");
+    c_field_mul(t, "_jy_c", "_jz_c", "_yz", c);
+    c_field_mul_const(t, "_yz", 2, "_Z3", c);
 
-    c_field_mul_big(t, "_d_Z3", &b, "_d_Z3b", c);
-    t.copy_to_top("_d_t2c", "_d_t2c_a");
-    c_field_sub(t, "_d_Z3b", "_d_t2c_a", "_d_Z3c", c);
-    t.copy_to_top("_d_t0", "_d_t0_a");
-    c_field_sub(t, "_d_Z3c", "_d_t0_a", "_d_Z3d", c);
-    c_field_mul_const(t, "_d_Z3d", 3, "_d_Z3e", c);
-
-    c_field_mul_const(t, "_d_t0", 3, "_d_t0b", c);
-    c_field_sub(t, "_d_t0b", "_d_t2c", "_d_t0c", c);
-
-    t.copy_to_top("_d_Z3e", "_d_Z3e_a");
-    c_field_mul(t, "_d_t0c", "_d_Z3e_a", "_d_t0d", c);
-    c_field_add(t, "_d_Y3d", "_d_t0d", "_d_Y3e", c);
-
-    c_field_mul(t, "_d_y_yz", "_d_z_yz", "_d_yz", c);
-    c_field_mul_const(t, "_d_yz", 2, "_d_t0e", c);
-
-    t.copy_to_top("_d_t0e", "_d_t0e_a");
-    c_field_mul(t, "_d_t0e_a", "_d_Z3e", "_d_Z3f", c);
-    c_field_sub(t, "_d_X3b", "_d_Z3f", "_d_X3c", c);
-
-    c_field_mul(t, "_d_t0e", "_d_t1_b", "_d_Z3g", c);
-    c_field_mul_const(t, "_d_Z3g", 4, "_d_Z3h", c);
-
-    t.to_top("_d_X3c"); t.rename("jx");
-    t.to_top("_d_Y3e"); t.rename("jy");
-    t.to_top("_d_Z3h"); t.rename("jz");
+    // Clean up and rename
+    t.to_top("_B"); t.drop();
+    t.to_top("jz"); t.drop();
+    t.to_top("jx"); t.drop();
+    t.to_top("jy"); t.drop();
+    t.to_top("_X3"); t.rename("jx");
+    t.to_top("_Y3"); t.rename("jy");
+    t.to_top("_Z3"); t.rename("jz");
 }
 
-/// Consumes jx, jy, jz; produces rx_name, ry_name.
-///
-/// c_field_inv is Fermat exponentiation, so inv(0) = 0: the point at infinity
-/// (Z = 0) converts to (0, 0), the all-zero point blob.
-fn c_projective_to_affine(t: &mut ECTracker, rx_name: &str, ry_name: &str, c: &NistCurveParams) {
+// ===========================================================================
+// Jacobian to affine conversion
+// ===========================================================================
+
+fn c_jacobian_to_affine(t: &mut ECTracker, rx_name: &str, ry_name: &str, c: &NistCurveParams) {
     c_field_inv(t, "jz", "_zinv", c);
-    t.copy_to_top("_zinv", "_zinv_b");
-    c_field_mul(t, "jx", "_zinv", rx_name, c);
-    c_field_mul(t, "jy", "_zinv_b", ry_name, c);
+    t.copy_to_top("_zinv", "_zinv_keep");
+    c_field_sqr(t, "_zinv", "_zinv2", c);
+    t.copy_to_top("_zinv2", "_zinv2_keep");
+    c_field_mul(t, "_zinv_keep", "_zinv2", "_zinv3", c);
+    c_field_mul(t, "jx", "_zinv2_keep", rx_name, c);
+    c_field_mul(t, "jy", "_zinv3", ry_name, c);
 }
 
-/// Complete mixed-add ops for use inside OP_IF — RCB Algorithm 5 (a = -3),
-/// 11M + 2 m_b.
+// ===========================================================================
+// Jacobian mixed addition (P_jacobian + Q_affine)
+// ===========================================================================
+
+fn c_build_jacobian_add_affine_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker, c: &NistCurveParams) {
+    let cloned_nm: Vec<String> = t.nm.clone();
+    let init_strs: Vec<&str> = cloned_nm.iter().map(|s| s.as_str()).collect();
+    let mut it = ECTracker::new(&init_strs, e);
+    c_jacobian_add_affine_body(&mut it, false, c);
+}
+
+/// The mixed-add itself, emitting through an ECTracker the caller owns.
 ///
-/// Complete: accumulator == Q doubles correctly (the case that returned the
-/// zero point for k = 2), accumulator == -Q yields infinity, and an infinity
-/// accumulator yields Q.
-fn c_build_projective_add_mixed_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker, c: &NistCurveParams) {
-    let names: Vec<String> = t.nm.clone();
-    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let it = &mut ECTracker::new(&name_refs, e);
-    let b: BigInt = (**c.curve_b).clone();
+/// `keep_hr` additionally leaves copies of H and R on the stack: both are zero
+/// exactly when the Jacobian accumulator is the same curve point as the affine
+/// operand, the one case these formulas cannot compute. See
+/// `c_build_jacobian_add_or_double_inline`.
+fn c_jacobian_add_affine_body(it: &mut ECTracker, keep_hr: bool, c: &NistCurveParams) {
+    it.copy_to_top("jz", "_jz_for_z1cu");
+    it.copy_to_top("jz", "_jz_for_z3");
+    it.copy_to_top("jy", "_jy_for_y3");
+    it.copy_to_top("jx", "_jx_for_u1h2");
 
-    it.copy_to_top("ax", "_m_x2a");
-    it.copy_to_top("ax", "_m_x2b");
-    it.copy_to_top("ax", "_m_x2c");
-    it.copy_to_top("ay", "_m_y2a");
-    it.copy_to_top("ay", "_m_y2b");
-    it.copy_to_top("ay", "_m_y2c");
-    it.copy_to_top("jx", "_m_x1a");
-    it.copy_to_top("jx", "_m_x1b");
-    it.copy_to_top("jy", "_m_y1a");
-    it.copy_to_top("jy", "_m_y1b");
-    it.copy_to_top("jz", "_m_z1a");
-    it.copy_to_top("jz", "_m_z1b");
-    it.copy_to_top("jz", "_m_z1c");
+    // Z1sq = jz^2
+    c_field_sqr(it, "jz", "_Z1sq", c);
 
-    c_field_mul(it, "jx", "_m_x2a", "_m_t0", c);
-    c_field_mul(it, "jy", "_m_y2a", "_m_t1", c);
-    c_field_add(it, "_m_x2b", "_m_y2b", "_m_s1", c);
-    c_field_add(it, "_m_x1a", "_m_y1a", "_m_s2", c);
-    c_field_mul(it, "_m_s1", "_m_s2", "_m_t3", c);
+    // Z1cu = _jz_for_z1cu * Z1sq
+    it.copy_to_top("_Z1sq", "_Z1sq_for_u2");
+    c_field_mul(it, "_jz_for_z1cu", "_Z1sq", "_Z1cu", c);
 
-    it.copy_to_top("_m_t0", "_m_t0a");
-    it.copy_to_top("_m_t1", "_m_t1a");
-    c_field_add(it, "_m_t0a", "_m_t1a", "_m_s3", c);
-    c_field_sub(it, "_m_t3", "_m_s3", "_m_t3b", c);
+    // U2 = ax * Z1sq_for_u2
+    it.copy_to_top("ax", "_ax_c");
+    c_field_mul(it, "_ax_c", "_Z1sq_for_u2", "_U2", c);
 
-    c_field_mul(it, "_m_y2c", "jz", "_m_t4", c);
-    c_field_add(it, "_m_t4", "_m_y1b", "_m_t4b", c);
-    c_field_mul(it, "_m_x2c", "_m_z1a", "_m_Y3", c);
-    c_field_add(it, "_m_Y3", "_m_x1b", "_m_Y3b", c);
+    // S2 = ay * Z1cu
+    it.copy_to_top("ay", "_ay_c");
+    c_field_mul(it, "_ay_c", "_Z1cu", "_S2", c);
 
-    c_field_mul_big(it, "_m_z1b", &b, "_m_Z3", c);
-    it.copy_to_top("_m_Y3b", "_m_Y3b_a");
-    c_field_sub(it, "_m_Y3b_a", "_m_Z3", "_m_X3", c);
-    c_field_mul_const(it, "_m_X3", 3, "_m_X3b", c);
+    // H = U2 - jx
+    c_field_sub(it, "_U2", "jx", "_H", c);
 
-    it.copy_to_top("_m_t1", "_m_t1b");
-    it.copy_to_top("_m_X3b", "_m_X3b_a");
-    c_field_sub(it, "_m_t1b", "_m_X3b_a", "_m_Z3b", c);
-    c_field_add(it, "_m_t1", "_m_X3b", "_m_X3c", c);
+    // R = S2 - jy
+    c_field_sub(it, "_S2", "jy", "_R", c);
 
-    c_field_mul_big(it, "_m_Y3b", &b, "_m_Y3c", c);
-    c_field_mul_const(it, "_m_z1c", 3, "_m_t2", c);
+    if keep_hr {
+        it.copy_to_top("_H", "_H_keep");
+        it.copy_to_top("_R", "_R_keep");
+    }
 
-    it.copy_to_top("_m_t2", "_m_t2a");
-    c_field_sub(it, "_m_Y3c", "_m_t2a", "_m_Y3d", c);
-    it.copy_to_top("_m_t0", "_m_t0b");
-    c_field_sub(it, "_m_Y3d", "_m_t0b", "_m_Y3e", c);
-    c_field_mul_const(it, "_m_Y3e", 3, "_m_Y3f", c);
+    it.copy_to_top("_H", "_H_for_h3");
+    it.copy_to_top("_H", "_H_for_z3");
 
-    c_field_mul_const(it, "_m_t0", 3, "_m_t0c", c);
-    c_field_sub(it, "_m_t0c", "_m_t2", "_m_t0d", c);
+    // H2 = H^2
+    c_field_sqr(it, "_H", "_H2", c);
 
-    it.copy_to_top("_m_t4b", "_m_t4b_a");
-    it.copy_to_top("_m_Y3f", "_m_Y3f_a");
-    c_field_mul(it, "_m_t4b_a", "_m_Y3f_a", "_m_t1c", c);
-    it.copy_to_top("_m_t0d", "_m_t0d_a");
-    c_field_mul(it, "_m_t0d_a", "_m_Y3f", "_m_t2b", c);
+    it.copy_to_top("_H2", "_H2_for_u1h2");
 
-    it.copy_to_top("_m_X3c", "_m_X3c_a");
-    it.copy_to_top("_m_Z3b", "_m_Z3b_a");
-    c_field_mul(it, "_m_X3c_a", "_m_Z3b_a", "_m_Y3g", c);
-    c_field_add(it, "_m_Y3g", "_m_t2b", "_m_Y3h", c);
+    // H3 = H_for_h3 * H2
+    c_field_mul(it, "_H_for_h3", "_H2", "_H3", c);
 
-    it.copy_to_top("_m_t3b", "_m_t3b_a");
-    c_field_mul(it, "_m_t3b_a", "_m_X3c", "_m_X3d", c);
-    c_field_sub(it, "_m_X3d", "_m_t1c", "_m_X3e", c);
+    // U1H2 = _jx_for_u1h2 * H2_for_u1h2
+    c_field_mul(it, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2", c);
 
-    c_field_mul(it, "_m_t4b", "_m_Z3b", "_m_Z3c", c);
-    c_field_mul(it, "_m_t3b", "_m_t0d", "_m_t1d", c);
-    c_field_add(it, "_m_Z3c", "_m_t1d", "_m_Z3d", c);
+    it.copy_to_top("_R", "_R_for_y3");
+    it.copy_to_top("_U1H2", "_U1H2_for_y3");
+    it.copy_to_top("_H3", "_H3_for_y3");
 
-    it.to_top("_m_X3e"); it.rename("jx");
-    it.to_top("_m_Y3h"); it.rename("jy");
-    it.to_top("_m_Z3d"); it.rename("jz");
+    // X3 = R^2 - H3 - 2*U1H2
+    c_field_sqr(it, "_R", "_R2", c);
+    c_field_sub(it, "_R2", "_H3", "_x3_tmp", c);
+    c_field_mul_const(it, "_U1H2", 2, "_2U1H2", c);
+    c_field_sub(it, "_x3_tmp", "_2U1H2", "_X3", c);
+
+    // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
+    it.copy_to_top("_X3", "_X3_c");
+    c_field_sub(it, "_U1H2_for_y3", "_X3_c", "_u_minus_x", c);
+    c_field_mul(it, "_R_for_y3", "_u_minus_x", "_r_tmp", c);
+    c_field_mul(it, "_jy_for_y3", "_H3_for_y3", "_jy_h3", c);
+    c_field_sub(it, "_r_tmp", "_jy_h3", "_Y3", c);
+
+    // Z3 = _jz_for_z3 * _H_for_z3
+    c_field_mul(it, "_jz_for_z3", "_H_for_z3", "_Z3", c);
+
+    it.to_top("_X3"); it.rename("jx");
+    it.to_top("_Y3"); it.rename("jy");
+    it.to_top("_Z3"); it.rename("jz");
 }
+
+/// Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+/// Consumes `add_name`, `dbl_name` and `cond_name`.
+fn c_select_coord(
+    t: &mut ECTracker, add_name: &str, dbl_name: &str, cond_name: &str, result_name: &str,
+    c: &NistCurveParams,
+) {
+    t.copy_to_top(add_name, "_sel_add_c");
+    c_field_sub(t, dbl_name, "_sel_add_c", "_sel_diff", c);
+    c_field_mul(t, "_sel_diff", cond_name, "_sel_scaled", c);
+    c_field_add(t, add_name, "_sel_scaled", result_name, c);
+}
+
+/// The ladder's LAST conditional step: mixed-add, but correct when the
+/// accumulator already equals the point being added.
+///
+/// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+/// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+/// infinity — and since `c_field_inv` is Fermat (inv(0) = 0),
+/// `c_jacobian_to_affine` turns that into the ALL-ZERO point instead of 2P.
+/// `p256Mul(P, 2n)` and `p384Mul(P, 2n)` returned 64 / 96 zero bytes.
+///
+/// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+/// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+/// (c_i - 1)*P. P-256 and P-384 both have cofactor 1, so P has order n and the
+/// degenerate cases are exactly c_i ≡ 2 (mod n) — accumulator == P — and
+/// c_i ≡ 0 or 1 (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS
+/// interval determined only by i, so this is decidable by interval arithmetic
+/// rather than by sampling, and over the whole domain k ∈ [0, n-1] only two
+/// steps qualify, both at i = 0:
+///
+///   k = 2  ->  c_0 = 3n+2 ≡ 2, odd, so the add runs: accumulator == P.  <- bug
+///   k = 0  ->  c_0 = 3n   ≡ 0, odd, so the add runs: accumulator == -P,
+///              true result the point at infinity, which affine coordinates
+///              cannot represent; it stays the all-zero point, as before.
+///
+/// At i ≥ 1, c_i lies in [3n>>i, (4n-1)>>i] — the lower bound is 3n, not 3n+1,
+/// because the reduce puts k = 0 in the domain.
+///
+/// Handling H == 0 at every step would cost ~75% more script bytes — on P-384
+/// that is another 600 KB; handling it here costs ~0.2%. The operand P is
+/// caller-supplied but cannot move the exception, because the condition depends
+/// only on c_i mod ord(P) and ord(P) = n for every point on these curves.
+/// Points that are NOT on the curve carry no such guarantee — gate untrusted
+/// input on `p256OnCurve` / `p384OnCurve` first. `c_decompress_pub_key` now
+/// enforces that itself for the one in-tree caller that takes a pubkey as
+/// input.
+///
+/// THE ENTIRE ARGUMENT IS CONDITIONED ON k ∈ [0, n-1], which is only true
+/// because `c_emit_mul` reduces k mod n before adding 3n. That reduce landed
+/// one commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN
+/// IS UNSOUND: a last-step-only select while the scalar is still unbounded
+/// leaves c_i free to hit 0, 1 or 2 (mod n) at other steps. The two commits
+/// must land together and must never be bisected, cherry-picked or reverted
+/// apart.
+///
+/// The interval argument does 100% of the work; there is no defence in depth
+/// here. In particular c_i ≡ 1 (mod n) — a pre-add accumulator of O — is
+/// UNREACHABLE, not handled: were it reachable the select would still take the
+/// ADD path, because O is carried as Z1 = 0, which makes U2 = 0 and
+/// H = -X1 != 0. Anything that changes the +3n offset, the iteration count or
+/// the reduce must redo the interval check, not assume this still holds.
+///
+/// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+fn c_build_jacobian_add_or_double_inline(
+    e: &mut dyn FnMut(StackOp), t: &ECTracker, c: &NistCurveParams,
+) {
+    let cloned_nm: Vec<String> = t.nm.clone();
+    let init_strs: Vec<&str> = cloned_nm.iter().map(|s| s.as_str()).collect();
+    let mut it = ECTracker::new(&init_strs, e);
+    let it = &mut it;
+
+    // Keep the pre-add accumulator: it is what must be DOUBLED in the
+    // exceptional case, and the add below consumes jx/jy/jz.
+    it.copy_to_top("jx", "_sx");
+    it.copy_to_top("jy", "_sy");
+    it.copy_to_top("jz", "_sz");
+
+    c_jacobian_add_affine_body(it, true, c);
+
+    // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+    // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+    // signals the point at infinity.
+    it.to_top("_H_keep");
+    it.push_int("_zero_h", 0);
+    it.raw_block(&["_H_keep", "_zero_h"], Some("_h_is0"), |e2| {
+        e2(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    it.to_top("_R_keep");
+    it.push_int("_zero_r", 0);
+    it.raw_block(&["_R_keep", "_zero_r"], Some("_r_is0"), |e2| {
+        e2(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    it.to_top("_h_is0");
+    it.to_top("_r_is0");
+    it.raw_block(&["_h_is0", "_r_is0"], Some("_cond"), |e2| {
+        e2(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
+    // Move the add result aside so c_jacobian_double can work on jx/jy/jz
+    // again, this time holding the saved accumulator.
+    it.to_top("jx"); it.rename("_add_x");
+    it.to_top("jy"); it.rename("_add_y");
+    it.to_top("jz"); it.rename("_add_z");
+    it.to_top("_sx"); it.rename("jx");
+    it.to_top("_sy"); it.rename("jy");
+    it.to_top("_sz"); it.rename("jz");
+    c_jacobian_double(it, c);
+    it.to_top("jx"); it.rename("_dbl_x");
+    it.to_top("jy"); it.rename("_dbl_y");
+    it.to_top("jz"); it.rename("_dbl_z");
+
+    it.copy_to_top("_cond", "_cond_x");
+    c_select_coord(it, "_add_x", "_dbl_x", "_cond_x", "jx", c);
+    it.copy_to_top("_cond", "_cond_y");
+    c_select_coord(it, "_add_y", "_dbl_y", "_cond_y", "jy", c);
+    it.to_top("_cond"); it.rename("_cond_z");
+    c_select_coord(it, "_add_z", "_dbl_z", "_cond_z", "jz", c);
+}
+
+// ===========================================================================
+// Scalar multiplication (generic for both P-256 and P-384)
+// ===========================================================================
 
 fn c_emit_mul(emit: &mut dyn FnMut(StackOp), c: &NistCurveParams, g: &NistGroupParams) {
     let mut t = ECTracker::new(&["_pt", "_k"], emit);
     c_decompose_point(&mut t, "_pt", "ax", "ay", c);
 
-    // Reduce the scalar into [0, n-1] so the ladder covers the whole domain:
-    // negative k and k >= n are now defined rather than undefined behaviour.
-    c_group_mod(&mut t, "_k", "_k", g);
+    // k' = k + 3n (pre-compute 3n to match Go peephole optimizer output)
+    //
+    // The "k ∈ [1, n-1]" precondition is one the caller cannot enforce — the
+    // scalar is usually an unlock argument — so reduce it first.
+    t.to_top("_k");
+    c_emit_scalar_reduce(&mut t, "_k", "_kr", g);
+    let three_n = &**g.n * 3;
+    t.push_big_int("_3n", &three_n);
+    t.raw_block(&["_kr", "_3n"], Some("_kn3"), |e| {
+        e(StackOp::Opcode("OP_ADD".into()));
+    });
+    t.rename("_k");
 
-    // Accumulator := point at infinity (0 : 1 : 0), a legal input to both
-    // complete formulas — which is why no leading-bit special case is needed.
-    t.push_int("jx", 0);
-    t.push_int("jy", 1);
-    t.push_int("jz", 0);
+    // Determine iteration count based on 3*n bit length
+    let four_n_minus_1: BigInt = (&**g.n) * 4 - BigInt::one();
+    let top_bit = four_n_minus_1.bits() as usize;
+    let start_bit = top_bit - 2; // highest bit is always 1 (init), start from next
 
-    // One iteration per bit of n: 256 for P-256, 384 for P-384.
-    let start_bit = (g.n.bits() as usize) - 1;
+    // Init accumulator = P (top bit of k+3n is always 1)
+    t.copy_to_top("ax", "jx");
+    t.copy_to_top("ay", "jy");
+    t.push_int("jz", 1);
 
+    // Iterate from start_bit down to 0
     for bit in (0..=start_bit).rev() {
-        c_projective_double(&mut t, c);
+        c_jacobian_double(&mut t, c);
 
         // Extract bit: (k >> bit) & 1
         t.copy_to_top("_k", "_k_copy");
@@ -833,8 +1052,15 @@ fn c_emit_mul(emit: &mut dyn FnMut(StackOp), c: &NistCurveParams, g: &NistGroupP
         // Conditional add
         t.to_top("_bit");
         t.nm.pop(); // _bit consumed by IF
+        // Only the final step can be handed two equal operands — see
+        // c_build_jacobian_add_or_double_inline for why, and for what it costs
+        // not to.
         let add_ops = collect_ops(|add_emit| {
-            c_build_projective_add_mixed_inline(add_emit, &t, c);
+            if bit == 0 {
+                c_build_jacobian_add_or_double_inline(add_emit, &t, c);
+            } else {
+                c_build_jacobian_add_affine_inline(add_emit, &t, c);
+            }
         });
         (t.e)(StackOp::If {
             then_ops: add_ops,
@@ -842,7 +1068,7 @@ fn c_emit_mul(emit: &mut dyn FnMut(StackOp), c: &NistCurveParams, g: &NistGroupP
         });
     }
 
-    c_projective_to_affine(&mut t, "_rx", "_ry", c);
+    c_jacobian_to_affine(&mut t, "_rx", "_ry", c);
 
     // Clean up
     t.to_top("ax"); t.drop();
@@ -882,6 +1108,33 @@ fn c_field_pow(t: &mut ECTracker, base_name: &str, exp: &BigInt, result_name: &s
 // Pubkey decompression (prefix byte + x -> (x, y))
 // ===========================================================================
 
+/// Decompress a compressed pubkey: [prefix||x] → (x_num, y_num, valid).
+///
+/// For P-256/P-384 where a = -3:
+///   y^2 = x^3 - 3x + b mod p
+///   y = (y^2)^((p+1)/4) mod p
+///   Select y or p-y based on prefix parity.
+///
+/// `(y^2)^((p+1)/4)` is a square root ONLY when y^2 is a quadratic residue; both
+/// primes are ≡ 3 (mod 4), so for a non-residue it returns a square root of
+/// -y^2 instead and the recovered point is NOT on the curve. Nor is x checked
+/// against p: `c_decompose_point`-style BIN2NUM accepts any width-fitting value
+/// and every field op silently reduces it, so a non-canonical x decompresses
+/// happily too.
+///
+/// Both matter because the only consumer is `c_emit_verify_ecdsa`, which feeds
+/// the result straight into `c_emit_mul`. That ladder's exception analysis (see
+/// `c_build_jacobian_add_or_double_inline`) is stated for points ON the curve,
+/// where cofactor 1 pins ord(P) = n; an off-curve point lands on the twist,
+/// whose order is composite, so the degenerate steps the interval argument
+/// rules out become reachable. The pubkey is a caller-supplied unlock argument.
+///
+/// So this emits a third output, `_dk_valid` = (x < p) AND (y_cand^2 == y^2)
+/// AND (prefix ∈ {0x02, 0x03}), which the caller ANDs into the verifier's
+/// boolean result. A flag, not an OP_VERIFY: `verifyECDSA_*` is a total
+/// boolean-valued builtin and turning attacker-chosen bytes into a script abort
+/// would be a liveness regression — the same argument c_emit_scalar_reduce
+/// makes for reducing rather than rejecting.
 fn c_decompress_pub_key(
     t: &mut ECTracker,
     pk_name: &str,
@@ -900,6 +1153,23 @@ fn c_decompress_pub_key(
     });
     t.nm.push("_dk_prefix".to_string());
     t.nm.push("_dk_xbytes".to_string());
+
+    // SEC1 §2.3.4 requires the prefix to be exactly 0x02 or 0x03. The parity
+    // reduction below is `BIN2NUM, 2 MOD`, which accepts far more than that:
+    // 0x00 / 0x04 / 0x82 all alias to "even", and 0x83 is worse than an alias —
+    // BIN2NUM(0x83) = -3 (sign-magnitude), -3 mod 2 = -1, which encodes as 0x81
+    // and can never equal `_dk_y_par` ∈ {<>, 0x01}, so the select silently
+    // returns the OTHER square root. Test the byte itself.
+    t.copy_to_top("_dk_prefix", "_dk_pfx_in");
+    t.raw_block(&["_dk_pfx_in"], Some("_dk_pfx_ok"), |e| {
+        e(StackOp::Dup);
+        e(StackOp::Push(PushValue::Bytes(vec![0x02])));
+        e(StackOp::Opcode("OP_EQUAL".into()));
+        e(StackOp::Swap);
+        e(StackOp::Push(PushValue::Bytes(vec![0x03])));
+        e(StackOp::Opcode("OP_EQUAL".into()));
+        e(StackOp::Opcode("OP_BOOLOR".into()));
+    });
 
     // Convert prefix to parity: 0x02 -> 0, 0x03 -> 1
     t.to_top("_dk_prefix");
@@ -936,7 +1206,11 @@ fn c_decompress_pub_key(
     t.push_big_int("_dk_b", curve_b);
     c_field_add(t, "_dk_x3m3x", "_dk_b", "_dk_y2", c);
 
-    // y = (y^2)^sqrtExp mod p
+    // y = (y^2)^sqrtExp mod p. c_field_pow CONSUMES its base, so keep a copy of
+    // y^2 for the residue check at the end. It has to sit BELOW _dk_y_cand: the
+    // parity select below is an OP_IF whose branches are a bare drop / nip, so
+    // nothing may come between _dk_y_cand and the negated candidate.
+    t.copy_to_top("_dk_y2", "_dk_y2_keep");
     c_field_pow(t, "_dk_y2", sqrt_exp, "_dk_y_cand", c);
 
     // Check if candidate y has the right parity
@@ -982,11 +1256,139 @@ fn c_decompress_pub_key(
     if let Some(xs_idx) = t.nm.iter().rposition(|n| n == "_dk_x_save") {
         t.nm[xs_idx] = qx_name.to_string();
     }
+
+    // valid = (qy^2 == y^2) AND (qx < p) AND (prefix ∈ {0x02, 0x03}).
+    // The selected qy is y_cand or p - y_cand, so squaring it tests the same
+    // residue property either way. The first conjunct rejects an x whose RHS is
+    // a quadratic non-residue — the recovered point is then off the curve; the
+    // second rejects a non-canonical encoding of an otherwise fine x; the third
+    // rejects a prefix byte the parity reduction would otherwise alias or, for
+    // 0x83, silently invert.
+    t.copy_to_top(qy_name, "_dk_y_sq_in");
+    c_field_sqr(t, "_dk_y_sq_in", "_dk_y_sq", c);
+    t.to_top("_dk_y_sq");
+    t.to_top("_dk_y2_keep");
+    t.raw_block(&["_dk_y_sq", "_dk_y2_keep"], Some("_dk_res_ok"), |e| {
+        e(StackOp::Opcode("OP_NUMEQUAL".into()));
+    });
+    t.copy_to_top(qx_name, "_dk_x_lt");
+    c_push_field_p(t, "_dk_p_lt", c);
+    t.raw_block(&["_dk_x_lt", "_dk_p_lt"], Some("_dk_x_ok"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.to_top("_dk_res_ok");
+    t.to_top("_dk_x_ok");
+    t.raw_block(&["_dk_res_ok", "_dk_x_ok"], Some("_dk_curve_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+    t.to_top("_dk_pfx_ok");
+    t.raw_block(&["_dk_curve_ok", "_dk_pfx_ok"], Some("_dk_valid"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
 }
 
 // ===========================================================================
 // ECDSA verification
 // ===========================================================================
+
+/// Length gate for an untrusted byte argument: leaves `[flag, clamped]`.
+///
+/// `flag` is `OP_SIZE(v) == want`; `clamped` is `v` forced to exactly `want`
+/// bytes by `v ‖ 00*want`, split at `want`, tail dropped — truncating a long
+/// value and zero-extending a short one.
+///
+/// The clamp exists so the gate can stay a FLAG. Everything downstream peels a
+/// fixed number of bytes (`OP_SPLIT coord_bytes`, then 32/48 single-byte splits
+/// inside emit_reverse_32/48); handed 32 <= len(sig) < 64 the reversal runs out
+/// of bytes mid-loop and the SCRIPT ABORTS, which would make
+/// `verifyECDSA_P256(...) || fallback` unwritable and contradict this module's
+/// own totality rule (see c_decompress_pub_key). Clamping first makes every path
+/// total; the caller ANDs `flag` into the result so a wrong-length argument can
+/// never verify whatever the clamped bytes computed.
+///
+/// Branch-free on purpose: the tracker's static stack model, and the emitted op
+/// sequence, are the same for every input length — the argument c_affine_add
+/// makes for selecting operands instead of branching.
+fn c_emit_length_gate(t: &mut ECTracker, name: &str, want: usize, flag_name: &str) {
+    t.to_top(name);
+    t.raw_block(&[name], None, |e| {
+        e(StackOp::Opcode("OP_SIZE".into()));
+        e(StackOp::Push(PushValue::Int(BigInt::from(want as i128))));
+        e(StackOp::Opcode("OP_NUMEQUAL".into()));
+        e(StackOp::Swap);
+        e(StackOp::Push(PushValue::Bytes(vec![0u8; want])));
+        e(StackOp::Opcode("OP_CAT".into()));
+        e(StackOp::Push(PushValue::Int(BigInt::from(want as i128))));
+        e(StackOp::Opcode("OP_SPLIT".into()));
+        e(StackOp::Drop);
+    });
+    t.nm.push(flag_name.to_string());
+    t.nm.push(name.to_string());
+}
+
+/// SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2: verify 1 <= r <= n-1 and
+/// 1 <= s <= n-1. Consumes nothing, leaves `_range_ok` above `_r` and `_s`.
+///
+/// ==> THIS IS A UNIVERSAL FORGERY GUARD, NOT A HYGIENE CHECK. <==
+///
+/// Nothing checked r or s at all, and `c_group_inv` is Fermat (a^(n-2) mod n),
+/// so inv(0) = 0 instead of an error. With `sig = 0x00…` and the contract's own
+/// genuine, PUBLIC key:
+///
+///   r = s = 0            (BIN2NUM of coord_bytes zero bytes -> empty vector)
+///   w = s^(n-2) = 0      Fermat, no failure channel
+///   u1 = u2 = 0          every c_group_mul in the ladder is 0*0 mod n
+///   R1 = R2 = O          c_emit_mul reduces 0, k' = 3n = 0 mod n, so Z3 = 0 and
+///                        c_jacobian_to_affine's Fermat inverse turns it all-zero
+///   R1 + R2              c_affine_add sees xeq = yeq = 1, takes the tangent
+///                        with den = 2*0 = 0, so s = 0 and rx = ry = 0
+///   (R.x mod n) == r     OP_EQUAL(<>, <>) = 1
+///
+/// ...and `_dk_valid` is 1 because the pubkey is genuine. TRUE. No secret, no
+/// off-curve point, not bound to the message: an all-zero signature verified for
+/// ANY message under ANY public key. `examples/ts/p256-wallet` made exactly that
+/// call its second authentication factor.
+///
+/// BOTH conjuncts are load-bearing and neither is redundant:
+///   - s = 0 (or s = n, which Fermat also inverts to 0) is what collapses both
+///     ladders to O;
+///   - r = 0 is what makes the final OP_EQUAL compare the resulting 0 against
+///     something that is also 0.
+/// `r = 0, s = n` is a second spelling of the same forgery that an `s != 0`
+/// check alone would miss, which is why the bound is `< n` and not `!= 0`.
+///
+/// A flag rather than an OP_VERIFY, for the reason c_decompress_pub_key gives.
+fn c_emit_sig_range_gate(t: &mut ECTracker, g: &NistGroupParams) {
+    t.copy_to_top("_r", "_r_nz_in");
+    t.raw_block(&["_r_nz_in"], Some("_r_nz"), |e| {
+        e(StackOp::Opcode("OP_0NOTEQUAL".into()));
+    });
+    t.copy_to_top("_r", "_r_lt_in");
+    c_push_group_n(t, "_n_for_r", g);
+    t.raw_block(&["_r_lt_in", "_n_for_r"], Some("_r_lt"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.raw_block(&["_r_nz", "_r_lt"], Some("_r_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
+    t.copy_to_top("_s", "_s_nz_in");
+    t.raw_block(&["_s_nz_in"], Some("_s_nz"), |e| {
+        e(StackOp::Opcode("OP_0NOTEQUAL".into()));
+    });
+    t.copy_to_top("_s", "_s_lt_in");
+    c_push_group_n(t, "_n_for_s", g);
+    t.raw_block(&["_s_lt_in", "_n_for_s"], Some("_s_lt"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.raw_block(&["_s_nz", "_s_lt"], Some("_s_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
+    t.raw_block(&["_r_ok", "_s_ok"], Some("_range_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+}
 
 fn c_emit_verify_ecdsa(
     emit: &mut dyn FnMut(StackOp),
@@ -998,6 +1400,20 @@ fn c_emit_verify_ecdsa(
     gy: &BigInt,
 ) {
     let mut t = ECTracker::new(&["_msg", "_sig", "_pk"], emit);
+
+    // Step 0: length gate. `_sig` and `_pk` are bare ByteString in the builtin
+    // table and the type checker imposes no width, so both arrive attacker-sized.
+    // Clamp them and remember whether they were the right size — see
+    // c_emit_length_gate for why a clamp and not an abort. Without it `sig ‖ junk`
+    // verified identically to `sig` (fatal for any contract using signature bytes
+    // as a nullifier), and a short `sig` aborted the script outright.
+    c_emit_length_gate(&mut t, "_pk", c.coord_bytes + 1, "_pk_len_ok");
+    c_emit_length_gate(&mut t, "_sig", c.coord_bytes * 2, "_sig_len_ok");
+    t.to_top("_pk_len_ok");
+    t.to_top("_sig_len_ok");
+    t.raw_block(&["_pk_len_ok", "_sig_len_ok"], Some("_len_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
 
     // Step 1: e = SHA-256(msg) as integer
     t.to_top("_msg");
@@ -1038,8 +1454,26 @@ fn c_emit_verify_ecdsa(
         e(StackOp::Opcode("OP_BIN2NUM".into()));
     });
 
-    // Step 3: Decompress pubkey
+    // Step 2b: 1 <= r, s <= n-1. Without this an all-zero signature verifies for
+    // any message under any pubkey — see c_emit_sig_range_gate.
+    c_emit_sig_range_gate(&mut t, g);
+
+    // Step 3: Decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
+    // bytes do not decompress to a canonical on-curve point, which is ANDed into
+    // the result below so such a key can never verify.
     c_decompress_pub_key(&mut t, "_pk", "_qx", "_qy", c, curve_b, sqrt_exp);
+
+    // Collapse the three argument verdicts into one flag. Everything below then
+    // carries a single item, as it did when `_dk_valid` was the only one.
+    t.to_top("_len_ok");
+    t.to_top("_range_ok");
+    t.raw_block(&["_len_ok", "_range_ok"], Some("_arg_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+    t.to_top("_dk_valid");
+    t.raw_block(&["_arg_ok", "_dk_valid"], Some("_input_ok"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
 
     // Step 4: w = s^{-1} mod n
     c_group_inv(&mut t, "_s", "_w", g);
@@ -1063,7 +1497,10 @@ fn c_emit_verify_ecdsa(
     t.push_bytes("_G", g_point_data);
     t.to_top("_u1");
 
-    // Stash items on altstack
+    // Stash items on altstack.
+    // _input_ok goes DEEPEST — the altstack is LIFO and it is popped last.
+    t.to_top("_input_ok");
+    t.to_alt();
     t.to_top("_r_save");
     t.to_alt();
     t.to_top("_u2");
@@ -1126,14 +1563,24 @@ fn c_emit_verify_ecdsa(
 
     c_group_mod(&mut t, "rx", "_rx_mod_n", g);
 
-    // Restore r
+    // Restore r, then the argument verdict beneath it
     t.from_alt("_r_save");
+    t.from_alt("_input_ok");
 
     // Compare
     t.to_top("_rx_mod_n");
     t.to_top("_r_save");
-    t.raw_block(&["_rx_mod_n", "_r_save"], Some("_result"), |e| {
+    t.raw_block(&["_rx_mod_n", "_r_save"], Some("_sig_ok"), |e| {
         e(StackOp::Opcode("OP_EQUAL".into()));
+    });
+
+    // Arguments that were the wrong length, out of range, or did not decompress
+    // to a canonical on-curve point can never verify, whatever the ladder made
+    // of them.
+    t.to_top("_input_ok");
+    t.to_top("_sig_ok");
+    t.raw_block(&["_input_ok", "_sig_ok"], Some("_result"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
 
@@ -1178,6 +1625,7 @@ pub fn emit_p256_negate(emit: &mut dyn FnMut(StackOp)) {
 pub fn emit_p256_on_curve(emit: &mut dyn FnMut(StackOp)) {
     let mut t = ECTracker::new(&["_pt"], emit);
     c_decompose_point(&mut t, "_pt", "_x", "_y", &P256_CURVE);
+    c_emit_canonicity_guard(&mut t, "_x", "_y", &P256_CURVE);
 
     // lhs = y^2
     c_field_sqr(&mut t, "_y", "_y2", &P256_CURVE);
@@ -1195,8 +1643,15 @@ pub fn emit_p256_on_curve(emit: &mut dyn FnMut(StackOp)) {
     // Compare
     t.to_top("_y2");
     t.to_top("_rhs");
-    t.raw_block(&["_y2", "_rhs"], Some("_result"), |e| {
+    t.raw_block(&["_y2", "_rhs"], Some("_curve_eq"), |e| {
         e(StackOp::Opcode("OP_EQUAL".into()));
+    });
+
+    // on-curve = canonical AND curve-equation
+    t.to_top("_canon");
+    t.to_top("_curve_eq");
+    t.raw_block(&["_canon", "_curve_eq"], Some("_result"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
 
@@ -1273,6 +1728,7 @@ pub fn emit_p384_negate(emit: &mut dyn FnMut(StackOp)) {
 pub fn emit_p384_on_curve(emit: &mut dyn FnMut(StackOp)) {
     let mut t = ECTracker::new(&["_pt"], emit);
     c_decompose_point(&mut t, "_pt", "_x", "_y", &P384_CURVE);
+    c_emit_canonicity_guard(&mut t, "_x", "_y", &P384_CURVE);
 
     // lhs = y^2
     c_field_sqr(&mut t, "_y", "_y2", &P384_CURVE);
@@ -1290,8 +1746,15 @@ pub fn emit_p384_on_curve(emit: &mut dyn FnMut(StackOp)) {
     // Compare
     t.to_top("_y2");
     t.to_top("_rhs");
-    t.raw_block(&["_y2", "_rhs"], Some("_result"), |e| {
+    t.raw_block(&["_y2", "_rhs"], Some("_curve_eq"), |e| {
         e(StackOp::Opcode("OP_EQUAL".into()));
+    });
+
+    // on-curve = canonical AND curve-equation
+    t.to_top("_canon");
+    t.to_top("_curve_eq");
+    t.raw_block(&["_canon", "_curve_eq"], Some("_result"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
 

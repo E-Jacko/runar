@@ -1192,26 +1192,51 @@ export class RunarInterpreter {
         return { kind: 'boolean', value: verifyECDSA_P384_impl(msg, rawSig, compressedPub) };
       }
 
-      // P-256 / P-384 curve operations (mocked — return zero bytes)
-      case 'p256Add':
-      case 'p256Mul':
-      case 'p256MulGen':
-      case 'p256Negate':
-      case 'p384Add':
-      case 'p384Mul':
-      case 'p384MulGen':
-      case 'p384Negate':
-        return { kind: 'bytes', value: new Uint8Array(64) };
+      // P-256 / P-384 curve operations.
+      //
+      // These were MOCKED — every point op returned 64 zero bytes and every
+      // on-curve check returned `true`. Nothing on any path therefore executed
+      // the emitted NIST script, which is exactly how `pNNNAdd(P, P)` and
+      // `pNNNMul(P, 2n)` shipped wrong: the differential oracle compared a
+      // constant against a constant and always agreed.
+      case 'p256Add': {
+        return { kind: 'bytes', value: nistAddImpl(P256, this.toBytes(args[0]!), this.toBytes(args[1]!)) };
+      }
+      case 'p256Mul': {
+        return { kind: 'bytes', value: nistMulImpl(P256, this.toBytes(args[0]!), this.toBigInt(args[1]!)) };
+      }
+      case 'p256MulGen': {
+        return { kind: 'bytes', value: nistMulGenImpl(P256, this.toBigInt(args[0]!)) };
+      }
+      case 'p256Negate': {
+        return { kind: 'bytes', value: nistNegateImpl(P256, this.toBytes(args[0]!)) };
+      }
+      case 'p384Add': {
+        return { kind: 'bytes', value: nistAddImpl(P384, this.toBytes(args[0]!), this.toBytes(args[1]!)) };
+      }
+      case 'p384Mul': {
+        return { kind: 'bytes', value: nistMulImpl(P384, this.toBytes(args[0]!), this.toBigInt(args[1]!)) };
+      }
+      case 'p384MulGen': {
+        return { kind: 'bytes', value: nistMulGenImpl(P384, this.toBigInt(args[0]!)) };
+      }
+      case 'p384Negate': {
+        return { kind: 'bytes', value: nistNegateImpl(P384, this.toBytes(args[0]!)) };
+      }
 
-      case 'p256OnCurve':
-      case 'p384OnCurve':
-        return { kind: 'boolean', value: true };
+      case 'p256OnCurve': {
+        return { kind: 'boolean', value: nistOnCurveImpl(P256, this.toBytes(args[0]!)) };
+      }
+      case 'p384OnCurve': {
+        return { kind: 'boolean', value: nistOnCurveImpl(P384, this.toBytes(args[0]!)) };
+      }
 
-      case 'p256EncodeCompressed':
-        return { kind: 'bytes', value: new Uint8Array(33) };
-
-      case 'p384EncodeCompressed':
-        return { kind: 'bytes', value: new Uint8Array(49) };
+      case 'p256EncodeCompressed': {
+        return { kind: 'bytes', value: nistEncodeCompressedImpl(P256, this.toBytes(args[0]!)) };
+      }
+      case 'p384EncodeCompressed': {
+        return { kind: 'bytes', value: nistEncodeCompressedImpl(P384, this.toBytes(args[0]!)) };
+      }
 
       case 'blake3Compress': {
         const cv = this.toBytes(args[0]!);
@@ -1514,6 +1539,12 @@ function verifyECDSA_P256_impl(
   compressedPub: Uint8Array,
 ): boolean {
   try {
+    // Exact widths, matching the emitted script's OP_SIZE gate. Without this
+    // the subarrays below silently IGNORE trailing bytes, so `sig ‖ junk`
+    // verified here while the script rejects it — a differential-oracle
+    // divergence on the malleability case the size gate exists to close.
+    if (rawSig.length !== 64 || compressedPub.length !== 33) return false;
+
     // Convert raw r||s (64 bytes) to DER for Node.js verify()
     const r = rawSig.subarray(0, 32);
     const s = rawSig.subarray(32, 64);
@@ -1585,6 +1616,10 @@ function verifyECDSA_P384_impl(
   compressedPub: Uint8Array,
 ): boolean {
   try {
+    // Exact widths, matching the emitted script's OP_SIZE gate — see the
+    // P-256 helper above for why ignoring trailing bytes is not harmless.
+    if (rawSig.length !== 96 || compressedPub.length !== 49) return false;
+
     // Convert raw r||s (96 bytes) to DER for Node.js verify()
     const r = rawSig.subarray(0, 48);
     const s = rawSig.subarray(48, 96);
@@ -1728,6 +1763,14 @@ function ecPointAddCoords(
   x1: bigint, y1: bigint, x2: bigint, y2: bigint,
 ): [bigint, bigint] {
   const p = EC_P;
+  // P + (-P) = O. Affine x||y cannot encode O, so both this interpreter and
+  // `affineAdd` in ec-codegen.ts represent it as the ALL-ZERO point — the same
+  // encoding `ecMul(P, 0n)` already yields. The two MUST agree: the differential
+  // oracle in conformance/witnesses/real-crypto-execution.test.ts asserts
+  // `interpreterAccepted === vmAccepted`, so a divergence here is a conformance
+  // failure, and "make the interpreter match the script" would be the wrong
+  // repair if the script were the one that had drifted.
+  if (x1 === x2 && y1 !== y2) return [0n, 0n];
   if (x1 === x2 && y1 === y2) {
     // Point doubling
     const s = ecMod(3n * x1 * x1 * ecModInv(2n * y1, p), p);
@@ -1744,7 +1787,12 @@ function ecPointAddCoords(
 function ecScalarMul(x: bigint, y: bigint, k: bigint): [bigint, bigint] {
   const n = EC_N;
   k = ecMod(k, n);
-  if (k === 0n) throw new Error('ecMul: scalar is 0');
+  // k ≡ 0 (mod n) is the point at infinity. Affine x‖y cannot encode it, and
+  // the emitted script yields the all-zero point there (fieldInv is Fermat, so
+  // inv(0) = 0). Return the same thing rather than throwing: the interpreter is
+  // a differential oracle for that script, so a throw here would be a
+  // divergence the oracle can never report.
+  if (k === 0n) return [0n, 0n];
   let rx = x;
   let ry = y;
   let started = false;
@@ -1824,6 +1872,160 @@ function ecPointXImpl(pt: Uint8Array): bigint {
 function ecPointYImpl(pt: Uint8Array): bigint {
   const [, y] = ecDecodePoint(pt);
   return y;
+}
+
+// ---------------------------------------------------------------------------
+// NIST P-256 / P-384 interpreter helpers
+// ---------------------------------------------------------------------------
+//
+// Real arithmetic over y^2 = x^3 - 3x + b. These replace mocks that returned a
+// constant zero point (and an unconditional `true` from the on-curve check),
+// which made the source-vs-script differential oracle vacuous for both curves.
+//
+// `nistOnCurveImpl` carries the same GAP-301 canonicity guard as
+// `ecOnCurveImpl`, because `emitP256OnCurve` / `emitP384OnCurve` now emit it
+// too. The two must move together: a differential oracle that accepts an input
+// the script rejects is not an oracle.
+
+type NistCurve = {
+  p: bigint;
+  n: bigint;
+  b: bigint;
+  gx: bigint;
+  gy: bigint;
+  /** 32 for P-256, 48 for P-384 */
+  coordBytes: number;
+  name: string;
+};
+
+const P256: NistCurve = {
+  p: 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFn,
+  n: 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551n,
+  b: 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604Bn,
+  gx: 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296n,
+  gy: 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5n,
+  coordBytes: 32,
+  name: 'P-256',
+};
+
+const P384: NistCurve = {
+  p: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFF0000000000000000FFFFFFFFn,
+  n: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973n,
+  b: 0xB3312FA7E23EE7E4988E056BE3F82D19181D9C6EFE8141120314088F5013875AC656398D8A2ED19D2A85C8EDD3EC2AEFn,
+  gx: 0xAA87CA22BE8B05378EB1C71EF320AD746E1D3B628BA79B9859F741E082542A385502F25DBF55296C3A545E3872760AB7n,
+  gy: 0x3617DE4A96262C6F5D9E98BF9292DC29F8F41DBD289A147CE9DA3113B5F0B8C00A60B1CE1D7E819D7A431D7C90EA0E5Fn,
+  coordBytes: 48,
+  name: 'P-384',
+};
+
+function nistDecodePoint(c: NistCurve, bytes: Uint8Array): [bigint, bigint] {
+  const w = c.coordBytes;
+  if (bytes.length !== w * 2) {
+    throw new Error(`${c.name} point must be ${w * 2} bytes, got ${bytes.length}`);
+  }
+  let x = 0n;
+  let y = 0n;
+  for (let i = 0; i < w; i++) x = (x << 8n) | BigInt(bytes[i]!);
+  for (let i = w; i < w * 2; i++) y = (y << 8n) | BigInt(bytes[i]!);
+  return [x, y];
+}
+
+function nistEncodePoint(c: NistCurve, x: bigint, y: bigint): Uint8Array {
+  const w = c.coordBytes;
+  const bytes = new Uint8Array(w * 2);
+  let vx = x;
+  let vy = y;
+  for (let i = w - 1; i >= 0; i--) {
+    bytes[i] = Number(vx & 0xFFn);
+    vx >>= 8n;
+  }
+  for (let i = w * 2 - 1; i >= w; i--) {
+    bytes[i] = Number(vy & 0xFFn);
+    vy >>= 8n;
+  }
+  return bytes;
+}
+
+/** Affine addition on an a = -3 curve, with the tangent case for P == Q. */
+function nistPointAddCoords(
+  c: NistCurve, x1: bigint, y1: bigint, x2: bigint, y2: bigint,
+): [bigint, bigint] {
+  const p = c.p;
+  // See ecPointAddCoords: P + (-P) = O, encoded as the all-zero point, exactly
+  // as cAffineAdd in p256-p384-codegen.ts does.
+  if (x1 === x2 && y1 !== y2) return [0n, 0n];
+  const s = (x1 === x2 && y1 === y2)
+    ? ecMod((3n * x1 * x1 - 3n) * ecModInv(2n * y1, p), p)   // tangent, a = -3
+    : ecMod((y2 - y1) * ecModInv(x2 - x1, p), p);            // chord
+  const rx = ecMod(s * s - x1 - x2, p);
+  return [rx, ecMod(s * (x1 - rx) - y1, p)];
+}
+
+function nistScalarMul(c: NistCurve, x: bigint, y: bigint, k: bigint): [bigint, bigint] {
+  const kk = ecMod(k, c.n);
+  // See ecScalarMul: k ≡ 0 (mod n) is O, which the emitted script yields as the
+  // all-zero point. Match it instead of throwing.
+  if (kk === 0n) return [0n, 0n];
+  let rx = x;
+  let ry = y;
+  let started = false;
+  for (let i = c.coordBytes * 8 - 1; i >= 0; i--) {
+    if (started) [rx, ry] = nistPointAddCoords(c, rx, ry, rx, ry);
+    if ((kk >> BigInt(i)) & 1n) {
+      if (!started) {
+        rx = x;
+        ry = y;
+        started = true;
+      } else {
+        [rx, ry] = nistPointAddCoords(c, rx, ry, x, y);
+      }
+    }
+  }
+  return [rx, ry];
+}
+
+function nistAddImpl(c: NistCurve, a: Uint8Array, b: Uint8Array): Uint8Array {
+  const [ax, ay] = nistDecodePoint(c, a);
+  const [bx, by] = nistDecodePoint(c, b);
+  const [rx, ry] = nistPointAddCoords(c, ax, ay, bx, by);
+  return nistEncodePoint(c, rx, ry);
+}
+
+function nistMulImpl(c: NistCurve, pt: Uint8Array, k: bigint): Uint8Array {
+  const [x, y] = nistDecodePoint(c, pt);
+  const [rx, ry] = nistScalarMul(c, x, y, k);
+  return nistEncodePoint(c, rx, ry);
+}
+
+function nistMulGenImpl(c: NistCurve, k: bigint): Uint8Array {
+  const [rx, ry] = nistScalarMul(c, c.gx, c.gy, k);
+  return nistEncodePoint(c, rx, ry);
+}
+
+function nistNegateImpl(c: NistCurve, pt: Uint8Array): Uint8Array {
+  const [x, y] = nistDecodePoint(c, pt);
+  return nistEncodePoint(c, x, ecMod(c.p - y, c.p));
+}
+
+function nistOnCurveImpl(c: NistCurve, pt: Uint8Array): boolean {
+  const [x, y] = nistDecodePoint(c, pt);
+  // GAP-301: reject non-canonical coordinate encodings (x >= p or y >= p) to
+  // match the compiled script, which range-checks the coordinates before the
+  // field arithmetic reduces them mod p.
+  if (x >= c.p || y >= c.p) return false;
+  return ecMod(y * y, c.p) === ecMod(x * x * x - 3n * x + c.b, c.p);
+}
+
+function nistEncodeCompressedImpl(c: NistCurve, pt: Uint8Array): Uint8Array {
+  const [x, y] = nistDecodePoint(c, pt);
+  const result = new Uint8Array(c.coordBytes + 1);
+  result[0] = (y & 1n) === 0n ? 0x02 : 0x03;
+  let vx = x;
+  for (let i = c.coordBytes; i >= 1; i--) {
+    result[i] = Number(vx & 0xFFn);
+    vx >>= 8n;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

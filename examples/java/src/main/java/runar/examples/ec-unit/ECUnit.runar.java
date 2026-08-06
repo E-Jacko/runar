@@ -52,6 +52,10 @@ class ECUnit extends SmartContract {
         assertThat(ecOnCurve(doubled));
         Point sum = ecAdd(g, g);
         assertThat(ecOnCurve(sum));
+        // P + (-P) is the point at infinity: ecAdd returns the all-zero blob
+        // from a SUCCESSFUL script, and ecOnCurve must reject it.
+        Point infPt = ecAdd(g, neg);
+        assertThat(!ecOnCurve(infPt));
         BigInteger x = ecPointX(g);
         BigInteger y = ecPointY(g);
         Point rebuilt = ecMakePoint(x, y);

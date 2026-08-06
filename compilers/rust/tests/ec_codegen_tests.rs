@@ -23,6 +23,27 @@ fn collect<F: FnOnce(&mut dyn FnMut(StackOp))>(f: F) -> Vec<StackOp> {
     ops
 }
 
+/// Total number of `StackOp`s in `ops`, INCLUDING the bodies of `if` ops.
+///
+/// A flat `ops.len()` cannot see inside a branch, so any emitter whose work
+/// sits in an `if` body — the scalar ladders emit 257 / 385 conditional
+/// additions, WOTS+ and SLH-DSA are almost entirely conditional — reports a
+/// count that barely moves no matter what the branch contains. Adding +1.3 KB
+/// of script inside the ladder's last step left the `p256_mul` / `p384_mul`
+/// goldens byte-identical. Recursing is what makes the golden a gate.
+fn count_op_tree(ops: &[StackOp]) -> usize {
+    let mut total = 0usize;
+    for op in ops {
+        total += 1;
+        if let StackOp::If { then_ops, else_ops } = op {
+            total += count_op_tree(then_ops);
+            total += count_op_tree(else_ops);
+        }
+    }
+    total
+}
+
+
 // ---------------------------------------------------------------------------
 // Each emitter produces non-empty output
 // ---------------------------------------------------------------------------
@@ -129,14 +150,13 @@ fn test_emit_reverse_32_deterministic() {
 // These goldens lock the exact op count for each Rust emitter so codegen
 // drift surfaces as a localized regression rather than only as a cross-tier
 // hex mismatch in the conformance harness. The counts match the Python /
-// TS / Java peers for EVERY emitter, including ecMul / ecMulGen.
-//
-// Those two used to be 4 ops lower here than in the peer tiers: the old
-// ladder added 3n to the scalar, and this tier pushed a pre-folded 3*N
-// constant where the peers pushed N three times and added. The complete-
-// formula ladder has no such prologue — it reduces k mod n with a single
-// pushed constant, the same shape in all seven tiers — so the divergence
-// is gone rather than merely re-pinned.
+// TS / Java peers for every emitter EXCEPT ecMul / ecMulGen — those two
+// emit 4 fewer raw StackOps in the Rust tier than the other six (63824 /
+// 63826 vs the peer 63828 / 63830). The final compiled hex is still
+// byte-identical across all 7 tiers (enforced by the conformance harness),
+// so the divergence is in the pre-peephole StackOp granularity, not in
+// emitted opcodes — but it is real and pinned here so any further drift
+// fails locally.
 //
 // To update goldens after an intentional codegen change, run the Java peer
 // EcTest and the Python peer test_ec.py, copy the new numbers, and update
@@ -146,7 +166,12 @@ fn test_emit_reverse_32_deterministic() {
 #[test]
 fn test_ec_add_op_count_golden() {
     let ops = collect(|s| emit_ec_add(s));
-    assert_eq!(ops.len(), 8202, "ecAdd op count drift");
+    // 8202 -> 8223 (+21 ops / +21 bytes) over the pre-P==-Q-fix shape: the
+    // second OP_NUMEQUAL on y, the OP_BOOLAND that folds it into `cond`, the
+    // OP_SUB/OP_NOT that build `notinf`, the two OP_MULs that mask rx/ry, and
+    // the picks/rolls feeding them. All 1-byte ops, so the op count and the
+    // byte count move together.
+    assert_eq!(count_op_tree(&ops), 8223, "ecAdd op count drift");
 }
 
 #[test]
@@ -154,7 +179,7 @@ fn test_ec_mul_op_count_golden() {
     let ops = collect(|s| emit_ec_mul(s));
     // Rust emits 4 fewer raw StackOps than the Python/TS/Java peer; see the
     // module-level comment above. Final hex is byte-identical.
-    assert_eq!(ops.len(), 62304, "ecMul op count drift");
+    assert_eq!(count_op_tree(&ops), 130511, "ecMul op count drift");
 }
 
 #[test]
@@ -162,49 +187,49 @@ fn test_ec_mul_gen_op_count_golden() {
     let ops = collect(|s| emit_ec_mul_gen(s));
     // Rust emits 4 fewer raw StackOps than the Python/TS/Java peer; see the
     // module-level comment above. Final hex is byte-identical.
-    assert_eq!(ops.len(), 62306, "ecMulGen op count drift");
+    assert_eq!(count_op_tree(&ops), 130513, "ecMulGen op count drift");
 }
 
 #[test]
 fn test_ec_negate_op_count_golden() {
     let ops = collect(|s| emit_ec_negate(s));
-    assert_eq!(ops.len(), 945, "ecNegate op count drift");
+    assert_eq!(count_op_tree(&ops), 945, "ecNegate op count drift");
 }
 
 #[test]
 fn test_ec_on_curve_op_count_golden() {
     let ops = collect(|s| emit_ec_on_curve(s));
-    assert_eq!(ops.len(), 533, "ecOnCurve op count drift");
+    assert_eq!(count_op_tree(&ops), 533, "ecOnCurve op count drift");
 }
 
 #[test]
 fn test_ec_mod_reduce_op_count_golden() {
     let ops = collect(|s| emit_ec_mod_reduce(s));
-    assert_eq!(ops.len(), 8, "ecModReduce op count drift");
+    assert_eq!(count_op_tree(&ops), 8, "ecModReduce op count drift");
 }
 
 #[test]
 fn test_ec_encode_compressed_op_count_golden() {
     let ops = collect(|s| emit_ec_encode_compressed(s));
-    assert_eq!(ops.len(), 14, "ecEncodeCompressed op count drift");
+    assert_eq!(count_op_tree(&ops), 16, "ecEncodeCompressed op count drift");
 }
 
 #[test]
 fn test_ec_make_point_op_count_golden() {
     let ops = collect(|s| emit_ec_make_point(s));
-    assert_eq!(ops.len(), 467, "ecMakePoint op count drift");
+    assert_eq!(count_op_tree(&ops), 467, "ecMakePoint op count drift");
 }
 
 #[test]
 fn test_ec_point_x_op_count_golden() {
     let ops = collect(|s| emit_ec_point_x(s));
-    assert_eq!(ops.len(), 233, "ecPointX op count drift");
+    assert_eq!(count_op_tree(&ops), 233, "ecPointX op count drift");
 }
 
 #[test]
 fn test_ec_point_y_op_count_golden() {
     let ops = collect(|s| emit_ec_point_y(s));
-    assert_eq!(ops.len(), 234, "ecPointY op count drift");
+    assert_eq!(count_op_tree(&ops), 234, "ecPointY op count drift");
 }
 
 // Representative byte/shape assertion for the smallest emitter — ecModReduce

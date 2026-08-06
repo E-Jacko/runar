@@ -871,7 +871,14 @@ public final class MockCrypto {
     }
 
     public static boolean ecOnCurve(Point p) {
-        if (p.infinity) return true;
+        // The all-zero blob is this codegen's encoding of the point at infinity,
+        // and it is NOT on the curve: the emitted ecOnCurve is exactly
+        // x < p AND y < p AND y^2 == x^3 + 7, and 0 != 7. Returning true here
+        // (the projective convention) made this mock disagree with the script it
+        // stands in for, so `assertThat(ecOnCurve(r))` passed off-chain and
+        // failed on-chain for r = O -- an unspendable output found only after
+        // deploy. O is now reachable from ecAdd(P, -P), so this matters.
+        if (p.infinity) return false;
         BigInteger lhs = mod(p.y.pow(2), EC_P);
         BigInteger rhs = mod(p.x.pow(3).add(BigInteger.valueOf(7)), EC_P);
         return lhs.equals(rhs);

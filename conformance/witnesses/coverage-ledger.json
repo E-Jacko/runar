@@ -217,19 +217,6 @@
       }
     },
     {
-      "fixture": "p256-primitives",
-      "cause": "crypto-witness-infeasible",
-      "reason": "NIST P-256 EC primitives — non-secp256k1 EC witness",
-      "closePlan": {
-        "date": "2026-08-06",
-        "plan": "BLOCKED ON TWO CONFIRMED CODEGEN BUGS, the same pair `ec-unit` is blocked on — do not close by adding a witness before they are fixed. Verified 2026-08-06 by executing the emitted script through @bsv/sdk's Spend: p256Add(G, G) returns 29d05c193da77b71… where 2G is 7cf27b188d034f7e… (cAffineAdd in packages/runar-compiler/src/passes/p256-p384-codegen.ts still implements ONLY the chord slope (qy-py)/(qx-px); the tangent-select fix that commit 8a6494b4 applied to secp256k1 affineAdd was NEVER ported to the NIST-P curves), and p256Mul(G, 2n) returns an all-zero point (the Jacobian ladder's add-affine step degenerates when the accumulator equals the point being added). p256Mul(G, 3n) is correct, pinning the blob format. verifyAdd(a, b) would exercise the first defect directly and verify(k, basePoint) the second, so a real witness written today would go RED for the codegen, not for the harness. ORDER: fix both in all seven tiers, then close. CAUSE NOT RECLASSIFIED, deliberately: the spend needs no signature, so `crypto-witness-infeasible` reads false on its own wording, and the plain differential oracle is in fact blocked by something else entirely — the ANF interpreter MOCKS p256Add / p256Mul / p256MulGen (returns 64 zero bytes) and p256OnCurve (returns true unconditionally), see packages/runar-testing/src/interpreter/interpreter.ts, which is `interpreter-unsupported` in all but name. The cause is left as-is because `crypto-witness-infeasible` also carries PROVENANCE (it marks exactly the entries that came from the former crypto-exempt.json) and flipping it would destroy that; and because the interpreter mock is removable, so `interpreter-unsupported` would go stale in turn. Neither cause is the real blocker. verify(k, basePoint), verifyAdd(a, b) and verifyMulGen(k) take plain scalars and points, not a signature, so conformance/script_execution_test.go can run them the same way its 16 TestECPrimitives_* functions already run the ec-primitives fixture: compileRúnar(\"p256-primitives\", ...) + executeScript, with the witness built by the encodePushBigInt (:2510) and encodePushPoint (:2545) helpers that are already in that file. THE HARD PART IS THE EXPECTED VALUES, not the harness: the repo has NO P-256 curve-arithmetic KAT — conformance/runtime-vectors/ecdsa-rfc6979.json carries P-256 SIGNATURE vectors only, and packages/runar-go/crypto_kat_test.go (TestOfficialKAT_ECDSA_RFC6979) feeds them to the NATIVE Go implementation, never to compiled script. Take the expected points from an external NIST/RFC source, NOT from this repo's own P-256 implementation — deriving them from the implementation under test reproduces the BUG-101 shape (seven tiers agreeing on a wrong answer) that this whole residual section exists to name."
-      },
-      "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "p256"
-      }
-    },
-    {
       "fixture": "p256-wallet",
       "cause": "crypto-witness-infeasible",
       "reason": "NIST P-256 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
@@ -240,19 +227,6 @@
       "coveredBy": {
         "kind": "codegen-golden",
         "family": "p256"
-      }
-    },
-    {
-      "fixture": "p384-primitives",
-      "cause": "crypto-witness-infeasible",
-      "reason": "NIST P-384 EC primitives — non-secp256k1 EC witness",
-      "closePlan": {
-        "date": "2026-08-06",
-        "plan": "BLOCKED ON TWO CONFIRMED CODEGEN BUGS, the same pair `ec-unit` is blocked on — do not close by adding a witness before they are fixed. Verified 2026-08-06 by executing the emitted script through @bsv/sdk's Spend: p384Add(G, G) returns aaf06bba82e9f590… where 2G is 08d999057ba3d2d9… (cAffineAdd in packages/runar-compiler/src/passes/p256-p384-codegen.ts still implements ONLY the chord slope (qy-py)/(qx-px); the tangent-select fix that commit 8a6494b4 applied to secp256k1 affineAdd was NEVER ported to the NIST-P curves), and p384Mul(G, 2n) returns an all-zero point (the Jacobian ladder's add-affine step degenerates when the accumulator equals the point being added). p384Mul(G, 3n) is correct, pinning the blob format. verifyAdd(a, b) would exercise the first defect directly and verify(k, basePoint) the second, so a real witness written today would go RED for the codegen, not for the harness. ORDER: fix both in all seven tiers, then close. CAUSE NOT RECLASSIFIED, deliberately: the spend needs no signature, so `crypto-witness-infeasible` reads false on its own wording, and the plain differential oracle is in fact blocked by something else entirely — the ANF interpreter MOCKS p384Add / p384Mul / p384MulGen (returns 64 zero bytes) and p384OnCurve (returns true unconditionally), see packages/runar-testing/src/interpreter/interpreter.ts, which is `interpreter-unsupported` in all but name. The cause is left as-is because `crypto-witness-infeasible` also carries PROVENANCE (it marks exactly the entries that came from the former crypto-exempt.json) and flipping it would destroy that; and because the interpreter mock is removable, so `interpreter-unsupported` would go stale in turn. Neither cause is the real blocker. verify(k, basePoint), verifyAdd(a, b) and verifyMulGen(k) take plain scalars and points, not a signature, so conformance/script_execution_test.go can run them the same way its 16 TestECPrimitives_* functions already run the ec-primitives fixture: compileRúnar(\"p384-primitives\", ...) + executeScript, with the witness built by the encodePushBigInt (:2510) and encodePushPoint (:2545) helpers that are already in that file. THE HARD PART IS THE EXPECTED VALUES, not the harness: the repo has NO P-384 curve-arithmetic KAT — conformance/runtime-vectors/ecdsa-rfc6979.json carries P-384 SIGNATURE vectors only, and packages/runar-go/crypto_kat_test.go (TestOfficialKAT_ECDSA_RFC6979) feeds them to the NATIVE Go implementation, never to compiled script. Take the expected points from an external NIST/RFC source, NOT from this repo's own P-384 implementation — deriving them from the implementation under test reproduces the BUG-101 shape (seven tiers agreeing on a wrong answer) that this whole residual section exists to name."
-      },
-      "coveredBy": {
-        "kind": "codegen-golden",
-        "family": "p384"
       }
     },
     {

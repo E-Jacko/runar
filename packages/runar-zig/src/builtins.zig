@@ -1089,6 +1089,14 @@ pub fn ecNegate(point: base.Point) base.Point {
 }
 
 pub fn ecOnCurve(point: base.Point) bool {
+    // The all-zero blob is this codegen's encoding of the point at infinity,
+    // and it is NOT on the curve: the emitted ecOnCurve is exactly
+    // x < p AND y < p AND y^2 == x^3 + 7, and 0 != 7. bsvz's Point.identity()
+    // reports isOnCurve() = true (the projective convention), which made this
+    // mock disagree with the script it stands in for, so `assert(ecOnCurve(r))`
+    // passed off-chain and failed on-chain for r = O -- an unspendable output
+    // found only after deploy. O is now reachable from ecAdd(P, -P).
+    if (isIdentityPoint(point)) return false;
     const p = parsePoint(point) catch return false;
     return p.isOnCurve();
 }
@@ -2227,7 +2235,11 @@ test "ec helpers use real secp256k1 arithmetic" {
     const identity = ecAdd(g, neg);
     defer freeIfOwned(identity);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), identity);
-    try std.testing.expect(ecOnCurve(identity));
+    // NOT on the curve: this is the ONLY way a contract can detect O, and the
+    // compiled script agrees (0^2 != 0^3 + 7). This assertion used to be
+    // `expect(ecOnCurve(identity))` — the mock said yes where the script says
+    // no, so an off-chain-green `assert(ecOnCurve(r))` deployed unspendable.
+    try std.testing.expect(!ecOnCurve(identity));
 
     const compressed = ecEncodeCompressed(g);
     defer freeIfOwned(compressed);

@@ -47,6 +47,19 @@ func loadConstHex(name, hexStr string) ir.ANFBinding {
 	return b
 }
 
+// loadParamBinding returns an ANFBinding representing a method parameter
+// reference (load_param) — a RUNTIME value the optimizer cannot fold, unlike
+// loadConstBigInt/loadConstHex.
+func loadParamBinding(name, paramName string) ir.ANFBinding {
+	return ir.ANFBinding{
+		Name: name,
+		Value: ir.ANFValue{
+			Kind: "load_param",
+			Name: paramName,
+		},
+	}
+}
+
 // loadConstBigInt returns an ANFBinding with a load_const holding an integer.
 func loadConstBigInt(name string, n int64) ir.ANFBinding {
 	raw, _ := json.Marshal(n)
@@ -657,6 +670,72 @@ func TestANFECOptimizer_Rule10_EcAddMulGenMulGen(t *testing.T) {
 	// After Rule 10, t4 should be ecMulGen with k1+k2 = 8
 	if t4Result.Value.Kind != "call" || t4Result.Value.Func != "ecMulGen" {
 		t.Errorf("expected t4 to be ecMulGen after Rule 10, got %s(%s)", t4Result.Value.Func, strings.Join(t4Result.Value.Args, ", "))
+	}
+}
+
+// TestECOptimizer_MulGenLinearRuntimeSumIsUnreduced pins the RUNTIME (both
+// scalars non-constant) path of the ec-mulgen-linear rule: the helper binding
+// the rule engine synthesizes for k1 + k2 is a plain bin_op "+" with NO mod-n
+// applied — buildOpHelper in ec_rules_engine.go only folds mod n when BOTH
+// operands are load_const bigints (the compile-time path); runtime operands
+// fall through to a bare bin_op.
+//
+// This is sound ONLY because emitEcMulGen's scalar reduce (emitScalarReduce
+// in codegen/ec.go, called via ecEmitScalarReduce) puts the unreduced sum back
+// into [0, n-1] before the ladder ever sees it. That reduce is therefore the
+// load-bearing dependency for this rewrite: delete or weaken it and
+// ec-mulgen-linear silently miscompiles every k1 + k2 >= n. See the
+// "LOAD-BEARING DEPENDENCY" note on the ec-mulgen-linear rule in
+// frontend/ec-rules.json and ec-scalar-domain.test.ts.
+func TestECOptimizer_MulGenLinearRuntimeSumIsUnreduced(t *testing.T) {
+	// Build ANF with:
+	//   k1 = load_param "k1Arg"    <- runtime (unlock argument), not load_const
+	//   k2 = load_param "k2Arg"    <- runtime (unlock argument), not load_const
+	//   t2 = ecMulGen(k1)
+	//   t3 = ecMulGen(k2)
+	//   t4 = ecAdd(t2, t3)         <- should become ecMulGen(<helper>)
+	//   assert(t4)
+	k1 := loadParamBinding("k1", "k1Arg")
+	k2 := loadParamBinding("k2", "k2Arg")
+	t2 := callBinding("t2", "ecMulGen", []string{"k1"})
+	t3 := callBinding("t3", "ecMulGen", []string{"k2"})
+	t4 := callBinding("t4", "ecAdd", []string{"t2", "t3"})
+	t5 := assertBinding("t5", "t4")
+
+	bindings := []ir.ANFBinding{k1, k2, t2, t3, t4, t5}
+	program := makeTestProgram(bindings)
+	result := OptimizeEC(program)
+	body := getMethodBody(result)
+
+	t4Result := findBinding(body, "t4")
+	if t4Result == nil {
+		t.Fatal("expected binding t4 to exist after optimization")
+	}
+	if t4Result.Value.Kind != "call" || t4Result.Value.Func != "ecMulGen" {
+		t.Fatalf("expected t4 to be ecMulGen after ec-mulgen-linear, got %s(%s)", t4Result.Value.Func, strings.Join(t4Result.Value.Args, ", "))
+	}
+	if len(t4Result.Value.Args) != 1 {
+		t.Fatalf("expected ecMulGen to take exactly one scalar arg, got %v", t4Result.Value.Args)
+	}
+
+	helperName := t4Result.Value.Args[0]
+	helper := findBinding(body, helperName)
+	if helper == nil {
+		t.Fatalf("expected helper binding %q for k1+k2 to exist after optimization", helperName)
+	}
+
+	// The load-bearing assertion: the helper is a bare bin_op "+" over the two
+	// original runtime scalars, with no mod-n (or any other) wrapping — the
+	// rule engine's compile-time fold path (which DOES reduce mod n) never
+	// fires here because neither k1 nor k2 resolves to a load_const bigint.
+	if helper.Value.Kind != "bin_op" {
+		t.Fatalf("expected helper %q to be a bin_op (unreduced runtime sum), got Kind=%q", helperName, helper.Value.Kind)
+	}
+	if helper.Value.Op != "+" {
+		t.Errorf("expected helper %q Op to be %q, got %q", helperName, "+", helper.Value.Op)
+	}
+	if helper.Value.Left != "k1" || helper.Value.Right != "k2" {
+		t.Errorf("expected helper %q to sum k1 and k2, got Left=%q Right=%q", helperName, helper.Value.Left, helper.Value.Right)
 	}
 }
 

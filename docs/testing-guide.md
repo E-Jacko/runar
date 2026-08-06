@@ -1377,7 +1377,7 @@ describe('SchnorrZKP contract', () => {
 - **Point format**: Points are 64 bytes (128 hex chars), big-endian unsigned, no prefix. Use `makePointHex()` or equivalent to construct valid test points.
 - **Modular arithmetic**: All scalar computations in tests must use `mod(value, EC_N)` to stay within the group order, matching what the on-chain contract does.
 - **Interpreter-based**: `TestContract` uses the interpreter, which performs real EC arithmetic (not mocked). This means test results accurately reflect the contract's mathematical behavior.
-- **Script size**: EC contracts generate large scripts (~50-100 KB per `ecMul`/`ecMulGen` call). Full Script VM execution of these contracts is feasible but slower than interpreter-based testing.
+- **Script size**: EC contracts generate very large scripts — **~429 KB** per `ecMul`/`ecMulGen` call, ~460 KB per `p256Mul`, ~927 KB per `p384Mul`, ~974 KB for one `verifyECDSA_P256` and ~1.99 MB for one `verifyECDSA_P384`. Full Script VM execution is feasible but slow (seconds per call). These sizes also matter beyond test runtime: most of them exceed the BSV default `maxscriptsizepolicy` of 500,000 B **per script**, so a contract that passes every test here may still be rejected as non-standard by a node on stock policy — see the script-size and relay-policy table in [`docs/language-reference.md`](language-reference.md#script-size-and-relay-policy). `integration/regtest.sh` runs with `maxscriptsizepolicy=0`, so the regtest suite cannot catch it.
 
 ---
 
