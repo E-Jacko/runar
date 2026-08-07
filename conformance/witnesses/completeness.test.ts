@@ -127,8 +127,18 @@ const RESIDUAL_KINDS = new Set(['codegen-golden', 'go-only-nocodegen']);
  * byte-identical to the fixtures' expected-script.hex (19,594 and 188,609
  * bytes, both fold modes). That is new execution being recognised, not a
  * relabel — the README's "the four *-wallet entries only deploy" was stale.
+ *
+ * 2026-08-07: 6 -> 3. Merge arithmetic, not a new decision. The 6 above was
+ * committed on fix/testing-gap-remediation, which removed 2 of the original 8;
+ * fix/ec-complete-formulas independently removed 3 more (`ec-unit`,
+ * `p256-primitives`, `p384-primitives`), which 03f50d48 gave real-crypto
+ * execution specs under witnesses/real-crypto/ and which the honesty guard in
+ * the completeness test above then REQUIRES to be dropped from the ledger.
+ * Neither branch could see the other's removals, so the merged residual set is
+ * 8 - 2 - 3 = 3 while the constant still read 6. Lowering it restores the
+ * no-slack invariant; the residual set itself did not grow.
  */
-const MAX_UNEXECUTED_GOLDENS = 6;
+const MAX_UNEXECUTED_GOLDENS = 3;
 
 interface ClosePlan {
   date?: unknown;

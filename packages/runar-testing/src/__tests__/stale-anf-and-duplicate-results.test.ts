@@ -134,7 +134,14 @@ describe('P1-2: ANF from a pre-multi-result compiler', () => {
     // passes later.
     let message = '';
     try {
-      const out = compileFromANF(anf as never, { disableConstantFolding: true });
+      // `compileFromANF` refuses by THROWING today, so the diagnostic branch
+      // below is unreachable — it is kept so this test still passes unchanged
+      // if the refusal is ever converted into a returned diagnostic list.
+      // `CompileFromANFResult` carries neither field, hence the cast.
+      const out = compileFromANF(anf as never, { disableConstantFolding: true }) as unknown as {
+        success: boolean;
+        diagnostics: { message: string }[];
+      };
       expect(out.success).toBe(false);
       message = out.diagnostics.map((d) => d.message).join(' ');
     } catch (e) {

@@ -269,7 +269,6 @@ describe('ec-mulgen-linear depends on the scalar reduce', () => {
   const A = makeArith(c);
   const w = c.bytes * 2;
   const G: NonNullable<Aff> = { x: c.gx, y: c.gy };
-  const G_HEX = c.gx.toString(16).padStart(w, '0') + c.gy.toString(16).padStart(w, '0');
   const hexOf = (pt: NonNullable<Aff>) =>
     pt.x.toString(16).padStart(w, '0') + pt.y.toString(16).padStart(w, '0');
   const ZERO = '00'.repeat(c.bytes * 2);
