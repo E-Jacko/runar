@@ -45,15 +45,25 @@ export class DataEmitter extends StatefulSmartContract {
 	contract := runar.NewRunarContract(artifact, []interface{}{int64(0)})
 
 	provider := runar.NewMockProvider("testnet")
-	mockAddr := strings.Repeat("00", 20)
-	signer := runar.NewMockSigner("", mockAddr)
+	// A REAL wallet, not a mock signer. MockProvider now executes every
+	// broadcast through the go-sdk interpreter, and a MockSigner cannot satisfy
+	// it at any layer: its address is fictional (OP_EQUALVERIFY) and its
+	// 72-zero-byte "signature" is not DER (malformed signature). Every other
+	// integration test already funds and signs with helpers.NewWallet(); these
+	// two were the last holdouts, and they passed only because MockProvider
+	// used to broadcast without validating.
+	funder := helpers.NewWallet()
+	signer, err := helpers.SDKSignerFromWallet(funder)
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
 
 	// Fund the mock address
-	provider.AddUtxo(mockAddr, runar.UTXO{
+	provider.AddUtxo(funder.Address, runar.UTXO{
 		Txid:        strings.Repeat("aa", 32),
 		OutputIndex: 0,
 		Satoshis:    1_000_000,
-		Script:      "76a914" + strings.Repeat("00", 20) + "88ac",
+		Script:      funder.P2PKHScript(),
 	})
 
 	_, _, err = contract.Deploy(provider, signer, runar.DeployOptions{Satoshis: 10_000})
