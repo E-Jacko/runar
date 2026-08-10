@@ -26,8 +26,20 @@
   // -ir, -anf, -canonical, -execute, -trimodal, -spend, -metamorphic.
   // `.tmp/` (the per-tier scratch sources) needs no entry — TypeScript's
   // include globs never match dot-directories.
+  // `fuzz-regressions/entries/*/contract.runar.ts` is the same category as the
+  // findings trees above, one step further along: a finding PROMOTED to a
+  // permanent regression fixture. The contracts are fuzzer output — Rúnar
+  // source read as TEXT by replay.ts (`readFileSync`), never imported as a
+  // module — and the generator emits shapes that are valid Rúnar but not
+  // idiomatic TypeScript. The 2026-08-06 branch-k1 entry pins
+  // `if ((-72n !== 13n))`, a constant-true guard that is the whole point of the
+  // reduction and that tsc rejects as TS2367 "no overlap". Typechecking these
+  // would mean PROMOTING A REGRESSION BREAKS THE BUILD, for the same reason the
+  // exclusion above exists — and editing the contract to placate tsc would
+  // destroy the very shape being pinned.
   "exclude": [
     "node_modules",
-    "fuzz-findings*"
+    "fuzz-findings*",
+    "fuzz-regressions/entries/*/contract.runar.ts"
   ]
 }
