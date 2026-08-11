@@ -80,7 +80,7 @@ agree with the other on a binding-shape invariant beyond the per-
 branch `structuralConstBody` closure that
 `runOps_lowerBindings_structuralConstBody_isSome` already discharges. -/
 def structuralIfValBodyNarrow : List ANFBinding → Prop
-  | [.mk _ (.ifVal _ thn els) _] =>
+  | [.mk _ (.ifVal _ thn els _) _] =>
       structuralConstBody thn ∧ structuralConstBody els
   | _ => False
 
@@ -122,7 +122,7 @@ theorem structuralConstBodyB_iff (body : List ANFBinding) :
         | unaryOp _ _ _ => simp at hHead
         | call _ _ => simp at hHead
         | methodCall _ _ _ => simp at hHead
-        | ifVal _ _ _ => simp at hHead
+        | ifVal _ _ _ _ => simp at hHead
         | loop _ _ _ => simp at hHead
         | assert _ => simp at hHead
         | updateProp _ _ => simp at hHead
@@ -152,7 +152,7 @@ theorem structuralConstBodyB_iff (body : List ANFBinding) :
         | unaryOp _ _ _ => simp [structuralConstValue] at hHead
         | call _ _ => simp [structuralConstValue] at hHead
         | methodCall _ _ _ => simp [structuralConstValue] at hHead
-        | ifVal _ _ _ => simp [structuralConstValue] at hHead
+        | ifVal _ _ _ _ => simp [structuralConstValue] at hHead
         | loop _ _ _ => simp [structuralConstValue] at hHead
         | assert _ => simp [structuralConstValue] at hHead
         | updateProp _ _ => simp [structuralConstValue] at hHead
@@ -172,7 +172,7 @@ instance instDecidableStructuralConstBody (body : List ANFBinding) :
 
 /-- Bool checker for `structuralIfValBodyNarrow`. -/
 def structuralIfValBodyNarrowB : List ANFBinding → Bool
-  | [.mk _ (.ifVal _ thn els) _] =>
+  | [.mk _ (.ifVal _ thn els _) _] =>
       structuralConstBodyB thn && structuralConstBodyB els
   | _ => false
 
@@ -182,7 +182,7 @@ theorem structuralIfValBodyNarrowB_iff (body : List ANFBinding) :
   | [] => simp [structuralIfValBodyNarrowB, structuralIfValBodyNarrow]
   | [.mk name v src] =>
       cases v with
-      | ifVal _ thn els =>
+      | ifVal _ thn els _ =>
           simp only [structuralIfValBodyNarrowB, structuralIfValBodyNarrow]
           rw [Bool.and_eq_true]
           rw [structuralConstBodyB_iff thn, structuralConstBodyB_iff els]
@@ -321,28 +321,28 @@ theorem runOps_lowerBindings_structuralIfValBodyNarrow_isSome
     (body : List ANFBinding) (sm : StackMap) (stk : StackState)
     (hBody : structuralIfValBodyNarrow body)
     (hCondLoad :
-      ∀ bn cond thn els src,
-        body = [.mk bn (.ifVal cond thn els) src] →
+      ∀ bn cond thn els results src,
+        body = [.mk bn (.ifVal cond thn els results) src] →
         ∃ condV stk1,
           runOps (Stack.Lower.loadRef sm cond) stk = .ok stk1
           ∧ stk1.stack = condV :: stk.stack
           ∧ (∃ b, asBool? condV = some b)) :
     (runOps (Stack.Lower.lowerBindings sm body).1 stk).toOption.isSome := by
   match body, hBody with
-  | [.mk bn (.ifVal cond thn els) src], hBody =>
+  | [.mk bn (.ifVal cond thn els results) src], hBody =>
       obtain ⟨hThn, hEls⟩ := hBody
-      have hWit := hCondLoad bn cond thn els src rfl
+      have hWit := hCondLoad bn cond thn els results src rfl
       -- `lowerBindings sm [single-ifVal]` unfolds to the lowerValue ops ++ [].
       have hUnfold :
           (Stack.Lower.lowerBindings sm
-              [.mk bn (.ifVal cond thn els) src]).1
-            = (Stack.Lower.lowerValue sm bn (.ifVal cond thn els)).1 := by
+              [.mk bn (.ifVal cond thn els results) src]).1
+            = (Stack.Lower.lowerValue sm bn (.ifVal cond thn els results)).1 := by
         simp [Stack.Lower.lowerBindings]
       rw [hUnfold]
       -- `lowerValue sm bn (.ifVal cond thn els)` =
       --   `(loadRef sm cond ++ [.ifOp thnOps (some elsOps)], sm.push bn)`.
       have hLowerEq :
-          (Stack.Lower.lowerValue sm bn (.ifVal cond thn els)).1
+          (Stack.Lower.lowerValue sm bn (.ifVal cond thn els results)).1
             = Stack.Lower.loadRef sm cond
               ++ [.ifOp (Stack.Lower.lowerBindings sm thn).1
                         (some (Stack.Lower.lowerBindings sm els).1)] := by
@@ -386,8 +386,8 @@ theorem runMethod_lower_public_unique_no_post_structuralIfVal_narrow_isSome
         (Stack.Lower.lowerBindings
           (m.params.map (fun p => p.name) |>.reverse) m.body).1)
     (hCondLoad :
-      ∀ bn cond thn els src,
-        m.body = [.mk bn (.ifVal cond thn els) src] →
+      ∀ bn cond thn els results src,
+        m.body = [.mk bn (.ifVal cond thn els results) src] →
         ∃ condV stk1,
           runOps
             (Stack.Lower.loadRef
@@ -952,8 +952,8 @@ theorem runMethod_lower_public_unique_no_post_ifValSingleConst_preserves
     -- the extra metadata-preservation arms, which the narrowed wrapper
     -- does not need (it discharges runtime success only).
     have hCondLoad' :
-        ∀ bn' cond' thn' els' src',
-          m.body = [.mk bn' (.ifVal cond' thn' els') src'] →
+        ∀ bn' cond' thn' els' results' src',
+          m.body = [.mk bn' (.ifVal cond' thn' els' results') src'] →
           ∃ condV stk1,
             runOps
               (Stack.Lower.loadRef
@@ -961,14 +961,14 @@ theorem runMethod_lower_public_unique_no_post_ifValSingleConst_preserves
               = .ok stk1
             ∧ stk1.stack = condV :: initialStack.stack
             ∧ (∃ b, asBool? condV = some b) := by
-      intro bn' cond' thn' els' src' hEq
+      intro bn' cond' thn' els' results' src' hEq
       rw [hBodyShape] at hEq
       -- The matched single-element list-equality fixes
       -- bn' = bn, cond' = cond, etc.
       obtain ⟨condV, stk1, hLoad, hStk, _, _, _, _, hBool⟩ := hCondLoad
       injection hEq with hHead _
       injection hHead with _hName hVal _
-      injection hVal with hCondEq _ _
+      injection hVal with hCondEq _ _ _
       subst hCondEq
       exact ⟨condV, stk1, hLoad, hStk, hBool⟩
     exact runMethod_lower_public_unique_no_post_structuralIfVal_narrow_isSome
@@ -1244,8 +1244,8 @@ theorem runMethod_lower_public_unique_no_post_ifValIdenticalConst_preserves
     -- Reshape `hCondLoad` to match the narrowed wrapper's
     -- `∀ bn' cond' thn' els' src', m.body = [...] → ...` shape.
     have hCondLoad' :
-        ∀ bn' cond' thn' els' src',
-          m.body = [.mk bn' (.ifVal cond' thn' els') src'] →
+        ∀ bn' cond' thn' els' results' src',
+          m.body = [.mk bn' (.ifVal cond' thn' els' results') src'] →
           ∃ condV stk1,
             runOps
               (Stack.Lower.loadRef
@@ -1253,12 +1253,12 @@ theorem runMethod_lower_public_unique_no_post_ifValIdenticalConst_preserves
               = .ok stk1
             ∧ stk1.stack = condV :: initialStack.stack
             ∧ (∃ b, asBool? condV = some b) := by
-      intro bn' cond' thn' els' src' hEq
+      intro bn' cond' thn' els' results' src' hEq
       rw [hBodyShape] at hEq
       obtain ⟨condV, stk1, hLoad, hStk, _, _, _, _, hBool⟩ := hCondLoad
       injection hEq with hHead _
       injection hHead with _hName hVal _
-      injection hVal with hCondEq _ _
+      injection hVal with hCondEq _ _ _
       subst hCondEq
       exact ⟨condV, stk1, hLoad, hStk, hBool⟩
     exact runMethod_lower_public_unique_no_post_structuralIfVal_narrow_isSome
@@ -1380,7 +1380,7 @@ private theorem runOps_lowerValue_loadConst_preserves_metadata
   | unaryOp _ _ _ => simp [structuralConstValue] at hHead
   | call _ _ => simp [structuralConstValue] at hHead
   | methodCall _ _ _ => simp [structuralConstValue] at hHead
-  | ifVal _ _ _ => simp [structuralConstValue] at hHead
+  | ifVal _ _ _ _ => simp [structuralConstValue] at hHead
   | loop _ _ _ => simp [structuralConstValue] at hHead
   | assert _ => simp [structuralConstValue] at hHead
   | updateProp _ _ => simp [structuralConstValue] at hHead
@@ -4679,7 +4679,7 @@ def ifValArithBody
     (outerProtected : List String) (constInts : List (String × Int))
     (sm : StackMap) :
     List ANFBinding → Prop
-  | [.mk _bn (.ifVal cond thn els) _src] =>
+  | [.mk _bn (.ifVal cond thn els []) _src] =>
       emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses thn) thn
         (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 false ∧
       emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses els) els
@@ -4698,7 +4698,7 @@ def ifValArithBodyBool
     (outerProtected : List String) (constInts : List (String × Int))
     (sm : StackMap) :
     List ANFBinding → Bool
-  | [.mk _bn (.ifVal cond thn els) _src] =>
+  | [.mk _bn (.ifVal cond thn els []) _src] =>
       emittableArithChainReadyNoDblNegBool (Stack.Lower.computeLastUses thn) thn
         (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 false &&
       emittableArithChainReadyNoDblNegBool (Stack.Lower.computeLastUses els) els
@@ -4720,9 +4720,14 @@ theorem ifValArithBodyBool_iff
         outerProtected constInts sm body
   | [] => by
       simp only [ifValArithBodyBool, ifValArithBody, Bool.false_eq_true]
-  | [.mk _bn (.ifVal cond thn els) _src] => by
+  | [.mk _bn (.ifVal cond thn els []) _src] => by
       simp only [ifValArithBodyBool, ifValArithBody, Bool.and_eq_true,
         emittableArithChainReadyNoDblNegBool_iff, decide_eq_true_eq, and_assoc]
+  -- Multi-result `if`: outside this fragment. Its lowering emits the
+  -- extra result-adoption ops (`adoptDeclaredResults`), which the
+  -- op-shape lemmas below do not cover, so both sides are `False`.
+  | [.mk _ (.ifVal _ _ _ (_ :: _)) _] => by
+      simp only [ifValArithBodyBool, ifValArithBody, Bool.false_eq_true]
   | [.mk _ (.loadParam _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
   | [.mk _ (.loadProp _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
   | [.mk _ (.loadConst _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]

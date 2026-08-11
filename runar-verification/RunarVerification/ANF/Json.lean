@@ -256,7 +256,16 @@ private def fromJsonANFValueAux? (fuel : Nat) (j : Json) : Except String ANFValu
       let elseArr ← elseJ.getArr?
       let thenBranch ← thenArr.toList.mapM (fromJsonANFBindingAux? f)
       let elseBranch ← elseArr.toList.mapM (fromJsonANFBindingAux? f)
-      return .ifVal cond thenBranch elseBranch
+      -- `results` is the multi-result branch node's declared result slots.
+      -- Absent on the single-result `if`s that predate the node, so a
+      -- missing key decodes as `[]` rather than failing the load.
+      let results ←
+        match j.getObjVal? "results" with
+        | .ok rj => do
+            let arr ← rj.getArr?
+            arr.toList.mapM (fun x => x.getStr?)
+        | .error _ => pure []
+      return .ifVal cond thenBranch elseBranch results
   | "loop" =>
       let count ← j.getObjValAs? Nat "count"
       let bodyJ ← j.getObjVal? "body"
@@ -362,10 +371,14 @@ private def toJsonANFValue : ANFValue → Json
   | .methodCall obj m args =>
       mkObj [("kind", .str "method_call"), ("object", .str obj),
              ("method", .str m), ("args", refList args)]
-  | .ifVal cond t e =>
-      mkObj [("kind", .str "if"), ("cond", .str cond),
-             ("then", .arr (t.map toJsonANFBinding).toArray),
-             ("else", .arr (e.map toJsonANFBinding).toArray)]
+  | .ifVal cond t e results =>
+      -- Emit `results` only when non-empty, so single-result `if`s
+      -- round-trip to exactly the JSON they came from.
+      mkObj ([("kind", .str "if"), ("cond", .str cond),
+              ("then", .arr (t.map toJsonANFBinding).toArray),
+              ("else", .arr (e.map toJsonANFBinding).toArray)]
+             ++ (if results.isEmpty then []
+                 else [("results", .arr ((results.map Json.str)).toArray)]))
   | .loop count body iter =>
       mkObj [("kind", .str "loop"), ("count", .num ⟨count, 0⟩),
              ("body", .arr (body.map toJsonANFBinding).toArray),

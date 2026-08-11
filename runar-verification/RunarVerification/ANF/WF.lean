@@ -117,6 +117,38 @@ binding/value frames), so a 100k cap is effectively infinite for any
 realistic input while still giving Lean a structurally-decreasing measure. -/
 private def wfRecFuel : Nat := 100000
 
+/--
+Names visible after an `if`: the binding's own name plus the multi-result
+branch node's DECLARED `results`.
+
+Each declared result names a local that both arms write and the code after
+the `if` reads, so it is defined at the join. Consumed by the scope rule in
+`bindingsAreWFAux`.
+-/
+def phiScopeTargets (bindingName : String) (results : List String) : List String :=
+  bindingName :: results
+
+/--
+Names that an `if` may bind in BOTH arms without breaking SSA uniqueness.
+
+This is deliberately NOT `phiScopeTargets`. The two rules answer different
+questions: scope asks "what can later code read?" (the declared results),
+while SSA asks "is this the same value defined twice on ONE path?". The
+arms of an `if` are mutually exclusive, so a name written once by each arm
+is one value, never two same-path definitions — and that covers the
+merge-copy temps (`branched-readonly-len` writes `t20`/`t21` in both arms
+without declaring them as results).
+
+Requiring exactly one write per arm is what keeps a genuine double
+definition *inside* a single arm a violation.
+-/
+def phiSsaExcused (bindingName : String)
+    (thenBranch elseBranch : List ANFBinding) : List String :=
+  let countName (bs : List ANFBinding) (n : String) : Nat :=
+    (bs.filter (fun bi => bi.name == n)).length
+  bindingName :: (thenBranch.map ANFBinding.name).filter
+    (fun n => countName thenBranch n == 1 && countName elseBranch n == 1)
+
 mutual
 
 /-- Every `TempRef` in `v` resolves in `env`, and any nested binding lists are themselves WF.
@@ -133,7 +165,7 @@ def valueIsWFAux (fuel : Nat) (env : ScopeEnv) : ANFValue → Bool
   | .unaryOp _ o _ => env.resolves o
   | .call _ args => args.all env.resolves
   | .methodCall obj _ args => env.resolves obj && args.all env.resolves
-  | .ifVal cond t e =>
+  | .ifVal cond t e _ =>
       match fuel with
       | 0 => false
       | f + 1 =>
@@ -171,7 +203,14 @@ def valueIsWFAux (fuel : Nat) (env : ScopeEnv) : ANFValue → Bool
 def bindingsAreWFAux (fuel : Nat) (env : ScopeEnv) : List ANFBinding → Bool
   | [] => true
   | b :: rest =>
-      valueIsWFAux fuel env b.value && bindingsAreWFAux fuel (env.addDefined b.name) rest
+      -- A multi-result `if` defines its phi targets for everything that
+      -- follows it, not just the binding's own name.
+      let envAfter :=
+        match b.value with
+        | .ifVal _ _ _ results =>
+            (phiScopeTargets b.name results).foldl ScopeEnv.addDefined env
+        | _ => env.addDefined b.name
+      valueIsWFAux fuel env b.value && bindingsAreWFAux fuel envAfter rest
 
 end
 
@@ -208,7 +247,7 @@ private def collectAllBindingNamesAux : Nat → List ANFBinding → List String
   | f + 1, b :: rest =>
       let here :=
         match b.value with
-        | .ifVal _ t e =>
+        | .ifVal _ t e _ =>
             -- A binding inside `t` or `e` whose name matches the
             -- outer if-binding `b.name` is a phi-input (TS-canonical
             -- since commit 3fed3295 — token-ft, conditional-data-output-stateful
@@ -216,8 +255,15 @@ private def collectAllBindingNamesAux : Nat → List ANFBinding → List String
             -- outer if-binding is also `t36`). Phi-inputs target the
             -- same SSA name as the if-binding itself, so they should
             -- not be counted as a separate SSA def.
+            -- The multi-result branch node generalizes that: one `if` may
+            -- merge several locals, and each merged local is a phi target
+            -- carrying its OWN name rather than the outer if-binding's.
+            -- `phiTargets` is the shared definition, also used by the
+            -- scope rule in `bindingsAreWFAux`.
+            let phis := phiSsaExcused b.name t e
+            let isPhi (n : String) : Bool := phis.contains n
             let dropPhi (bs : List ANFBinding) : List ANFBinding :=
-              bs.filter (fun bi => bi.name ≠ b.name)
+              bs.filter (fun bi => !isPhi bi.name)
             collectAllBindingNamesAux f (dropPhi t) ++ collectAllBindingNamesAux f (dropPhi e)
         | .loop _ body _ => collectAllBindingNamesAux f body
         | _ => []
@@ -238,6 +284,63 @@ def tempNamesUnique (xs : List String) : Bool :=
 /-- A method's body satisfies the SSA discipline. -/
 def methodSSAUnique (m : ANFMethod) : Bool :=
   tempNamesUnique (collectAllBindingNames m.body)
+
+/-! ### Regression: multi-result branch phi targets
+
+The multi-result branch node lets one `if` merge several locals at once.
+Each merged local is a phi target defined in BOTH arms, exactly like the
+single-target case `dropPhi` already excuses — but the target name is the
+merged local's own name, not the outer if-binding's. When the merged local
+is a compiler temp rather than a user variable, the target is `tN`-shaped
+and the two arm definitions used to collide in `tempNamesUnique`.
+
+This is the `assert-false-guard` / `branched-readonly-len` shape: outer
+binding `t20`, phi target `t17` written by both arms.
+-/
+private def phiTargetProbe : List ANFBinding :=
+  [ .mk "t9" (.loadConst (.bool true))
+  , .mk "t20" (.ifVal "t9"
+      [ .mk "t17" (.loadConst (.int 1)) ]
+      [ .mk "t17" (.loadConst (.int 2)) ]
+      ["t17"]) ]
+
+#guard tempNamesUnique (collectAllBindingNames phiTargetProbe)
+
+/-- Two defs of one temp on the SAME path stay a violation — the phi
+excuse rests on the arms being mutually exclusive, which does not
+apply within a single arm. -/
+private def sameArmDuplicateProbe : List ANFBinding :=
+  [ .mk "t9" (.loadConst (.bool true))
+  , .mk "t20" (.ifVal "t9"
+      [ .mk "t17" (.loadConst (.int 1))
+      , .mk "t17" (.loadConst (.int 2)) ]
+      []) ]
+
+#guard !tempNamesUnique (collectAllBindingNames sameArmDuplicateProbe)
+
+/-- A merged local is in scope after the `if` that merges it. This is the
+`branched-readonly-len` shape: if-binding `t28` merges `count`, which the
+following bindings read. -/
+private def phiScopeProbe : List ANFBinding :=
+  [ .mk "t9" (.loadConst (.bool true))
+  , .mk "t20" (.ifVal "t9"
+      [ .mk "count" (.loadConst (.int 1)) ]
+      [ .mk "count" (.loadConst (.int 2)) ]
+      ["count"])
+  , .mk "t21" (.assert "count") ]
+
+#guard bindingsAreWF { params := [], props := [], defined := [], readonlyProps := [] }
+  phiScopeProbe
+
+/-- A name written by only ONE arm is not a merged local, so it stays out
+of scope afterwards — reading it is still a WF violation. -/
+private def oneArmOnlyProbe : List ANFBinding :=
+  [ .mk "t9" (.loadConst (.bool true))
+  , .mk "t20" (.ifVal "t9" [ .mk "count" (.loadConst (.int 1)) ] [])
+  , .mk "t21" (.assert "count") ]
+
+#guard !bindingsAreWF { params := [], props := [], defined := [], readonlyProps := [] }
+  oneArmOnlyProbe
 
 /-! ## Property and contract rules -/
 

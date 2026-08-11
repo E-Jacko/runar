@@ -1225,10 +1225,10 @@ private theorem checkBody_cons_guardFree
   | loadConst c =>
       cases c <;>
         first
-        | (rw [TypeCheck.checkBody] <;> first | rfl | (intro _ _ _ h; cases h))
+        | (rw [TypeCheck.checkBody] <;> first | rfl | (intros; simp_all))
         | simp [arithFragmentValueGuardFree] at hgf
-  | binOp op l r rt => rw [TypeCheck.checkBody] <;> first | rfl | (intro _ _ _ h; cases h)
-  | unaryOp op o rt => rw [TypeCheck.checkBody] <;> first | rfl | (intro _ _ _ h; cases h)
+  | binOp op l r rt => rw [TypeCheck.checkBody] <;> first | rfl | (intros; simp_all)
+  | unaryOp op o rt => rw [TypeCheck.checkBody] <;> first | rfl | (intros; simp_all)
   | _ => simp [arithFragmentValueGuardFree] at hgf
 
 /-- **Body-level type preservation (strong form).**  For a binding list whose

@@ -190,8 +190,25 @@ inductive ANFValue where
   /-- `{kind: "method_call", object, method, args}` — `obj.method(args)`. -/
   | methodCall      (object : TempRef) (method : String)
                     (args : List TempRef) : ANFValue
-  /-- `{kind: "if", cond, then, else}` — conditional with two binding lists. -/
-  | ifVal           (cond : TempRef) (thenBranch elseBranch : List ANFBinding) : ANFValue
+  /--
+  `{kind: "if", cond, then, else, results?}` — conditional with two binding
+  lists.
+
+  `results` are the multi-result branch node's DECLARED result slots,
+  deepest first (`results[0]` is the deepest). Each names a local that both
+  arms write and the code after the `if` reads. It defaults to `[]` so the
+  ~840 existing 3-argument applications across the proof corpus keep
+  elaborating unchanged; only the handful of pattern matches bind it.
+
+  It is a declared field rather than something recovered from the trailing
+  `__merge$N` bindings on purpose: the TS reference (`05-stack-lower.ts`
+  `lowerIf`) used to infer results from that naming convention and
+  deliberately stopped, so inferring it here would re-introduce the
+  fragility the reference removed and verify against a convention instead
+  of against the IR.
+  -/
+  | ifVal           (cond : TempRef) (thenBranch elseBranch : List ANFBinding)
+                    (results : List String := []) : ANFValue
   /-- `{kind: "loop", count, body, iterVar}` — bounded loop, fully unrollable. -/
   | loop            (count : Nat) (body : List ANFBinding) (iterVar : String) : ANFValue
   /-- `{kind: "assert", value}` — script aborts iff `value` is false. -/
