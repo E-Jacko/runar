@@ -415,6 +415,12 @@ def removeConsumedAtDepths (sm : StackMap) (names : List String) :
         (ops ++ rest, smF)
   go sm sorted
 
+/-- Shallowest depth `≥ start` holding `name`, if any. -/
+def StackMap.findFrom? (sm : StackMap) (start : Nat) (name : String) : Option Nat :=
+  match (sm.drop start).findIdx? (fun n => n == name) with
+  | some i => some (start + i)
+  | none   => none
+
 /--
 Adopt a multi-result `if`'s DECLARED result slots into the stack map.
 
@@ -434,7 +440,15 @@ iteration fail to resolve a merged local.
 -/
 def adoptDeclaredResults (sm : StackMap) (results : List String) :
     List StackOp × StackMap :=
-  (([] : List StackOp), results.foldl StackMap.push sm)
+  let n := results.length
+  let smWith := results.foldl StackMap.push sm
+  results.reverse.foldl
+    (init := (([] : List StackOp), smWith))
+    fun (ops, m) name =>
+      match m.findFrom? n name with
+      | some d => (ops ++ [.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop],
+                   m.removeAtDepth d)
+      | none   => (ops, m)
 
 /-- Compute the set of parent-scope refs that branches must NOT consume.
 
