@@ -329,39 +329,144 @@ func collectDeepBindingNames(bindings []ir.ANFBinding) map[string]bool {
 	return names
 }
 
-// countMergedLocalResults reports how many branch-merged locals an
-// if-statement's two arms carry as results.
+// collectLoopCarriedRebinds returns the locals a loop body REBINDS and then
+// READS AGAIN in the same iteration.
 //
-// ANF lowering's appendMergedLocalResults ends both arms with the same
-// K-binding block — `<local> = @ref:__merge$<i>` for i in 0..K-1 — so the
-// merged values sit on top in the same canonical order whichever branch runs.
-// Counting the trailing block is how stack lowering learns K: it must trim
-// each arm down to exactly those K slots before the N>=2 reconcile compares
-// the arms, since everything beneath them is the arm's own (dead, and
-// arm-specific) working values.
+// computeLastUses maps a name to the MAXIMUM index that references it, so for
+// a body like
 //
-// Returns 0 unless BOTH arms end with a block of the same size — anything else
-// is not a normalised merge and must not be trimmed.
-func countMergedLocalResults(thenBindings, elseBindings []ir.ANFBinding) int {
-	trailing := func(bindings []ir.ANFBinding) int {
-		n := 0
-		for i := len(bindings) - 1; i >= 0; i-- {
-			v := &bindings[i].Value
-			if v.Kind != "load_const" || v.ConstString == nil {
-				break
-			}
-			if !strings.HasPrefix(*v.ConstString, "@ref:"+ir.MergedLocalTempPrefix) {
-				break
-			}
-			n++
+//	t3   = acc + step     (index 1 — reads the value carried in)
+//	acc  = @ref:t3        (index 2 — rebinds: renames t3's slot to `acc`)
+//	t4   = wacc + acc     (index 3 — reads the value just rebound)
+//
+// `acc` gets last-use 3. Index 1 is therefore NOT a last use and copies (PICK)
+// instead of consuming, leaving the incoming slot on the stack under the same
+// name as the rebound one; index 3 then IS the last use, and findDepth
+// resolves to the topmost match — so it consumes the UPDATED value and leaves
+// the dead incoming one. The next iteration reads that dead slot, and every
+// iteration recomputes from the pre-loop value:
+// `for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc + acc; }`
+// produced `wacc = step*N` where the source says `step*N*(N+1)/2` — silently
+// in a stateless contract, and as a permanently unspendable UTXO in a stateful
+// one (the covenant commits to a continuation the SDK never builds). outerRefs
+// does not cover it: `acc` is excluded there precisely because the body binds
+// it.
+//
+// The value these names hold at the end of an iteration is live at the start of
+// the next one, so lowerLoop protects them from consumption exactly like an
+// outer ref. The incoming slot each rebinding shadows is left behind and
+// drained with the rest of the frame at method exit — a name always resolves to
+// its newest slot, so the reads stay correct.
+//
+// Both halves of the predicate are load-bearing:
+//   - read BEFORE the first rebinding: the name is carried IN from the
+//     enclosing scope, rather than being a body-private temp that merely
+//     happens to be read after it is bound;
+//   - read AFTER the last rebinding: without it the rebound value is dead at
+//     the end of the iteration and consuming it is correct. This is what keeps
+//     every shipped accumulator (`sum = sum + i`, `off = off + len`)
+//     byte-for-byte unchanged.
+//
+// NESTED loops: the scan runs over flattenNestedLoopBodies(body), not over body
+// itself. A name rebound only inside an INNER loop is bound at no top-level
+// index of the outer body, so the raw scan classified it as neither an outer
+// ref (collectDeepBindingNames excludes it — the body does bind it, deeply) nor
+// a carried rebind, and the outer loop never marked it live. The inner loop's
+// final iteration then consumed it, because usedAfterLoop asks the enclosing
+// scope and the enclosing scope had not been told either, so every outer
+// iteration restarted from the slot the previous one left behind:
+// `for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }` with
+// step = 3 produced `wacc = 24` where the source says 30. Splicing the inner
+// body in at the loop's position preserves the read/rebind/read ordering the
+// inner level already sees, so the outer level draws the same conclusion.
+func collectLoopCarriedRebinds(body []ir.ANFBinding) map[string]bool {
+	flat := flattenNestedLoopBodies(body)
+
+	firstBind := make(map[string]int, len(flat))
+	lastBind := make(map[string]int, len(flat))
+	for i := range flat {
+		name := flat[i].Name
+		if _, ok := firstBind[name]; !ok {
+			firstBind[name] = i
 		}
-		return n
+		lastBind[name] = i
 	}
-	thenCount := trailing(thenBindings)
-	if thenCount > 0 && thenCount == trailing(elseBindings) {
-		return thenCount
+
+	readBeforeBind := make(map[string]bool)
+	readAfterBind := make(map[string]bool)
+	for i := range flat {
+		for _, ref := range collectRefs(&flat[i].Value) {
+			if first, ok := firstBind[ref]; ok && i < first {
+				readBeforeBind[ref] = true
+			}
+			if last, ok := lastBind[ref]; ok && i > last {
+				readAfterBind[ref] = true
+			}
+		}
 	}
-	return 0
+
+	carried := make(map[string]bool)
+	for ref := range readBeforeBind {
+		if readAfterBind[ref] {
+			carried[ref] = true
+		}
+	}
+	return carried
+}
+
+// flattenNestedLoopBodies returns the binding sequence with every nested loop
+// binding — and every if binding — replaced, in place, by its own (recursively
+// flattened) body.
+//
+// Only collectLoopCarriedRebinds uses this, and only to order reads against
+// rebindings. Neither replaced binding contributes a stack slot that predicate
+// reasons about, so dropping it loses nothing; splicing the sub-body in at its
+// position is what lets an enclosing loop see a rebinding one level down.
+//
+// if arms ARE spliced, in then ++ else order, even though they are
+// alternatives rather than a sequence. The predicate asks only "is this name
+// read, then rebound, then read again", and treating the arms as a sequence
+// can only ADD names to the carried set, never remove one — conservative in
+// the safe direction. Without it a local rebound ONLY inside an if arm was
+// bound at no index the predicate could see: neither an outer ref
+// (deepBodyBindingNames excludes it, since the body does bind it, deeply) nor
+// a carried rebind. The loop consumed it and the next iteration had nothing to
+// read, so `for (i<2) { if (i<5) { acc = acc + step; } wacc = wacc + acc; }`
+// was REJECTED outright with `Value 'acc' not found on stack` — the loud face
+// of the same gap the merged-local protection in lowerIf fixes silently at
+// K>=2.
+//
+// The if binding itself is NOT re-appended after its arms. Appending it would
+// count the arms' reads a second time at an index past every arm rebinding,
+// making a local that BOTH arms rebind look "read after its last rebinding" —
+// which protected a K=1 alias that must stay consumable.
+//
+// A body with no nested loop and no if is returned entry-for-entry unchanged,
+// which is what makes this byte-neutral for every flat loop.
+func flattenNestedLoopBodies(body []ir.ANFBinding) []ir.ANFBinding {
+	nested := false
+	for i := range body {
+		if body[i].Value.Kind == "loop" || body[i].Value.Kind == "if" {
+			nested = true
+			break
+		}
+	}
+	if !nested {
+		return body
+	}
+	flat := make([]ir.ANFBinding, 0, len(body))
+	for i := range body {
+		switch body[i].Value.Kind {
+		case "loop":
+			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Body)...)
+		case "if":
+			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Then)...)
+			flat = append(flat, flattenNestedLoopBodies(body[i].Value.Else)...)
+		default:
+			flat = append(flat, body[i])
+		}
+	}
+	return flat
 }
 
 // dropSlotAtDepth physically removes the stack slot `depth` places below the
@@ -1057,7 +1162,7 @@ func (ctx *loweringContext) lowerBindings(bindings []ir.ANFBinding, terminalAsse
 			ctx.lowerAssert(binding.Value.ValueRef, i, lastUses, true)
 		} else if binding.Value.Kind == "if" && i == terminalIfIdx {
 			// Terminal if: propagate terminalAssert into both branches
-			ctx.lowerIf(binding.Name, binding.Value.Cond, binding.Value.Then, binding.Value.Else, i, lastUses, true)
+			ctx.lowerIf(binding.Name, binding.Value.Cond, binding.Value.Then, binding.Value.Else, binding.Value.Results, i, lastUses, true)
 		} else {
 			ctx.lowerBinding(&binding, i, lastUses)
 		}
@@ -1109,7 +1214,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "method_call":
 		ctx.lowerMethodCall(name, value.Object, value.Method, value.Args, bindingIndex, lastUses)
 	case "if":
-		ctx.lowerIf(name, value.Cond, value.Then, value.Else, bindingIndex, lastUses)
+		ctx.lowerIf(name, value.Cond, value.Then, value.Else, value.Results, bindingIndex, lastUses)
 	case "loop":
 		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, value.Start, value.Step, bindingIndex, lastUses)
 	case "assert":
@@ -1791,8 +1896,58 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 	}
 }
 
-func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
+// results is the `if` node's declared result slots, deepest first (see
+// ir.ANFValue.Results). Empty for an `if` that carries at most one result,
+// and then every path below behaves exactly as it did before the
+// multi-result contract existed.
+func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, elseBindings []ir.ANFBinding, results []string, bindingIndex int, lastUses map[string]int, terminalAssert ...bool) {
 	ta := len(terminalAssert) > 0 && terminalAssert[0]
+
+	// The ANF wire format has no version field, and --ir / --ir-parity are
+	// documented surfaces that feed a checked-in ANF JSON straight into this
+	// pass. An ANF produced BEFORE the multi-result node carries the trailing
+	// `__merge$` block WITHOUT Results — back then the block was a naming
+	// CONVENTION this pass recognised, and no tier recognises it any more. It
+	// deserialises cleanly, the declared count is 0, and the result count falls
+	// back to thenDepth - parentDepth, which counts the arm's untrimmed block
+	// residue as results. Refuse it: the block can only be emitted by
+	// appendBranchResults, which only runs for an `if` that declares Results,
+	// so block-without-results is by construction an ANF no current compiler
+	// could have produced. Emits no opcodes.
+	if len(results) == 0 {
+		for _, b := range append(append([]ir.ANFBinding{}, thenBindings...), elseBindings...) {
+			if strings.HasPrefix(b.Name, ir.MergedLocalTempPrefix) {
+				panic(fmt.Sprintf(
+					"ANF produced by a pre-multi-result compiler: the conditional's arm "+
+						"carries a '%s' block but the node declares no results (binding '%s'). "+
+						"That block used to be a naming convention this pass inferred results "+
+						"from; it is now a declared contract, and no tier reads the convention "+
+						"any more. Recompile the source with the current compiler instead of "+
+						"reusing the stored ANF. binding='%s'.",
+					ir.MergedLocalTempPrefix, b.Name, bindingName))
+			}
+		}
+	}
+
+	// Result slots are identified BY NAME — the layout assertion below compares
+	// the arm's top-N slot names against this list, so two identically-named
+	// results are indistinguishable and the assertion would be satisfied by
+	// coincidence while one value silently replaced the other. ANF lowering
+	// refuses the source shape that produces it; this guards the --ir path,
+	// where the list arrives as data.
+	if len(results) > 1 {
+		seen := make(map[string]bool, len(results))
+		for _, r := range results {
+			if seen[r] {
+				panic(fmt.Sprintf(
+					"Internal codegen error: the conditional declares duplicate result "+
+						"names [%s]. Result slots are matched by name, so duplicates cannot "+
+						"be told apart and one value would silently replace the other. "+
+						"binding='%s'.", strings.Join(results, ", "), bindingName))
+			}
+			seen[r] = true
+		}
+	}
 
 	isLast := ctx.isLastUse(cond, bindingIndex, lastUses)
 	ctx.bringToTop(cond, isLast)
@@ -1803,6 +1958,43 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	for ref, lastIdx := range lastUses {
 		if lastIdx > bindingIndex && ctx.sm.has(ref) {
 			protectedRefs[ref] = true
+		}
+	}
+
+	// The K>=2 merged-local block reads every merged local in BOTH arms, and
+	// that read is RECONCILIATION, not a use: it is what makes each arm leave
+	// exactly K equally-named result slots for the N>=2 reconcile below to
+	// adopt. So the merged locals must be copied, never consumed — regardless
+	// of whether the ENCLOSING scope reads them again.
+	//
+	// appendMergedLocalResults (ANF lowering) states that as its premise:
+	// "pass 1 always COPIES ... because a local live after the if is in
+	// outerProtectedRefs". Enclosing-scope liveness is the wrong question, and
+	// the premise silently failed for every merged local whose last enclosing
+	// use IS this if — which is EVERY merged local of an if in a loop body,
+	// since the body's last-use map ends at the if itself.
+	//
+	// What happened then: pass 1 ROLLED instead of picking, the arm's stack
+	// effect stopped being +K, the arms ended at different depths, phase 3
+	// padded the shortfall with EMPTY pushes, elseMatchesThenNResultLayout saw
+	// an unnamed slot where it needed the merged name, and control fell through
+	// to the single-slot fallback push(bindingName) — ONE stackMap name
+	// registered for K physical results, with acc/wacc still naming the dead
+	// pre-if slots. `for (i<2) { if (i<5) { acc = acc + step;
+	// wacc = wacc + acc; } }` with step = 3 produced wacc = 3 where the source
+	// says 9: silently in a stateless contract, and as a permanently
+	// unspendable UTXO in a stateful one.
+	//
+	// Byte-neutral for every program whose merged locals were already live
+	// after the if: those names are already protected above, which is precisely
+	// why those programs compiled correctly.
+	//
+	// Now driven by the node's DECLARED results instead of by recognising a
+	// trailing __merge$ block, so an arm-written property is protected on the
+	// same footing as a rebound local.
+	for _, name := range results {
+		if ctx.sm.has(name) {
+			protectedRefs[name] = true
 		}
 	}
 
@@ -1923,21 +2115,21 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
-	// Branch-merged locals: trim each arm down to exactly its K result slots.
+	// Trim each arm down to exactly its declared result slots.
 	//
-	// ANF lowering ends both arms with an identical K-binding block that
-	// rebinds every merged local from a `__merge$<i>` temp (see
-	// appendMergedLocalResults). That block leaves the K live values on top in
-	// the same canonical order in both arms — but BENEATH them each arm still
-	// holds whatever its own body produced, and those differ per arm, which is
-	// exactly what the N>=2 reconcile further down compares. Everything
-	// beneath the K results is dead: the block copied each merged local before
-	// rebinding it, and a branch-local binding is not visible after the `if`.
+	// ANF lowering ends both arms with an identical N-binding block that
+	// rebinds every declared result from a `__merge$<i>` temp (see
+	// appendBranchResults). That block leaves the N live values on top in the
+	// same canonical order in both arms — but BENEATH them each arm still
+	// holds whatever its own body produced, and those differ per arm.
+	// Everything beneath the N results is dead: the block copied each result
+	// before rebinding it, and a branch-local binding is not visible after the
+	// `if`.
 	//
 	// Runs AFTER the phase-2 consumption drops, so both arms have given up the
 	// same parent slots and share one base depth.
-	mergedResultCount := countMergedLocalResults(thenBindings, elseBindings)
-	if mergedResultCount >= 2 {
+	nDeclared := len(results)
+	if nDeclared >= 1 {
 		stillHeld := thenCtx.sm.namedSlots()
 		consumedFromParent := 0
 		for name := range preIfNames {
@@ -1945,10 +2137,32 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 				consumedFromParent++
 			}
 		}
-		targetDepth := ctx.sm.depth() - consumedFromParent + mergedResultCount
+		targetDepth := ctx.sm.depth() - consumedFromParent + nDeclared
 		for _, armCtx := range []*loweringContext{thenCtx, elseCtx} {
 			for armCtx.sm.depth() > targetDepth {
-				armCtx.dropSlotAtDepth(mergedResultCount)
+				armCtx.dropSlotAtDepth(nDeclared)
+			}
+		}
+
+		// The declared contract, checked rather than assumed: after the trim,
+		// each arm's top N slots must BE the declared results, in the declared
+		// order (results[0] deepest). appendBranchResults is what makes this
+		// true; if it ever stops being true the arms disagree on layout, which
+		// is precisely the failure that produced the 2026-08 miscompile family.
+		// Emits no opcodes.
+		for _, arm := range []struct {
+			label string
+			c     *loweringContext
+		}{{"then", thenCtx}, {"else", elseCtx}} {
+			if arm.c.sm.depth() != targetDepth {
+				panic(fmt.Sprintf("internal codegen error: branch result layout mismatch — the %s-arm of the conditional ends at depth %d, but its %d declared result(s) require depth %d; binding=%q", arm.label, arm.c.sm.depth(), nDeclared, targetDepth, bindingName))
+			}
+			for i := 0; i < nDeclared; i++ {
+				want := results[nDeclared-1-i]
+				got := arm.c.sm.peekAtDepth(i)
+				if got != want {
+					panic(fmt.Sprintf("internal codegen error: branch result layout mismatch — the %s-arm of the conditional holds %q where the node declares %q (slot %d of [%s]); every later operand would resolve to the wrong slot; binding=%q", arm.label, got, want, nDeclared-1-i, strings.Join(results, ", "), bindingName))
+				}
 			}
 		}
 	}
@@ -2007,6 +2221,13 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 	ctx.emitOp(ifOp)
 
+	// Physical slots this function drops AFTER OP_ENDIF, while reconciling the
+	// parent stackMap against the arms' results. Counted because the invariant
+	// at the end of lowerIf cannot compare the two depths directly: the
+	// post-ENDIF reconcile legitimately ROLL/DROPs stale slots out from under
+	// the results, so those drops have to be added back before comparing.
+	postEndifDrops := 0
+
 	// Reconcile parent stackMap: remove items consumed by the branches.
 	postBranchNames := thenCtx.sm.namedSlots()
 	for name := range preIfNames {
@@ -2041,7 +2262,40 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 
 	// The if expression may produce a result value on top.
-	if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {
+	if nDeclared >= 1 {
+		// DECLARED RESULTS. Both arms were normalised by appendBranchResults
+		// and the layout check above proved they hold exactly `results`, so the
+		// parent adopts them BY THE DECLARED ORDER — no counting of trailing
+		// __merge$ bindings, no comparison of arm depths, no inference of which
+		// names are still live. results[0] is the deepest slot, matching the
+		// order pass 2 of the normalisation rebound them in.
+		//
+		// Then each parent slot the block shadows (the pre-`if` binding of a
+		// merged local, the stale value of a written property) is physically
+		// rolled out from under the results, exactly as the pre-existing N>=2
+		// reconcile did — which is why the four __merge$ goldens keep their
+		// bytes.
+		for _, name := range results {
+			ctx.sm.push(name)
+		}
+		for i := nDeclared - 1; i >= 0; i-- {
+			name := results[i]
+			for d := nDeclared; d < ctx.sm.depth(); d++ {
+				if ctx.sm.peekAtDepth(d) == name {
+					ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(d))})
+					ctx.sm.push("")
+					ctx.emitOp(StackOp{Op: "roll", Depth: d + 1})
+					ctx.sm.pop()
+					rolled := ctx.sm.removeAtDepth(d)
+					ctx.sm.push(rolled)
+					ctx.emitOp(StackOp{Op: "drop"})
+					ctx.sm.pop()
+					postEndifDrops++
+					break
+				}
+			}
+		}
+	} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {
 		// #99 Bug 1: a conditional write of N>=2 state fields leaves N result
 		// values on top (new values if taken, preserved old values if skipped).
 		// Record the N results in their on-stack order, then physically remove
@@ -2072,6 +2326,7 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 					ctx.sm.push(rolled)
 					ctx.emitOp(StackOp{Op: "drop"})
 					ctx.sm.pop()
+					postEndifDrops++
 					break
 				}
 			}
@@ -2108,6 +2363,7 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 						ctx.emitOp(StackOp{Op: "drop"})
 						ctx.sm.pop()
 					}
+					postEndifDrops++
 					break
 				}
 			}
@@ -2131,6 +2387,7 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 						ctx.emitOp(StackOp{Op: "drop"})
 						ctx.sm.pop()
 					}
+					postEndifDrops++
 					break
 				}
 			}
@@ -2142,6 +2399,36 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	} else {
 		// Void if — don't push phantom
 	}
+
+	// Layer C — branch result-depth invariant.
+	//
+	// The stackMap is the compiler's ONLY model of the stack, so a stackMap
+	// that names FEWER slots than the arms physically left is not detectable
+	// anywhere downstream: every later operand silently resolves N slots off.
+	// That single failure mode produced the whole 2026-08 branch/loop
+	// miscompile family — wrong-but-accepted state continuations at best, and
+	// scripts the interpreter rejects outright (locked funds) at worst.
+	//
+	// What must hold when lowerIf returns: the parent stackMap describes
+	// exactly the physical stack. Both arms ended at armDepth (the
+	// branch-balance guard above proves they agree), OP_ENDIF changes nothing,
+	// and the only physical effect after it is the postEndifDrops stale-slot
+	// drops the reconcile emitted. So:
+	//
+	//	ctx.sm.depth() + postEndifDrops == armDepth
+	//
+	// The naive ctx.sm.depth() == armDepth is WRONG — the reconcile
+	// legitimately ROLL/DROPs stale slots out from under the results, which is
+	// exactly what postEndifDrops counts.
+	//
+	// A failure here is always a codegen bug, never a user error. Emits no
+	// opcodes: byte-neutral by construction. Same genre as the branch-balance
+	// guard (#99), added for the same reason.
+	armDepth := thenCtx.sm.depth()
+	if ctx.sm.depth()+postEndifDrops != armDepth {
+		panic(fmt.Sprintf("internal codegen error: branch result depth mismatch — the parent stack model does not describe the physical stack after OP_ENDIF (stackMap depth %d + %d post-ENDIF drop(s) != arm depth %d); the arms leave %d more physical slot(s) than the compiler recorded, so every later operand would resolve to the wrong slot and the script would be wrong or unspendable; binding=%q", ctx.sm.depth(), postEndifDrops, armDepth, armDepth-ctx.sm.depth()-postEndifDrops, bindingName))
+	}
+
 	ctx.trackDepth()
 
 	if thenCtx.maxDepth > ctx.maxDepth {
@@ -2185,6 +2472,17 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 			if ref != iterVar && !deepBodyBindingNames[ref] {
 				outerRefs[ref] = true
 			}
+		}
+	}
+
+	// A local the body REBINDS and then READS AGAIN in the same iteration is
+	// carried across iterations through the rebound slot, so it must survive
+	// the body exactly like an outer ref. deepBodyBindingNames above excludes
+	// it precisely because the body binds it — which is what made the updated
+	// value consumable. See collectLoopCarriedRebinds.
+	for ref := range collectLoopCarriedRebinds(body) {
+		if ref != iterVar {
+			outerRefs[ref] = true
 		}
 	}
 

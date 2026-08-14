@@ -1,0 +1,85 @@
+{
+  "case": "bytes-pushdata2",
+  "contract": "SlotMatrix",
+  "valueClass": "ByteString 300 bytes → OP_PUSHDATA2 with BOTH length bytes non-zero (0x4d 2c 01 + data); a byte-swapped LE length is otherwise undetectable",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "7"
+    },
+    {
+      "type": "ByteString",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 683,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 303,
+      "headerBytes": 3,
+      "valueByteOffset": 3,
+      "valueByteLength": 300,
+      "encoding": "data",
+      "pushedHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 305,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 305,
+      "valueByteLength": 1,
+      "encoding": "scriptnum",
+      "pushedHex": "07"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 308,
+      "byteLength": 303,
+      "headerBytes": 3,
+      "valueByteOffset": 311,
+      "valueByteLength": 300,
+      "encoding": "data",
+      "pushedHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 611,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 612,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 648,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 649,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

@@ -960,10 +960,23 @@ func bn254BuildJacobianAddAffineStandard(it *BN254Tracker) {
 // doubling case, we check H == 0 at runtime and delegate to Jacobian doubling
 // of (jx, jy, jz) when it fires. The standard mixed-add runs otherwise.
 //
-// The negation case (H == 0 with R != 0, i.e., acc = -base) produces incorrect
-// results, but is cryptographically unreachable for valid Groth16 public
-// inputs and is therefore not guarded separately.
-func bn254BuildJacobianAddAffineInline(e func(StackOp), t *BN254Tracker) {
+// `strict` additionally requires R == 0, which separates the two cases H == 0
+// covers: accumulator == +base (double it) from accumulator == -base (the sum
+// is the point at infinity). Without it BOTH went to the doubling branch, so
+// accumulator == -base returned -2*base where the answer is O. That is NOT
+// unreachable, as an earlier version of this comment claimed: sweeping
+// c_i = (k+3r) >> i over k in [0, r-1] puts it at i = 0, k = 0 — and a Groth16
+// public input of 0 is entirely ordinary. See bn254_scalar_domain_test.go for
+// the sweep and EmitBN254G1ScalarMul for the interval bounds it rests on.
+//
+// The sweep also shows H == 0 is unreachable at every step EXCEPT i = 0, so
+// `strict` is passed only there. Measured on EmitBN254G1ScalarMul: the extra
+// R == 0 test (two field multiplications plus copies) is +23 bytes at one step
+// and +5,865 bytes across all 255, so paying it everywhere would be ~5.8 KB
+// spent re-deciding a branch that provably cannot fire. The cheap H == 0 test
+// is kept at i >= 1 as-is rather than removed, because it is the existing
+// shape and it costs nothing new.
+func bn254BuildJacobianAddAffineInline(e func(StackOp), t *BN254Tracker, strict bool) {
 	// Create inner tracker with cloned stack state
 	initNm := make([]string, len(t.nm))
 	copy(initNm, t.nm)
@@ -985,6 +998,10 @@ func bn254BuildJacobianAddAffineInline(e func(StackOp), t *BN254Tracker) {
 	// compare against a fresh copy of jx. Consumes only the copies.
 	it.copyToTop("jz", "_jz_chk_in")
 	bn254FieldSqr(it, "_jz_chk_in", "_jz_chk_sq")
+	if strict {
+		// Z1sq is consumed by U2 below; keep a copy for Z1cu.
+		it.copyToTop("_jz_chk_sq", "_jz_chk_sq_keep")
+	}
 	it.copyToTop("ax", "_ax_chk_copy")
 	bn254FieldMul(it, "_ax_chk_copy", "_jz_chk_sq", "_u2_chk")
 	it.copyToTop("jx", "_jx_chk_copy")
@@ -992,8 +1009,31 @@ func bn254BuildJacobianAddAffineInline(e func(StackOp), t *BN254Tracker) {
 		e(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
 	})
 
-	// Move _h_is_zero to top so OP_IF can consume it.
-	it.toTop("_h_is_zero")
+	condName := "_h_is_zero"
+	if strict {
+		// R = ay*jz^3 - jy == 0 ? Only H == 0 AND R == 0 means the two
+		// operands are the SAME point; H == 0 with R != 0 means they are
+		// negatives, whose sum is O — and the standard mixed-add already
+		// answers that correctly, with Z3 = jz*H = 0 flowing through the
+		// Fermat inverse to the all-zero point.
+		it.copyToTop("jz", "_jz_chk_for_cu")
+		bn254FieldMul(it, "_jz_chk_for_cu", "_jz_chk_sq_keep", "_z1cu_chk")
+		it.copyToTop("ay", "_ay_chk_copy")
+		bn254FieldMul(it, "_ay_chk_copy", "_z1cu_chk", "_s2_chk")
+		it.copyToTop("jy", "_jy_chk_copy")
+		it.rawBlock([]string{"_s2_chk", "_jy_chk_copy"}, "_r_is_zero", func(e func(StackOp)) {
+			e(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+		})
+		it.toTop("_h_is_zero")
+		it.toTop("_r_is_zero")
+		it.rawBlock([]string{"_h_is_zero", "_r_is_zero"}, "_dbl_cond", func(e func(StackOp)) {
+			e(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
+		})
+		condName = "_dbl_cond"
+	}
+
+	// Move the condition to top so OP_IF can consume it.
+	it.toTop(condName)
 	it.nm = it.nm[:len(it.nm)-1] // consumed by IF
 
 	// ------------------------------------------------------------------
@@ -1103,21 +1143,68 @@ func EmitBN254G1Add(emit func(StackOp)) {
 	t.PopPrimeCache()
 }
 
+// bn254EmitScalarReduce reduces a scalar to [0, r-1]: ((k mod r) + r) mod r.
+//
+// OP_MOD takes the sign of the DIVIDEND, so `k mod r` alone lands in (-r, r);
+// the `+ r, mod r` normalises the negative half. One push of r covers both
+// reductions — the same shape as emitScalarReduce in ec.go and
+// cEmitScalarReduce in p256_p384.go, neither of whose numbers carry here (see
+// EmitBN254G1ScalarMul for the BN254 interval bounds).
+//
+// Without it the ladder below is correct only while 2^255 <= k + 3r < 2^256.
+// A scalar >= 2^256 - 3r (about 2.2902*r) sets bit 256, which the loop never
+// reads, and one <= -r drops k' under 2^255, invalidating the accumulator seed;
+// either way the ladder returns a DIFFERENT multiple of P rather than failing.
+// In Groth16 the scalars are the caller-supplied PUBLIC INPUTS of
+// vk_x = IC[0] + sum(IC[i] * pub_i), so the domain is attacker-chosen.
+func bn254EmitScalarReduce(t *BN254Tracker, kName, resultName string) {
+	t.pushBigInt("_r_red", bn254CurveR)
+	t.rawBlock([]string{kName, "_r_red"}, resultName, func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+		e(StackOp{Op: "rot"})
+		e(StackOp{Op: "drop"})
+		e(StackOp{Op: "over"})
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+		e(StackOp{Op: "swap"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+	})
+}
+
 // EmitBN254G1ScalarMul performs scalar multiplication P * k on BN254 G1.
 // Stack in: [point, scalar] (scalar on top)
 // Stack out: [result_point]
 //
-// Uses 254-bit double-and-add with Jacobian coordinates.
+// Uses 255-iteration double-and-add with Jacobian coordinates.
 // k' = k + 3*r guarantees bit 255 is set (r is the curve order).
+//
+// THE INTERVAL BOUNDS ARE BN254'S OWN — the secp256k1 / NIST numbers do NOT
+// carry, because r is 254 bits here against 256 there:
+//
+//	r.bit_length  = 254        3r.bit_length  = 256
+//	3r >= 2^255                4r-1 < 2^256
+//
+// so for k in [0, r-1] bit 255 of k' is always set and nothing above it ever
+// is: seed the accumulator at bit 255, iterate bits 254..0, 255 iterations.
+// (secp256k1 offsets by 3n with n 256 bits, giving a 258-bit 3n, a bit-257
+// seed and 257 iterations.) Adding 3r preserves the point: 3r = 0 mod r.
+//
+// Everything here is conditioned on k in [0, r-1], which is why the reduce
+// above runs first. Any change to the offset, the iteration count or the
+// reduce invalidates the bounds and must redo them.
 func EmitBN254G1ScalarMul(emit func(StackOp)) {
 	t := NewBN254Tracker([]string{"_pt", "_k"}, emit)
 	t.PushPrimeCache()
 	// Decompose to affine base point
 	bn254DecomposePoint(t, "_pt", "ax", "ay")
 
+	// Reduce first: the +3r trick below is only sound for k in [0, r-1], and
+	// the scalar is caller input.
+	t.toTop("_k")
+	bn254EmitScalarReduce(t, "_k", "_kr")
+	t.rename("_k")
+
 	// k' = k + 3r: guarantees bit 255 is set.
-	// k in [1, r-1], so k+3r in [3r+1, 4r-1]. Since 3r > 2^255, bit 255
-	// is always 1. Adding 3r (= 0 mod r) preserves the EC point: k*G = (k+3r)*G.
 	t.toTop("_k")
 	t.pushBigInt("_r1", bn254CurveR)
 	t.rawBlock([]string{"_k", "_r1"}, "_kr1", func(e func(StackOp)) {
@@ -1170,7 +1257,10 @@ func EmitBN254G1ScalarMul(emit func(StackOp)) {
 		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
-		bn254BuildJacobianAddAffineInline(addEmit, t)
+		// Only the LAST step can be handed accumulator == -base (k = 0 mod r);
+		// see bn254BuildJacobianAddAffineInline for why the strict H == 0 AND
+		// R == 0 test is paid there and nowhere else.
+		bn254BuildJacobianAddAffineInline(addEmit, t, bit == 0)
 		emit(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 

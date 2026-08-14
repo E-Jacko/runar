@@ -166,32 +166,42 @@ public final class ConstantFold {
         }
 
         if (value instanceof If ifv) {
-            ConstSlot cond = env.get(ifv.cond());
-            if (cond != null && cond.kind() == ConstSlot.Kind.BOOL) {
-                if (cond.boolVal()) {
-                    Map<String, ConstSlot> thenEnv = new HashMap<>(env);
-                    List<AnfBinding> foldedThen = foldBindings(orEmpty(ifv.thenBranch()), thenEnv);
-                    // Merge constants from the taken branch back into the outer env.
-                    for (AnfBinding b : foldedThen) {
-                        ConstSlot s = anfValueToConst(b.value());
-                        if (s != null) env.put(b.name(), s);
-                    }
-                    return new If(ifv.cond(), foldedThen, List.of());
-                }
-                Map<String, ConstSlot> elseEnv = new HashMap<>(env);
-                List<AnfBinding> foldedElse = foldBindings(orEmpty(ifv.elseBranch()), elseEnv);
-                for (AnfBinding b : foldedElse) {
-                    ConstSlot s = anfValueToConst(b.value());
-                    if (s != null) env.put(b.name(), s);
-                }
-                return new If(ifv.cond(), List.of(), foldedElse);
-            }
-            // Condition not known — fold both branches independently.
+            // Fold both arms independently, ALWAYS — including when the condition is a
+            // compile-time constant.
+            //
+            // This pass used to "optimise" a statically-known condition by blanking the
+            // untaken arm (List.of()) while LEAVING the `if` node itself in place, and by
+            // propagating the taken arm's constants into the enclosing env. Both halves
+            // were unsound:
+            //
+            //   * An arm is not a free-floating binding list — it carries a STACK-SHAPE
+            //     CONTRACT that ANF lowering establishes and stack lowering depends on.
+            //     For two or more branch-merged locals both arms end with the identical
+            //     __merge$<i> result block, which is how lowerIf learns K and adopts the
+            //     K results by name. Blanking one arm makes the merged-result count 0,
+            //     the N>=2 name-matched reconcile cannot fire, and ONE stack slot is
+            //     registered for K physical results — every post-branch operand then
+            //     resolves one or more slots off. At K=2 that miscompiled SILENTLY: the
+            //     deployed script accepted spends the source rejects and rejected spends
+            //     the source accepts. At K=1 it surfaced as "value not found on stack", a
+            //     compile-time rejection of source that compiles with folding disabled.
+            //   * Propagating the taken arm's constants outward is only sound if the
+            //     other arm is really gone. The `if` node survives this pass, so both
+            //     arms are still emitted and either can run.
+            //
+            // Correct dead-arm elimination would have to delete the `if` and splice the
+            // live arm into the parent, re-establishing the parent's shape. That is a
+            // lowering-level rewrite, not a fold, so it does not live here. The bytes
+            // given up are the statically-dead arm's ops, which never execute.
             Map<String, ConstSlot> thenEnv = new HashMap<>(env);
             Map<String, ConstSlot> elseEnv = new HashMap<>(env);
             List<AnfBinding> foldedThen = foldBindings(orEmpty(ifv.thenBranch()), thenEnv);
             List<AnfBinding> foldedElse = foldBindings(orEmpty(ifv.elseBranch()), elseEnv);
-            return new If(ifv.cond(), foldedThen, foldedElse);
+            // The declared result list survives folding untouched: folding an
+            // arm's bindings cannot change WHICH slots the arm leaves, and
+            // dropping the list would silently return the `if` to the
+            // single-result reconcile it was migrated off.
+            return new If(ifv.cond(), foldedThen, foldedElse, ifv.results());
         }
 
         if (value instanceof Loop lp) {

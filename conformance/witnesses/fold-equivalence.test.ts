@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runFoldEquivalence, type WitnessArg } from 'runar-testing';
+import { runFoldEquivalence, type WitnessArg } from '../../packages/runar-testing/src/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TESTS_DIR = join(__dirname, '..', 'tests');

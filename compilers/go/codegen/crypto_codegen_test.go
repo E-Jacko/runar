@@ -2,6 +2,27 @@ package codegen
 
 import "testing"
 
+// countOpTree returns the total number of StackOps in ops, INCLUDING the
+// bodies of "if" ops.
+//
+// A flat len(ops) cannot see inside a branch, so any emitter whose work sits in
+// an if body — the scalar ladders emit 257 / 385 conditional additions, WOTS+
+// and SLH-DSA are almost entirely conditional — reports a count that barely
+// moves no matter what the branch contains. Adding +1.3 KB of script inside the
+// ladder's last step left the P256Mul / P384Mul goldens byte-identical.
+// Recursing is what makes the golden a gate.
+func countOpTree(ops []StackOp) int {
+	total := 0
+	for _, op := range ops {
+		total++
+		if op.Op == "if" {
+			total += countOpTree(op.Then)
+			total += countOpTree(op.Else)
+		}
+	}
+	return total
+}
+
 // Localized op-count goldens for the must-ship crypto codegen families
 // (SHA-256, BLAKE3, EC/secp256k1, NIST P-256/P-384, WOTS+, SLH-DSA).
 //
@@ -9,7 +30,8 @@ import "testing"
 // conformance suite, so a Go-only emit regression cannot ship — it would
 // diverge from the other six tiers' goldens. But that signal is whole-suite
 // and cross-tier; these unit tests pin the raw (pre-peephole) emit size of
-// each family's entry point so a Go-side regression fails *here*, naming the
+// each family's entry point — as an op TREE, if bodies included (see
+// countOpTree) — so a Go-side regression fails *here*, naming the
 // offending emitter, instead of only surfacing as an opaque conformance hex
 // mismatch. Each Emit* function produces a deterministic constant template
 // (no input dependence), so the counts are stable — update them only
@@ -24,23 +46,29 @@ func TestCryptoEmitOpCountGoldens(t *testing.T) {
 		{"Sha256Finalize", EmitSha256Finalize, 63941},
 		{"Blake3Compress", EmitBlake3Compress, 10373},
 		{"Blake3Hash", EmitBlake3Hash, 10387},
-		{"EcAdd", EmitEcAdd, 8202},
-		{"EcMul", EmitEcMul, 63828},
-		{"EcMulGen", EmitEcMulGen, 63830},
+		{"EcAdd", EmitEcAdd, 8223},
+		{"EcMul", EmitEcMul, 130515},
+		{"EcMulGen", EmitEcMulGen, 130517},
 		{"EcNegate", EmitEcNegate, 945},
 		{"EcOnCurve", EmitEcOnCurve, 533},
-		{"P256Add", EmitP256Add, 6505},
-		{"P256Mul", EmitP256Mul, 73306},
-		{"VerifyECDSA_P256", EmitVerifyECDSA_P256, 163589},
-		{"P384Add", EmitP384Add, 11311},
-		{"P384Mul", EmitP384Mul, 111424},
-		{"VerifyWOTS", EmitVerifyWOTS, 5438},
+		{"P256Add", EmitP256Add, 6663},
+		{"P256Mul", EmitP256Mul, 140036},
+		// +58 ops: SEC1 §4.1.4 / FIPS 186-5 input-validation gates on the
+		// verifier's untrusted arguments — sig/pubkey length gate
+		// (cEmitLengthGate), signature range gate 1<=r,s<=n-1
+		// (cEmitSigRangeGate), and the pubkey prefix-byte check folded into
+		// cDecompressPubKey's _dk_valid. P-384 carries the identical fix but
+		// has no golden entry in this table.
+		{"VerifyECDSA_P256", EmitVerifyECDSA_P256, 297331},
+		{"P384Add", EmitP384Add, 11469},
+		{"P384Mul", EmitP384Mul, 211178},
+		{"VerifyWOTS", EmitVerifyWOTS, 15488},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ops := gatherOps(tc.emit)
-			if len(ops) != tc.want {
-				t.Fatalf("%s: emitted %d ops, want %d (deliberate codegen change? update the golden)", tc.name, len(ops), tc.want)
+			if got := countOpTree(ops); got != tc.want {
+				t.Fatalf("%s: emitted %d ops, want %d (deliberate codegen change? update the golden)", tc.name, got, tc.want)
 			}
 			for i, o := range ops {
 				if o.Op == "" {
@@ -64,14 +92,14 @@ func TestSlhdsaEmitOpCountGoldens(t *testing.T) {
 		// window to ceil((bitOffset+a)/8) instead of capping at 2 bytes, so a=14
 		// sets (192s/256s) emit a 3-byte window on unlucky alignments. Must match
 		// the TS peer goldens in slh-dsa-codegen.test.ts.
-		{"SHA2_128f", 85765},
-		{"SHA2_192s", 41951},
+		{"SHA2_128f", 514147},
+		{"SHA2_192s", 256935},
 	}
 	for _, tc := range cases {
 		t.Run(tc.param, func(t *testing.T) {
 			ops := gatherOps(func(e func(StackOp)) { EmitVerifySLHDSA(e, tc.param) })
-			if len(ops) != tc.want {
-				t.Fatalf("SLHDSA %s: emitted %d ops, want %d (deliberate codegen change? update the golden)", tc.param, len(ops), tc.want)
+			if got := countOpTree(ops); got != tc.want {
+				t.Fatalf("SLHDSA %s: emitted %d ops, want %d (deliberate codegen change? update the golden)", tc.param, got, tc.want)
 			}
 		})
 	}

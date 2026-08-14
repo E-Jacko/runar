@@ -1,0 +1,70 @@
+{
+  "fixture": "merge-locals-prop-updates",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "Merged locals CROSSED WITH property mutation — the combination that no contract in the repo exercised. `settle` merges `na`/`nb` across an `if` whose arms rebind DIFFERENT ones, then writes all three properties from the merged results (`total` reads BOTH), and the addOutput continuation is built from the properties. Every accept pins expectedState for all three fields, so a merge that resurrects a dead pre-branch binding shows up as a wrong committed value rather than a rejected spend.",
+  "constructorArgs": [
+    "3n",
+    "5n",
+    "8n"
+  ],
+  "spends": [
+    {
+      "method": "settle",
+      "args": [
+        "7n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "toFirst>0: then-arm rebinds na=3+7=10; nb must survive as 5; total=10+5=15",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "10n",
+        "b": "5n",
+        "total": "15n"
+      }
+    },
+    {
+      "method": "settle",
+      "args": [
+        "7n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "toFirst==0: else-arm rebinds nb=5+7=12; na must survive as 3; total=3+12=15",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "3n",
+        "b": "12n",
+        "total": "15n"
+      }
+    },
+    {
+      "method": "settle",
+      "args": [
+        "0n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "amount=0 — the merged locals still have to be written through to the properties unchanged",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "3n",
+        "b": "5n",
+        "total": "8n"
+      }
+    },
+    {
+      "method": "settle",
+      "args": [
+        "7n",
+        "1n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the property block written from the merged locals must be committed to by hashOutputs",
+      "satoshis": 1000
+    }
+  ]
+}

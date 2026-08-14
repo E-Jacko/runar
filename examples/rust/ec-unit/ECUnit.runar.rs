@@ -19,6 +19,10 @@ impl ECUnit {
         assert!(ec_on_curve(doubled));
         let sum = ec_add(g, g);
         assert!(ec_on_curve(sum));
+        // P + (-P) is the point at infinity: ec_add returns the all-zero blob
+        // from a SUCCESSFUL script, and ec_on_curve must reject it.
+        let inf_pt = ec_add(g, neg);
+        assert!(!ec_on_curve(inf_pt));
         let x = ec_point_x(g);
         let y = ec_point_y(g);
         let rebuilt = ec_make_point(x, y);

@@ -21,6 +21,7 @@ import runar.compiler.ir.anf.BinOp;
 import runar.compiler.ir.anf.BoolConst;
 import runar.compiler.ir.anf.BytesConst;
 import runar.compiler.ir.anf.Call;
+import runar.compiler.ir.anf.If;
 import runar.compiler.ir.anf.CheckPreimage;
 import runar.compiler.ir.anf.LoadConst;
 import runar.compiler.ir.anf.LoadParam;
@@ -385,4 +386,85 @@ class ConstantFoldTest {
                 + t2Enabled.value().getClass().getSimpleName());
         assertEquals(BigInteger.valueOf(5), bigInt(t2Enabled.value()));
     }
+
+    // ---------------------------------------------------------------
+    // If-branch folding
+    // ---------------------------------------------------------------
+    //
+    // A statically-known condition must NOT blank the untaken arm.
+    //
+    // The folder used to return an empty arm while leaving the `if` node itself in
+    // place. An arm is not a free-floating binding list — it carries the stack-shape
+    // contract AnfLower builds (the __merge$<i> result block for K>=2 merged locals)
+    // and StackLower consumes. Erasing one arm made lowerIf register ONE stack slot
+    // for K physical results, which at K=2 silently miscompiled the guard (the
+    // deployed script accepted spends the source rejects) and at K=1 rejected source
+    // that compiles with folding disabled.
+
+    @Test
+    void keepsBothArmsWhenConditionKnownTrue() {
+        List<AnfBinding> body = List.of(
+            boolConst("t0", true),
+            bind("t1", new If("t0",
+                List.of(bigIntConst("t2", 42)),
+                List.of(bigIntConst("t3", 99))))
+        );
+        AnfMethod m = soleMethod(ConstantFold.run(singleMethodProgram(body)));
+        AnfValue v = findBinding(m, "t1").value();
+        assertTrue(v instanceof If, "expected the if to survive, got " + v.getClass().getSimpleName());
+        If ifv = (If) v;
+        assertEquals(1, ifv.thenBranch().size());
+        assertEquals(1, ifv.elseBranch().size());
+    }
+
+    @Test
+    void keepsBothArmsWhenConditionKnownFalse() {
+        List<AnfBinding> body = List.of(
+            boolConst("t0", false),
+            bind("t1", new If("t0",
+                List.of(bigIntConst("t2", 42)),
+                List.of(bigIntConst("t3", 99))))
+        );
+        AnfMethod m = soleMethod(ConstantFold.run(singleMethodProgram(body)));
+        AnfValue v = findBinding(m, "t1").value();
+        assertTrue(v instanceof If, "expected the if to survive, got " + v.getClass().getSimpleName());
+        If ifv = (If) v;
+        assertEquals(1, ifv.thenBranch().size());
+        assertEquals(1, ifv.elseBranch().size());
+    }
+
+    @Test
+    void foldsConstantsInsideBothArms() {
+        List<AnfBinding> body = List.of(
+            bind("t0", new LoadParam("flag")),
+            bigIntConst("c1", 5),
+            bigIntConst("c2", 3),
+            bind("t1", new If("t0",
+                List.of(bind("t2", new BinOp("+", "c1", "c2", null))),
+                List.of(bind("t3", new BinOp("-", "c1", "c2", null)))))
+        );
+        AnfMethod m = soleMethod(ConstantFold.run(singleMethodProgram(body)));
+        If ifv = (If) findBinding(m, "t1").value();
+        assertEquals(BigInteger.valueOf(8), bigInt(ifv.thenBranch().get(0).value()));
+        assertEquals(BigInteger.valueOf(2), bigInt(ifv.elseBranch().get(0).value()));
+    }
+
+    // A statically-known condition must not leak an arm's constants into the
+    // enclosing environment either: the `if` survives the pass, so both arms are
+    // still emitted and either can run.
+    @Test
+    void doesNotPropagateTakenArmConstants() {
+        List<AnfBinding> body = List.of(
+            boolConst("t0", true),
+            bind("t1", new If("t0",
+                List.of(bigIntConst("x", 42)),
+                List.of(bigIntConst("x", 99)))),
+            bind("t2", new BinOp("+", "x", "x", null))
+        );
+        AnfMethod m = soleMethod(ConstantFold.run(singleMethodProgram(body)));
+        AnfValue v = findBinding(m, "t2").value();
+        assertTrue(v instanceof BinOp,
+            "the post-if bin_op must survive unfolded, got " + v.getClass().getSimpleName());
+    }
+
 }

@@ -1344,6 +1344,154 @@ class StackLowerTest {
     }
 
     /**
+     * A loop-carried local REASSIGNED and then READ AGAIN in the same
+     * iteration. The rebinding shadows the incoming slot under the same name;
+     * the later read was its last body use, so it consumed the UPDATED value
+     * and left the dead incoming one for the next iteration to resolve.
+     * {@code wacc} came out as {@code step*N} instead of
+     * {@code step*N*(N+1)/2} — silently in a stateless contract, and as a
+     * permanently unspendable UTXO in a stateful one. The expected hex is
+     * byte-identical to the TypeScript reference compiler's fold-OFF output.
+     * Real-VM proof: {@code loop-carried-local-read-after-reassign-vm.test.ts}.
+     */
+    @Test
+    void loopCarriedLocalReadAfterReassignmentSurvivesTheIteration() throws Exception {
+        String src = """
+            import { SmartContract, assert } from 'runar-lang';
+
+            class LoopCarriedRebind extends SmartContract {
+              readonly expected: bigint;
+
+              constructor(expected: bigint) {
+                super(expected);
+                this.expected = expected;
+              }
+
+              public verify(step: bigint) {
+                let acc = 0n;
+                let wacc = 0n;
+                for (let i = 0n; i < 2n; i++) {
+                  acc = acc + step;
+                  wacc = wacc + acc;
+                }
+                assert(wacc === this.expected);
+              }
+            }
+            """;
+        assertEquals("000000537953797c937b789351557a53797c937b7c93009c77777777",
+            PipelineTestSupport.hex(src, "LoopCarriedRebind.runar.ts"));
+    }
+
+    /**
+     * Control for the test above: the same loop with a single self-accumulating
+     * carrier — no read after the rebinding. Its bytes must NOT move, or the
+     * carried-rebind fix has been written too wide and every shipped
+     * {@code BoundedLoop}-shaped contract pays.
+     */
+    @Test
+    void plainAccumulatorLoopIsUntouchedByTheCarriedRebindFix() throws Exception {
+        String src = """
+            import { SmartContract, assert } from 'runar-lang';
+
+            class LoopPlainAccumulator extends SmartContract {
+              readonly expected: bigint;
+
+              constructor(expected: bigint) {
+                super(expected);
+                this.expected = expected;
+              }
+
+              public verify(step: bigint) {
+                let acc = 0n;
+                for (let i = 0n; i < 2n; i++) {
+                  acc = acc + step;
+                }
+                assert(acc === this.expected);
+              }
+            }
+            """;
+        assertEquals("000052797b7c9351537a7b7c93009c7777",
+            PipelineTestSupport.hex(src, "LoopPlainAccumulator.runar.ts"));
+    }
+
+    /**
+     * The same cross-read one loop deeper. The predicate keys on the body's
+     * TOP-LEVEL binding names, and at the OUTER level {@code acc} is bound only
+     * inside the nested loop — so it was neither an outer ref nor a carried
+     * rebind, and every outer iteration restarted from the slot the previous
+     * one left behind. {@code wacc} came out 24 where the source says 30
+     * (step = 3). The expected hex is byte-identical to the TypeScript
+     * reference compiler's fold-OFF output. Real-VM proof:
+     * {@code nested-loop-carried-local-vm.test.ts}.
+     */
+    @Test
+    void nestedLoopCarriedLocalReadAfterReassignmentSurvivesTheIteration() throws Exception {
+        String src = """
+            import { SmartContract, assert } from 'runar-lang';
+
+            class LoopNestedCarriedRebind extends SmartContract {
+              readonly expected: bigint;
+
+              constructor(expected: bigint) {
+                super(expected);
+                this.expected = expected;
+              }
+
+              public verify(step: bigint) {
+                let acc = 0n;
+                let wacc = 0n;
+                for (let i = 0n; i < 2n; i++) {
+                  for (let j = 0n; j < 2n; j++) {
+                    acc = acc + step;
+                    wacc = wacc + acc;
+                  }
+                }
+                assert(wacc === this.expected);
+              }
+            }
+            """;
+        assertEquals(
+            "00000000547954797c93537a789351567953797c937b78935100597954797c93537a7893"
+                + "515b7a53797c937b7c93009c77777777777777777777",
+            PipelineTestSupport.hex(src, "LoopNestedCarriedRebind.runar.ts"));
+    }
+
+    /**
+     * Control for the test above: NESTED loops with a single self-accumulating
+     * carrier. The flatten step fires here (the body does contain a nested
+     * loop) but the predicate still says "not carried", so the bytes must NOT
+     * move — that is what keeps nesting itself from costing anything.
+     */
+    @Test
+    void nestedPlainAccumulatorLoopIsUntouchedByTheNestedFix() throws Exception {
+        String src = """
+            import { SmartContract, assert } from 'runar-lang';
+
+            class LoopNestedPlainAccumulator extends SmartContract {
+              readonly expected: bigint;
+
+              constructor(expected: bigint) {
+                super(expected);
+                this.expected = expected;
+              }
+
+              public verify(step: bigint) {
+                let acc = 0n;
+                for (let i = 0n; i < 2n; i++) {
+                  for (let j = 0n; j < 2n; j++) {
+                    acc = acc + step;
+                  }
+                }
+                assert(acc === this.expected);
+              }
+            }
+            """;
+        assertEquals(
+            "0000005379537a7c935154797b7c9351005679537a7c9351577a7b7c93009c777777777777",
+            PipelineTestSupport.hex(src, "LoopNestedPlainAccumulator.runar.ts"));
+    }
+
+    /**
      * A hand-written ANF {@code load_param} of a parameter the method does
      * not have can no longer be silently lowered to OP_0 — it is a hard
      * error. Mirrors the {@code compileFromANF} case in

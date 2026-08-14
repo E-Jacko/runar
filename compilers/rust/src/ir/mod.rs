@@ -180,6 +180,15 @@ pub enum ANFValue {
         then: Vec<ANFBinding>,
         #[serde(rename = "else")]
         else_branch: Vec<ANFBinding>,
+        /// Ordered named result slots both arms leave (`results[0]` deepest).
+        /// Entries name a branch-merged local or an arm-written contract
+        /// property; stack lowering tells the two apart from the contract's
+        /// property list, so the wire format stays a plain array of strings.
+        /// Absent (not empty) when the `if` carries at most one result — see
+        /// the TypeScript reference in
+        /// `packages/runar-compiler/src/ir/anf-ir.ts` for the full contract.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        results: Vec<String>,
     },
 
     #[serde(rename = "loop")]

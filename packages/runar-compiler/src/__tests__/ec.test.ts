@@ -199,26 +199,65 @@ class Bad extends SmartContract {
 // The "compilation" tests above only check that EC builtins compile without
 // errors; they don't pin codegen output. These goldens — copied from the
 // Python peer (compilers/python/tests/codegen/test_ec.py) which in turn
-// matches the Java reference EcTest — lock the exact op count for each
-// emitter so codegen drift surfaces here as a localized regression rather
-// than only as a cross-tier hex mismatch in the conformance harness.
+// matches the Java reference EcTest — lock the exact size of each emitter's
+// op TREE (`if` bodies included, see countOpTree) so codegen drift surfaces
+// here as a localized regression rather than only as a cross-tier hex
+// mismatch in the conformance harness.
 //
 // To update goldens after an intentional codegen change, run the Java peer
 // EcTest, copy the new numbers, and update Python + this file together.
+//
+// WHY THE ZIG GOLDENS DIFFER (~8%) AND THAT IS NOT A BUG.
+// These are OP counts, not bytes. For the ladder's `k' = k + 3n` step this file
+// (and the Go / Rust / Python / Ruby / Java peers) emit `push n; OP_ADD` three
+// times and let the peephole optimizer fold them — see the 4-op chain rule
+// `PUSH(a), ADD, PUSH(b), ADD -> PUSH(a+b), ADD` in
+// packages/runar-compiler/src/optimizer/peephole.ts. Zig pre-computes the sum
+// and emits `push 3n; OP_ADD` directly — see the `p256_3n_be` / `p384_3n_be`
+// constants and the "matches Go peephole output" comments in
+// compilers/zig/src/passes/helpers/nist_ec_emitters.zig. Both reach the SAME
+// post-peephole hex, which is what conformance compares; only the pre-peephole
+// op count differs. Do not "reconcile" the two sets of goldens — they are
+// measuring different points in the pipeline.
 // ---------------------------------------------------------------------------
+
+/**
+ * Total number of StackOps in `ops`, INCLUDING the bodies of `if` ops.
+ *
+ * A flat `ops.length` cannot see inside a branch, so any emitter whose work
+ * sits in an `if` body — the scalar ladders emit 257 / 385 conditional
+ * additions, WOTS+ and SLH-DSA are almost entirely conditional — reports a
+ * count that barely moves no matter what the branch contains. Adding +1.3 KB
+ * of script inside the ladder's last step left the `p256Mul` / `p384Mul`
+ * goldens byte-identical. Recursing is what makes the golden a gate.
+ */
+function countOpTree(ops: StackOp[]): number {
+  let total = 0;
+  for (const op of ops) {
+    total++;
+    if (op.op === 'if') {
+      total += countOpTree(op.then);
+      total += countOpTree(op.else ?? []);
+    }
+  }
+  return total;
+}
 
 describe('EC builtins — op-count goldens (T-11)', () => {
   const goldens: Array<[name: string, fn: (emit: (op: StackOp) => void) => void, expected: number]> = [
     // 8078 -> 8202 (+124): affineAdd now selects the tangent numerator and
     // denominator so ecAdd can DOUBLE a point. One fieldInv still, so the cost
     // is +1.5%, not +100%.
-    ['ecAdd',              emitEcAdd,                8202],
-    ['ecMul',              emitEcMul,               63828],
-    ['ecMulGen',           emitEcMulGen,            63830],
+    // 8202 -> 8223 (+21): and it now detects P == -Q (px == qx but py != qy)
+    // and forces the all-zero point, instead of taking the tangent and
+    // returning an on-curve, plausible, WRONG 2P. +21 bytes of script.
+    ['ecAdd',              emitEcAdd,                8223],
+    ['ecMul',              emitEcMul,              130515],
+    ['ecMulGen',           emitEcMulGen,           130517],
     ['ecNegate',           emitEcNegate,              945],
     ['ecOnCurve',          emitEcOnCurve,             533],
     ['ecModReduce',        emitEcModReduce,             8],
-    ['ecEncodeCompressed', emitEcEncodeCompressed,     14],
+    ['ecEncodeCompressed', emitEcEncodeCompressed,     16],
     ['ecMakePoint',        emitEcMakePoint,           467],
     ['ecPointX',           emitEcPointX,              233],
     ['ecPointY',           emitEcPointY,              234],
@@ -228,7 +267,7 @@ describe('EC builtins — op-count goldens (T-11)', () => {
     it(`${name} op count is ${expected}`, () => {
       const ops: StackOp[] = [];
       fn((op: StackOp) => ops.push(op));
-      expect(ops.length).toBe(expected);
+      expect(countOpTree(ops)).toBe(expected);
     });
   }
 

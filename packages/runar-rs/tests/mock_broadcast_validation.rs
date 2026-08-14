@@ -1,0 +1,318 @@
+//! Testing-gap remediation Phase A5 (Rust tier): `MockProvider::broadcast` is
+//! fail-CLOSED by default. It replays every input whose outpoint the provider
+//! knows through `bsv-sdk`'s `Spend` with full transaction context, enforces
+//! value conservation, and refuses to hand back a fake txid for a transaction
+//! a real node would reject.
+//!
+//! The TypeScript reference (`packages/runar-sdk/src/providers/mock.ts`) has a
+//! fail-OPEN hole this port deliberately closes: a transaction none of whose
+//! inputs are known validated NOTHING and was accepted. Here that is an error,
+//! so the gate can never pass vacuously.
+//!
+//! Divergence recorded honestly rather than papered over: `bsv-sdk` 0.1.72's
+//! script parser desyncs on the `0x8d` byte a Rúnar OP_PUSH_TX covenant
+//! embeds and aborts with `disabled opcode: OP_2MUL`. Such an input is counted
+//! as UNVALIDATABLE, never as validated — so it can never satisfy the
+//! non-vacuity requirement on its own. See `last_validation_report()`.
+
+use std::path::Path;
+
+use bsv::script::{LockingScript, UnlockingScript};
+use bsv::transaction::{
+    Transaction as BsvTx, TransactionInput as BsvTxIn, TransactionOutput as BsvTxOut,
+};
+use runar_lang::sdk::script_utils::build_p2pkh_script;
+use runar_lang::sdk::types::RunarArtifact;
+use runar_lang::sdk::{
+    DeployOptions, LocalSigner, MockProvider, Provider, RunarContract, SdkValue, Signer, Utxo,
+};
+
+const ANYONE_CAN_SPEND: &str = "51"; // OP_TRUE
+const DEPLOYER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000003";
+
+/// One-input, one-output transaction spending `prev_txid:0`.
+fn one_input_tx(prev_txid: &str, unlocking_hex: &str, out_sats: u64) -> BsvTx {
+    let mut tx = BsvTx::new();
+    tx.add_input(BsvTxIn {
+        source_txid: Some(prev_txid.to_string()),
+        source_output_index: 0,
+        unlocking_script: Some(UnlockingScript::from_hex(unlocking_hex).unwrap()),
+        sequence: 0xffff_ffff,
+        source_transaction: None,
+    });
+    tx.add_output(BsvTxOut {
+        satoshis: Some(out_sats),
+        locking_script: LockingScript::from_hex(ANYONE_CAN_SPEND).unwrap(),
+        change: false,
+    });
+    tx
+}
+
+fn seed(provider: &mut MockProvider, txid: &str, satoshis: i64, script: &str) {
+    provider.add_utxo(
+        "addr",
+        Utxo {
+            txid: txid.to_string(),
+            output_index: 0,
+            satoshis,
+            script: script.to_string(),
+        },
+    );
+}
+
+// --- rejection: script-invalid spend ----------------------------------------
+
+#[test]
+fn broadcast_rejects_script_invalid_spend() {
+    let mut p = MockProvider::testnet();
+    // "00" is OP_0: leaves a falsey top of stack, so the spend must fail.
+    seed(&mut p, &"11".repeat(32), 10_000, "00");
+    let tx = one_input_tx(&"11".repeat(32), "", 1_000);
+
+    let err = p
+        .broadcast(&tx)
+        .expect_err("MockProvider accepted a script-INVALID transaction; validation is fail-open");
+    assert!(err.contains("input 0"), "error should name the failing input: {}", err);
+}
+
+// --- rejection: underfunded --------------------------------------------------
+
+#[test]
+fn broadcast_rejects_underfunded_tx() {
+    let mut p = MockProvider::testnet();
+    seed(&mut p, &"22".repeat(32), 1_000, ANYONE_CAN_SPEND);
+    let tx = one_input_tx(&"22".repeat(32), "", 5_000);
+
+    let err = p
+        .broadcast(&tx)
+        .expect_err("MockProvider accepted an UNDERFUNDED transaction (outputs 5000 > inputs 1000)");
+    assert!(err.contains("underfunded"), "expected an underfunded error, got: {}", err);
+}
+
+// --- rejection: vacuous validation (zero inputs actually executed) -----------
+
+#[test]
+fn broadcast_rejects_vacuous_validation() {
+    let mut p = MockProvider::testnet();
+    // Nothing seeded: the provider knows no outpoints, so it can execute
+    // nothing. A gate that validates nothing is worse than no gate.
+    let tx = one_input_tx(&"33".repeat(32), "", 1_000);
+
+    let err = p.broadcast(&tx).expect_err(
+        "MockProvider accepted a transaction whose inputs are ALL unknown — \
+         validation ran on zero inputs and passed vacuously",
+    );
+    assert!(
+        err.contains("NOTHING was checked") && err.contains("0 of 1 inputs executed"),
+        "expected a non-vacuity error naming the validated/total counts, got: {}",
+        err
+    );
+}
+
+// --- pins on the two upstream bsv-sdk defects that bound this tier ----------
+//
+// These are DELIBERATELY written to go RED if `bsv-sdk` ever fixes them, so the
+// gate in `provider.rs` can be tightened at that moment instead of silently
+// staying weaker than it needs to be.
+
+/// `bsv-sdk` 0.1.72 builds `hashPrevouts` as "current input's outpoint first,
+/// then other_inputs" — transaction input order only for `input_index == 0`.
+/// A genuine BIP-143 signature on input 1 (produced by this SDK's own
+/// `LocalSigner`, and accepted by the Go tier's go-sdk interpreter) therefore
+/// evaluates to FALSE. That is why `validate_broadcast_tx` refuses to draw any
+/// conclusion from inputs at index > 0.
+#[test]
+fn pin_bsv_sdk_cannot_sighash_input_index_above_zero() {
+    use bsv::script::spend::{Spend, SpendParams};
+
+    let signer = LocalSigner::new(DEPLOYER_KEY).unwrap();
+    let pubkey = signer.get_public_key().unwrap();
+    let script = build_p2pkh_script(&pubkey);
+
+    let mut tx = BsvTx::new();
+    for t in ["aa", "bb"] {
+        tx.add_input(BsvTxIn {
+            source_txid: Some(t.repeat(32)),
+            source_output_index: 0,
+            unlocking_script: None,
+            sequence: 0xffff_ffff,
+            source_transaction: None,
+        });
+    }
+    tx.add_output(BsvTxOut {
+        satoshis: Some(1_000),
+        locking_script: LockingScript::from_hex(ANYONE_CAN_SPEND).unwrap(),
+        change: false,
+    });
+    let tx_hex = tx.to_hex().unwrap();
+    for i in 0..2 {
+        let sig = signer.sign(&tx_hex, i, &script, 10_000, None).unwrap();
+        let unlock = format!("{:02x}{}{:02x}{}", sig.len() / 2, sig, pubkey.len() / 2, pubkey);
+        tx.inputs[i].unlocking_script = Some(UnlockingScript::from_hex(&unlock).unwrap());
+    }
+
+    let verdict = |i: usize| -> bool {
+        let others: Vec<_> = tx
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, v)| v.clone())
+            .collect();
+        Spend::new(SpendParams {
+            locking_script: LockingScript::from_hex(&script).unwrap(),
+            unlocking_script: tx.inputs[i].unlocking_script.clone().unwrap(),
+            source_txid: tx.inputs[i].source_txid.clone().unwrap(),
+            source_output_index: 0,
+            source_satoshis: 10_000,
+            transaction_version: tx.version,
+            transaction_lock_time: tx.lock_time,
+            transaction_sequence: tx.inputs[i].sequence,
+            other_inputs: others,
+            other_outputs: tx.outputs.clone(),
+            input_index: i,
+        })
+        .validate()
+        .unwrap_or(false)
+    };
+
+    assert!(verdict(0), "input 0 must validate — if this fails, bsv-sdk's BIP-143 broke entirely");
+    assert!(
+        !verdict(1),
+        "bsv-sdk now sighashes input_index > 0 correctly! Remove the `unsupported_index` \
+         carve-out in src/sdk/provider.rs::validate_broadcast_tx and validate ALL known inputs."
+    );
+}
+
+/// A validating provider must never report an input it could not execute as
+/// validated. This pins the bucket accounting itself.
+#[test]
+fn report_buckets_never_count_an_unexecuted_input_as_validated() {
+    let mut p = MockProvider::testnet();
+    seed(&mut p, &"66".repeat(32), 10_000, ANYONE_CAN_SPEND);
+    let mut tx = one_input_tx(&"66".repeat(32), "", 1_000);
+    // Second input at index 1 — known, but bsv-sdk cannot sighash index > 0.
+    p.add_utxo(
+        "addr",
+        Utxo {
+            txid: "77".repeat(32),
+            output_index: 0,
+            satoshis: 10_000,
+            script: ANYONE_CAN_SPEND.to_string(),
+        },
+    );
+    tx.add_input(BsvTxIn {
+        source_txid: Some("77".repeat(32)),
+        source_output_index: 0,
+        unlocking_script: Some(UnlockingScript::from_hex("").unwrap()),
+        sequence: 0xffff_ffff,
+        source_transaction: None,
+    });
+
+    p.broadcast(&tx).expect("a conserving 2-input tx with a valid input 0 is acceptable");
+    let r = p.last_validation_report();
+    assert_eq!(r.total, 2);
+    assert_eq!(r.validated, 1, "only input 0 could actually be executed");
+    assert_eq!(r.unsupported_index, 1, "input 1 must be reported as NOT executed, not as validated");
+    assert!(r.value_conserved, "both outpoints were known, so value conservation ran");
+}
+
+// --- rejection: unsigned transaction ----------------------------------------
+
+#[test]
+fn broadcast_rejects_input_without_unlocking_script() {
+    let mut p = MockProvider::testnet();
+    seed(&mut p, &"55".repeat(32), 10_000, ANYONE_CAN_SPEND);
+    let mut tx = one_input_tx(&"55".repeat(32), "", 1_000);
+    tx.inputs[0].unlocking_script = None;
+
+    let err = p.broadcast(&tx).expect_err("an unsigned input must not be accepted");
+    assert!(err.contains("unsigned"), "got: {}", err);
+}
+
+// --- acceptance: a valid spend of a known outpoint --------------------------
+
+#[test]
+fn broadcast_accepts_valid_spend_and_reports_non_vacuity() {
+    let mut p = MockProvider::testnet();
+    seed(&mut p, &"44".repeat(32), 10_000, ANYONE_CAN_SPEND);
+    let tx = one_input_tx(&"44".repeat(32), "", 9_000);
+
+    let txid = p.broadcast(&tx).expect("MockProvider rejected a VALID spend");
+    assert_eq!(txid.len(), 64);
+    assert_eq!(
+        p.last_validated_input_count(),
+        1,
+        "the gate must report the input it actually executed (non-vacuity witness)"
+    );
+    assert_eq!(p.last_validation_report().unvalidatable, 0);
+}
+
+// --- acceptance: a real compiled contract's deploy ---------------------------
+
+fn compile_counter() -> RunarArtifact {
+    let src_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/rust/add-raw-output/RawOutputTest.runar.rs");
+    let compiler_art = runar_compiler_rust::compile_from_source(&src_path)
+        .expect("RawOutputTest.runar.rs should compile");
+    let json = serde_json::to_string(&compiler_art).expect("serialize compiler artifact");
+    serde_json::from_str(&json).expect("deserialize into SDK RunarArtifact")
+}
+
+#[test]
+fn broadcast_accepts_real_deploy_with_a_spendable_funding_coin() {
+    let signer = LocalSigner::new(DEPLOYER_KEY).unwrap();
+    let address = signer.get_address().unwrap();
+    let pubkey = signer.get_public_key().unwrap();
+    let mut provider = MockProvider::testnet();
+    // A REAL P2PKH funding script for this signer. The old fixture
+    // ("76a914" + "00"*20 + "88ac") is not spendable by ANY key, so the deploy
+    // input it produced would be rejected by a node — the pre-Phase-A5
+    // always-ack MockProvider hid that.
+    provider.add_utxo(
+        &address,
+        Utxo {
+            txid: "cc".repeat(32),
+            output_index: 0,
+            satoshis: 500_000,
+            script: build_p2pkh_script(&pubkey),
+        },
+    );
+
+    let mut contract = RunarContract::new(compile_counter(), vec![SdkValue::Int(0)]);
+    contract
+        .deploy(
+            &mut provider,
+            &signer,
+            &DeployOptions { satoshis: 50_000, change_address: None, funding_signer: None },
+        )
+        .expect("deploy REJECTED by the validating MockProvider");
+
+    assert_eq!(provider.get_broadcasted_txs().len(), 1);
+    assert!(
+        provider.last_validated_input_count() >= 1,
+        "the deploy's P2PKH funding input must have really executed, got report {:?}",
+        provider.last_validation_report()
+    );
+}
+
+// --- the governed opt-out ----------------------------------------------------
+
+#[test]
+fn always_ack_provider_skips_validation() {
+    let mut p = MockProvider::always_ack("testnet");
+    let tx = one_input_tx(&"33".repeat(32), "", 1_000);
+    p.broadcast(&tx).expect("always-ack provider must not validate");
+}
+
+#[test]
+fn disable_and_re_enable_broadcast_validation() {
+    let mut p = MockProvider::testnet();
+    let tx = one_input_tx(&"33".repeat(32), "", 1_000);
+
+    assert!(p.broadcast(&tx).is_err(), "default provider must validate");
+    p.disable_broadcast_validation();
+    assert!(p.broadcast(&tx).is_ok(), "after disable_broadcast_validation the provider must ack");
+    p.enable_broadcast_validation(true);
+    assert!(p.broadcast(&tx).is_err(), "after enable_broadcast_validation(true) it must validate again");
+}

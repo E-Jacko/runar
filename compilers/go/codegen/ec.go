@@ -243,14 +243,14 @@ func ecFieldMod(t *ECTracker, aName, resultName string) {
 	ecPushFieldP(t, "_fmod_p")
 	// (a % p + p) % p
 	t.rawBlock([]string{aName, "_fmod_p"}, resultName, func(e func(StackOp)) {
-		e(StackOp{Op: "opcode", Code: "OP_2DUP"})  // a p a p
-		e(StackOp{Op: "opcode", Code: "OP_MOD"})    // a p (a%p)
-		e(StackOp{Op: "rot"})                        // p (a%p) a
-		e(StackOp{Op: "drop"})                       // p (a%p)
-		e(StackOp{Op: "over"})                       // p (a%p) p
-		e(StackOp{Op: "opcode", Code: "OP_ADD"})     // p (a%p+p)
-		e(StackOp{Op: "swap"})                       // (a%p+p) p
-		e(StackOp{Op: "opcode", Code: "OP_MOD"})     // ((a%p+p)%p)
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"}) // a p a p
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})  // a p (a%p)
+		e(StackOp{Op: "rot"})                     // p (a%p) a
+		e(StackOp{Op: "drop"})                    // p (a%p)
+		e(StackOp{Op: "over"})                    // p (a%p) p
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})  // p (a%p+p)
+		e(StackOp{Op: "swap"})                    // (a%p+p) p
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})  // ((a%p+p)%p)
 	})
 }
 
@@ -459,19 +459,59 @@ func ecAffineAdd(t *ECTracker) {
 	// selected and the single expensive fieldInv still runs exactly once.
 	// rx and ry below are already correct for doubling.
 	//
-	//   cond = (px == qx)
-	//   num  = cond ? 3*px^2 : (qy - py)
-	//   den  = cond ? 2*py   : (qx - px)
+	//   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+	//   num    = cond ? 3*px^2 : (qy - py)
+	//   den    = cond ? 2*py   : (qx - px)
 	//
 	// selected as `b + cond*(a - b)`, which needs no branch and keeps the
 	// emitted op sequence identical on both paths.
 	//
-	// NOT handled: P == -Q, whose true result is the point at infinity, which
-	// affine coordinates cannot represent.
+	// THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+	// sends it down the tangent path and returns 2P — an on-curve, entirely
+	// plausible, WRONG point. Before the doubling fix the chord path ran there,
+	// divided by zero (ecFieldInv is Fermat, inv(0) = 0) and produced an
+	// OFF-curve blob, so `assert(ecOnCurve(ecAdd(a, b)))` — the idiom this
+	// codegen tells authors to write — happened to reject it. Selecting on px
+	// alone would have silently disarmed that.
+	//
+	// P + (-P) is the point at infinity, which affine x||y cannot represent.
+	// This codegen already has a representation for O: the ALL-ZERO blob, which
+	// is what `ecMul(P, 0n)` returns and what the ec-mulgen-linear rewrite in
+	// frontend/ec-rules.json produces for k1 + k2 ≡ 0 (mod n). So return that,
+	// by masking the result with `notinf = NOT(px == qx AND NOT cond)`:
+	//
+	//   - it agrees with the rewrite, so the same source cannot give two
+	//     answers depending on whether the optimizer fired;
+	//   - O is not on the curve (0^2 != 0^3 + 7), so the on-curve gate rejects
+	//     it and the idiom above works again;
+	//   - it adds no failure channel to what is a pure value-producing
+	//     expression, the same reason ecEmitScalarReduce reduces instead of
+	//     rejecting.
+	//
+	// The mask is a bare OP_MUL with no reduction: rx, ry are already in
+	// [0, p) and notinf is 0 or 1, so the product is canonical either way.
 	t.copyToTop("px", "_px_eq")
 	t.copyToTop("qx", "_qx_eq")
-	t.rawBlock([]string{"_px_eq", "_qx_eq"}, "_cond", func(e func(StackOp)) {
+	t.rawBlock([]string{"_px_eq", "_qx_eq"}, "_xeq", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+	t.copyToTop("py", "_py_eq")
+	t.copyToTop("qy", "_qy_eq")
+	t.rawBlock([]string{"_py_eq", "_qy_eq"}, "_yeq", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+	t.copyToTop("_xeq", "_xeq_c")
+	t.toTop("_yeq")
+	t.rawBlock([]string{"_xeq_c", "_yeq"}, "_cond", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
+	})
+	// notinf = NOT(xeq - cond): xeq - cond is 1 exactly when px == qx and the
+	// points are not equal, i.e. exactly the P == -Q case.
+	t.toTop("_xeq")
+	t.copyToTop("_cond", "_cond_c")
+	t.rawBlock([]string{"_xeq", "_cond_c"}, "_notinf", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_SUB"})
+		e(StackOp{Op: "opcode", Code: "OP_NOT"})
 	})
 
 	// chord numerator / denominator
@@ -533,6 +573,18 @@ func ecAffineAdd(t *ECTracker) {
 	t.drop()
 	t.toTop("qy")
 	t.drop()
+
+	// P == -Q -> force the all-zero point (see the header comment).
+	t.toTop("rx")
+	t.copyToTop("_notinf", "_notinf_x")
+	t.rawBlock([]string{"rx", "_notinf_x"}, "rx", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_MUL"})
+	})
+	t.toTop("ry")
+	t.toTop("_notinf")
+	t.rawBlock([]string{"ry", "_notinf"}, "ry", func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_MUL"})
+	})
 }
 
 // ===========================================================================
@@ -622,13 +674,22 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 	// Create inner tracker with cloned stack state
 	initNm := make([]string, len(t.nm))
 	copy(initNm, t.nm)
-	it := NewECTracker(initNm, e)
+	ecJacobianAddAffineBody(NewECTracker(initNm, e), false)
+}
 
+// ecJacobianAddAffineBody is the mixed-add itself, emitting through a tracker
+// the caller owns.
+//
+// keepHR additionally leaves copies of H and R on the stack. They are the
+// exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when
+// the Jacobian accumulator is the same curve point as the affine operand, the
+// one case these formulas cannot compute (see ecBuildJacobianAddOrDoubleInline).
+func ecJacobianAddAffineBody(it *ECTracker, keepHR bool) {
 	// Save copies of values that get consumed but are needed later
-	it.copyToTop("jz", "_jz_for_z1cu")  // consumed by Z1sq, needed for Z1cu
-	it.copyToTop("jz", "_jz_for_z3")    // needed for Z3
-	it.copyToTop("jy", "_jy_for_y3")    // consumed by R, needed for Y3
-	it.copyToTop("jx", "_jx_for_u1h2")  // consumed by H, needed for U1H2
+	it.copyToTop("jz", "_jz_for_z1cu") // consumed by Z1sq, needed for Z1cu
+	it.copyToTop("jz", "_jz_for_z3")   // needed for Z3
+	it.copyToTop("jy", "_jy_for_y3")   // consumed by R, needed for Y3
+	it.copyToTop("jx", "_jx_for_u1h2") // consumed by H, needed for U1H2
 
 	// Z1sq = jz^2
 	ecFieldSqr(it, "jz", "_Z1sq")
@@ -650,6 +711,11 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 
 	// R = S2 - jy
 	ecFieldSub(it, "_S2", "jy", "_R")
+
+	if keepHR {
+		it.copyToTop("_H", "_H_keep")
+		it.copyToTop("_R", "_R_keep")
+	}
 
 	// Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
 	it.copyToTop("_H", "_H_for_h3")
@@ -697,6 +763,130 @@ func ecBuildJacobianAddAffineInline(e func(StackOp), t *ECTracker) {
 	it.rename("jz")
 }
 
+// ecSelectCoord is a branchless select of one Jacobian coordinate:
+// `add + cond*(dbl - add)`. Same shape as the numerator/denominator select in
+// ecAffineAdd, so both paths emit the identical op sequence and the tracker's
+// static stack model holds. Consumes addName, dblName and condName.
+func ecSelectCoord(t *ECTracker, addName, dblName, condName, resultName string) {
+	t.copyToTop(addName, "_sel_add_c")
+	ecFieldSub(t, dblName, "_sel_add_c", "_sel_diff")
+	ecFieldMul(t, "_sel_diff", condName, "_sel_scaled")
+	ecFieldAdd(t, addName, "_sel_scaled", resultName)
+}
+
+// ecBuildJacobianAddOrDoubleInline is the ladder's LAST conditional step:
+// mixed-add, but correct when the accumulator already equals the point being
+// added.
+//
+// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+// infinity — and since ecFieldInv is Fermat (inv(0) = 0), ecJacobianToAffine
+// turns that into the ALL-ZERO point instead of 2P. ecMul(P, 2n) and
+// ecMulGen(2n) returned 64 zero bytes.
+//
+// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+// (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the degenerate
+// cases are exactly c_i ≡ 2 (mod n) — accumulator == P — and c_i ≡ 0 or 1
+// (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS interval
+// determined only by i, so this is decidable by interval arithmetic rather
+// than by sampling, and over the whole domain k ∈ [0, n-1] only two steps
+// qualify, both at i = 0:
+//
+//	k = 2  ->  c_0 = 3n+2 ≡ 2, odd, so the add runs: accumulator == P.  <- bug
+//	k = 0  ->  c_0 = 3n   ≡ 0, odd, so the add runs: accumulator == -P,
+//	           true result the point at infinity, which affine coordinates
+//	           cannot represent; it stays the all-zero point, as before.
+//
+// At i ≥ 1, c_i lies in [3n>>i, (4n-1)>>i] — the lower bound is 3n, not 3n+1,
+// because the reduce puts k = 0 in the domain — and that interval contains no
+// value ≡ 0, 1 or 2 (mod n) that is also odd; c_256 = 2 is even, so no add
+// runs. Handling H == 0 at every one of the 257 steps would cost ~70% more
+// script bytes; handling it here costs 0.26%.
+//
+// THE ENTIRE ARGUMENT IS CONDITIONED ON k ∈ [0, n-1], which is only true
+// because EmitEcMul reduces k mod n before adding 3n. That reduce landed one
+// commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS
+// UNSOUND: a last-step-only select while the scalar is still unbounded leaves
+// c_i free to hit 0, 1 or 2 (mod n) at other steps. The two commits must land
+// together and must never be bisected, cherry-picked or reverted apart.
+//
+// The interval argument does 100% of the work; there is no defence in depth
+// here. In particular c_i ≡ 1 (mod n) — a pre-add accumulator of O — is
+// UNREACHABLE, not handled: were it reachable the select would still take the
+// ADD path, because O is carried as Z1 = 0, which makes U2 = 0 and
+// H = -X1 != 0. Anything that changes the +3n offset, the iteration count or
+// the reduce must redo the interval check, not assume this still holds.
+//
+// The operand P is caller-supplied but cannot move the exception, because the
+// condition depends only on c_i mod ord(P) and ord(P) = n for every point on
+// the curve. Points that are NOT on the curve carry no such guarantee — gate
+// untrusted input on ecOnCurve first.
+//
+// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+func ecBuildJacobianAddOrDoubleInline(e func(StackOp), t *ECTracker) {
+	initNm := make([]string, len(t.nm))
+	copy(initNm, t.nm)
+	it := NewECTracker(initNm, e)
+
+	// Keep the pre-add accumulator: it is what must be DOUBLED in the
+	// exceptional case, and the add below consumes jx/jy/jz.
+	it.copyToTop("jx", "_sx")
+	it.copyToTop("jy", "_sy")
+	it.copyToTop("jz", "_sz")
+
+	ecJacobianAddAffineBody(it, true)
+
+	// cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+	// accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+	// signals the point at infinity.
+	it.toTop("_H_keep")
+	it.pushInt("_zero_h", 0)
+	it.rawBlock([]string{"_H_keep", "_zero_h"}, "_h_is0", func(e2 func(StackOp)) {
+		e2(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+	it.toTop("_R_keep")
+	it.pushInt("_zero_r", 0)
+	it.rawBlock([]string{"_R_keep", "_zero_r"}, "_r_is0", func(e2 func(StackOp)) {
+		e2(StackOp{Op: "opcode", Code: "OP_NUMEQUAL"})
+	})
+	it.toTop("_h_is0")
+	it.toTop("_r_is0")
+	it.rawBlock([]string{"_h_is0", "_r_is0"}, "_cond", func(e2 func(StackOp)) {
+		e2(StackOp{Op: "opcode", Code: "OP_BOOLAND"})
+	})
+
+	// Move the add result aside so ecJacobianDouble can work on jx/jy/jz
+	// again, this time holding the saved accumulator.
+	it.toTop("jx")
+	it.rename("_add_x")
+	it.toTop("jy")
+	it.rename("_add_y")
+	it.toTop("jz")
+	it.rename("_add_z")
+	it.toTop("_sx")
+	it.rename("jx")
+	it.toTop("_sy")
+	it.rename("jy")
+	it.toTop("_sz")
+	it.rename("jz")
+	ecJacobianDouble(it)
+	it.toTop("jx")
+	it.rename("_dbl_x")
+	it.toTop("jy")
+	it.rename("_dbl_y")
+	it.toTop("jz")
+	it.rename("_dbl_z")
+
+	it.copyToTop("_cond", "_cond_x")
+	ecSelectCoord(it, "_add_x", "_dbl_x", "_cond_x", "jx")
+	it.copyToTop("_cond", "_cond_y")
+	ecSelectCoord(it, "_add_y", "_dbl_y", "_cond_y", "jy")
+	it.toTop("_cond")
+	it.rename("_cond_z")
+	ecSelectCoord(it, "_add_z", "_dbl_z", "_cond_z", "jz")
+}
+
 // ===========================================================================
 // Public entry points (called from stack lowerer)
 // ===========================================================================
@@ -712,6 +902,32 @@ func EmitEcAdd(emit func(StackOp)) {
 	ecComposePoint(t, "rx", "ry", "_result")
 }
 
+// ecEmitScalarReduce reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+//
+// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+// the `+ n, mod n` normalises the negative half. One push of n covers both
+// reductions — the same shape as EmitEcModReduce.
+//
+// Without it, EmitEcMul's ladder is only correct while 2^257 <= k + 3n < 2^258:
+// a scalar >= ~n sets bit 258, the 257-iteration loop never sees it, and the
+// ladder returns a DIFFERENT multiple of P rather than failing. Scalars are
+// contract input, so that is attacker-chosen. Reducing costs 1 push + 8 opcodes
+// (42 bytes) against a ~429 KB script, and makes k >= n, k < 0 and k = 0 all
+// well defined.
+func ecEmitScalarReduce(t *ECTracker, kName, resultName string, n *big.Int) {
+	t.pushBigInt("_n_red", n)
+	t.rawBlock([]string{kName, "_n_red"}, resultName, func(e func(StackOp)) {
+		e(StackOp{Op: "opcode", Code: "OP_2DUP"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+		e(StackOp{Op: "rot"})
+		e(StackOp{Op: "drop"})
+		e(StackOp{Op: "over"})
+		e(StackOp{Op: "opcode", Code: "OP_ADD"})
+		e(StackOp{Op: "swap"})
+		e(StackOp{Op: "opcode", Code: "OP_MOD"})
+	})
+}
+
 // EmitEcMul performs scalar multiplication P * k.
 // Stack in: [point, scalar] (scalar on top)
 // Stack out: [result_point]
@@ -725,10 +941,14 @@ func EmitEcMul(emit func(StackOp)) {
 	// k' = k + 3n: guarantees bit 257 is set.
 	// k ∈ [1, n-1], so k+3n ∈ [3n+1, 4n-1]. Since 3n > 2^257, bit 257
 	// is always 1. Adding 3n (≡ 0 mod n) preserves the EC point: k*G = (k+3n)*G.
+	//
+	// "k ∈ [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar is
+	// usually an unlock argument — so reduce it first. See ecEmitScalarReduce.
 	curveN, _ := new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
 	t.toTop("_k")
+	ecEmitScalarReduce(t, "_k", "_kr", curveN)
 	t.pushBigInt("_n", curveN)
-	t.rawBlock([]string{"_k", "_n"}, "_kn", func(e func(StackOp)) {
+	t.rawBlock([]string{"_kr", "_n"}, "_kn", func(e func(StackOp)) {
 		e(StackOp{Op: "opcode", Code: "OP_ADD"})
 	})
 	t.pushBigInt("_n2", curveN)
@@ -778,7 +998,13 @@ func EmitEcMul(emit func(StackOp)) {
 		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
-		ecBuildJacobianAddAffineInline(addEmit, t)
+		// Only the final step can be handed two equal operands — see
+		// ecBuildJacobianAddOrDoubleInline for why, and for what it costs not to.
+		if bit == 0 {
+			ecBuildJacobianAddOrDoubleInline(addEmit, t)
+		} else {
+			ecBuildJacobianAddAffineInline(addEmit, t)
+		}
 		emit(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 

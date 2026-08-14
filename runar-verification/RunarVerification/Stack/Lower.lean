@@ -123,7 +123,7 @@ def collectRefs : ANFValue → List String
   | .unaryOp _ operand _      => [operand]
   | .call _ args              => args
   | .methodCall obj _ args    => (obj :: args : List String)
-  | .ifVal cond thn els       =>
+  | .ifVal cond thn els _       =>
       (cond :: collectRefsBindings thn) ++ collectRefsBindings els
   | .loop _ body _            => collectRefsBindings body
   | .assert ref               => [ref]
@@ -187,7 +187,7 @@ def collectConstInts : List ANFBinding → List (String × Int)
       let here : List (String × Int) :=
         match v with
         | .loadConst (.int i)   => [(name, i)]
-        | .ifVal _ thn els      => collectConstInts thn ++ collectConstInts els
+        | .ifVal _ thn els _      => collectConstInts thn ++ collectConstInts els
         | .loop _ body _        => collectConstInts body
         | _                     => []
       here ++ collectConstInts rest
@@ -260,36 +260,96 @@ def collectBoundNames : List ANFBinding → List String
         | _              => [name]
       here ++ collectBoundNames rest
 
-/-- Outer-scope refs referenced by `body`. Mirrors TS
-`lowerLoop`'s `outerRefs` computation (`05-stack-lower.ts:2115-2133`)
-EXACTLY: the TS reference iterates over body bindings and adds outer
-refs ONLY for
+/-- Every name bound anywhere in `body`, including inside `if` arms and
+nested `loop` bodies. TS `collectDeepBindingNames`.
 
-* `load_param` values whose name is not the iter var, and
-* `load_const "@ref:..."` values whose target name is not in
-  `bodyBindingNames` (= the plain binding-name set, NOT
-  `collectBoundNames` — TS does not include `update_prop` targets).
+Structurally recursive (no fuel) so that concrete small bodies reduce
+definitionally — the `rfl`-level loop pins in `AgreesA7` depend on it. -/
+def collectDeepBindingNames : List ANFBinding → List String
+  | [] => []
+  | (.mk name (.ifVal _ t e _) _) :: rest =>
+      (name :: (collectDeepBindingNames t ++ collectDeepBindingNames e))
+        ++ collectDeepBindingNames rest
+  | (.mk name (.loop _ body _) _) :: rest =>
+      (name :: collectDeepBindingNames body) ++ collectDeepBindingNames rest
+  | (.mk name _ _) :: rest => name :: collectDeepBindingNames rest
+termination_by xs => sizeOf xs
 
-A previous version of this function approximated the set by collecting
-EVERY read name not bound in the body. That over-approximation
-PROTECTED outer non-param locals read as raw binop/call operands, so
-the model accepted (and emitted bytes for) loop shapes the TS reference
-REJECTS with "Value not found on stack" — the consumed ref simply
-fails to resolve in the next iteration. With the faithful narrow set,
-those shapes now reach `bringToTop`'s unresolved branch
-(`OP_RUNAR_UNRESOLVED_*`) and `compileSafe` rejects them, matching the
-TS compile error. -/
+/-- A binding sequence with every nested `loop` and every `if` binding
+replaced, in place, by its own recursively-flattened body (`if` arms in
+`then ++ else` order, and the `if` binding itself NOT re-appended).
+Mirrors TS `flattenNestedLoopBodies`. Only `collectLoopCarriedRebinds`
+uses it, and only to order reads against rebindings. -/
+def flattenNestedLoopBodies : List ANFBinding → List ANFBinding
+  | [] => []
+  | (.mk _ (.loop _ body _) _) :: rest =>
+      flattenNestedLoopBodies body ++ flattenNestedLoopBodies rest
+  | (.mk _ (.ifVal _ t e _) _) :: rest =>
+      (flattenNestedLoopBodies t ++ flattenNestedLoopBodies e)
+        ++ flattenNestedLoopBodies rest
+  | b :: rest => b :: flattenNestedLoopBodies rest
+termination_by xs => sizeOf xs
+
+/-- Locals the body REBINDS and then READS again, so their value is carried
+across iterations through the rebound slot and they must survive the body
+exactly like an outer ref. TS `collectLoopCarriedRebinds`: a name read
+before its first binding AND read after its last binding. -/
+def collectLoopCarriedRebinds (body : List ANFBinding) : List String :=
+  let flat := flattenNestedLoopBodies body
+  let names := flat.map ANFBinding.name
+  let firstBind (n : String) : Option Nat := names.findIdx? (fun m => m == n)
+  let lastBind (n : String) : Option Nat :=
+    match names.reverse.findIdx? (fun m => m == n) with
+    | some i => some (names.length - 1 - i)
+    | none   => none
+  let idxs := List.range flat.length
+  let scan (pick : Nat → String → Bool) : List String :=
+    idxs.foldl (init := ([] : List String)) fun acc i =>
+      match flat[i]? with
+      | none   => acc
+      | some b =>
+          (collectRefs b.value).foldl (init := acc) fun a r =>
+            if pick i r && !listContains a r then a ++ [r] else a
+  let readBeforeBind := scan (fun i r => match firstBind r with
+                                          | some f => i < f
+                                          | none   => false)
+  let readAfterBind  := scan (fun i r => match lastBind r with
+                                          | some l => i > l
+                                          | none   => false)
+  readBeforeBind.filter (fun n => listContains readAfterBind n)
+
+/-- Outer-scope refs referenced by `body`, mirroring TS `lowerLoop`
+(`05-stack-lower.ts:2680-2705`).
+
+The scan is RECURSIVE (`collectRefs` descends into `if` arms and nested
+loop bodies) and excludes the DEEP bound-name set. An earlier version
+scanned only top-level `load_param` / `@ref:` bindings against the
+top-level bound names; a ref used only inside an `if` arm was then never
+clamped, the first iteration consumed it, and the next iteration emitted
+`OP_RUNAR_UNRESOLVED_*` — `loop-if-merged-locals`' `x`. The comment on
+that version claimed it matched the TS reference exactly; it matched an
+older TS, which has since fixed the same bug ("The previous top-level-only
+scan missed nested references"). -/
 def bodyOuterRefs (body : List ANFBinding) (iterVar : String) :
     List String :=
-  let bound := body.map (fun b => b.name)
-  body.foldl (init := ([] : List String)) fun acc b =>
-    match b.value with
-    | .loadParam n =>
-        if n == iterVar || listContains acc n then acc else acc ++ [n]
-    | .loadConst (.refAlias r) =>
-        if listContains bound r || listContains acc r then acc
-        else acc ++ [r]
-    | _ => acc
+  let deepBound := collectDeepBindingNames body
+  let base :=
+    body.foldl (init := ([] : List String)) fun acc b =>
+      (collectRefs b.value).foldl (init := acc) fun a r =>
+        if r == iterVar || listContains deepBound r || listContains a r then a
+        else a ++ [r]
+  (collectLoopCarriedRebinds body).foldl (init := base) fun a n =>
+    if n == iterVar || listContains a n then a else a ++ [n]
+
+/-- The loop body's outer refs that the ENCLOSING scope still reads AFTER
+the loop binding. TS clamps exactly these in the FINAL iteration as well
+(`05-stack-lower.ts:2723-2741`); everything else may be consumed there. -/
+def loopOuterRefsUsedAfter (body : List ANFBinding) (iterVar : String)
+    (lastUses : List (String × Nat)) (currentIndex : Nat) : List String :=
+  (bodyOuterRefs body iterVar).filter fun r =>
+    match lastUsesLookup lastUses r with
+    | some idx => decide (idx > currentIndex)
+    | none     => false
 
 /-- For non-final loop iters, bump the recorded last-use index of every
 outer ref to `clampTo` so they cannot be considered last-use within the
@@ -354,6 +414,41 @@ def removeConsumedAtDepths (sm : StackMap) (names : List String) :
         let (rest, smF) := go sm' ds
         (ops ++ rest, smF)
   go sm sorted
+
+/-- Shallowest depth `≥ start` holding `name`, if any. -/
+def StackMap.findFrom? (sm : StackMap) (start : Nat) (name : String) : Option Nat :=
+  match (sm.drop start).findIdx? (fun n => n == name) with
+  | some i => some (start + i)
+  | none   => none
+
+/--
+Adopt a multi-result `if`'s DECLARED result slots into the stack map.
+
+Mirrors TS `lowerIf` (`05-stack-lower.ts:2481-2495`): the parent adopts
+the declared results — `results[0]` deepest — instead of naming a single
+`bindingName`.
+
+Map-only, deliberately. TS pairs the adoption with a `push d / OP_ROLL /
+drop` that rolls each shadowed parent slot out from under the results. In
+this model that removal has ALREADY happened by the time we get here: the
+arms consume the shadowed parent slots themselves and
+`removeConsumedAtDepths` / `smParentReconciled` reconcile them (visible in
+the lowered bytes as the `push 9, OP_ROLL, drop` inside the ELSE arm of
+`loop-if-merged-locals`). Emitting the removal again dropped each slot
+twice, drifting the depth by one per iteration and making the NEXT loop
+iteration fail to resolve a merged local.
+-/
+def adoptDeclaredResults (sm : StackMap) (results : List String) :
+    List StackOp × StackMap :=
+  let n := results.length
+  let smWith := results.foldl StackMap.push sm
+  results.reverse.foldl
+    (init := (([] : List StackOp), smWith))
+    fun (ops, m) name =>
+      match m.findFrom? n name with
+      | some d => (ops ++ [.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop],
+                   m.removeAtDepth d)
+      | none   => (ops, m)
 
 /-- Compute the set of parent-scope refs that branches must NOT consume.
 
@@ -2847,7 +2942,7 @@ def lowerValue (sm : StackMap) (bindingName : String) :
       -- placeholder is preserved only for Sim.lean's `rfl`-level rewrite
       -- lemmas covering the simple `Phase 3a` constructors.
       ([.opcode "OP_RUNAR_METHODCALL_NOPROG"], sm.push bindingName)
-  | .ifVal cond thn els =>
+  | .ifVal cond thn els _ =>
       -- Phase 3c: concrete IF/ELSE/ENDIF lowering. Both branches lower
       -- independently against the *original* stack map (each branch is
       -- popped on entry and restored on exit by Bitcoin's IF semantics).
@@ -3582,7 +3677,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
               -- Propagate the inner `localBindings` to the outer continuation
               -- (the load-bearing TS bug).
               (objDropOps ++ argLoads ++ bodyOps, smFinal, innerLocalBindings)
-  | .ifVal cond thn els =>
+  | .ifVal cond thn els results =>
       -- Bring the cond to top (consume on last use, modulo outerProtected).
       let (condOps, sm1) := loadRefLive sm cond currentIndex lastUses outerProtected
       -- The IF block consumes the cond, so peel it off the stack map for
@@ -3732,15 +3827,35 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
               match m.depth? n with
               | some d => m.removeAtDepth d
               | none   => m
-          -- Determine post-IF top: if branches added a value, push bindingName.
-          let smPostIf : StackMap :=
-            if smThnAfter.length > smParentReconciled.length then
-              smParentReconciled.push bindingName
-            else
-              smParentReconciled
+          -- Determine the post-IF stack.
+          --
+          -- Multi-result branch node (`results` non-empty): the parent
+          -- adopts the DECLARED result slots rather than a single
+          -- `bindingName`, and drops the parent slots they shadow. TS
+          -- takes this path whenever `nDeclared >= 1` and never pushes
+          -- `bindingName` for it (`05-stack-lower.ts:2481`).
+          --
+          -- Otherwise (single-result `if`): if the branches added a
+          -- value, the parent names it `bindingName`.
           let elseOpt : Option (List StackOp) :=
             if elsFinalOps.isEmpty then none else some elsFinalOps
-          (condOps ++ [.ifOp thnFinalOps elseOpt], smPostIf, localBindings)
+          -- Matched on `results` (not `results.isEmpty`) so that the
+          -- single-result case reduces DEFINITIONALLY to the term the
+          -- pre-existing Agrees* proofs already reason about — an
+          -- `if`-expression would leave a `++ []` residue that blocks
+          -- their `rfl`/`simp` steps.
+          match results with
+          | [] =>
+              let smPostIf : StackMap :=
+                if smThnAfter.length > smParentReconciled.length then
+                  smParentReconciled.push bindingName
+                else
+                  smParentReconciled
+              (condOps ++ [.ifOp thnFinalOps elseOpt], smPostIf, localBindings)
+          | _ :: _ =>
+              let (adoptOps, smPostIf) := adoptDeclaredResults smParentReconciled results
+              (condOps ++ [.ifOp thnFinalOps elseOpt] ++ adoptOps,
+               smPostIf, localBindings)
   | .assert ref =>
       let (load, sm1) := loadRefLive sm ref currentIndex lastUses outerProtected
       let ops := load ++ [.opcode "OP_VERIFY"]
@@ -3808,9 +3923,25 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       let outerRefs := bodyOuterRefs body iterVar
       let naturalLU := computeLastUses body
       let nonFinalLU := clampLastUsesForOuter naturalLU outerRefs body.length
+      -- FINAL iteration: TS clamps an outer ref too when the ENCLOSING scope
+      -- still reads it after the loop (`05-stack-lower.ts:2723-2741`).
+      -- Without this the last iteration consumes it at its last body use, so
+      -- a value read after the loop is gone from the stack — TS's own comment
+      -- records the consequence: "compilation succeeded, the env-based
+      -- interpreter passed, but the emitted Script failed at runtime (silent
+      -- interpreter <-> Script divergence)". Here it surfaces instead as an
+      -- `OP_RUNAR_UNRESOLVED_*` sentinel (`loop-if-merged-locals`' `na`).
+      let usedAfterLoop := loopOuterRefsUsedAfter body iterVar lastUses currentIndex
+      -- Matched (not `if`) so that a body with no after-loop outer ref
+      -- reduces DEFINITIONALLY to `naturalLU`, keeping the pre-existing
+      -- `rfl`-level loop pins in `AgreesA7` matching syntactically.
+      let finalLU :=
+        match usedAfterLoop with
+        | []     => naturalLU
+        | _ :: _ => clampLastUsesForOuter naturalLU usedAfterLoop body.length
       let loopLocal := localBindings ++ body.map (fun b => b.name)
       let (ops, smPostLoop) :=
-        lowerLoopItersP progMethods props budget naturalLU nonFinalLU
+        lowerLoopItersP progMethods props budget finalLU nonFinalLU
           loopLocal constInts body iterVar count sm count
       -- Loops are statements, not expressions — no stack value is produced
       -- (TS 2172-2175) and the enclosing localBindings set is restored
@@ -3933,7 +4064,7 @@ def bindingsUseCheckPreimage : List ANFBinding → Bool
       let here : Bool :=
         match v with
         | .checkPreimage _    => true
-        | .ifVal _ thn els    =>
+        | .ifVal _ thn els _    =>
             bindingsUseCheckPreimage thn || bindingsUseCheckPreimage els
         | .loop _ body _      => bindingsUseCheckPreimage body
         | _                   => false
@@ -3958,7 +4089,7 @@ def bindingsUseCodePart : List ANFBinding → Bool
         | .addRawOutput _ _   => true
         | .call f _           =>
             f = "computeStateOutput" || f = "computeStateOutputHash"
-        | .ifVal _ thn els    =>
+        | .ifVal _ thn els _    =>
             bindingsUseCodePart thn || bindingsUseCodePart els
         | .loop _ body _      => bindingsUseCodePart body
         | _                   => false
@@ -3990,7 +4121,7 @@ def bindingsUseDeserializeState : List ANFBinding → Bool
       let here : Bool :=
         match v with
         | .deserializeState _ => true
-        | .ifVal _ thn els    =>
+        | .ifVal _ thn els _    =>
             bindingsUseDeserializeState thn || bindingsUseDeserializeState els
         | .loop _ body _      => bindingsUseDeserializeState body
         | _                   => false
@@ -4135,7 +4266,7 @@ def simpleValue : ANFValue → Bool
   | .updateProp _ _           => true
   | .arrayLiteral _           => true
   | .methodCall _ _ _         => true
-  | .ifVal _ thn els          =>
+  | .ifVal _ thn els _          =>
       simpleBindings thn && simpleBindings els
   | .loop _ body _            =>
       simpleBindings body

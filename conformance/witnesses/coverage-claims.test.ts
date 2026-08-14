@@ -308,3 +308,148 @@ describe('ledger honesty — every spend spec has >=1 accept and >=1 reject, or 
     expect(failures, failures.join('\n')).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stateful accept ⇒ "expectedState" pin (Phase B / TG-002, PALMER-1 class).
+//
+// Accept/reject alone cannot catch a stateful spend whose script is accepted
+// but whose post-spend state is silently wrong — that is exactly the PALMER-1
+// shape (branch-merged locals producing a script the guard accepts, over the
+// wrong continuation state). `real-crypto-execution.test.ts` already enforces
+// this at execution time (`runStatefulSpend`'s caller throws if a stateful
+// accept spend has neither "expectedState" nor "noStateCheck"); this block
+// makes the same claim statically greppable without running the harness, per
+// design principle P5 ("machine-check claims").
+//
+// Exception convention: reuses the harness's own opt-out
+// (`noStateCheck: true` + a non-empty "note" explaining the burn/terminal
+// state) rather than inventing a parallel "terminal"/"terminalReason" pair —
+// one exception mechanism, not two that can drift apart.
+// ---------------------------------------------------------------------------
+
+interface StatefulSpendSpec {
+  method?: string;
+  expect: 'accept' | 'reject';
+  tamperOutput?: boolean;
+  expectedState?: Record<string, unknown> | null;
+  noStateCheck?: boolean;
+  note?: string;
+  issue?: string;
+  [key: string]: unknown;
+}
+interface StatefulSpec {
+  fixture?: string;
+  kind?: string;
+  spends: StatefulSpendSpec[];
+}
+
+/** Closed vocabulary for `real-crypto/*.json`'s top-level "kind" — the exact
+ * two values `real-crypto-execution.test.ts` branches on (`=== 'stateless-signed'`
+ * vs. its `else`). A missing/misspelled "kind" must fail loudly here rather
+ * than silently falling into the runtime harness's `else` (= "stateful") while
+ * being invisible to this static gate (audit P2-1). */
+const SPEC_KINDS = new Set(['stateful', 'stateless-signed']);
+
+function checkExpectedStatePins(
+  dir: string,
+  files: string[],
+): { failures: string[]; noStateCheckOptOuts: number } {
+  const failures: string[] = [];
+  let noStateCheckOptOuts = 0;
+  for (const f of files) {
+    const spec: StatefulSpec = JSON.parse(readFileSync(join(dir, f), 'utf-8'));
+    if (!SPEC_KINDS.has(spec.kind as string)) {
+      failures.push(
+        `${f}: unknown spec "kind" ${JSON.stringify(spec.kind)} — must be one of ` +
+          `${[...SPEC_KINDS].join(', ')}`,
+      );
+      continue;
+    }
+    // Mirror real-crypto-execution.test.ts's exact runtime branch
+    // (`if (spec.kind === 'stateless-signed') { ... } else { /* stateful */ }`,
+    // real-crypto-execution.test.ts:198) as its COMPLEMENT, not as an
+    // `=== 'stateful'` check — the two must never be able to silently
+    // diverge on what "stateful" means (audit P2-1).
+    if (spec.kind === 'stateless-signed') continue;
+    for (const s of spec.spends ?? []) {
+      // A tampered continuation output must be a NEAR-MISS, never a claimed
+      // accept — `tamperOutput: true` deliberately corrupts output 0
+      // (real-crypto-execution.ts:tamperOutput handling), and the runtime
+      // harness never populates `continuationState` for one, so an
+      // `{"expect": "accept", "tamperOutput": true}` spend would assert that
+      // a CORRUPTED continuation validates, with no state pin at all — a
+      // silent hole in the exact guarantee this block exists to enforce
+      // (audit P2-2).
+      if (s.tamperOutput && s.expect !== 'reject') {
+        failures.push(
+          `${f}: ${spec.fixture}.${s.method} sets "tamperOutput": true with "expect": "${s.expect}" ` +
+            `— a tampered continuation output must be asserted as a reject`,
+        );
+        continue;
+      }
+      // Mirror real-crypto-execution.test.ts's exact gate condition
+      // (`s.expect === 'accept' && !s.tamperOutput`) so the static claim here
+      // and the runtime enforcement there can never silently diverge.
+      if (s.expect !== 'accept' || s.tamperOutput) continue;
+      const hasState =
+        s.expectedState !== undefined &&
+        s.expectedState !== null &&
+        typeof s.expectedState === 'object' &&
+        Object.keys(s.expectedState).length > 0;
+      const optsOut = s.noStateCheck === true;
+      if (hasState && optsOut) {
+        failures.push(
+          `${f}: ${spec.fixture}.${s.method} sets both "expectedState" and "noStateCheck": true — pick one`,
+        );
+        continue;
+      }
+      if (optsOut) {
+        noStateCheckOptOuts++;
+        if (typeof s.note !== 'string' || s.note.trim().length === 0) {
+          failures.push(
+            `${f}: ${spec.fixture}.${s.method} sets "noStateCheck": true but has no non-empty "note" ` +
+              `explaining why — a silent opt-out is not an honest one`,
+          );
+        }
+        // Mandatory "issue" field, same precedent as coverage-ledger.json's
+        // "UNCOVERED" kind above: a free opt-out with no residual accounting
+        // is exactly the hole this block exists to keep loud (audit P2-3).
+        if (typeof s.issue !== 'string' || s.issue.trim().length === 0) {
+          failures.push(
+            `${f}: ${spec.fixture}.${s.method} sets "noStateCheck": true but has no non-empty "issue" ` +
+              `field describing the follow-up`,
+          );
+        }
+        continue;
+      }
+      if (!hasState) {
+        failures.push(
+          `${f}: ${spec.fixture}.${s.method} is a stateful accept spend with no non-empty ` +
+            `"expectedState" and no "noStateCheck": true opt-out — accept alone does not prove ` +
+            `correct post-state (PALMER-1 class)`,
+        );
+      }
+    }
+  }
+  return { failures, noStateCheckOptOuts };
+}
+
+describe('ledger honesty — every stateful accept spend pins expectedState (Phase B / PALMER-1)', () => {
+  it('witnesses/real-crypto/*.json stateful accepts require "expectedState" or an explicit "noStateCheck" opt-out', () => {
+    const dir = join(__dirname, 'real-crypto');
+    const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+    const { failures } = checkExpectedStatePins(dir, files);
+    expect(failures, failures.join('\n')).toEqual([]);
+  });
+
+  // "noStateCheck" is an opt-OUT of the PALMER-1 state-value check, not a
+  // free pass — nothing uses it today. Pinning the count at 0 turns the
+  // first use into a deliberate, reviewable diff instead of a silent
+  // accumulation of un-pinned stateful accepts (audit P2-3).
+  it('"noStateCheck" opt-outs must not grow silently', () => {
+    const dir = join(__dirname, 'real-crypto');
+    const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+    const { noStateCheckOptOuts } = checkExpectedStatePins(dir, files);
+    expect(noStateCheckOptOuts, 'noStateCheck opt-outs must not grow').toBe(0);
+  });
+});

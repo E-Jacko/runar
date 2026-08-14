@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod codegen;
 pub mod frontend;
 pub mod ir;
+pub mod refusal;
 
 use artifact::{assemble_artifact, RunarArtifact};
 use codegen::emit::emit;
@@ -316,8 +317,8 @@ pub fn compile_from_source_str_with_options(
     }
     let contract = expand_result.contract;
 
-    // Pass 4: ANF Lower
-    let mut anf_program = frontend::anf_lower::lower_to_anf(&contract);
+    // Pass 4: ANF Lower (catch panics)
+    let mut anf_program = frontend::anf_lower::try_lower_to_anf(&contract)?;
 
     // Bake constructor args into ANF properties (validated first).
     let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
@@ -414,7 +415,8 @@ pub fn compile_source_str_to_ir_with_options(
     }
     let contract = expand_result.contract;
 
-    let mut anf_program = frontend::anf_lower::lower_to_anf(&contract);
+    // Pass 4: ANF Lower (catch panics)
+    let mut anf_program = frontend::anf_lower::try_lower_to_anf(&contract)?;
 
     // Bake constructor args into ANF properties (validated first).
     let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
@@ -578,8 +580,14 @@ pub fn compile_from_source_str_with_result(
     let contract = &expanded_contract;
     // Keep result.contract as the pre-expansion AST (mirrors TS spike).
 
-    // Pass 4: ANF lowering
-    let mut anf_program = frontend::anf_lower::lower_to_anf(contract);
+    // Pass 4: ANF lowering (catch panics)
+    let mut anf_program = match frontend::anf_lower::try_lower_to_anf(contract) {
+        Ok(program) => program,
+        Err(e) => {
+            result.diagnostics.push(Diagnostic::error(e, None));
+            return result;
+        }
+    };
 
     // Bake constructor args into ANF properties (validated first).
     let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);

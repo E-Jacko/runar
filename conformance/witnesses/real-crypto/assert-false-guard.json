@@ -1,0 +1,87 @@
+{
+  "fixture": "assert-false-guard",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "The assert(false)-else guard, in the two positions the multi-result branch node missed. Both used to compile to a script that ran to the end and left a falsy top of stack, because the state continuation committed the PRE-call value of the written property while the SDK serialised the post-call one. Every expectedState below is derived from the source by hand, not from anything the compiler produced, so a continuation that commits stale state fails here even though the arms are balanced and the script is well-formed.",
+  "constructorArgs": [
+    "0n",
+    "0n",
+    "0n"
+  ],
+  "spends": [
+    {
+      "method": "bump",
+      "args": [
+        "5n"
+      ],
+      "expect": "accept",
+      "note": "P0-1: guarded single-property write. n=5 > 0 takes the then-arm, so count = 0 + 5 = 5; a and b are untouched. The stale-slot bug committed count = 0 here.",
+      "satoshis": 1000,
+      "expectedState": {
+        "count": "5n",
+        "a": "0n",
+        "b": "0n"
+      }
+    },
+    {
+      "method": "bump",
+      "args": [
+        "0n"
+      ],
+      "expect": "reject",
+      "note": "P0-1 negative: n=0 is not > 0, so the else-arm's assert(false) must abort. The guard has to keep rejecting after the fix, not merely start accepting.",
+      "satoshis": 1000
+    },
+    {
+      "method": "dispatch",
+      "args": [
+        "0n",
+        "7n"
+      ],
+      "expect": "accept",
+      "note": "P0-2: the dispatch chain inside a loop body, sel=0. The loop is unrolled twice and both iterations take the first arm, so a = 7 and b is never written.",
+      "satoshis": 1000,
+      "expectedState": {
+        "count": "0n",
+        "a": "7n",
+        "b": "0n"
+      }
+    },
+    {
+      "method": "dispatch",
+      "args": [
+        "1n",
+        "9n"
+      ],
+      "expect": "accept",
+      "note": "P0-2, the other arm: sel=1 writes b = 9 in both unrolled iterations and leaves a at 0. Two arms writing DIFFERENT property sets is the shape the multi-result node exists to fix.",
+      "satoshis": 1000,
+      "expectedState": {
+        "count": "0n",
+        "a": "0n",
+        "b": "9n"
+      }
+    },
+    {
+      "method": "dispatch",
+      "args": [
+        "5n",
+        "9n"
+      ],
+      "expect": "reject",
+      "note": "P0-2 negative: an out-of-range selector must abort on the chain's terminal assert(false) rather than produce a spendable no-op continuation (the C20 funds-safety property, here inside a loop).",
+      "satoshis": 1000
+    },
+    {
+      "method": "bump",
+      "args": [
+        "5n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output",
+      "satoshis": 1000
+    }
+  ]
+}

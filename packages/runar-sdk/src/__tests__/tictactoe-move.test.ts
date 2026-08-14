@@ -14,6 +14,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, UnlockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -52,7 +53,7 @@ async function setupWallet(
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(pubKeyHex),
   });
   return { signer, pubKeyHex };
 }
@@ -65,7 +66,7 @@ describe('TicTacToe move method script validation', () => {
   it('move TX should pass local script validation', async () => {
     const artifact = compileContract('examples/ts/tic-tac-toe/TicTacToe.runar.ts');
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const playerX = await setupWallet(provider, PLAYER_X_KEY, 500_000);
     const playerO = await setupWallet(provider, PLAYER_O_KEY, 500_000);
 

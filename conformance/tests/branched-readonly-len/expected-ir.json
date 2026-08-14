@@ -183,7 +183,7 @@
           }
         },
         {
-          "name": "t26",
+          "name": "t28",
           "value": {
             "cond": "t13",
             "else": [
@@ -232,9 +232,43 @@
                   "name": "tag",
                   "value": "t24"
                 }
+              },
+              {
+                "name": "__merge$0",
+                "value": {
+                  "kind": "load_prop",
+                  "name": "count"
+                }
+              },
+              {
+                "name": "__merge$1",
+                "value": {
+                  "kind": "load_prop",
+                  "name": "tag"
+                }
+              },
+              {
+                "name": "t26",
+                "value": {
+                  "kind": "update_prop",
+                  "name": "count",
+                  "value": "__merge$0"
+                }
+              },
+              {
+                "name": "t27",
+                "value": {
+                  "kind": "update_prop",
+                  "name": "tag",
+                  "value": "__merge$1"
+                }
               }
             ],
             "kind": "if",
+            "results": [
+              "count",
+              "tag"
+            ],
             "then": [
               {
                 "name": "t14",
@@ -281,80 +315,110 @@
                   "name": "tag",
                   "value": "t18"
                 }
+              },
+              {
+                "name": "__merge$0",
+                "value": {
+                  "kind": "load_prop",
+                  "name": "count"
+                }
+              },
+              {
+                "name": "__merge$1",
+                "value": {
+                  "kind": "load_prop",
+                  "name": "tag"
+                }
+              },
+              {
+                "name": "t20",
+                "value": {
+                  "kind": "update_prop",
+                  "name": "count",
+                  "value": "__merge$0"
+                }
+              },
+              {
+                "name": "t21",
+                "value": {
+                  "kind": "update_prop",
+                  "name": "tag",
+                  "value": "__merge$1"
+                }
               }
             ]
           }
         },
         {
-          "name": "t27",
+          "name": "t29",
           "value": {
             "kind": "load_const",
             "value": 1000
           }
         },
         {
-          "name": "t28",
+          "name": "t30",
           "value": {
             "kind": "load_prop",
             "name": "count"
           }
         },
         {
-          "name": "t29",
+          "name": "t31",
           "value": {
             "kind": "load_prop",
             "name": "tag"
           }
         },
         {
-          "name": "t30",
+          "name": "t32",
           "value": {
             "kind": "add_output",
             "preimage": "",
-            "satoshis": "t27",
+            "satoshis": "t29",
             "stateValues": [
-              "t28",
-              "t29"
+              "t30",
+              "t31"
             ]
           }
         },
         {
-          "name": "t31",
+          "name": "t33",
           "value": {
             "kind": "load_param",
             "name": "_changePKH"
           }
         },
         {
-          "name": "t32",
+          "name": "t34",
           "value": {
             "kind": "load_param",
             "name": "_changeAmount"
           }
         },
         {
-          "name": "t33",
+          "name": "t35",
           "value": {
             "kind": "load_const",
             "value": 0
           }
         },
         {
-          "name": "t34",
+          "name": "t36",
           "value": {
             "kind": "bin_op",
-            "left": "t32",
+            "left": "t34",
             "op": "!==",
-            "right": "t33"
+            "right": "t35"
           }
         },
         {
-          "name": "t37",
+          "name": "t39",
           "value": {
-            "cond": "t34",
+            "cond": "t36",
             "else": [
               {
-                "name": "t36",
+                "name": "t38",
                 "value": {
                   "kind": "load_const",
                   "value": ""
@@ -364,11 +428,11 @@
             "kind": "if",
             "then": [
               {
-                "name": "t35",
+                "name": "t37",
                 "value": {
                   "args": [
-                    "t31",
-                    "t32"
+                    "t33",
+                    "t34"
                   ],
                   "func": "buildChangeOutput",
                   "kind": "call"
@@ -378,31 +442,14 @@
           }
         },
         {
-          "name": "t38",
+          "name": "t40",
           "value": {
             "args": [
-              "t30",
-              "t37"
+              "t32",
+              "t39"
             ],
             "func": "cat",
             "kind": "call"
-          }
-        },
-        {
-          "name": "t39",
-          "value": {
-            "args": [
-              "t38"
-            ],
-            "func": "hash256",
-            "kind": "call"
-          }
-        },
-        {
-          "name": "t40",
-          "value": {
-            "kind": "load_param",
-            "name": "txPreimage"
           }
         },
         {
@@ -411,26 +458,43 @@
             "args": [
               "t40"
             ],
-            "func": "extractOutputHash",
+            "func": "hash256",
             "kind": "call"
           }
         },
         {
           "name": "t42",
           "value": {
-            "kind": "bin_op",
-            "left": "t39",
-            "op": "===",
-            "result_type": "bytes",
-            "right": "t41"
+            "kind": "load_param",
+            "name": "txPreimage"
           }
         },
         {
           "name": "t43",
           "value": {
+            "args": [
+              "t42"
+            ],
+            "func": "extractOutputHash",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t44",
+          "value": {
+            "kind": "bin_op",
+            "left": "t41",
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t43"
+          }
+        },
+        {
+          "name": "t45",
+          "value": {
             "isAutoInjectedStateCheck": true,
             "kind": "assert",
-            "value": "t42"
+            "value": "t44"
           }
         }
       ],

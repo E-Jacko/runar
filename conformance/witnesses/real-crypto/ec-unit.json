@@ -1,0 +1,18 @@
+{
+  "fixture": "ec-unit",
+  "kind": "stateless-signed",
+  "note": "testOps() exercises ecMulGen(1), ecOnCurve, ecNegate, ecMul(g, 2n), ecMul(g, 0n), ecAdd(g, g), ecPointX/Y, ecMakePoint and ecEncodeCompressed. It takes NO arguments and needs no cryptographic witness, so the fixture's ACTUAL compiled locking script runs end-to-end on @bsv/sdk's Spend engine — the same thing the live regtest node did when it rejected this fixture with 'Script failed an OP_VERIFY operation'. It failed on two degenerate EC cases the codegen never handled: ecAdd(P,P) could not double (fixed in 8a6494b4) and ecMul(P,2n) returned the all-zero point (fixed here). This spec is the standing proof that both are gone. It also now pins the THIRD degenerate case, P + (-P): that is the point at infinity, which affine x||y cannot encode, so ecAdd returns the all-zero blob from a SUCCESSFUL script — the same thing ecMul yields for any k = 0 (mod n). The return value alone cannot be distinguished from a real point; ecOnCurve is the only detector, and `assert(!ecOnCurve(ecAdd(g, neg)))` pins that it works, in every tier and every format. Selecting the tangent on (px == qx) alone answered this with 2G — on-curve, plausible, wrong, and accepted by the same gate. ecAdd(g, neg) is used rather than ecMul(g, 0n) because the two produce the same all-zero point while ecAdd costs ~26 KB of script against ecMul's ~429 KB, which would have grown this fixture 94% for no extra property.",
+  "acceptOnly": true,
+  "acceptOnlyReason": "testOps() takes no arguments and reads no caller-controlled value — every assertion is a fixed EC identity over the generator — so there is no input to vary and no reject spend is constructible for this fixture. The negative direction is covered instead by packages/runar-testing/src/__tests__/ec-mul-k2.test.ts, which compares the emitted primitives against @bsv/sdk's own secp256k1 for a spread of scalars, and by the p256/p384-primitives specs, which do carry a reject.",
+  "constructorArgs": {
+    "pubKey": "0x0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+  },
+  "spends": [
+    {
+      "method": "testOps",
+      "args": [],
+      "expect": "accept",
+      "note": "every EC assertion in testOps() holds on the real Spend engine, including the ecMul(g,2n) and ecAdd(g,g) doubling cases that used to make this script unspendable"
+    }
+  ]
+}

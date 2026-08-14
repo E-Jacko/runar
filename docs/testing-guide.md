@@ -2,6 +2,487 @@
 
 This guide covers how to test Rúnar smart contracts at every level, from unit tests of individual contracts to property-based fuzzing and cross-compiler conformance testing.
 
+Read [Layers of assurance](#layers-of-assurance) first. It is the part of this
+guide that says which of the tools below actually prove a contract is
+spendable, and which only prove that seven implementations made the same
+choice. Getting that distinction wrong is how the two 2026-08 fund-safety bugs
+shipped through a green CI net.
+
+---
+
+## Layers of assurance
+
+Rúnar's test suite has three structurally different kinds of gate. They are
+**not** interchangeable, and a claim of the form "this is covered" is only
+meaningful once you say *which layer* covers it.
+
+| Layer | The question it answers | Examples in this repo |
+|---|---|---|
+| **Horizontal** | Do the independent implementations of the same thing agree with *each other*? | `conformance/tests/**` (7 compilers, byte-identical IR + hex), `conformance/sdk-output/**` (7 SDKs, byte-identical locking script), `conformance/fuzzer` `--ir` / `anf-differential` (tier vs tier) |
+| **Vertical** | Does one component agree with the *other side of the same boundary*? | `conformance/sdk-vertical/**` (compiler artifact ↔ SDK splice / codesep), `conformance/sdk-output/tests/stateful-bytestring-op-n-state` (compiler state framing ↔ SDK `serializeState`), `conformance/sdk-bip143` (TS reference preimage ↔ six consumers) |
+| **Absolute execution** | Would the Bitcoin network accept these exact bytes, and what state do they leave behind? | `conformance/witnesses/real-crypto/*.json` (real `@bsv/sdk` `Spend` + real secp256k1 + `expectedState`), `MockProvider`'s default broadcast validation, `conformance/script_execution_test.go`, `integration/**` on regtest, `conformance/fuzzer --spend-oracle` |
+
+### Horizontal agreement proves agreement, not correctness
+
+All seven tiers can be identically wrong, and the suite will be entirely
+green while they are. This is not a hypothetical risk; it is the observed
+failure mode of both 2026-08 fund-safety bugs.
+
+**PALMER-1 — branch-merged locals.** An `if` statement carries exactly one
+value, so when a method merged **two or more** locals across a branch, ANF
+lowering kept post-branch references pointing at the dead pre-branch binding
+and stack lowering registered one `stackMap` slot for N physical results. All
+seven compilers produced byte-identical output, so every horizontal gate was
+green. Worse, the bug has two faces:
+
+- *Face A* — the script is unspendable. Any accept/reject oracle catches this
+  once a fixture of that shape exists. None did.
+- *Face B* — the script **validates**, and silently commits the wrong
+  continuation state. Accept/reject agreement cannot see this at all: the
+  interpreter and the compiled script both "accept" the same wrong answer.
+
+**PALMER-2 — state-section framing.** Issue #110 taught all seven SDKs the
+MINIMALDATA rule for the state section (`0x05` written as `OP_5`) and none of
+the seven compilers (which read `<len><data>`). Every round-trip test stayed
+green, because `deserialize(serialize(x)) === x` holds for *any*
+self-consistent framing including a wrong one. Cross-SDK conformance stayed
+green, because all seven SDKs moved together. **Zero goldens moved.** Any
+contract carrying a 1-byte `0x01`–`0x10` ByteString state value became
+permanently unspendable.
+
+### Which gate catches each one now
+
+| Bug | Gate that now catches it | Where |
+|---|---|---|
+| PALMER-1 Face A (unspendable) | Conformance fixtures of that shape + the source-vs-script differential oracle | `conformance/tests/merge-locals-shapes`, `merge-locals-prop-updates`, `branch-merged-locals`; `witnesses/differential.test.ts` |
+| PALMER-1 Face B (wrong state, still accepted) | Real-crypto witness with a hand-authored `expectedState`, machine-required for every stateful accept | `conformance/witnesses/real-crypto/branch-merged-locals.json`; enforced by `witnesses/coverage-claims.test.ts` + `real-crypto-execution.test.ts` |
+| PALMER-1 (as a *class*, not a fixture) | Construct ledger row + mutation mutants + Spend-oracle fuzz | `conformance/construct-ledger.json` (`merge-locals-*`), mutants `anflower-merge-locals-single-only` / `stacklower-merge-locals-property-only`, `conformance/fuzzer --spend-oracle` |
+| PALMER-2 (framing) | Compiler↔SDK vertical pin + a 1-byte OP_N-range state fixture + wire-primitive register | `conformance/sdk-output/tests/stateful-bytestring-op-n-state`, `conformance/sdk-vertical/**`, `conformance/wire-primitives.json` (`state-section-framing`) |
+| PALMER-2 (the *process* hole: zero goldens moved) | Must-move-a-golden gate | `conformance/scripts/wire-format-pr-audit.ts`, `wire-format-must-move-golden` CI job |
+| Both (as regressions) | Mutation corpus with `expectCaughtBy` gates | `conformance/mutation/mutants.json` (`sdkstate-encode-minimaldata-opn`, `sdkstate-decode-opn-as-length`, …) |
+
+The rule that falls out of this, and which the rest of the guide applies:
+
+> **New parity work that only extends a horizontal matrix, without a vertical
+> pin or an absolute execution pin for the same family, is incomplete for
+> fund-safety.**
+> (`docs/audit/2026-08-testing-gap-remediation-plan.md` §2 P7.)
+
+---
+
+## Broadcast validation is on by default
+
+`MockProvider` (`packages/runar-sdk/src/providers/mock.ts`) **validates every
+transaction you broadcast through it**, by default, with no flag. It:
+
+1. replays each input whose UTXO it knows about through `@bsv/sdk`'s
+   production `Spend` interpreter (real secp256k1, real BIP-143 sighash);
+2. **fails closed** if a tx has inputs but *none* of them could be validated —
+   an entirely-unregistered-input broadcast is not "passing validation", it
+   never ran a script (register funding UTXOs with `addUtxo()` /
+   `addContractUtxo()` / `addTransaction()`);
+3. when every input is known, rejects an output with `satoshis === undefined`,
+   and requires the tx to pay at least the SDK's own fee model,
+   `ceil(txSize * feeRate / 1000)`.
+
+`broadcast()` **throws** on failure instead of returning a fake txid. So an SDK
+test that "successfully deploys and calls" is now, by default, an assertion
+that the script really runs.
+
+`getValidationStats()` returns `{ validated, skipped }` — cumulative input
+counts across every validated broadcast. Use it to prove a test was not
+validated *vacuously*: `validated === 0` means no script actually ran.
+
+### Opting out (and the allowlist policy)
+
+There are two independent switches. They are deliberately separate:
+
+| Switch | What it turns off | How |
+|---|---|---|
+| **Broadcast validation** | Everything above — no `Spend`, no conservation, no fee check | `new MockProvider('testnet', { validateBroadcasts: false })`, `disableBroadcastValidation()`, `enableBroadcastValidation(false)`, or `newAlwaysAckMockProvider()` |
+| **Fee floor only** | Only the `ceil(txSize * feeRate / 1000)` requirement; `Spend` and the outputs-≤-inputs check still run | `new MockProvider('testnet', { enforceFeeFloor: false })` or `disableFeeFloor()` |
+
+If your test intentionally underpays a fee (e.g. an exact-cover UTXO case),
+use **`disableFeeFloor()`**. It is not an always-ack escape hatch and does not
+need an allowlist entry.
+
+`newAlwaysAckMockProvider()` is **not** exported from `runar-sdk`'s public
+barrels (`src/index.ts`, `src/providers/index.ts`) — only from the non-public
+`providers/mock.js` module — so a downstream package cannot reach the
+never-validate factory at all. `p1-3-always-ack-not-public.test.ts` asserts
+that absence.
+
+**Every use of an always-ack escape hatch inside `packages/runar-sdk` must be
+allowlisted.** `always-ack-allowlist.test.ts` scans **every `.ts` file under
+`src/`** — not just `*.test.ts`, so a non-test-named helper that quietly
+disables validation cannot hide — excluding only the audit file itself and
+`providers/mock.ts` (the escape hatches' own declaration site). It matches
+`disableBroadcastValidation` / `newAlwaysAckMockProvider` /
+`validateBroadcasts: false` / `validateBroadcasts = false` /
+`enableBroadcastValidation(false)` and fails on any unlisted hit — and on any
+**stale** entry, so the list can only shrink.
+
+To add an entry to `packages/runar-sdk/src/__tests__/always-ack-allowlist.json`:
+
+```jsonc
+{
+  "file": "src/__tests__/my-test.test.ts",
+  "reason": "Which test(s) in the file opt out, and why the rest use the default validating provider.",
+  "category": "structure-only",   // | negative-api | fixture-shape | pending-a3
+  // REQUIRED if the file matches /\.deploy\(|\.call\(|finalizeCall\(/ :
+  "fundPathJustification": "why this does not launder an unverified fund-moving tx"
+}
+```
+
+Three constraints, all machine-checked:
+
+- The entry count is **ratcheted** against a committed ceiling
+  (`MAX_ALLOWLIST_ENTRIES`, currently **9**). Lower it when an entry goes
+  away; raising it to admit a new file is the wrong move — fix the test.
+- A file that calls `.deploy(` / `.call(` / `finalizeCall(` is a **fund-path**
+  file and needs a `fundPathJustification`. The bar is high: every current
+  one either re-proves rejection itself through the *same* `Spend` interpreter
+  on the *same* input, or is pointed at a synthetic `OP_TRUE` artifact that
+  can never be script-valid for any call, so there is no real covenant to
+  protect.
+- **Scope caveat, stated in the allowlist's own `$comment`:** this gate
+  governs `MockProvider` only. A test can still hand-roll an inline `Provider`
+  object whose `broadcast()` acks anything, and that surface is invisible to
+  the gate. Passing it means "no unlisted `MockProvider` always-ack usage",
+  not "every broadcast in this package is validated".
+
+### `dryRun` vs provider validation — two different questions
+
+`CallOptions.dryRun` (`RunarContract.call` / `finalizeCall`) is a **separate**
+gate from provider broadcast validation, and neither substitutes for the other.
+
+|  | `{ dryRun: true }` | `MockProvider` broadcast validation |
+|---|---|---|
+| **Question** | "Does *this contract's* unlocking script satisfy *this* locking script?" | "Would this *whole transaction* be accepted?" |
+| **Scope** | The primary contract input (index 0) only | Every input whose UTXO the provider knows |
+| **Value semantics** | None — no conservation, no fee check | Outputs ≤ known inputs, plus the fee floor |
+| **When it runs** | Inside `finalizeCall`, *before* broadcast | Inside `provider.broadcast()` |
+| **Default** | **OFF (opt-in)**, in production and in tests | **ON** |
+| **Failure message** | `RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8)…` | `MockProvider: refusing to broadcast invalid transaction (C8)…` |
+
+**The production default stays opt-in, deliberately.** The local dry-run
+harness still produces at least one documented **false rejection** (it rejects
+an `Auction.bid()` that the independent real-crypto oracle accepts, plus
+clean-stack failures on synthetic stub artifacts). For a fail-closed
+pre-broadcast gate a false rejection is worse than the hole it closes — it
+would strand funds. The polarity flips only once `dryRunContractInput` agrees
+with `runStatefulSpend` on every `witnesses/real-crypto/*.json` accept case.
+The full evidence is in the `CallOptions.dryRun` docstring in
+`packages/runar-sdk/src/contract.ts`.
+
+> **`dryRun: false` does not mean "unvalidated".** With the provider default
+> on, the broadcast is still replayed through the real `Spend` engine. `dryRun`
+> buys you a *narrower, earlier, value-free* check, not the only check.
+
+**Do not infer one from the other's error string.** The
+`MockProvider: refusing to broadcast invalid transaction (C8)` prefix covers
+three structurally different causes:
+
+1. `input i: script evaluated to false` — a genuine engine rejection;
+2. `input i: <exception>` — the `Spend` **constructor** threw; the engine
+   never evaluated anything;
+3. `underfunded: …` / `fee too low: …` — **not engine results at all**, and
+   reachable only *after* every known input's script already validated
+   **true**.
+
+A "this spend is rejected" test that keys on that prefix can therefore pass
+having never exercised the contract's guard. The real-crypto oracle
+(`packages/runar-testing/src/oracle/real-crypto-execution.ts`) hit exactly
+that: its near-miss reject helper was switched to drive `{ dryRun: true }` and
+key on `dryRunContractInput`'s **unique** message, which checks the primary
+contract input only and has no fee semantics to be confused with a rejection.
+If you write a rejection assertion, make it name the input and the mechanism.
+
+---
+
+## When `TestContract` is enough, and when a real `Spend` is mandatory
+
+`TestContract` is an **AST interpreter with mocked ECDSA**. It walks the parsed
+contract (`RunarInterpreter.executeMethod` over the `ContractNode`), not the
+compiled Bitcoin Script, and `checkSig` / `checkMultiSig` / `checkPreimage` /
+`verifyRabinSig` always return `true`.
+
+> **`TestContract` proves business logic. It never proves spendability.**
+
+That is not a criticism of the tool — it is what makes it usable for
+state-transition tests without managing keys and sighashes. It just means a
+green `TestContract` suite is silent about whether the contract can be spent
+on-chain at all.
+
+| Use `TestContract` for | Use real `Spend` for |
+|---|---|
+| State transitions, arithmetic, assertion logic | "Is this locking script spendable?" |
+| Which branch a condition takes | Post-spend **state values** on a covenant continuation |
+| Output count / values registered via `addOutput` | Anything about signatures, preimages, or sighash |
+| Fast iteration while writing a contract | Any claim used as coverage evidence for a fund-critical construct |
+
+Real-`Spend` paths, in rising order of cost:
+
+1. **`ScriptVM`** (TS / Go / Rust / Python) — executes compiled script bytes
+   against a synthetic single-input tx context. Real `OP_CHECKSIG`. Not
+   available in Zig / Ruby / Java (documented platform limits — see CLAUDE.md
+   ⇒ "Off-chain Script VM").
+2. **Real-crypto witnesses** (`conformance/witnesses/real-crypto/*.json`) —
+   deploy→call driven through the SDK, re-validated on `Spend`, with a
+   hand-authored `expectedState` pin. This is the canonical path for a
+   stateful contract.
+3. **`MockProvider` deploy/call** (default-validating) — an end-to-end SDK
+   path in a plain vitest, e.g.
+   `examples/ts/fixed-array-nested/Grid2x2.test.ts`.
+4. **Regtest integration** (`integration/{ts,go,rust,python,ruby,zig,java}`) —
+   a real node. The canonical real-crypto path for Zig, Ruby and Java.
+
+### The example policy for `examples/ts/`
+
+Every **stateful** example under `examples/ts/` that ships a vitest must
+either:
+
+- **(a)** have a spendability test — a real `Spend`, `ScriptVM`, or a
+  default-validating `MockProvider` deploy/call — or
+- **(b)** carry a banner comment at the top of the test file:
+
+  ```ts
+  // INTERPRETER-ONLY: spendability covered by conformance/witnesses/real-crypto/<fixture>.json
+  ```
+
+  naming a path that **actually covers this contract**. Verify it. A banner
+  pointed at a witness for a different contract is worse than no banner: it
+  converts a visible hole into a false claim.
+
+`examples/ts/example-spendability-policy.test.ts` enforces this and fails on a
+stateful example test with neither. Examples with genuinely no covering path
+use a third, ratcheted form that is an honest hole, not a pass:
+
+```ts
+// INTERPRETER-ONLY: UNCOVERED — <what was checked, when, and what would close it>
+```
+
+The count of `UNCOVERED` banners is asserted against a committed ceiling in
+that test, so it can shrink and never grow.
+
+Two scope notes, both deliberate:
+
+- **A stateful example with no vitest at all is out of scope.** No test means
+  no claim, so there is no false confidence to correct. Their coverage is
+  tracked per-construct in `conformance/construct-ledger.json` and per-fixture
+  in `conformance/witnesses/coverage-ledger.json`, not here. The lint prints
+  that set on every run so it stays visible.
+- **The lint verifies the banner, not just its presence.** For a
+  `conformance/witnesses/real-crypto/<fixture>.json` banner it resolves
+  `conformance/tests/<fixture>/source.json` and requires the `.runar.ts`
+  source to land *inside this example's directory* — a hard identity check.
+  For any other path (a Go script-execution test, a regtest suite) it requires
+  the file to mention this example or one of its stateful contract classes.
+
+At the time of writing, one example is `UNCOVERED`: `companion-verifier`, a
+two-input cross-contract covenant that neither `runStatefulSpend` nor the
+sdk-output driver protocol can compose. Its banner carries the close plan.
+
+---
+
+## Construct coverage: the construct ledger
+
+`conformance/construct-ledger.json` + `construct-ledger.test.ts` count
+coverage in **fund-critical constructs** — language shapes and wire value
+classes — instead of fixtures. Every other gate answers "is this *fixture*
+exercised?"; this one answers "is this *shape* exercised?". Both 2026-08 bugs
+were **empty cells** in this matrix while the fixture-counted suite was green.
+
+**How to add a row** (the full contract is in
+`conformance/README.md` ⇒ "Construct ledger"):
+
+1. Pick a stable `id` and, if the construct is fund-critical, add it to
+   `REQUIRED_CONSTRUCTS` in `construct-ledger.test.ts`. That array is
+   hard-coded **in the test**, not derived from the ledger — deriving it would
+   make the gate vacuous, because deleting a row would delete its own
+   requirement.
+2. Add the row with `category`, `severity` and a human `description`.
+3. Fill the cell with `coveredBy` **XOR** (`status: "UNCOVERED"` + `issue`).
+   Never both, never neither.
+
+**What counts as evidence.** `kind` is one of `conformance-fixture`,
+`real-crypto-witness`, `sdk-output`, `vertical-pin`, `negative-compile`,
+`vm-unit`. Every `path` is repo-relative and must exist on disk — deleting a
+witness turns its construct **red** rather than letting the claim decay
+silently. Round-trip-only tests are denylisted (`ROUND_TRIP_ONLY_PATHS`) and
+can never be a row's evidence.
+
+**Empty cells are the deliverable.** An honest `UNCOVERED` row with a dated
+close plan is the signal this file exists to produce. A cell pointed at a weak
+or unrelated file is strictly worse than an empty one.
+
+---
+
+## Wire primitives: never round-trip alone
+
+For anything whose **bytes cross a boundary** — SDK ↔ compiler, SDK ↔ peer SDK,
+unlocking script vs state section — the gate is:
+
+```text
+bytes_from_A(value) === bytes_from_B(value)
+```
+
+or
+
+```text
+spend(A_bytes) accepts and yields expectedState
+```
+
+**never only**
+
+```text
+deserialize(serialize(x)) === x
+```
+
+`conformance/wire-primitives.json` is the register of every fund-critical wire
+primitive and the **absolute** pin that proves it. Rows carry `producedBy`
+(encode side), `consumedBy` (decode side or the independent other-side
+implementation), `absolutePins` (machine-checked, non-empty, path must exist,
+must not be a known round-trip test), and optional `roundTripSmokeTests` —
+allowed, informative, and never sufficient alone. `wire-primitives.test.ts`
+fails a row whose only evidence is a round-trip file. The current rows:
+`state-section-framing`, `unlocking-encodeArg-minimaldata`,
+`constructor-slot-splicing`, `codeseparator-index`, `bip143-preimage-layout`,
+`signed-envelope-bytes`, `canonicalJson`.
+
+Round-trip tests you keep should say so in a comment:
+
+```ts
+// round-trip only — absolute pin: conformance/sdk-vertical/cases/bytes-op-n-mid/expected-vertical.json
+```
+
+### Must move a golden
+
+A change to a wire-format implementation path that moves **zero** pinned bytes
+is **untested by definition** and fails CI — it does not reassure anyone. That
+is the `wire-format-must-move-golden` job
+(`conformance/scripts/wire-format-pr-audit.ts`); the authoritative path list is
+`WIRE_FORMAT_RULES` in that script, and the checklist for satisfying it is in
+`conformance/README.md` ⇒ "Encoding-change checklist". Reproducing #110's
+"change all seven SDK serializers, move zero goldens" now fails.
+
+---
+
+## Adding a vertical pin or a real-crypto witness
+
+### Vertical pins (state / `constructorSlots` / codeSeparator)
+
+`conformance/sdk-vertical/` holds the compiler↔SDK pins for constructor-arg
+splicing (**C3**) and codeSeparator offsets (**C4**); state-section framing
+(**C2**) is pinned by
+`conformance/sdk-output/tests/stateful-bytestring-op-n-state`. The expected
+bytes come from an independent re-implementation in
+`conformance/sdk-vertical/reference/`, which **imports nothing from
+`packages/**`** — that restriction is the whole point of the directory and is
+worth defending on review, because deriving the expectation from the SDK under
+test would prove only that the SDK agrees with itself.
+
+To add a row:
+
+1. Append to `MATRIX` in `conformance/sdk-vertical/matrix.ts` with a
+   `valueClass` that says what the row is *for*. New contract shapes go under
+   `contracts/`.
+2. `cd conformance && npx tsx sdk-vertical/generate.ts`.
+3. Review the golden diff — the derived goldens **are** the reviewable
+   artifact.
+4. `npx tsx sdk-vertical/runner/vertical-runner.ts --update-golden` to pin
+   `expected-locking.hex`, then re-run without the flag.
+5. Add a provenance allowlist entry for each new/changed golden (see
+   [Provenance discipline](#provenance-discipline) below).
+
+Tier divergences this gate has found and that are not yet fixed live in
+`known-divergences.json`. An entry makes a divergence **tracked, not
+acceptable**: the runner also fails in the *other* direction if an entry stops
+reproducing, so a fixed bug must delete its entry in the same commit.
+
+### Real-crypto witnesses with `expectedState`
+
+`conformance/witnesses/real-crypto/<fixture>.json` declares concrete spends
+executed through `@bsv/sdk`'s `Spend` with real secp256k1 — real DER
+signatures over the real BIP-143 sighash and, for stateful contracts, a real
+state-continuation preimage synthesised by the deploy→call SDK path.
+
+Two spec kinds: `stateless-signed` (a `SmartContract`; `$sig` args are filled
+with real signatures, and the accept path is cross-checked against the
+reference AST interpreter) and `stateful` (a `StatefulSmartContract` driven deploy→call and
+re-validated on `Spend`).
+
+**Every `stateful` spend with `expect: "accept"` must pin `expectedState`** —
+a hand-authored, property → scalar map of the continuation state, compared
+against the state decoded from the call transaction's bytes. This is
+machine-required by `witnesses/coverage-claims.test.ts` and enforced at run
+time by `real-crypto-execution.test.ts`. Accept alone does not prove a correct
+state transition (PALMER-1 Face B).
+
+```jsonc
+{
+  "fixture": "stateful-counter",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "constructorArgs": ["5n"],
+  "spends": [
+    { "method": "increment", "args": [], "expect": "accept",
+      "expectedState": { "count": "6n" } },
+    { "method": "increment", "args": [], "tamperOutput": true,
+      "cryptoNearMiss": true, "expect": "reject",
+      "note": "tampered continuation output" }
+  ]
+}
+```
+
+Each fixture carries **≥1 accept and ≥1 reject/near-miss**. The only escape
+from the `expectedState` requirement is `noStateCheck: true`, which additionally
+requires a non-empty `note` **and** a non-empty `issue`, and is **ratcheted at
+zero occurrences** — adding one means editing that assertion in the open. (The
+remediation plan sketched a `terminal` / `expectedState: null` pair for this;
+the implementation reused the repo's pre-existing `noStateCheck` convention
+instead. `noStateCheck` is the mechanism that exists.)
+
+---
+
+## Horizontal fuzz vs Spend-oracle fuzz
+
+Both live in `conformance/fuzzer/`, and they answer different questions.
+
+| Mode | Oracle | Layer | Catches |
+|---|---|---|---|
+| `--ir` / `anf-differential` / `ir-differential` | The other six tiers | **Horizontal** | One tier drifting from the other six |
+| `--execute` | Reference AST interpreter vs `ScriptVM` on generated scripts | Absolute, but **stateless fragments** and **verdict-only** | Codegen bugs that flip accept/reject |
+| `--spend-oracle` | Post-state decoded from the **broadcast transaction's bytes** vs the generator's own model | Absolute, **full tx context + state value** | Reject-when-accept-intended, accept-when-reject-intended, interpreter↔`Spend` disagreement, and `expectedState` mismatch |
+
+```bash
+cd conformance
+npx tsx fuzzer/index.ts --ir --hex --num 100 --seed 1   # horizontal (parity only)
+npx tsx fuzzer/index.ts --execute --num 200             # absolute, stateless, verdict-only
+npx tsx fuzzer/index.ts --spend-oracle --num 50 --seed 1 # absolute, stateful, state-pinned
+```
+
+Tier-vs-tier differential fuzzing is **necessary but not sufficient** for
+fund-safety: agreement can be universally wrong, which is precisely what
+PALMER-1 was. `--spend-oracle` is construct-biased — it generates the
+asymmetric multi-local branch merge, 1-byte OP_N-range / `0x00` / empty /
+negative state values, and multi-slot constructor args with shifting offsets —
+and it compares against the **generator's own model**, never against the SDK's
+next-state computation, which runs through the same ANF the covenant does and
+is therefore poisoned by the very bug class it is hunting.
+
+---
+
+## Provenance discipline
+
+Goldens are **self-produced** by the implementation under test. Changing one
+requires an independent justification — `conformance/README.md` ⇒
+"Golden-regeneration integrity gate" is the authoritative description, and
+"Provenance discipline (plan §F3)" in the same file states the rule for
+regenerating them. In short: `verified-against` plus a witness/oracle
+co-change whenever execution for that fixture exists, and **no golden-only PRs
+for control-flow or wire fixtures**.
+
 ---
 
 ## TypeScript Unit Testing with Vitest
@@ -83,6 +564,10 @@ The full per-tier tooling for Go, Rust, Python, Zig, Ruby, and Java is documente
 
 > **Important:** `TestContract` uses mocked ECDSA cryptographic operations — `checkSig`, `checkMultiSig`, and `checkPreimage` always return `true`. This is intentional: it lets you test business logic (state transitions, assertions, arithmetic) without managing real keys or signatures. The post-quantum (`verifyWOTS`, `verifySLHDSA_SHA2_*`) and Schnorr / EC-arithmetic builtins are **not** mocked — they execute the real algorithm in the interpreter. See [Cryptographic verification in tests](#cryptographic-verification-in-tests) below for the full mocked-vs-real list and the escape hatches for exercising real ECDSA / preimage rejection.
 
+> **`TestContract` proves business logic, never spendability.** It is an AST
+> interpreter — it never runs the compiled Bitcoin Script. See
+> [When `TestContract` is enough, and when a real `Spend` is mandatory](#when-testcontract-is-enough-and-when-a-real-spend-is-mandatory).
+
 ### Creating an Instance
 
 ```typescript
@@ -161,7 +646,7 @@ expect(result.success).toBe(true);
 
 ## Cryptographic verification in tests
 
-`TestContract` runs contracts through the ANF interpreter, not a Bitcoin Script VM. The interpreter mocks the ECDSA / preimage builtins so you can write business-logic tests without managing real keys, signatures, or transaction sighashes. The trade-off: a `TestContract` test that "rejects a bad signature" by passing a malformed `sig` value **does not actually exercise ECDSA verification** — `checkSig` returned `true` either way. The rejection in such a test, if there is one, comes from some *other* assertion in the method (a hash mismatch, a state check, etc.), not from the signature being invalid.
+`TestContract` runs contracts through the reference **AST** interpreter (`RunarInterpreter`, which walks the parsed `ContractNode`), not a Bitcoin Script VM. The interpreter mocks the ECDSA / preimage builtins so you can write business-logic tests without managing real keys, signatures, or transaction sighashes. The trade-off: a `TestContract` test that "rejects a bad signature" by passing a malformed `sig` value **does not actually exercise ECDSA verification** — `checkSig` returned `true` either way. The rejection in such a test, if there is one, comes from some *other* assertion in the method (a hash mismatch, a state check, etc.), not from the signature being invalid.
 
 This applies symmetrically to every native-tier mock package: `runar` (Go), `runar::prelude` (Rust), `runar` (Python), `runar` (Zig), `runar` (Ruby), and `runar.lang` (Java) all ship `MockSig` / `mock_sig` / `MockPubKey` / `MockPreimage` helpers plus mock `CheckSig` / `CheckPreimage` that always return `true`. Native-tier tests are running the contract as plain code in the host language — they verify business logic, not on-chain cryptographic acceptance.
 
@@ -236,7 +721,7 @@ For Zig, Ruby, and Java contracts, drop the `ScriptVM` step and write the equiva
 
 ## Script VM Testing (Compiled Script Execution)
 
-The `ScriptVM` class can be used directly for lower-level testing without the `TestSmartContract` wrapper. Unlike `TestContract` (which interprets ANF IR with mocked crypto), `ScriptVM` executes actual compiled Bitcoin Script opcodes.
+The `ScriptVM` class can be used directly for lower-level testing without the `TestSmartContract` wrapper. Unlike `TestContract` (which interprets the parsed Rúnar AST with mocked crypto), `ScriptVM` executes actual compiled Bitcoin Script opcodes.
 
 ```typescript
 import { ScriptVM, hexToBytes, bytesToHex, disassemble } from 'runar-testing';
@@ -294,7 +779,7 @@ The reason mirrors the [Off-chain Script VM (`ScriptVM`)](../CLAUDE.md) policy: 
 
 ## Reference Interpreter for Oracle Testing
 
-The reference interpreter (`RunarInterpreter`) evaluates ANF IR directly, without compiling to Bitcoin Script. It serves as an oracle: if the compiled script and the interpreter produce different results for the same inputs, there is a bug.
+The reference interpreter (`RunarInterpreter`) evaluates the **Rúnar AST** (`ContractNode`) directly, without compiling to Bitcoin Script. It does *not* consume ANF IR: `04-anf-lower.ts` sits downstream of its input, which is exactly why it can disagree with — and catch — a miscompile in ANF lowering. (The per-SDK `AnfInterpreter`s and `conformance/anf-interpreter/` are a different thing, and those genuinely do consume ANF IR.) It serves as an oracle: if the compiled script and the interpreter produce different results for the same inputs, there is a bug.
 
 ```typescript
 import { RunarInterpreter } from 'runar-testing';
@@ -345,6 +830,18 @@ it('compiler and interpreter agree', () => {
 ```
 
 This pattern is the foundation of differential testing. If they ever disagree, you have found a compiler bug.
+
+> **It compares verdicts only.** The two engines share just
+> parse/validate/typecheck — the interpreter reads the parsed AST directly and
+> `04-anf-lower.ts` sits downstream of that input, so the oracle *can* catch a
+> miscompile in ANF lowering / stack-lower / emit — but **only when the bug
+> flips accept/reject**. A miscompile that leaves the script acceptable while
+> committing the wrong continuation state (PALMER-1 Face B) reports
+> `agrees: true` while the state is wrong. Catching that needs an independent,
+> hand-authored pin that is not derived from this pipeline: `expectedState` in
+> `conformance/witnesses/real-crypto/*.json`, or an external KAT. The full
+> statement is in the header of
+> `packages/runar-testing/src/oracle/differential-execution.ts`.
 
 ---
 
@@ -397,6 +894,11 @@ describe('compiler fuzzing', () => {
 
 The conformance fuzzer in `conformance/fuzzer/` generates random ANF programs and checks that all seven compiler tiers produce **byte-identical** Bitcoin Script hex for each program (a cross-tier *parity* oracle). It does **not** execute the generated scripts or compare against the interpreter — that source-vs-script execution oracle is provided separately by `packages/runar-testing/src/oracle/differential-execution.ts` and the `--execute` fuzzer mode (see "Differential execution").
 
+> This mode is **horizontal**: it proves the seven tiers agree, not that they
+> are right. For an absolute oracle over a full transaction context *and* the
+> post-spend state value, use `--spend-oracle` — see
+> [Horizontal fuzz vs Spend-oracle fuzz](#horizontal-fuzz-vs-spend-oracle-fuzz).
+
 ```bash
 # Run the differential fuzzer
 pnpm run fuzz -- --num 10000
@@ -404,8 +906,11 @@ pnpm run fuzz -- --num 10000
 # Run with a specific seed for reproducibility
 pnpm run fuzz -- --seed 42 --num 5000
 
-# Run the source-vs-script execution oracle (accept/reject + state)
+# Run the source-vs-script execution oracle (accept/reject only, stateless fragments)
 pnpm run fuzz -- --execute --num 200
+
+# Run the Spend-oracle fuzzer (absolute: full tx context + expectedState)
+cd conformance && npx tsx fuzzer/index.ts --spend-oracle --num 50 --seed 1
 ```
 
 The fuzzer follows this pipeline:
@@ -414,7 +919,7 @@ The fuzzer follows this pipeline:
 Generate random .runar.ts --> Compile to ANF IR --> Compile to Script
                          |                    |
                          v                    v
-                    Interpret ANF IR     Execute in VM
+                 Interpret the AST       Execute in VM
                          |                    |
                          v                    v
                     Compare results: must match
@@ -872,7 +1377,7 @@ describe('SchnorrZKP contract', () => {
 - **Point format**: Points are 64 bytes (128 hex chars), big-endian unsigned, no prefix. Use `makePointHex()` or equivalent to construct valid test points.
 - **Modular arithmetic**: All scalar computations in tests must use `mod(value, EC_N)` to stay within the group order, matching what the on-chain contract does.
 - **Interpreter-based**: `TestContract` uses the interpreter, which performs real EC arithmetic (not mocked). This means test results accurately reflect the contract's mathematical behavior.
-- **Script size**: EC contracts generate large scripts (~50-100 KB per `ecMul`/`ecMulGen` call). Full Script VM execution of these contracts is feasible but slower than interpreter-based testing.
+- **Script size**: EC contracts generate very large scripts — **~429 KB** per `ecMul`/`ecMulGen` call, ~460 KB per `p256Mul`, ~927 KB per `p384Mul`, ~974 KB for one `verifyECDSA_P256` and ~1.99 MB for one `verifyECDSA_P384`. Full Script VM execution is feasible but slow (seconds per call). These sizes also matter beyond test runtime: most of them exceed the BSV default `maxscriptsizepolicy` of 500,000 B **per script**, so a contract that passes every test here may still be rejected as non-standard by a node on stock policy — see the script-size and relay-policy table in [`docs/language-reference.md`](language-reference.md#script-size-and-relay-policy). `integration/regtest.sh` runs with `maxscriptsizepolicy=0`, so the regtest suite cannot catch it.
 
 ---
 
@@ -950,21 +1455,34 @@ Review the diffs carefully. An unexpected change in a golden file indicates eith
 
 ## Testing Strategy Summary
 
-Rúnar employs a layered testing strategy:
+Rúnar employs a layered testing strategy. The **Assurance** column is the one
+that matters when you are deciding whether a claim of "covered" is load-bearing
+— see [Layers of assurance](#layers-of-assurance).
 
-| Layer | What It Tests | Tool |
-|-------|--------------|------|
-| **Unit tests per pass** | Each compiler pass in isolation | vitest |
-| **End-to-end compilation** | Full pipeline: source to script | vitest + conformance golden files |
-| **VM execution** | Compiled script with specific inputs | `TestSmartContract` / `ScriptVM` (execute compiled Bitcoin Script) |
-| **Interpreter oracle** | ANF IR evaluation matches VM execution | `RunarInterpreter` vs `ScriptVM` |
-| **Property-based fuzzing** | Random valid programs compile correctly | fast-check generators |
-| **Differential fuzzing (parity)** | All 7 tiers emit byte-identical hex | `conformance/fuzzer` |
-| **Differential execution (semantics)** | Interpreter and BSV engine agree on accept/reject + state | `packages/runar-testing/src/oracle`, `conformance/fuzzer --execute` |
-| **Cross-compiler conformance** | All compilers produce identical output | Golden-file SHA-256 comparison |
-| **Post-quantum dual-oracle** | Compiled PQ script matches interpreter | `TestContract` vs `ScriptExecutionContract` |
+| Layer | What It Tests | Assurance | Tool |
+|-------|--------------|-----------|------|
+| **Unit tests per pass** | Each compiler pass in isolation | tier-local | vitest |
+| **End-to-end compilation** | Full pipeline: source to script | tier-local | vitest + conformance golden files |
+| **VM execution** | Compiled script with specific inputs | absolute (verdict) | `TestSmartContract` / `ScriptVM` (execute compiled Bitcoin Script) |
+| **Interpreter oracle** | AST evaluation matches compiled-script execution | absolute (**verdict only**) | `RunarInterpreter` vs `ScriptVM` |
+| **Real-crypto witnesses** | Real `Spend` accept/reject **plus** post-spend `expectedState` | absolute (verdict **+ value**) | `conformance/witnesses/real-crypto/*.json` |
+| **Provider broadcast validation** | Whole-tx acceptance on the SDK path (default ON) | absolute | `MockProvider` + `@bsv/sdk` `Spend` |
+| **Property-based fuzzing** | Random valid programs compile correctly | tier-local | fast-check generators |
+| **Differential fuzzing (parity)** | All 7 tiers emit byte-identical hex | **horizontal** | `conformance/fuzzer` |
+| **Differential execution (semantics)** | Interpreter and BSV engine agree on accept/reject | absolute (**verdict only**) | `packages/runar-testing/src/oracle`, `conformance/fuzzer --execute` |
+| **Spend-oracle fuzzing** | Generated stateful contracts deploy→call→`Spend` with a state pin | absolute (verdict **+ value**) | `conformance/fuzzer --spend-oracle` |
+| **Cross-compiler conformance** | All compilers produce identical output | **horizontal** | Golden-file SHA-256 comparison |
+| **Cross-SDK conformance** | All 7 SDKs emit identical locking scripts | **horizontal** | `conformance/sdk-output` |
+| **Compiler↔SDK vertical pins** | SDK behaviour matches the compiler's declaration | **vertical** | `conformance/sdk-vertical`, `stateful-bytestring-op-n-state` |
+| **Construct ledger** | Which fund-critical *shapes* are exercised at all | coverage meta-gate | `conformance/construct-ledger.json` |
+| **Post-quantum dual-oracle** | Compiled PQ script matches interpreter | absolute (verdict) | `TestContract` vs `ScriptExecutionContract` |
 
 The layers build on each other. Unit tests catch obvious regressions. VM tests verify that the compiled script actually works. The interpreter oracle catches subtle semantic bugs. Fuzzing searches for edge cases that hand-written tests miss. Conformance testing ensures the multi-compiler strategy holds together.
+
+What conformance testing does **not** do is prove any of them right: seven
+tiers agreeing byte-for-byte on a wrong answer is a green horizontal suite. The
+vertical pins, the real-crypto `expectedState` pins, and the Spend-oracle
+fuzzer are the layers that can disagree with a consensus.
 
 ### Per-Pass Test Structure
 

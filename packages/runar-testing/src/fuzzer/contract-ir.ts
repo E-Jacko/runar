@@ -103,6 +103,7 @@ export type Stmt =
   | AssignStmt
   | IfStmt
   | ForStmt
+  | AddOutputStmt
   | ExprStmt;
 
 export interface VarDeclStmt {
@@ -147,6 +148,24 @@ export interface ForStmt {
   op: '<' | '<=' | '>' | '>=';
   step: 1 | -1;
   body: Stmt[];
+}
+
+/**
+ * The multi-output intrinsic — `this.addOutput(satoshis, ...values)`.
+ *
+ * `values` is POSITIONAL against the contract's MUTABLE properties in
+ * DECLARATION ORDER, so it must carry exactly one expression per mutable
+ * property. Renderers do not re-derive that list; they emit what the generator
+ * supplied, which is what makes a wrong-arity node a fuzzer bug rather than a
+ * silently-different contract.
+ *
+ * StatefulSmartContract only: the intrinsic writes a state-carrying
+ * continuation output, and a stateless contract has no state to carry.
+ */
+export interface AddOutputStmt {
+  kind: 'add_output';
+  satoshis: bigint;
+  values: Expr[];
 }
 
 export interface ExprStmt {
@@ -242,6 +261,11 @@ export function collectUsedFunctions(contract: GeneratedContract): Set<string> {
         break;
       case 'for':
         stmt.body.forEach(walkStmt);
+        break;
+      case 'add_output':
+        // `addOutput` itself is an intrinsic on the base class, not an
+        // importable builtin — only its operands can pull in imports.
+        stmt.values.forEach(walkExpr);
         break;
       case 'expr':
         walkExpr(stmt.expr);

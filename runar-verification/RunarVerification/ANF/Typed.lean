@@ -105,7 +105,7 @@ def freeNames : ANFValue → List String
   | .unaryOp _ o _ => [o]
   | .call _ args => args
   | .methodCall obj _ args => obj :: args
-  | .ifVal cond _ _ => [cond]   -- nested branch references are scoped to nested envs
+  | .ifVal cond _ _ _ => [cond]   -- nested branch references are scoped to nested envs
   | .loop _ _ _ => []           -- loop body has its own scope (with iterVar)
   | .assert v => [v]
   | .updateProp _ v => [v]

@@ -2,13 +2,39 @@
  * Source-vs-script differential-execution oracle (TS-GAP-001).
  *
  * Runs the same spend attempt through two independent engines:
- *   1. source semantics — the ANF `RunarInterpreter` (via `TestContract`)
+ *   1. source semantics — the AST-walking `RunarInterpreter` (via `TestContract`)
  *   2. script semantics — the compiled Bitcoin Script on the `@bsv/sdk`-backed
  *      `ScriptVM`
  * on the compiler's **fold-ON deployed bytes** (the shipped default), and
- * asserts they agree on accept/reject. A bug all seven compilers share
- * (byte-identical but wrong) is caught here because the interpreter is a
- * second, independent implementation of the same source semantics.
+ * asserts they agree on accept/reject.
+ *
+ * What this DOES catch: a codegen bug downstream of ANF lowering
+ * (stack-lower / emit) that makes the compiled script diverge from the
+ * interpreter's independent read of the same source semantics — the two
+ * engines consume the IR at different pipeline stages, so they can disagree
+ * when only one side is wrong.
+ *
+ * What this does NOT prove (testing-gap remediation Phase B / TG-008):
+ * accept/reject AGREEMENT is not evidence of a correct post-spend STATE, and
+ * it does not mean "a bug shared by all seven compilers is always caught".
+ * This oracle compares VERDICTS ONLY. The two engines share just
+ * parse/validate/typecheck: the interpreter (`TestContract` →
+ * `RunarInterpreter.executeMethod`, see `test-contract.ts` /
+ * `interpreter/interpreter.ts`) reads the parsed AST (`ContractNode`)
+ * directly, and `04-anf-lower.ts` sits downstream of that input — it is NOT
+ * shared with the interpreter. So this oracle CAN disagree with, and catch,
+ * a miscompile in ANF lowering / stack-lower / emit — but ONLY when the bug
+ * flips accept/reject. A miscompile that leaves the script acceptable while
+ * committing the WRONG continuation state (the PALMER-1 class' Face B:
+ * branch-merged locals producing a wrong-but-self-consistent continuation
+ * that both engines happily "accept") is invisible to a verdict-only
+ * comparison — this oracle reports `agrees: true` while the state is wrong.
+ * Catching that needs an INDEPENDENT, hand-authored pin that is not derived
+ * from this pipeline — `expectedState` in
+ * `conformance/witnesses/real-crypto/*.json` (machine-checked by
+ * `coverage-claims.test.ts`, enforced at run time by
+ * `real-crypto-execution.test.ts`) or an external KAT vector — not this
+ * oracle's own accept/reject agreement.
  */
 import { compile } from 'runar-compiler';
 import { ScriptVM, hexToBytes, bytesToHex } from '../vm/index.js';

@@ -28,6 +28,10 @@ class ECUnit(SmartContract):
         assert_(ec_on_curve(doubled))
         sum_ = ec_add(g, g)
         assert_(ec_on_curve(sum_))
+        # P + (-P) is the point at infinity: ec_add returns the all-zero blob
+        # from a SUCCESSFUL script, and ec_on_curve must reject it.
+        inf_pt = ec_add(g, neg)
+        assert_(not ec_on_curve(inf_pt))
         x = ec_point_x(g)
         y = ec_point_y(g)
         rebuilt = ec_make_point(x, y)

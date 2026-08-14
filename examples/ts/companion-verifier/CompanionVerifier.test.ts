@@ -1,3 +1,16 @@
+// INTERPRETER-ONLY: UNCOVERED — verified 2026-08-06: nothing in the repo spends this
+// contract. There is no conformance fixture for CompanionVerifier / AttributedToken (the
+// `cross-covenant` fixture is a different, stateless contract), no real-crypto witness, and
+// no integration suite mentions either class. The test derives the verifier's slot layout
+// and template hash from the REAL compiled artifact and builds real companion locking
+// scripts via RunarContract — but it executes through TestContract, so checkSig and
+// checkPreimage are mocked and the compiled script is never run.
+// CLOSE PLAN: this is a two-input covenant (verifier at input 0 parsing the companion's
+// parent tx at input 1), which neither runStatefulSpend nor the sdk-output driver protocol
+// can compose today. Cheapest real gate is a hand-built 2-input tx in
+// conformance/script_execution_test.go, in the style of TestRawOutput_ScriptExecution_Accept
+// (accept + a near-miss with a tampered companion script). Until then this row is an honest
+// hole, counted by the ratchet in examples/ts/example-spendability-policy.test.ts.
 /**
  * Verified Companion Inputs — cross-contract composition example.
  *

@@ -65,6 +65,19 @@ describe('MINIMALDATA single-byte push — contract arg encoder (encodeArg)', ()
   it('0x05 -> 55 (OP_5)', () => {
     expect(encodeArg('05')).toBe('55');
   });
+  // C5 (plan Phase C5 / docs/audit/2026-08-testing-gap-remediation-plan.md):
+  // encodeArg is REQUIRED to emit OP_1..OP_16 for the WHOLE 1-byte 0x01..0x10
+  // range, not just the 0x05 spot-check above -- this is the opposite rule
+  // from serializeState (state.ts), which is REQUIRED to keep <len><data> for
+  // the same range. Both requirements are enforced as strict `.toBe()`
+  // equality, so either direction regressing is a hard failure.
+  it('the WHOLE OP_N range 0x01..0x10 uses OP_1..OP_16, never a direct push', () => {
+    for (let n = 1; n <= 16; n++) {
+      const hex = n.toString(16).padStart(2, '0');
+      const opN = (0x50 + n).toString(16).padStart(2, '0'); // OP_1 = 0x51 .. OP_16 = 0x60
+      expect(encodeArg(hex)).toBe(opN);
+    }
+  });
   it('0x00 -> 0100 (direct push, NOT OP_0 -- OP_0 pushes [], not [0x00])', () => {
     expect(encodeArg('00')).toBe('0100');
   });
@@ -76,5 +89,47 @@ describe('MINIMALDATA single-byte push — contract arg encoder (encodeArg)', ()
   });
   it('two-byte payload still direct-pushes (0xdeadbeef -> 04deadbeef)', () => {
     expect(encodeArg('deadbeef')).toBe('04deadbeef');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C5 vs C2 — the unlocking encoder and the state encoder must NEVER converge
+// on the same bytes for an OP_N-range value.
+//
+// serializeState (state section, never executed -> always <len><data>) and
+// encodeArg (unlocking script, executed -> MINIMALDATA/OP_N) implement
+// OPPOSITE rules for exactly the value class #110 confused them on. This is
+// the regression test the plan (docs/audit/2026-08-testing-gap-remediation-
+// plan.md, "C5 Success") asks for: it must fail if anyone ever "cleans up"
+// the two encoders into one shared implementation, because a single shared
+// implementation can only pick ONE of the two required behaviours above and
+// will therefore fail either the state describe block or the encodeArg
+// describe block. This test additionally makes the DIVERGENCE ITSELF the
+// assertion, so unification is caught even before either literal changes.
+// ---------------------------------------------------------------------------
+describe('C5: the unlocking encoder and the state encoder must stay DIVERGENT for OP_N-range values', () => {
+  it('serializeState and encodeArg produce DIFFERENT bytes for every 1-byte OP_N-range value', () => {
+    for (let n = 1; n <= 16; n++) {
+      const hex = n.toString(16).padStart(2, '0');
+      const stateBytes = serializeState(byteStringField, { b: hex });
+      const unlockBytes = encodeArg(hex);
+      expect(
+        stateBytes,
+        `serializeState and encodeArg must diverge for 0x${hex} (state=${stateBytes}, unlock=${unlockBytes}) -- ` +
+          `if these ever match, the two encoders have been unified and PALMER-2 is back`,
+      ).not.toBe(unlockBytes);
+    }
+  });
+
+  it('serializeState and encodeArg produce DIFFERENT bytes for 0x81 (OP_1NEGATE range)', () => {
+    expect(serializeState(byteStringField, { b: '81' })).not.toBe(encodeArg('81'));
+  });
+
+  it('0x00 is the one value where the two paths legitimately AGREE (0100 either way)', () => {
+    // Not evidence of unification: both encoders independently exclude 0x00
+    // from their respective minimal-opcode shortcuts (OP_0 pushes [], not
+    // [0x00]), so `0100` is the correct answer on BOTH sides for a different
+    // reason each time. See the 0x00 tests in both describe blocks above.
+    expect(serializeState(byteStringField, { b: '00' })).toBe(encodeArg('00'));
   });
 });

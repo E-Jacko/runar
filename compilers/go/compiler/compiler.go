@@ -457,8 +457,11 @@ func CompileFromSource(sourcePath string, opts ...CompileOptions) (*Artifact, er
 	}
 	expandedContract := expandResult.Contract
 
-	// Pass 4: ANF lowering
-	program := frontend.LowerToANF(expandedContract)
+	// Pass 4: ANF lowering (recover from panics)
+	program, err := lowerToANFRecovering(expandedContract)
+	if err != nil {
+		return nil, err
+	}
 
 	// Feed into existing compilation pipeline (passes 4.25+)
 	return CompileFromProgram(program, opts...)
@@ -536,7 +539,11 @@ func CompileSourceToIR(sourcePath string, opts ...CompileOptions) (*ir.ANFProgra
 		return nil, fmt.Errorf("expand-fixed-arrays errors:\n  %s", strings.Join(diagStrings(expandResult.Errors), "\n  "))
 	}
 
-	program := frontend.LowerToANF(expandResult.Contract)
+	// Pass 4: ANF lowering (recover from panics)
+	program, err := lowerToANFRecovering(expandResult.Contract)
+	if err != nil {
+		return nil, err
+	}
 
 	o := mergeOptions(opts)
 	// Pass 4.25: Constant folding (on by default)
@@ -577,6 +584,25 @@ type CompileResult struct {
 
 	// ScriptAsm is the human-readable ASM (available if compilation succeeds).
 	ScriptAsm string
+}
+
+// lowerToANFRecovering runs pass 4 (ANF lowering) under a recover, converting a
+// panic into an ordinary error carrying the original message.
+//
+// Pass 4 panics deliberately: it is how the lowering pass refuses a construct it
+// must not emit (e.g. a conditional that both declares outputs and merges two or
+// more locals, which used to compile to an unspendable script). Passes 5 and 6
+// already trap their panics; without this wrapper a pass-4 refusal escaped the
+// compiler as an unrecovered panic + stack trace instead of a diagnostic.
+// The "anf lowering panic: " prefix mirrors the "stack lowering panic: " /
+// "emit panic: " wording used by the pass-5 / pass-6 recovers.
+func lowerToANFRecovering(contract *frontend.ContractNode) (program *ir.ANFProgram, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("anf lowering panic: %v", r)
+		}
+	}()
+	return frontend.LowerToANF(contract), nil
 }
 
 // hasErrors returns true if any diagnostic has error severity.
@@ -664,8 +690,17 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 	}
 	result.Contract = expandResult.Contract
 
-	// Pass 4: ANF lowering
-	result.ANF = frontend.LowerToANF(result.Contract)
+	// Pass 4: ANF lowering (recover from panics)
+	anfProgram, anfErr := lowerToANFRecovering(result.Contract)
+	if anfErr != nil {
+		result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
+			anfErr.Error(),
+			frontend.SeverityError,
+			nil,
+		))
+		return result
+	}
+	result.ANF = anfProgram
 
 	// Bake constructor args into ANF properties.
 	if errs := applyConstructorArgs(result.ANF, o.ConstructorArgs); len(errs) > 0 {
@@ -819,8 +854,17 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 	}
 	result.Contract = expandResult.Contract
 
-	// Pass 4: ANF lowering
-	result.ANF = frontend.LowerToANF(result.Contract)
+	// Pass 4: ANF lowering (recover from panics)
+	anfProgram, anfErr := lowerToANFRecovering(result.Contract)
+	if anfErr != nil {
+		result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
+			anfErr.Error(),
+			frontend.SeverityError,
+			nil,
+		))
+		return result
+	}
+	result.ANF = anfProgram
 
 	// Bake constructor args into ANF properties.
 	if errs := applyConstructorArgs(result.ANF, o.ConstructorArgs); len(errs) > 0 {

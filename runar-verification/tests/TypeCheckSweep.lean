@@ -68,7 +68,7 @@ def valueKindName : ANFValue → String
   | .unaryOp op _ _       => s!"unary_op:{op}"
   | .call func _          => s!"call:{func}"
   | .methodCall _ m _     => s!"method_call:{m}"
-  | .ifVal _ _ _          => "if"
+  | .ifVal _ _ _ _          => "if"
   | .loop _ _ _           => "loop"
   | .assert _             => "assert"
   | .updateProp _ _       => "update_prop"
@@ -96,7 +96,7 @@ partial def firstFailure (retEnv : List (String × ANFType)) (Γ : TypeEnv) :
   | [] => none
   | .mk name v _ :: rest =>
     match v with
-    | .ifVal cond thenBranch elseBranch =>
+    | .ifVal cond thenBranch elseBranch _ =>
         -- Condition must be `.bool`.
         if Γ.lookup cond != some .bool then
           some (name, s!"if (condition `{cond}` not bool)")

@@ -25,11 +25,16 @@ final class PipelineTestSupport {
 
     /** Full fold-OFF compile → Bitcoin Script hex. */
     static String hex(String src, String file) throws Exception {
+        return hex(src, file, /* disableConstantFolding */ true);
+    }
+
+    /** Full compile → Bitcoin Script hex, choosing the constant-folding mode. */
+    static String hex(String src, String file, boolean disableConstantFolding) throws Exception {
         ContractNode contract = parseValidated(src, file);
         contract = ExpandFixedArrays.run(contract);
         Typecheck.run(contract);
         AnfProgram anf = AnfLower.run(contract);
-        anf = Cli.optimizeAnf(anf, true); // fold-OFF; DCE + EC rewrite ON
+        anf = Cli.optimizeAnf(anf, disableConstantFolding); // DCE + EC rewrite always ON
         StackProgram stack = StackLower.run(anf);
         stack = Peephole.run(stack);
         return Emit.run(stack);

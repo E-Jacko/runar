@@ -39,7 +39,7 @@ class StateRead extends StatefulSmartContract {
 	signer, _ := NewLocalSigner("0000000000000000000000000000000000000000000000000000000000000003")
 	addr, _ := signer.GetAddress()
 	provider := NewMockProvider("testnet")
-	provider.AddUtxo(addr, UTXO{Txid: strings.Repeat("aa", 32), OutputIndex: 0, Satoshis: 500000, Script: "76a914" + strings.Repeat("00", 20) + "88ac"})
+	provider.AddUtxo(addr, UTXO{Txid: strings.Repeat("aa", 32), OutputIndex: 0, Satoshis: 500000, Script: BuildP2PKHScript(addr)})
 
 	init := strings.Repeat("00", 8) + strings.Repeat("cc", 20)
 	live := strings.Repeat("11", 8) + strings.Repeat("dd", 20)

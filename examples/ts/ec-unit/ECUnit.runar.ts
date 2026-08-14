@@ -21,6 +21,13 @@ class ECUnit extends SmartContract {
         assert(ecOnCurve(doubled));
         const sum = ecAdd(g, g);
         assert(ecOnCurve(sum));
+        // P + (-P) is the point at infinity, which affine x||y cannot encode:
+        // ecAdd returns the all-zero blob from a SUCCESSFUL script (as does
+        // ecMul for any k = 0 mod n). ecOnCurve is the only way to notice,
+        // so it must reject it. Selecting the tangent on px == qx alone
+        // returned 2G here instead: on-curve, plausible, and accepted.
+        const infPt = ecAdd(g, neg);
+        assert(!ecOnCurve(infPt));
         const x = ecPointX(g);
         const y = ecPointY(g);
         const rebuilt = ecMakePoint(x, y);

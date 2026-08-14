@@ -330,34 +330,37 @@ function foldValue(value: ANFValue, env: ConstEnv): ANFValue {
       return value;
 
     case 'if': {
-      // Check if condition is a known constant
-      const condConst = env.get(value.cond);
-
-      if (condConst !== undefined && typeof condConst === 'boolean') {
-        // Branch is statically known — fold to just one branch
-        if (condConst) {
-          const thenEnv = env.clone();
-          const foldedThen = foldBindings(value.then, thenEnv);
-          // Merge constants from the taken branch back into env
-          for (const b of foldedThen) {
-            if (b.value.kind === 'load_const') {
-              env.set(b.name, b.value.value);
-            }
-          }
-          return { ...value, then: foldedThen, else: [] };
-        } else {
-          const elseEnv = env.clone();
-          const foldedElse = foldBindings(value.else, elseEnv);
-          for (const b of foldedElse) {
-            if (b.value.kind === 'load_const') {
-              env.set(b.name, b.value.value);
-            }
-          }
-          return { ...value, then: [], else: foldedElse };
-        }
-      }
-
-      // Condition not known — fold both branches independently
+      // Fold both arms independently, ALWAYS — including when the condition is
+      // a compile-time constant.
+      //
+      // This pass used to "optimise" a statically-known condition by blanking
+      // the untaken arm (`else: []`) while LEAVING the `if` node itself in
+      // place, and by propagating the taken arm's constants into the enclosing
+      // env. Both halves of that were unsound:
+      //
+      //   * An arm is not a free-floating list of bindings — it carries a
+      //     STACK-SHAPE CONTRACT that 04-anf-lower establishes and
+      //     05-stack-lower depends on. An `if` that declares `results` ends
+      //     BOTH arms with the identical `__merge$<i>` block
+      //     (`appendBranchResults`), which is what makes the declaration true:
+      //     `lowerIf` trims each arm to `results.length` and adopts the slots
+      //     by the declared ORDER. Blanking one arm leaves the node still
+      //     declaring K results that the arm no longer holds, so the reconcile
+      //     adopts slots that are not the results — every post-branch operand
+      //     then resolves one or more slots off. At K=2 that miscompiled
+      //     SILENTLY: the deployed
+      //     script accepted spends the source rejects and rejected spends the
+      //     source accepts. At K=1 it surfaced as `value 'tN' not found on
+      //     stack`, i.e. a compile-time rejection of source that compiles fine
+      //     with folding disabled.
+      //   * Propagating the taken arm's constants outward is only sound if the
+      //     other arm is really gone. The `if` node survives this pass, so both
+      //     arms are still emitted and either can run.
+      //
+      // Correct dead-arm elimination would have to delete the `if` and splice
+      // the live arm into the parent, re-establishing the parent's shape. That
+      // is a lowering-level rewrite, not a fold, so it does not live here. The
+      // bytes given up are the statically-dead arm's ops, which never execute.
       const thenEnv = env.clone();
       const elseEnv = env.clone();
       const foldedThen = foldBindings(value.then, thenEnv);

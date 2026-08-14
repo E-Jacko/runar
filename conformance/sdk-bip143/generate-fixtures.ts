@@ -63,7 +63,7 @@ const PROJECT_ROOT = resolve(__dirname, '..', '..');
 /** SIGHASH_ALL | SIGHASH_FORKID — the only sighash type these SDKs emit. */
 const SIGHASH_ALL_FORKID = 0x41;
 
-const ALICE_PRIV = new PrivateKey(1n);
+const ALICE_PRIV = new PrivateKey(1);
 const ALICE_PUB_HEX = ALICE_PRIV.toPublicKey().toDER('hex') as string;
 
 // ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ async function compileCounterScript(): Promise<string> {
   );
   const result = compile(src, { fileName: 'Counter.runar.ts' });
   if (!result.artifact) {
-    throw new Error(`Counter compile failed: ${JSON.stringify(result.errors)}`);
+    throw new Error(`Counter compile failed: ${JSON.stringify(result.diagnostics)}`);
   }
   // codePart is the locking script template (hex). For a stateful contract
   // this is exactly the prev locking script a `call` spends.

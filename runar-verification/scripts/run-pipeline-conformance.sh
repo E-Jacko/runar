@@ -86,12 +86,14 @@ fi
 # Build (idempotent: lake build is a no-op when up to date).
 # --------------------------------------------------------------------
 BIN_PATH="./.lake/build/bin/pipelineConformance"
-if [ ! -x "$BIN_PATH" ]; then
-  echo "[pipeline-conformance] building pipelineConformance..."
-  if ! lake build pipelineConformance; then
-    echo "[pipeline-conformance] FAIL: lake build pipelineConformance failed" >&2
-    exit 2
-  fi
+# Build unconditionally. Guarding on `[ ! -x "$BIN_PATH" ]` meant an
+# existing binary was run however stale it was, so a source change could
+# be reported against a months-old build — silently, and in either
+# direction. `lake build` is itself the up-to-date check.
+echo "[pipeline-conformance] building pipelineConformance..."
+if ! lake build pipelineConformance; then
+  echo "[pipeline-conformance] FAIL: lake build pipelineConformance failed" >&2
+  exit 2
 fi
 
 if [ ! -x "$BIN_PATH" ]; then

@@ -19,6 +19,10 @@ func (c *ECUnit) TestOps() {
 	runar.Assert(runar.EcOnCurve(doubled))
 	sum := runar.EcAdd(g, g)
 	runar.Assert(runar.EcOnCurve(sum))
+	// P + (-P) is the point at infinity: EcAdd returns the all-zero blob from
+	// a SUCCESSFUL script, and EcOnCurve must reject it.
+	infPt := runar.EcAdd(g, neg)
+	runar.Assert(!runar.EcOnCurve(infPt))
 	x := runar.EcPointX(g)
 	y := runar.EcPointY(g)
 	rebuilt := runar.EcMakePoint(x, y)

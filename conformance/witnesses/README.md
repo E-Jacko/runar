@@ -5,8 +5,25 @@ execution oracle (`packages/runar-testing/src/oracle/differential-execution.ts`)
 The oracle compiles the fixture to its **fold-ON deployed bytes**, runs the
 declared spend through the ANF interpreter (source semantics) *and* through the
 `@bsv/sdk`-backed `ScriptVM` (script semantics), and asserts both engines agree
-on accept/reject — catching a bug all seven compilers share (byte-identical but
-wrong). Every non-crypto conformance fixture SHOULD have one.
+on accept/reject — catching a codegen bug downstream of ANF lowering where the
+compiled script diverges from the interpreter's independent read of the same
+source semantics. Every non-crypto conformance fixture SHOULD have one.
+
+**This does NOT prove a correct post-spend state**, and it does NOT mean a bug
+shared by all seven compilers is always caught (testing-gap remediation Phase
+B / TG-008, see the docstring in `differential-execution.ts` for the full
+argument): the oracle compares VERDICTS ONLY. The two engines share just
+parse/validate/typecheck — the interpreter reads the parsed AST directly, and
+ANF lowering sits downstream of that, so it is NOT shared with the
+interpreter. This oracle CAN disagree with, and catch, a miscompile in ANF
+lowering / stack-lower / emit, but ONLY when the bug flips accept/reject. A
+miscompile that leaves the script acceptable while committing the WRONG
+continuation state (the PALMER-1 class — branch-merged locals producing a
+wrong-but-self-consistent continuation that both engines happily "accept") is
+invisible to a verdict-only comparison, and this oracle reports `agrees: true`
+while the state is wrong. The independent check for that failure mode is the
+hand-authored `expectedState` pin on stateful accepts under `real-crypto/`
+below (audit #4), not this oracle's agreement.
 
 Schema:
 
@@ -40,13 +57,17 @@ Schema:
 
 ## Real-crypto execution (`real-crypto/`) — post-mortem remediation #1
 
-The plain differential oracle runs on the in-process `ScriptVM`, whose
-`checkSigCallback` defaults to MOCK crypto (`() => true`) and which has NO tx
-context — so it can neither verify a real signature nor a real BIP-143 sighash
-preimage. Every fixture needing a signature or a tx-context preimage was
-therefore routed OUT into the coverage ledger (`coverage-ledger.json`)
-and got **no real execution** — the exact blind spot behind BUG-100 / #99 /
-#100 / #44 (all seven tiers agreed on bytes nobody ever ran with real crypto).
+The plain differential oracle runs on the in-process `ScriptVM`, which wraps
+`@bsv/sdk`'s production `Spend` — its `OP_CHECKSIG` / `OP_CHECKMULTISIG` are
+REAL secp256k1, there is no mock `checkSigCallback` (see root `CLAUDE.md` §
+"Off-chain Script VM"). Its limitation is the TX CONTEXT, not the crypto: it
+runs against a synthetic, fixed transaction (null outpoint, no outputs), so no
+witness it is handed carries a signature over a real spending transaction, and
+it cannot exercise a state-continuation preimage at all. Every fixture needing
+a signature or a tx-context preimage was therefore routed OUT into the
+coverage ledger (`coverage-ledger.json`) and got **no real execution** — the
+exact blind spot behind BUG-100 / #99 / #100 / #44 (all seven tiers agreed on
+bytes nobody ever ran with real crypto).
 
 `real-crypto/<fixture>.json` closes that gap. Each spec is EXECUTED by
 `real-crypto-execution.test.ts` through `@bsv/sdk`'s production `Spend`
@@ -205,25 +226,77 @@ what happened in BUG-101 (BLAKE3 was byte-identical across all tiers and wrong i
 all of them, because nothing ever ran it against a KAT). "Parity-green-but-wrong"
 is a real, observed failure mode in this repo, not a hypothetical.
 
-**Current exposure — 8 fixtures** (was 15; see the correction below). Both
-categories are legitimate opt-outs, both are machine-verified as *claims* by
-`coverage-claims.test.ts`, and neither is execution:
+**Current exposure — 6 fixtures** (was 15, then 8; see both corrections below).
+Both categories are legitimate opt-outs, both are machine-verified as *claims*
+by `coverage-claims.test.ts`, and neither is execution. **The count is no longer
+prose:** `completeness.test.ts` pins it against `MAX_UNEXECUTED_GOLDENS` and
+requires every member to carry a dated `closePlan` (plan Phase G1/G3), because
+this paragraph said 15 while the truth was 8 for months.
 
-- `codegen-golden` (7) — byte-golden only, executed by no engine:
+- `codegen-golden` (5) — byte-golden only, executed by no engine:
   `ec-unit`, `p256-primitives`, `p256-wallet`, `p384-primitives`,
-  `p384-wallet`, `post-quantum-wallet`, `sphincs-wallet`.
-  EC / NIST-P / post-quantum verification scripts. They are unexecuted because
-  the accept path needs a real cryptographic witness the in-process oracle
-  cannot synthesise from plain args, and several compile to 200-900 KB of
-  script. Their PRIMITIVES are covered elsewhere (`real-crypto/`, the Go
-  `go-family-exec` markers, KAT vector tests) — it is these fixtures' own
-  composed bytes that nothing runs. Note the four `*-wallet` entries DO have
-  integration tests, but those only **deploy**; deploying does not execute a
-  locking script, so they buy no execution coverage. Closing them needs a spend.
+  `p384-wallet`.
+  EC / NIST-P verification scripts. Their PRIMITIVES are covered elsewhere
+  (`real-crypto/`, the Go `go-family-exec` markers, KAT vector tests) — it is
+  these fixtures' own composed bytes that nothing runs. The reason differs per
+  family and is recorded per entry in `coverage-ledger.json` under `closePlan`:
+  - `ec-unit` is **blocked on a confirmed open codegen bug**, not on harness
+    capability. `testOps()` takes no arguments and needs no witness, so it was
+    spent on a live regtest node and **rejected** — `ecMul(g, 2n)` returns an
+    all-zero point (the Jacobian ladder cannot double when the accumulator
+    equals the point being added). Fix that in all seven tiers first; adding a
+    stronger label now would freeze a known-unspendable script as correct.
+  - `p256-primitives` / `p384-primitives` are **blocked on the same two codegen
+    bugs as `ec-unit`**, confirmed 2026-08-06 by executing the emitted script
+    through `@bsv/sdk`'s `Spend`: `p256Add(G, G)` / `p384Add(G, G)` return the
+    wrong point (`cAffineAdd` in `p256-p384-codegen.ts` still implements ONLY
+    the chord slope — the tangent-select fix commit `8a6494b4` applied to
+    secp256k1 `affineAdd` was never ported to the NIST-P curves), and
+    `p256Mul(G, 2n)` / `p384Mul(G, 2n)` return an all-zero point. `k = 3n` is
+    correct in both, pinning the blob format. `verifyAdd(a, b)` exercises the
+    first defect and `verify(k, basePoint)` the second, so a witness written
+    today would go red for the codegen, not for the harness.
+    Two further notes. They need **no signature at all** — `verify` /
+    `verifyAdd` / `verifyMulGen` take plain scalars and points — so the
+    `crypto-witness-infeasible` cause reads false on its own wording, and what
+    actually blocks the plain differential oracle is that the ANF interpreter
+    MOCKS `p256Add` / `p256Mul` / `p256MulGen` (64 zero bytes) and
+    `p256OnCurve` (unconditionally `true`). The cause is nonetheless left
+    unchanged, deliberately: `crypto-witness-infeasible` carries provenance
+    (see the cause vocabulary above), and the interpreter mock is removable, so
+    `interpreter-unsupported` would go stale in turn. And beyond the bugs, an
+    EXTERNAL curve-arithmetic KAT is still missing:
+    `runtime-vectors/ecdsa-rfc6979.json` holds P-256/P-384 *signature* vectors
+    only, and `packages/runar-go/crypto_kat_test.go` feeds them to the native Go
+    implementation, never to compiled script.
+  - `p256-wallet` / `p384-wallet` do need a real NIST-P signature. Their
+    integration tests genuinely only **deploy**, and the Go/TS regtest spends
+    that exist run *inline* 2-parameter contracts, not these 4-parameter
+    fixtures. Deploying does not execute a locking script.
 - `go-only-nocodegen` (1) — `compilers:["go"]` proof-system fixture:
   `babybear-ext4`. Single-tier by project policy (see the EVM/STARK note in the
   root `CLAUDE.md`), so it has no cross-tier agreement signal at all — a Go-only
   bug in it has neither an execution check nor a parity check behind it.
+  `conformance/script_execution_test.go` has no babybear test of any kind, even
+  though `compileRúnar` + `executeScript` is exactly the pattern its 16
+  `TestECPrimitives_*` functions already use.
+
+**Correction (2026-08-06): the two post-quantum wallets ARE executed.**
+`post-quantum-wallet` and `sphincs-wallet` were carried here as unexecuted, and
+the sentence above used to read "the four `*-wallet` entries DO have integration
+tests, but those only **deploy**". That was true of the two NIST-P wallets and
+wrong about these two. `integration/go/wots_test.go` and
+`integration/go/slhdsa_test.go` deploy **and spend** them on a live regtest
+node: a real ECDSA signature over the real spending input, then a real WOTS+ /
+SLH-DSA-SHA2-128s signature over those signature bytes, `AssertTxAccepted`, plus
+two `AssertTxRejected` legs each. Each test compiles the fixture's own
+`.runar.ts` source, and both compiles were verified byte-identical to the
+fixtures' `expected-script.hex` (19,594 and 188,609 bytes, in *both* fold
+modes), so the bytes the node executed are the fixtures' own bytes with only the
+two constructor slots substituted. Both entries now carry
+`kind: "integration"`. Scope worth knowing: the Go tier is the only one that
+spends — the ts/python/rust/ruby/zig/java peer suites are deploy-only, and
+`integration/README.md`'s "Deploy + Spend" row over-claims for those six.
 
 **Correction (2026-08-03): seven fixtures were listed here that ARE executed.**
 `babybear`, `convergence-proof`, `ec-demo`, `merkle-proof`, `oracle-price`,
@@ -237,10 +310,10 @@ bytes. Two of them (`babybear`, `merkle-proof`) are `compilers:["go"]` fixtures
 where the Zig port nonetheless reproduces the Go golden exactly. Their ledger
 entries now carry `kind: "integration"` with the test path and that evidence.
 
-**What is actually guaranteed today.** For the remaining 8: the bytes are stable
+**What is actually guaranteed today.** For the remaining 6: the bytes are stable
 (a silent regeneration fails the golden-provenance gate), the fixture parses in
 all seven frontends (the parser-only matrix ignores the `compilers` allowlist),
-and for the 7 non-single-tier ones the seven compilers agree byte-for-byte.
+and for the 5 non-single-tier ones the seven compilers agree byte-for-byte.
 That is meaningful but it is *consistency*, not *correctness*.
 
 **What would actually close it.** Per family, one of: (a) an official KAT
@@ -254,4 +327,21 @@ because its expected values come from outside this codebase entirely.
 **Do not "fix" this by relabelling.** Moving a fixture from `codegen-golden` to a
 stronger-sounding `coveredBy.kind` without adding real execution makes the gate
 report better coverage than exists — the precise over-claim
-`coverage-claims.test.ts` was written to prevent.
+`coverage-claims.test.ts` was written to prevent. The bar an upgrade must clear
+is the one the 2026-08-03 and 2026-08-06 corrections above both met: name the
+test, and verify the compiled bytes of the source that test actually runs are
+byte-identical to the fixture's `expected-script.hex`. Without that byte match
+the executed script is *some* script, not *this fixture's* script.
+
+**And do not fix it by deleting the residual.** `completeness.test.ts` enforces
+two things about this set (plan Phase G1/G3), so neither the count nor the
+follow-up can drift back into prose:
+
+- `MAX_UNEXECUTED_GOLDENS` is a committed ceiling held EQUAL to the current
+  count, so the next `codegen-golden` / `go-only-nocodegen` entry fails CI —
+  including one that appears by *downgrading* an existing execution claim.
+  Lowering it is how a genuine close is recorded; raising it is a deliberate,
+  argued diff.
+- Every member must carry `closePlan: {date, plan}` with an ISO `YYYY-MM-DD`
+  date and a non-empty plan. "Soon" does not parse. Both gates carry RED-PROOFs
+  in the same file.

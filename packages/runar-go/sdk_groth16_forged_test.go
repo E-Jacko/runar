@@ -215,7 +215,7 @@ func assertForgedSpendRejectedOnChain(
 		Script:      fix.lockingScript,
 	})
 
-	provider := NewMockProvider("mocknet")
+	provider := NewAlwaysAckMockProvider("mocknet")
 	// Set a low fee rate so the contract UTXO comfortably covers fee +
 	// dust output, regardless of the (large) verifier-tx size.
 	provider.SetFeeRate(1)

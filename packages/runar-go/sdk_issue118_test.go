@@ -17,7 +17,7 @@ func TestTerminalCall_FeeUtxoAddsFeeInput_Issue118(t *testing.T) {
 	})
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 	provider.AddUtxo(mockAddr, UTXO{Txid: strings.Repeat("aa", 32), OutputIndex: 0, Satoshis: 100000, Script: "76a914" + strings.Repeat("00", 20) + "88ac"})
@@ -63,7 +63,7 @@ func TestTerminalCall_NoFeeUtxo_SingleInput_Issue118(t *testing.T) {
 	})
 	contract := NewRunarContract(artifact, nil)
 
-	provider := NewMockProvider("testnet")
+	provider := NewAlwaysAckMockProvider("testnet")
 	mockAddr := strings.Repeat("00", 20)
 	signer := NewMockSigner("", mockAddr)
 	provider.AddUtxo(mockAddr, UTXO{Txid: strings.Repeat("aa", 32), OutputIndex: 0, Satoshis: 100000, Script: "76a914" + strings.Repeat("00", 20) + "88ac"})

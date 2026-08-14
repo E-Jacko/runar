@@ -111,6 +111,7 @@ pub fn collect_refs_from_value(value: &ANFValue, refs: &mut HashSet<String>) {
             cond,
             then: then_branch,
             else_branch,
+            ..
         } => {
             refs.insert(cond.clone());
             for b in then_branch {

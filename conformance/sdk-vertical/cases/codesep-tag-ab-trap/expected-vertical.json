@@ -1,0 +1,72 @@
+{
+  "case": "codesep-tag-ab-trap",
+  "contract": "CodeSepMatrix",
+  "valueClass": "codesep + 0xab bytes in push data near the separator",
+  "constructorArgs": [
+    {
+      "type": "ByteString",
+      "value": "48656c6c6f"
+    },
+    {
+      "type": "ByteString",
+      "value": "ababab"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 2964,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 878,
+      "byteOffset": 878,
+      "byteLength": 4,
+      "headerBytes": 1,
+      "valueByteOffset": 879,
+      "valueByteLength": 3,
+      "encoding": "data",
+      "pushedHex": "ababab"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 2922,
+      "byteOffset": 2927,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 2928,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [
+    6,
+    1074,
+    2135
+  ],
+  "deployedCodeSeparators": [
+    6,
+    1077,
+    2140
+  ],
+  "codeSepSlotValues": [
+    {
+      "templateByteOffset": 842,
+      "templateCodeSepIndex": 6,
+      "deployedByteOffset": 842,
+      "expectedBakedValue": 6,
+      "actualBakedValue": 6
+    },
+    {
+      "templateByteOffset": 1910,
+      "templateCodeSepIndex": 1074,
+      "deployedByteOffset": 1913,
+      "expectedBakedValue": 1077,
+      "actualBakedValue": 1077
+    }
+  ]
+}

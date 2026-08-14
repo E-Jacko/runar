@@ -417,7 +417,7 @@ def typeOfValue (retEnv : List (String × ANFType)) (Γ : TypeEnv) : ANFValue �
       | none => none
   | .methodCall _obj method _args =>
       (retEnv.find? (·.1 == method)).map (·.2)
-  | .ifVal _ _ _ => none   -- handled in `checkBody`
+  | .ifVal _ _ _ _ => none   -- handled in `checkBody`
   | .loop _ _ _  => none    -- handled in `checkBody`
   | .assert ref =>
       if Γ.lookup ref == some .bool then some .bool else none
@@ -494,7 +494,7 @@ def checkBody (retEnv : List (String × ANFType)) (Γ : TypeEnv) :
   | [] => some Γ
   | .mk name v _ :: rest =>
     match v with
-    | .ifVal cond thenBranch elseBranch =>
+    | .ifVal cond thenBranch elseBranch _ =>
         if Γ.lookup cond == some .bool then
           match checkBody retEnv Γ thenBranch, checkBody retEnv Γ elseBranch with
           | some envT, some envE =>

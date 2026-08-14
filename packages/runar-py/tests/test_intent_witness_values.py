@@ -48,7 +48,7 @@ def _make_intent_artifact(prev_out_inputs: list[int], serialised: bool) -> Runar
 
 
 def _funded_provider(address: str, satoshis: int = 100_000) -> MockProvider:
-    provider = MockProvider('testnet')
+    provider = MockProvider.always_ack('testnet')
     provider.add_utxo(address, Utxo(
         txid='aa' * 32,
         output_index=0,

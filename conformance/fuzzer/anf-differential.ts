@@ -1,4 +1,32 @@
 /**
+ * SCOPE (testing-gap remediation, plan design principle P8): this fuzzer is
+ * HORIZONTAL — its oracle is TIER AGREEMENT, not correctness. Seven tiers that
+ * share one bug agree with each other perfectly and this mode stays green;
+ * both 2026-08 fund-safety bugs were of exactly that shape. It is necessary and
+ * it is NOT fund-safety-complete on its own. The absolute oracles are
+ * `--execute` / `--tri-modal` (stateless fragments) and `--spend-oracle`
+ * (full deploy->call transaction context + an independent post-state pin).
+ * See `conformance/fuzzer/README.md`.
+ *
+ * GENERATOR REACH (2026-08-06). `this.addOutput(...)` used to be unreachable
+ * from every IR-based generator: `spend-shapes.ts` exercised it under the
+ * ABSOLUTE post-state oracle, but that harness renders TypeScript only and
+ * therefore said nothing about the other six frontends. `contract-ir.ts` now
+ * carries an `add_output` node, all seven renderers emit it, and the stateful
+ * generator draws it on roughly three quarters of stateful methods — so the
+ * intrinsic's CROSS-TIER parity is gated for the first time, by the
+ * `--ir --hex --stateful` PR gate added in `.github/workflows/fuzzer-nightly.yml`.
+ * It is load-bearing, not decorative: removing the node from a generated
+ * contract changes the emitted script in every tier.
+ *
+ * That node lives in the CONTRACT-level generator, not here. This module
+ * generates raw ANF directly and feeds it to each tier's `--ir <json>` loader,
+ * a different entry point; `add_output` is already in all seven loaders'
+ * known-kinds sets, so extending THIS generator to emit it needs no compiler
+ * change if someone wants that coverage too.
+ */
+
+/**
  * Item 7 — Property-based cross-tier ANF differential fuzzer.
  *
  * Generates random *valid* ANF IR programs (using the TS schema as
@@ -97,9 +125,32 @@ interface AnfProgram {
 // call / array_literal / assert / update_prop — already exercise every
 // loader + every stack-lowering dispatch site touched by the
 // non-stateful program shape used by 80+% of the conformance corpus.
-// Stateful + control-flow kinds are covered by the source-based
-// fuzzers in `ir-differential.ts` and the hand-written conformance
-// fixtures.
+//
+// WHERE THE EXCLUDED KINDS ACTUALLY GET COVERED (corrected 2026-08-06 — the
+// previous blanket hand-off to "the source-based fuzzers in
+// `ir-differential.ts`" was FALSE for every kind listed here):
+//
+//   * `if` / `loop` — true as of 2026-08-06, and NOT before it. Until then
+//     `arbIfStmtIR` emitted branch arms containing a single `assert` and
+//     nothing else, and no method generator emitted a `ForStmt` at all, so
+//     the contract-level `--ir` fuzzer had compiled zero loops and zero
+//     assigning branch arms in any tier. `arbGeneratedContract` now draws
+//     from `BRANCH_SHAPES` and `IR_LOOP_SHAPES`
+//     (`packages/runar-testing/src/fuzzer/generator.ts`), proved reachable
+//     at a fixed seed by
+//     `packages/runar-testing/src/__tests__/fuzzer-branch-shapes.test.ts`.
+//
+//   * the six STATEFUL-only kinds — still NOT covered by any fuzzer.
+//     `contract-ir.ts` has no `addOutput` node at all, so no IR-based
+//     generator can express the multi-output intrinsic; and while
+//     `ir-differential.ts` accepts `--stateful`, no CI job passes it (the
+//     PR gate in `.github/workflows/fuzzer-nightly.yml` runs
+//     `--ir --render native` without it), so `arbGeneratedStatefulContract`
+//     never runs in CI either. Their real coverage is (a) the hand-written
+//     conformance fixtures, which do give 9-format / 7-tier parity, and
+//     (b) `conformance/fuzzer/spend-shapes.ts`, whose randomized
+//     `addOutput` shapes get an ABSOLUTE post-state oracle but are rendered
+//     to TypeScript only — one tier, not seven.
 type AnfValue =
   | { kind: 'load_param'; name: string }
   | { kind: 'load_prop'; name: string }

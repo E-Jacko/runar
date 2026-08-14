@@ -321,7 +321,7 @@ module RunarCompiler
         # Get all instance variable names
         ivars = %i[
           kind name raw_value op left right result_type operand func args
-          object method cond then else_ count iter_var body start step value_ref
+          object method cond then else_ results count iter_var body start step value_ref
           preimage satoshis state_values script_bytes elements
           bytes in_arity out_arity
           is_auto_injected_state_check

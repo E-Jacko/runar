@@ -1,0 +1,125 @@
+{
+  "fixture": "state-bigint-edges",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "bigint state values at the SIGN boundary. A bigint state field is a fixed 8-byte little-endian SIGN-MAGNITUDE word (OP_NUM2BIN semantics): magnitude in bytes 0..6 little-endian, sign in bit 0x80 of byte 7 — NOT two's complement, so -1 is `0100000000000080`. Every pre-existing pin stopped short of that bit: state.test.ts covers negatives only as a self-inverse round-trip, and all seven sdk-output bigint goldens are small and non-negative. Here the contract is DEPLOYED carrying a negative value and then SPENT, so the SDK's serializer (which wrote the deployed state section) and the compiler's on-chain rebuild (which recomputes it inside the covenant) have to agree byte for byte or the hash256(outputs) check fails. Each accept additionally pins the post-state VALUE. Expected bytes are hand-derived in the fixture's source comment and in conformance/sdk-output/tests/state-bigint-edges*/.",
+  "constructorArgs": [
+    "0n",
+    "0n"
+  ],
+  "spends": [
+    {
+      "method": "shift",
+      "args": [
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "0 -> -1 / +1: the minimal sign-bit crossing. lo=-1 must serialise 0100000000000080, NOT ffffffffffffffff.",
+      "satoshis": 1000,
+      "expectedState": {
+        "lo": "-1n",
+        "hi": "1n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-1n",
+        "1n"
+      ],
+      "method": "shift",
+      "args": [
+        "126n"
+      ],
+      "expect": "accept",
+      "note": "deployed ALREADY negative (lo=-1). -1-126=-127 (7f00000000000080), 1+126=127 (7f00000000000000) — the 1-byte magnitude boundary either side of zero.",
+      "satoshis": 1000,
+      "expectedState": {
+        "lo": "-127n",
+        "hi": "127n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-1n",
+        "1n"
+      ],
+      "method": "shift",
+      "args": [
+        "127n"
+      ],
+      "expect": "accept",
+      "note": "-128 (8000000000000080) / 128 (8000000000000000) — the byte where a two's-complement encoder and a sign-magnitude encoder first disagree.",
+      "satoshis": 1000,
+      "expectedState": {
+        "lo": "-128n",
+        "hi": "128n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-1n",
+        "1n"
+      ],
+      "method": "shift",
+      "args": [
+        "255n"
+      ],
+      "expect": "accept",
+      "note": "-256 (0001000000000080) / 256 (0001000000000000) — magnitude spills into byte 1, sign stays in byte 7.",
+      "satoshis": 1000,
+      "expectedState": {
+        "lo": "-256n",
+        "hi": "256n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-9999999999n",
+        "9999999999n"
+      ],
+      "method": "shift",
+      "args": [
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "large 5-byte magnitude, deployed negative and spent with delta=0: the values must survive a full deploy->call round unchanged. -9999999999 = ffe30b5402000080, +9999999999 = ffe30b5402000000.",
+      "satoshis": 1000,
+      "expectedState": {
+        "lo": "-9999999999n",
+        "hi": "9999999999n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-9223372036854775807n",
+        "9223372036854775807n"
+      ],
+      "method": "shift",
+      "args": [
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "the 8-byte NUM2BIN field boundary: +/-(2^63-1), the LARGEST magnitude a sign-magnitude word of 8 bytes can hold (all 63 magnitude bits set, sign in the 64th). -(2^63-1) = ffffffffffffffff and +(2^63-1) = ffffffffffffff7f — the one place where the negative encoding really is all-ones, and where an off-by-one in the width check would clobber the sign bit. RESIDUAL, deliberately NOT pinned here: a magnitude of 2^63 or more overflows the field, and the contract then deploys successfully but can never be spent (verified 2026-08-05) with no compile-time or deploy-time diagnostic. Pinning that as a `reject` would record the current behaviour as correct; it should be a guard, not a witness.",
+      "satoshis": 1000,
+      "expectedState": {
+        "lo": "-9223372036854775807n",
+        "hi": "9223372036854775807n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-1n",
+        "1n"
+      ],
+      "method": "shift",
+      "args": [
+        "126n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the negative state field must be committed to by hashOutputs",
+      "satoshis": 1000
+    }
+  ]
+}

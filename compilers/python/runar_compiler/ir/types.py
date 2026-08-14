@@ -148,6 +148,14 @@ class ANFValue:
     cond: str | None = None
     then: list[ANFBinding] | None = None
     else_: list[ANFBinding] | None = None
+    #: Ordered named result slots both arms leave (``results[0]`` deepest).
+    #: Entries name a branch-merged local or an arm-written contract property;
+    #: stack lowering tells the two apart from the contract's property list, so
+    #: the wire format stays a plain array of strings. ``None`` (not ``[]``)
+    #: when the ``if`` carries at most one result -- see the TypeScript
+    #: reference in ``packages/runar-compiler/src/ir/anf-ir.ts`` for the full
+    #: contract.
+    results: list[str] | None = None
 
     # -- loop --------------------------------------------------------------
     count: int | None = None
@@ -351,6 +359,8 @@ def _anf_value_from_dict(d: dict[str, Any]) -> ANFValue:
         v.then = [_anf_binding_from_dict(b) for b in d["then"]]
     if "else" in d and d["else"] is not None:
         v.else_ = [_anf_binding_from_dict(b) for b in d["else"]]
+    if "results" in d and d["results"]:
+        v.results = list(d["results"])
     if "body" in d and d["body"] is not None:
         v.body = [_anf_binding_from_dict(b) for b in d["body"]]
 

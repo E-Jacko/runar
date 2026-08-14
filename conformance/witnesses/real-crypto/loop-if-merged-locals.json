@@ -1,0 +1,100 @@
+{
+  "fixture": "loop-if-merged-locals",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "Branch-merged locals whose merged values are DEAD in the enclosing scope, which is what an `if` inside a loop body always makes them: the body's last-use map ends AT the `if`, so no merged local is live after it, and `appendMergedLocalResults`' stated premise (\"pass 1 always COPIES ... because a local live after the `if` is in outerProtectedRefs\") silently failed. Pre-fix all seven tiers registered ONE stackMap name for the K physical results and the continuation committed the wrong values while the spend still ACCEPTED — the PALMER-1 failure mode that a verdict-only oracle cannot see, so every accept below pins expectedState. Constructor state is (a,b,c) = (0,0,9); `c` is the untouched control field, and a merge that shifts a stack slot corrupts it. Values hand-derived from the source, never read off a compiler.",
+  "constructorArgs": [
+    "0n",
+    "0n",
+    "9n"
+  ],
+  "spends": [
+    {
+      "method": "guarded",
+      "args": [
+        "7n",
+        "2n"
+      ],
+      "expect": "accept",
+      "note": "K=2 merged locals, both loop iterations take the branch (i=0,1 < limit=2): na 7 then 14; nb 7 then 21. The pre-fix script committed nb=7 (one carrier holding two live values), so this accept is what the defect corrupted.",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "14n",
+        "b": "21n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "guarded",
+      "args": [
+        "7n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "K=2, branch taken on iteration 0 only (limit=1): na 7, nb 7. Distinguishes 'the branch ran twice' from 'the branch ran once' — a merge that re-runs a dead slot cannot land here.",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "7n",
+        "b": "7n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "guarded",
+      "args": [
+        "7n",
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "K=2, branch NEVER taken (limit=0): the reconciliation block must carry the untouched 0/0 through both iterations. Pre-fix the else arm pushed EMPTY placeholders here instead of preserving them.",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "0n",
+        "b": "0n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "afterIf",
+      "args": [
+        "5n",
+        "2n"
+      ],
+      "expect": "accept",
+      "note": "K=1 arity, the local read AFTER the `if` but still inside the loop body. Both iterations take the branch: na 5 then 10; nb 0+5=5 then 5+10=15. Pre-fix this shape did not compile at all (`Value 'na' not found on stack`).",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "10n",
+        "b": "15n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "afterIf",
+      "args": [
+        "5n",
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "K=1, branch taken on iteration 0 only: na 5 after i=0 and unchanged at i=1; nb 5 then 10. The two iterations read DIFFERENT states of the same local, which is what makes the post-`if` read load-bearing.",
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "5n",
+        "b": "10n",
+        "c": "9n"
+      }
+    },
+    {
+      "method": "guarded",
+      "args": [
+        "7n",
+        "2n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the K=2 merged result block must be committed to by hashOutputs",
+      "satoshis": 1000
+    }
+  ]
+}

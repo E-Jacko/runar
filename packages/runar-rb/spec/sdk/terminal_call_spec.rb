@@ -82,12 +82,16 @@ RSpec.describe Runar::SDK::RunarContract do
     [Runar::SDK::TerminalOutput.new(script_hex: "76a914#{TERMINAL_PKH}88ac", satoshis: 5_000)]
   end
 
-  def contract_with_utxo(artifact, txid_pattern)
+  # +provider+ is optional: pass it when the spec actually BROADCASTS, so the
+  # fail-closed MockProvider knows the contract outpoint being spent. Injecting
+  # @current_utxo directly bypasses the provider, which would otherwise see a
+  # transaction none of whose inputs it recognises and refuse to ack it (rather
+  # than pass vacuously).
+  def contract_with_utxo(artifact, txid_pattern, provider = nil)
     c = described_class.new(artifact, [TERMINAL_PKH])
-    c.instance_variable_set(
-      :@current_utxo,
-      make_term_utxo(txid_pattern * 32, 10_000, script: "76a914#{TERMINAL_PKH}88ac")
-    )
+    utxo = make_term_utxo(txid_pattern * 32, 10_000, script: "76a914#{TERMINAL_PKH}88ac")
+    c.instance_variable_set(:@current_utxo, utxo)
+    provider&.add_contract_utxo(utxo.script, utxo)
     c
   end
 
@@ -207,7 +211,7 @@ RSpec.describe Runar::SDK::RunarContract do
     let(:artifact) { make_artifact(SIMPLE_TERMINAL_ARTIFACT_JSON) }
     let(:provider) { funded_provider }
     let(:signer) { make_signer }
-    let(:contract) { contract_with_utxo(artifact, 'ee') }
+    let(:contract) { contract_with_utxo(artifact, 'ee', provider) }
     let(:opts) { Runar::SDK::CallOptions.new(terminal_outputs: sample_terminal_outputs) }
 
     it 'returns [txid, transaction]' do

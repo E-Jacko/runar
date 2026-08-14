@@ -1,0 +1,80 @@
+{
+  "fixture": "p256-primitives",
+  "kind": "stateless-signed",
+  "note": "P-256 point arithmetic needs no signature, so the fixture's ACTUAL compiled locking script runs on @bsv/sdk's Spend engine with concrete points. Every expected point is OpenSSL's (crypto.createECDH('prime256v1') with the scalar as private key), NOT compiler output. The k=2 and P+P spends are the two defects fixed here: p256Mul(G,2n) returned 64 zero bytes and p256Add(G,G) returned a wrong point.",
+  "constructorArgs": {
+    "expectedPoint": "0x7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1"
+  },
+  "spends": [
+    {
+      "method": "verify",
+      "args": [
+        "2n",
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+      ],
+      "expect": "accept",
+      "note": "p256Mul(G, 2) == 2G — the scalar that returned the all-zero point"
+    },
+    {
+      "method": "verifyMulGen",
+      "args": [
+        "2n"
+      ],
+      "expect": "accept",
+      "note": "p256MulGen(2) == 2G — same ladder, generator entry point"
+    },
+    {
+      "method": "verifyAdd",
+      "args": [
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+      ],
+      "expect": "accept",
+      "note": "p256Add(G, G) == 2G — the affine doubling case that returned a wrong point"
+    },
+    {
+      "method": "verify",
+      "args": [
+        "3n",
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+      ],
+      "expect": "reject",
+      "note": "p256Mul(G, 3) == 3G != the committed 2G — proves the accepts are not vacuous"
+    },
+    {
+      "method": "verify",
+      "args": [
+        "115792089210356248762697446949407573529996955224135760342422259061068512044371n",
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+      ],
+      "expect": "accept",
+      "note": "p256Mul(G, n+2) == 2G. Before the scalar reduce landed (f16790a9) the ladder ran over k+3n with the top bit fallen off the end of the loop and returned a DIFFERENT multiple of G. Nothing outside the TS tier had ever executed a k >= n scalar; this is that path on the real Spend engine, in every tier."
+    },
+    {
+      "method": "verifyMulGen",
+      "args": [
+        "115792089210356248762697446949407573529996955224135760342422259061068512044371n"
+      ],
+      "expect": "accept",
+      "note": "p256MulGen(n+2) == 2G — same reduce, generator entry point."
+    },
+    {
+      "method": "verifyAdd",
+      "args": [
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        "0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296b01cbd1c01e58065711814b583f061e9d431cca994cea1313449bf97c840ae0a"
+      ],
+      "expect": "reject",
+      "note": "p256Add(G, -G) is the point at infinity, which affine x||y cannot encode, so the emitter returns the ALL-ZERO blob — and p256OnCurve rejects it, which is the first assert in verifyAdd. Selecting the tangent on (px == qx) alone made this return 2G instead: on-curve, plausible, wrong, and ACCEPTED by the same assert. This spend is the cross-tier standing proof that it does not."
+    },
+    {
+      "method": "verifyAdd",
+      "args": [
+        "0x0000000000000000000000000000000000000000000000000000000000000005459243b9aa581806fe913bce99817ade11ca503c64d9a3c533415c083248fbcc",
+        "0xffffffff00000001000000000000000000000001000000000000000000000004459243b9aa581806fe913bce99817ade11ca503c64d9a3c533415c083248fbcc"
+      ],
+      "expect": "reject",
+      "note": "GAP-301 on a real engine: the two arguments are ONE group element in two encodings (x = 5 and x + p; this curve has an on-curve point with x small enough that x + p still fits the coordinate width). p256Add compares the RAW x coordinates to detect doubling, so it takes the chord path, divides by (qx - px) = p = 0, and — cFieldInv being Fermat, inv(0) = 0 — returns a point that is neither 2P nor on the curve, from a script that SUCCEEDS. The only thing that can reject it is p256OnCurve, which is verifyAdd's first assert, and which is also where the x < p canonicity guard lives. Nothing outside the TS tier had ever executed a non-canonical coordinate."
+    }
+  ]
+}

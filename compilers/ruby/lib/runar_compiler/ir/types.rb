@@ -133,6 +133,15 @@ module RunarCompiler
                     :cond,
                     :then,
                     :else_,
+                    # Ordered named result slots both arms leave (results[0]
+                    # deepest). Entries name a branch-merged local or an
+                    # arm-written contract property; stack lowering tells the
+                    # two apart from the contract's property list, so the wire
+                    # format stays a plain array of strings. nil (not []) when
+                    # the +if+ carries at most one result -- see the TypeScript
+                    # reference in packages/runar-compiler/src/ir/anf-ir.ts for
+                    # the full contract.
+                    :results,
                     # -- loop ----------------------------------------------
                     :count,
                     :iter_var,
@@ -193,6 +202,7 @@ module RunarCompiler
         @cond = nil
         @then = nil
         @else_ = nil
+        @results = nil
         @count = nil
         @iter_var = nil
         @body = nil
@@ -371,6 +381,7 @@ module RunarCompiler
       if d.key?("else") && !d["else"].nil?
         v.else_ = d["else"].map { |b| _anf_binding_from_hash(b) }
       end
+      v.results = d["results"] if d.key?("results") && !d["results"].nil?
       if d.key?("body") && !d["body"].nil?
         v.body = d["body"].map { |b| _anf_binding_from_hash(b) }
       end

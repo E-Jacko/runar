@@ -228,7 +228,7 @@ def _make_stateless_artifact() -> RunarArtifact:
 
 def _deploy(satoshis: int, wallet_utxos: list[Utxo], signer: MockSigner):
     contract = RunarContract(_make_stateless_artifact(), [])
-    provider = MockProvider(network='testnet')
+    provider = MockProvider.always_ack('testnet')
     for u in wallet_utxos:
         provider.add_utxo(signer.get_address(), u)
     contract.deploy(provider, signer, DeployOptions(satoshis=satoshis))

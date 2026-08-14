@@ -71,6 +71,176 @@ class ConstLoop extends SmartContract {
 }
 `
 
+// A loop-carried local REASSIGNED and then READ AGAIN in the same iteration.
+// The rebinding shadows the incoming slot under the same name; the later read
+// was its last body use, so it consumed the UPDATED value and left the dead
+// incoming one for the next iteration to resolve. `wacc` came out as `step*N`
+// instead of `step*N*(N+1)/2` — silently in a stateless contract, and as a
+// permanently unspendable UTXO in a stateful one. Real-VM proof:
+// packages/runar-testing/src/__tests__/loop-carried-local-read-after-reassign-vm.test.ts
+const carriedRebindSource = `import { SmartContract, assert } from 'runar-lang';
+
+class LoopCarriedRebind extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    let wacc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      acc = acc + step;
+      wacc = wacc + acc;
+    }
+    assert(wacc === this.expected);
+  }
+}
+`
+
+// Control: the same loop with a single self-accumulating carrier — no read
+// after the rebinding. Its bytes must NOT move, or the carried-rebind fix has
+// been written too wide and every shipped BoundedLoop-shaped contract pays.
+const plainAccumulatorSource = `import { SmartContract, assert } from 'runar-lang';
+
+class LoopPlainAccumulator extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      acc = acc + step;
+    }
+    assert(acc === this.expected);
+  }
+}
+`
+
+// The same cross-read one loop deeper. The predicate keys on the body's
+// TOP-LEVEL binding names, and at the OUTER level `acc` is bound only inside
+// the nested loop — so it was neither an outer ref nor a carried rebind, and
+// every outer iteration restarted from the slot the previous one left behind.
+// `wacc` came out 24 where the source says 30 (step = 3). Real-VM proof:
+// packages/runar-testing/src/__tests__/nested-loop-carried-local-vm.test.ts
+const nestedCarriedRebindSource = `import { SmartContract, assert } from 'runar-lang';
+
+class LoopNestedCarriedRebind extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    let wacc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      for (let j = 0n; j < 2n; j++) {
+        acc = acc + step;
+        wacc = wacc + acc;
+      }
+    }
+    assert(wacc === this.expected);
+  }
+}
+`
+
+// Control: NESTED loops with a single self-accumulating carrier. The flatten
+// step fires here (the body does contain a nested loop) but the predicate still
+// says "not carried", so the bytes must NOT move — that is what keeps nesting
+// itself from costing anything.
+const nestedPlainAccumulatorSource = `import { SmartContract, assert } from 'runar-lang';
+
+class LoopNestedPlainAccumulator extends SmartContract {
+  readonly expected: bigint;
+
+  constructor(expected: bigint) {
+    super(expected);
+    this.expected = expected;
+  }
+
+  public verify(step: bigint) {
+    let acc = 0n;
+    for (let i = 0n; i < 2n; i++) {
+      for (let j = 0n; j < 2n; j++) {
+        acc = acc + step;
+      }
+    }
+    assert(acc === this.expected);
+  }
+}
+`
+
+// Byte-identical across all seven compiler tiers (fold-OFF).
+const carriedRebindHex = "000000537953797c937b789351557a53797c937b7c93009c77777777"
+const plainAccumulatorHex = "000052797b7c9351537a7b7c93009c7777"
+const nestedCarriedRebindHex = "00000000547954797c93537a789351567953797c937b78935100597954797c93537a7893515b7a53797c937b7c93009c77777777777777777777"
+const nestedPlainAccumulatorHex = "0000005379537a7c935154797b7c9351005679537a7c9351577a7b7c93009c777777777777"
+
+func TestLoopCarriedRebind_SurvivesTheIteration(t *testing.T) {
+	result := CompileFromSourceStrWithResult(carriedRebindSource, "LoopCarriedRebind.runar.ts",
+		CompileOptions{DisableConstantFolding: true})
+	if !result.Success {
+		t.Fatalf("compilation failed: %v", result.Diagnostics)
+	}
+	if result.Artifact == nil {
+		t.Fatal("no artifact produced")
+	}
+	if result.Artifact.Script != carriedRebindHex {
+		t.Fatalf("carried-rebind hex mismatch\n  want %s\n  got  %s", carriedRebindHex, result.Artifact.Script)
+	}
+}
+
+func TestLoopCarriedRebind_PlainAccumulatorUnchanged(t *testing.T) {
+	result := CompileFromSourceStrWithResult(plainAccumulatorSource, "LoopPlainAccumulator.runar.ts",
+		CompileOptions{DisableConstantFolding: true})
+	if !result.Success {
+		t.Fatalf("compilation failed: %v", result.Diagnostics)
+	}
+	if result.Artifact == nil {
+		t.Fatal("no artifact produced")
+	}
+	if result.Artifact.Script != plainAccumulatorHex {
+		t.Fatalf("plain-accumulator hex mismatch\n  want %s\n  got  %s", plainAccumulatorHex, result.Artifact.Script)
+	}
+}
+
+func TestLoopCarriedRebind_NestedSurvivesTheIteration(t *testing.T) {
+	result := CompileFromSourceStrWithResult(nestedCarriedRebindSource, "LoopNestedCarriedRebind.runar.ts",
+		CompileOptions{DisableConstantFolding: true})
+	if !result.Success {
+		t.Fatalf("compilation failed: %v", result.Diagnostics)
+	}
+	if result.Artifact == nil {
+		t.Fatal("no artifact produced")
+	}
+	if result.Artifact.Script != nestedCarriedRebindHex {
+		t.Fatalf("nested carried-rebind hex mismatch\n  want %s\n  got  %s", nestedCarriedRebindHex, result.Artifact.Script)
+	}
+}
+
+func TestLoopCarriedRebind_NestedPlainAccumulatorUnchanged(t *testing.T) {
+	result := CompileFromSourceStrWithResult(nestedPlainAccumulatorSource, "LoopNestedPlainAccumulator.runar.ts",
+		CompileOptions{DisableConstantFolding: true})
+	if !result.Success {
+		t.Fatalf("compilation failed: %v", result.Diagnostics)
+	}
+	if result.Artifact == nil {
+		t.Fatal("no artifact produced")
+	}
+	if result.Artifact.Script != nestedPlainAccumulatorHex {
+		t.Fatalf("nested plain-accumulator hex mismatch\n  want %s\n  got  %s", nestedPlainAccumulatorHex, result.Artifact.Script)
+	}
+}
+
 func TestLoopOuterRefs_ParamAfterLoopIsNotEmptyPush(t *testing.T) {
 	result := CompileFromSourceStrWithResult(loopWalkSource, "LoopWalk.runar.ts", CompileOptions{})
 	if !result.Success {

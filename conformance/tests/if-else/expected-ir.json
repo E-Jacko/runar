@@ -102,9 +102,26 @@
                   "kind": "load_const",
                   "value": "@ref:t7"
                 }
+              },
+              {
+                "name": "__merge$0",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:result"
+                }
+              },
+              {
+                "name": "result",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:__merge$0"
+                }
               }
             ],
             "kind": "if",
+            "results": [
+              "result"
+            ],
             "then": [
               {
                 "name": "t2",
@@ -135,6 +152,20 @@
                   "kind": "load_const",
                   "value": "@ref:t4"
                 }
+              },
+              {
+                "name": "__merge$0",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:result"
+                }
+              },
+              {
+                "name": "result",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:__merge$0"
+                }
               }
             ]
           }
@@ -150,7 +181,7 @@
           "name": "t10",
           "value": {
             "kind": "bin_op",
-            "left": "t8",
+            "left": "result",
             "op": ">",
             "right": "t9"
           }

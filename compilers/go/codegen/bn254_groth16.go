@@ -2171,7 +2171,10 @@ func emitG1ScalarMulNamed(t *BN254Tracker, bxName, byName, scalarName, resultXNa
 		t.nm = t.nm[:len(t.nm)-1] // _bit consumed by IF
 		var addOps []StackOp
 		addEmit := func(op StackOp) { addOps = append(addOps, op) }
-		bn254BuildJacobianAddAffineInline(addEmit, t)
+		// Only the LAST step can be handed accumulator == -base (k = 0 mod r);
+		// see bn254BuildJacobianAddAffineInline for why the strict H == 0 AND
+		// R == 0 test is paid there and nowhere else.
+		bn254BuildJacobianAddAffineInline(addEmit, t, bit == 0)
 		t.e(StackOp{Op: "if", Then: addOps, Else: []StackOp{}})
 	}
 

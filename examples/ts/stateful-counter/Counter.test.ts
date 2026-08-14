@@ -1,3 +1,6 @@
+// INTERPRETER-ONLY: spendability covered by conformance/witnesses/real-crypto/stateful-counter.json
+// (real deploy->call->@bsv/sdk Spend on THIS source, with a pinned expectedState:
+//  increment 5->6 accepts, decrement 5->4 accepts, tampered continuation rejects).
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';

@@ -112,7 +112,7 @@ theorem structuralLoopValue_iff_B (v : ANFValue) :
   | unaryOp _ _ _ => simp [structuralLoopValue, structuralLoopValueB]
   | call _ _ => simp [structuralLoopValue, structuralLoopValueB]
   | methodCall _ _ _ => simp [structuralLoopValue, structuralLoopValueB]
-  | ifVal _ _ _ => simp [structuralLoopValue, structuralLoopValueB]
+  | ifVal _ _ _ _ => simp [structuralLoopValue, structuralLoopValueB]
   | loop count body _ =>
       cases count with
       | zero => simp [structuralLoopValue, structuralLoopValueB]
@@ -265,7 +265,7 @@ theorem runOps_lowerValueP_structuralLoopValue_id
   | unaryOp _ _ _ => exact (hSupp).elim
   | call _ _ => exact (hSupp).elim
   | methodCall _ _ _ => exact (hSupp).elim
-  | ifVal _ _ _ => exact (hSupp).elim
+  | ifVal _ _ _ _ => exact (hSupp).elim
   | loop count body iv =>
       cases count with
       | zero =>
@@ -589,7 +589,7 @@ theorem structuralLoopValueExt_iff_B (v : ANFValue) :
   | unaryOp _ _ _ => simp [structuralLoopValueExt, structuralLoopValueExtB]
   | call _ _ => simp [structuralLoopValueExt, structuralLoopValueExtB]
   | methodCall _ _ _ => simp [structuralLoopValueExt, structuralLoopValueExtB]
-  | ifVal _ _ _ => simp [structuralLoopValueExt, structuralLoopValueExtB]
+  | ifVal _ _ _ _ => simp [structuralLoopValueExt, structuralLoopValueExtB]
   | loop count body _ =>
       cases count with
       | zero => simp [structuralLoopValueExt, structuralLoopValueExtB]
@@ -647,7 +647,7 @@ theorem structuralLoopValue_implies_Ext (v : ANFValue)
   | unaryOp _ _ _ => exact h
   | call _ _ => exact h
   | methodCall _ _ _ => exact h
-  | ifVal _ _ _ => exact h
+  | ifVal _ _ _ _ => exact h
   | loop count body iv =>
       cases count with
       | zero => simp [structuralLoopValueExt]
@@ -703,7 +703,7 @@ theorem runOps_lowerValueP_structuralLoopValueExt_id
   | unaryOp _ _ _ => exact (hSupp).elim
   | call _ _ => exact (hSupp).elim
   | methodCall _ _ _ => exact (hSupp).elim
-  | ifVal _ _ _ => exact (hSupp).elim
+  | ifVal _ _ _ _ => exact (hSupp).elim
   | loop count body iv =>
       cases count with
       | zero =>
@@ -1323,7 +1323,7 @@ theorem lowerBindingsP_structuralLoopConstBody_ops :
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.unaryOp _ _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.call _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.methodCall _ _ _) _ :: _, h => h.elim
-  | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.ifVal _ _ _) _ :: _, h => h.elim
+  | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.ifVal _ _ _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.loop _ _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.assert _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.updateProp _ _) _ :: _, h => h.elim
@@ -1378,7 +1378,7 @@ theorem lowerBindingsP_structuralLoopConstBody_sm :
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.unaryOp _ _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.call _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.methodCall _ _ _) _ :: _, h => h.elim
-  | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.ifVal _ _ _) _ :: _, h => h.elim
+  | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.ifVal _ _ _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.loop _ _ _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.assert _) _ :: _, h => h.elim
   | _, _, _, _, _, _, _, _, _, ANFBinding.mk _ (.updateProp _ _) _ :: _, h => h.elim
@@ -1430,8 +1430,8 @@ theorem constBodyStackMap_preserves_listContains
           | methodCall _ _ _ =>
               show ((constBodyStackMap (ANFBinding.mk _ (.methodCall _ _ _) _ :: rest) sm).any (· == name)) = true
               unfold constBodyStackMap; exact ih sm name h
-          | ifVal _ _ _ =>
-              show ((constBodyStackMap (ANFBinding.mk _ (.ifVal _ _ _) _ :: rest) sm).any (· == name)) = true
+          | ifVal _ _ _ _ =>
+              show ((constBodyStackMap (ANFBinding.mk _ (.ifVal _ _ _ _) _ :: rest) sm).any (· == name)) = true
               unfold constBodyStackMap; exact ih sm name h
           | loop _ _ _ =>
               show ((constBodyStackMap (ANFBinding.mk _ (.loop _ _ _) _ :: rest) sm).any (· == name)) = true
@@ -1501,7 +1501,7 @@ theorem runOps_emitConstChain_structuralLoopConstBody :
   | ANFBinding.mk _ (.unaryOp _ _ _) _ :: _, h, _ => h.elim
   | ANFBinding.mk _ (.call _ _) _ :: _, h, _ => h.elim
   | ANFBinding.mk _ (.methodCall _ _ _) _ :: _, h, _ => h.elim
-  | ANFBinding.mk _ (.ifVal _ _ _) _ :: _, h, _ => h.elim
+  | ANFBinding.mk _ (.ifVal _ _ _ _) _ :: _, h, _ => h.elim
   | ANFBinding.mk _ (.loop _ _ _) _ :: _, h, _ => h.elim
   | ANFBinding.mk _ (.assert _) _ :: _, h, _ => h.elim
   | ANFBinding.mk _ (.updateProp _ _) _ :: _, h, _ => h.elim
@@ -1623,7 +1623,7 @@ private theorem applyDrop_constChainPostState_dropLast
     | unaryOp _ _ _ => exact h.elim
     | call _ _ => exact h.elim
     | methodCall _ _ _ => exact h.elim
-    | ifVal _ _ _ => exact h.elim
+    | ifVal _ _ _ _ => exact h.elim
     | loop _ _ _ => exact h.elim
     | assert _ => exact h.elim
     | updateProp _ _ => exact h.elim
@@ -2076,10 +2076,11 @@ private theorem singletonRefParam_consume_false_nonFinal
   have hOuterRefs :
       Stack.Lower.bodyOuterRefs
         [ANFBinding.mk xName (.loadParam n) none] iterVar = [n] := by
-    unfold Stack.Lower.bodyOuterRefs
-    simp [List.foldl_cons, List.foldl_nil, ANFBinding.value,
-          Stack.Lower.listContains]
-    exact Ne.symm hIterFresh
+    simp [Stack.Lower.bodyOuterRefs, Stack.Lower.collectDeepBindingNames,
+          Stack.Lower.collectLoopCarriedRebinds, Stack.Lower.flattenNestedLoopBodies,
+          Stack.Lower.collectRefs,
+          Stack.Lower.listContains, ANFBinding.value, ANFBinding.name,
+          hNe, hXNe, hIterFresh, hRefNotLocal, Ne.symm hIterFresh]
   -- Step 2: characterize computeLastUses.
   have hNaturalLU : Stack.Lower.computeLastUses
       [ANFBinding.mk xName (.loadParam n) none] = [(n, 0)] := by
@@ -2322,7 +2323,9 @@ theorem lowerValueP_loop_one_singletonRefProp_ops_eq
     (d : Nat)
     (hIterFresh : iterVar ≠ n)
     (hXNe : (xName == iterVar) = false)
-    (hDepth : sm.depth? n = some d) :
+    (hDepth : sm.depth? n = some d)
+    (hNoAfter : Stack.Lower.loopOuterRefsUsedAfter
+      [.mk xName (.loadProp n) none] iterVar lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         outerProtected localBindings constInts sm bindingName
         (.loop 1 [.mk xName (.loadProp n) none] iterVar)).1
@@ -2357,6 +2360,7 @@ theorem lowerValueP_loop_one_singletonRefProp_ops_eq
     [] (xName :: iterVar :: sm)
     hBody (cleanupGate_buried xName iterVar sm hXNe)
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [hOne, List.append_nil]
   rfl
 
@@ -2383,7 +2387,9 @@ theorem lowerValueP_loop_one_singletonRefRefAlias_ops_eq
         && !Stack.Lower.listContains ([] : List String) n
         && Stack.Lower.isLastUse
             (Stack.Lower.computeLastUses
-              [ANFBinding.mk xName (.loadConst (.refAlias n)) none]) n 0) = false) :
+              [ANFBinding.mk xName (.loadConst (.refAlias n)) none]) n 0) = false)
+    (hNoAfter : Stack.Lower.loopOuterRefsUsedAfter
+      [.mk xName (.loadConst (.refAlias n)) none] iterVar lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         outerProtected localBindings constInts sm bindingName
         (.loop 1 [.mk xName (.loadConst (.refAlias n)) none] iterVar)).1
@@ -2428,6 +2434,7 @@ theorem lowerValueP_loop_one_singletonRefRefAlias_ops_eq
     [] (xName :: iterVar :: sm)
     hBody (cleanupGate_buried xName iterVar sm hXNe)
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [hOne, List.append_nil]
   rfl
 
@@ -2445,7 +2452,9 @@ theorem lowerValueP_loop_one_singletonRefParam_ops_eq
     (d : Nat)
     (hIterFresh : iterVar ≠ n)
     (hXNe : (xName == iterVar) = false)
-    (hDepth : sm.depth? n = some d) :
+    (hDepth : sm.depth? n = some d)
+    (hNoAfter : Stack.Lower.loopOuterRefsUsedAfter
+      [.mk xName (.loadParam n) none] iterVar lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         outerProtected localBindings constInts sm bindingName
         (.loop 1 [.mk xName (.loadParam n) none] iterVar)).1
@@ -2495,6 +2504,7 @@ theorem lowerValueP_loop_one_singletonRefParam_ops_eq
     [] (xName :: iterVar :: rest)
     hBody (cleanupGate_buried xName iterVar rest hXNe)
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [hOne, List.append_nil]
   rfl
 
@@ -2563,19 +2573,28 @@ theorem tier3b_refParam_count2_pin :
       = ["x", "i", "x", "i", "p"]) := by
   refine ⟨by native_decide, by native_decide⟩
 
-/-- Must-reject pin (divergence-4 narrowing of `bodyOuterRefs`): a loop
-body reading outer non-param locals as RAW binop operands consumes them
-in iteration 0 and fails to resolve them in iteration 1 — the lowering
-emits `OP_RUNAR_UNRESOLVED_*` sentinels, which `compileSafe` rejects
-(matching the TS reference's "Value not found on stack" compile error;
-verified against the production compiler 2026-06-11). -/
-theorem tier3b_outer_raw_binop_sentinel_pin :
+/-- Must-ACCEPT pin: a loop body reading outer non-param locals as RAW
+binop operands lowers WITHOUT sentinels.
+
+This pin previously asserted the opposite. It was justified by the TS
+reference erroring with "Value not found on stack" (verified against the
+production compiler 2026-06-11), which held while `bodyOuterRefs` only
+collected top-level `load_param` / `@ref:` values. TS has since widened
+its `outerRefs` to `collectRefs(b.value)` over every body binding —
+"Collect ALL outer-scope refs used anywhere in the body ... The previous
+top-level-only scan missed nested references" (`05-stack-lower.ts`) — so
+raw binop operands are now protected and the shape compiles.
+
+Re-verified against an INDEPENDENT tier rather than against this model:
+the Go compiler accepts the equivalent program (`--ir ... --hex` emits
+`0132016400785379a2697c5379935178547aa2697c537a937777`). -/
+theorem tier3b_outer_raw_binop_no_sentinel_pin :
     ((Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
         [] [] [] [] ["l", "r"] "L"
         (.loop 2 [ANFBinding.mk "t" (.binOp "+" "l" "r" none) none] "i")).1.any
       (fun op => match op with
         | .opcode s => s.startsWith "OP_RUNAR_UNRESOLVED"
-        | _ => false)) = true := by
+        | _ => false)) = false := by
   native_decide
 
 /-! ### Growing-depth closed form — singleton-ref `loadProp` body
@@ -2907,12 +2926,15 @@ theorem lowerValueP_loop_singletonRefParam_ops_eq
     (count d : Nat)
     (hXNe : (xName == iterVar) = false)
     (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
-    (hDepth : sm.depth? n = some d) :
+    (hDepth : sm.depth? n = some d)
+    (hNoAfter : Stack.Lower.loopOuterRefsUsedAfter
+      [.mk xName (.loadParam n) none] iterVar lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         outerProtected localBindings constInts sm bindingName
         (.loop count [.mk xName (.loadParam n) none] iterVar)).1
       = loopRefConsumeAssemble xName iterVar n count sm count := by
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [lowerLoopItersP_singletonRefParam_eq xName iterVar n hXNe hIterNe
     hXNameNe progMethods props budget
     (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadParam n) none])
@@ -2940,7 +2962,7 @@ theorem lowerValueP_loop_singletonRefParam_count2_matches_pin :
           (loopRefConsumeAssemble "x" "i" "q" 2 ["p", "q"] 2))) := by
   rw [lowerValueP_loop_singletonRefParam_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
         [] [] [] [] ["p", "q"] "L" "x" "i" "q" 2 1
-        (by decide) (by decide) (by decide) (by decide)]
+        (by decide) (by decide) (by decide) (by decide) (by native_decide)]
 
 /-- Concrete byte certificate: the loadParam closed-form assemble at
 `count = 2` emits the exact pinned hex `00527951547a` (final ROLL). -/
@@ -3036,7 +3058,9 @@ theorem lowerValueP_loop_singletonRefAliasCopy_ops_eq
     (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
     (hDepth : sm.depth? n = some d)
     (hNotLocal :
-      Stack.Lower.listContains (localBindings ++ [xName]) n = false) :
+      Stack.Lower.listContains (localBindings ++ [xName]) n = false)
+    (hNoAfter : Stack.Lower.loopOuterRefsUsedAfter
+      [.mk xName (.loadConst (.refAlias n)) none] iterVar lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         outerProtected localBindings constInts sm bindingName
         (.loop count [.mk xName (.loadConst (.refAlias n)) none] iterVar)).1
@@ -3051,6 +3075,7 @@ theorem lowerValueP_loop_singletonRefAliasCopy_ops_eq
           (fun b => b.name)) n = false := by
     rw [hLoopLocal]; exact hNotLocal
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [lowerLoopItersP_singletonRefAliasCopy_eq xName iterVar n hXNe hIterNe
     hXNameNe progMethods props budget
     (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
@@ -3077,7 +3102,7 @@ theorem lowerValueP_loop_singletonRefAliasCopy_count2_matches_pin :
       = "005279515479" := by
   rw [lowerValueP_loop_singletonRefAliasCopy_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
         [] [] [] [] ["p", "q"] "L" "x" "i" "q" 2 1
-        (by decide) (by decide) (by decide) (by decide) (by decide)]
+        (by decide) (by decide) (by decide) (by decide) (by decide) (by native_decide)]
   exact loopRefPropAssemble_count2_hex
 
 /-! ### Growing-depth closed form — singleton-ref `refAlias` body,
@@ -3191,25 +3216,28 @@ private theorem refAlias_computeLastUses (xName n : String) :
 `[n]`: the target is not body-bound, so it is collected as an outer
 ref. -/
 private theorem refAlias_bodyOuterRefs (xName iterVar n : String)
-    (hXNameNe : xName ≠ n) :
+    (hIterFresh : iterVar ≠ n) (hXNameNe : xName ≠ n) :
     Stack.Lower.bodyOuterRefs
       [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar = [n] := by
-  unfold Stack.Lower.bodyOuterRefs
-  simp [List.foldl_cons, List.foldl_nil, ANFBinding.value,
-        Stack.Lower.listContains]
-  exact hXNameNe
+  have hNe : (iterVar == n) = false := by simpa [beq_iff_eq] using hIterFresh
+  have hXNe : (xName == n) = false := by simpa [beq_iff_eq] using hXNameNe
+  simp [Stack.Lower.bodyOuterRefs, Stack.Lower.collectDeepBindingNames,
+        Stack.Lower.collectLoopCarriedRebinds, Stack.Lower.flattenNestedLoopBodies,
+        Stack.Lower.collectRefs,
+        Stack.Lower.listContains, ANFBinding.value, ANFBinding.name,
+        hNe, hXNe, hIterFresh, hXNameNe, Ne.symm hIterFresh]
 
 /-- `clampLastUsesForOuter` bumps `n`'s recorded index to `1` for a
 singleton refAlias body (with `xName ≠ n`). -/
 private theorem refAlias_clampLastUses (xName iterVar n : String)
-    (hXNameNe : xName ≠ n) :
+    (hIterFresh : iterVar ≠ n) (hXNameNe : xName ≠ n) :
     Stack.Lower.clampLastUsesForOuter
       (Stack.Lower.computeLastUses
         [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
       (Stack.Lower.bodyOuterRefs
         [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar)
       [ANFBinding.mk xName (.loadConst (.refAlias n)) none].length = [(n, 1)] := by
-  rw [refAlias_computeLastUses, refAlias_bodyOuterRefs xName iterVar n hXNameNe]
+  rw [refAlias_computeLastUses, refAlias_bodyOuterRefs xName iterVar n hIterFresh hXNameNe]
   show Stack.Lower.clampLastUsesForOuter [(n, 0)] [n] 1 = [(n, 1)]
   unfold Stack.Lower.clampLastUsesForOuter
   simp only [List.foldl_cons, List.foldl_nil]
@@ -3233,7 +3261,9 @@ theorem lowerValueP_loop_singletonRefAliasConsume_ops_eq
     (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
     (hDepth : sm.depth? n = some d)
     (hLocal :
-      Stack.Lower.listContains (localBindings ++ [xName]) n = true) :
+      Stack.Lower.listContains (localBindings ++ [xName]) n = true)
+    (hNoAfter : Stack.Lower.loopOuterRefsUsedAfter
+      [.mk xName (.loadConst (.refAlias n)) none] iterVar lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         outerProtected localBindings constInts sm bindingName
         (.loop count [.mk xName (.loadConst (.refAlias n)) none] iterVar)).1
@@ -3245,6 +3275,7 @@ theorem lowerValueP_loop_singletonRefAliasConsume_ops_eq
     show Stack.Lower.listContains (localBindings ++ [xName]) n = true
     exact hLocal
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [lowerLoopItersP_singletonRefAliasConsume_eq xName iterVar n hXNe hIterNe
     hXNameNe progMethods props budget
     (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
@@ -3263,7 +3294,7 @@ theorem lowerValueP_loop_singletonRefAliasConsume_ops_eq
         Stack.Lower.lastUsesLookup
       simp [List.find?])
     (by
-      rw [hLocal', refAlias_clampLastUses xName iterVar n hXNameNe]
+      rw [hLocal', refAlias_clampLastUses xName iterVar n hIterNe hXNameNe]
       show (true && !Stack.Lower.listContains ([] : List String) n
               && Stack.Lower.isLastUse [(n, 1)] n 0) = false
       unfold Stack.Lower.listContains Stack.Lower.isLastUse
@@ -3283,7 +3314,7 @@ theorem lowerValueP_loop_singletonRefAliasConsume_count2_matches_pin :
       = "00527951547a" := by
   rw [lowerValueP_loop_singletonRefAliasConsume_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
         [] [] ["q"] [] ["p", "q"] "L" "x" "i" "q" 2 1
-        (by decide) (by decide) (by decide) (by decide) (by decide)]
+        (by decide) (by decide) (by decide) (by decide) (by decide) (by native_decide)]
   exact loopRefConsumeAssemble_count2_hex
 
 /-! ### TIER 2 — the multi-binding accumulator (`loopOk` body)
@@ -3946,7 +3977,9 @@ theorem lowerValueP_loop_loopOkBody_ops_eq
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected localBindings : List String)
     (bindingName : String)
-    (count : Nat) (tail : StackMap) :
+    (count : Nat) (tail : StackMap)
+    (hNoAfter :
+      Stack.Lower.loopOuterRefsUsedAfter loopOkBody "i" lastUses currentIndex = []) :
     (Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget currentIndex lastUses
         outerProtected localBindings [] ("sum" :: "start" :: tail) bindingName
         (.loop count loopOkBody "i")).1
@@ -3975,7 +4008,7 @@ theorem lowerValueP_loop_loopOkBody_ops_eq
       have hBody : (loopOkBody.map (fun b => b.name)).any (· == "t2") = true := by native_decide
       rw [hBody, Bool.or_true]
     rw [hLocal, hlu]; rfl
-  simp only []
+  simp only [hNoAfter]
   rw [lowerLoopItersP_loopOkBody_eq
         (Stack.Lower.computeLastUses loopOkBody)
         (Stack.Lower.clampLastUsesForOuter (Stack.Lower.computeLastUses loopOkBody)
@@ -4010,7 +4043,8 @@ theorem lowerValueP_loop_loopOkBody_count3_matches_pin :
         (.loop 3 loopOkBody "i")).1)
       = "0052797b7c935153797b7c9352547a7b7c93" := by
   rw [show (["sum", "start"] : Stack.Lower.StackMap) = "sum" :: "start" :: [] from rfl]
-  rw [lowerValueP_loop_loopOkBody_ops_eq 0 [] [] ["t0", "sum"] "t9" 3 []]
+  rw [lowerValueP_loop_loopOkBody_ops_eq 0 [] [] ["t0", "sum"] "t9" 3 []
+        (by native_decide)]
   exact loopOkAssemble_count3_hex
 
 /-! ### Generic op-level transports (op-list facts; unchanged) -/
@@ -4335,6 +4369,8 @@ theorem lowerValueP_loop_neutral_ops_eq
     (constInts : List (String × Int))
     (sm : StackMap) (bindingName iterVar : String)
     (count : Nat) (body : List ANFBinding)
+    (hNoAfter :
+      Stack.Lower.loopOuterRefsUsedAfter body iterVar lastUses currentIndex = [])
     (bodyOpsNF : List StackOp) (smNF : StackMap) (dropNF : List StackOp)
     (bodyOpsF : List StackOp) (smF : StackMap) (dropF : List StackOp)
     (smPost : StackMap)
@@ -4360,6 +4396,7 @@ theorem lowerValueP_loop_neutral_ops_eq
         (.loop count body iterVar)).1
       = loopNeutralAssemble count bodyOpsNF dropNF bodyOpsF dropF count := by
   unfold Stack.Lower.lowerValueP
+  simp only [hNoAfter]
   simp only [lowerLoopItersP_neutral_eq progMethods props budget
     (Stack.Lower.computeLastUses body)
     (Stack.Lower.clampLastUsesForOuter
@@ -4403,6 +4440,8 @@ theorem runOps_lowerValueP_loop_neutral_id
       runOps ([.push (.bigint (Int.ofNat i))] ++ bodyOpsNF ++ dropNF) s = .ok s)
     (hFrun : ∀ (i : Nat) (s : StackState),
       runOps ([.push (.bigint (Int.ofNat i))] ++ bodyOpsF ++ dropF) s = .ok s)
+    (hNoAfter :
+      Stack.Lower.loopOuterRefsUsedAfter body iterVar lastUses currentIndex = [])
     (s : StackState) :
     runOps
       (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
@@ -4410,7 +4449,7 @@ theorem runOps_lowerValueP_loop_neutral_id
         (.loop count body iterVar)).1 s = .ok s := by
   rw [lowerValueP_loop_neutral_ops_eq progMethods props budget currentIndex
         lastUses outerProtected localBindings constInts sm bindingName iterVar
-        count body bodyOpsNF smNF dropNF bodyOpsF smF dropF smPost
+        count body hNoAfter bodyOpsNF smNF dropNF bodyOpsF smF dropF smPost
         hNF hCleanNF hF hCleanF hCount]
   exact runOps_loopNeutralAssemble_id count bodyOpsNF dropNF bodyOpsF dropF
     hNFrun hFrun count s
@@ -4661,6 +4700,8 @@ theorem successAgrees_loop_neutralBody_unconditional
     (constInts : List (String × Int))
     (sm : StackMap) (loopName iterVar : String)
     (count : Nat) (body : List ANFBinding)
+    (hNoAfter :
+      Stack.Lower.loopOuterRefsUsedAfter body iterVar lastUses currentIndex = [])
     (bodyOpsNF : List StackOp) (smNF : StackMap) (dropNF : List StackOp)
     (bodyOpsF : List StackOp) (smF : StackMap) (dropF : List StackOp)
     (smPost : StackMap)
@@ -4710,7 +4751,7 @@ theorem successAgrees_loop_neutralBody_unconditional
     rw [runOps_lowerValueP_loop_neutral_id progMethods props budget
           currentIndex lastUses outerProtected localBindings constInts sm
           loopName iterVar count body bodyOpsNF smNF dropNF bodyOpsF smF dropF
-          smPost hNF hCleanNF hF hCleanF hCount hNFrun hFrun initialStack]
+          smPost hNF hCleanNF hF hCleanF hCount hNFrun hFrun hNoAfter initialStack]
     simp [Except.toOption]
   exact ⟨fun _ => hStk, fun _ => hAnf⟩
 
@@ -4772,7 +4813,7 @@ theorem tier3d_successAgrees_loop_smoke :
   intro s0
   exact successAgrees_loop_neutralBody_unconditional [] []
     Stack.Lower.defaultInlineBudget 0 [] [] [] [] (["a"] : StackMap)
-    "loop0" "i" 3 [] [] (Stack.Lower.StackMap.push ["a"] "i") [.drop]
+    "loop0" "i" 3 [] (by native_decide) [] (Stack.Lower.StackMap.push ["a"] "i") [.drop]
     [] (Stack.Lower.StackMap.push ["a"] "i") [.drop] ["a"]
     (default : State) s0
     (fun s' => ⟨s', by unfold RunarVerification.ANF.Eval.evalBindingsP; rfl⟩)

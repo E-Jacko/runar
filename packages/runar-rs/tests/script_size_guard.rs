@@ -42,7 +42,7 @@ fn make_artifact(script: &str, contract_name: &str, methods: Vec<AbiMethod>) -> 
 fn deploy_rejects_oversized_script() {
     let artifact = make_artifact(&oversized_script_hex(), "OversizedContract", vec![]);
     let mut contract = RunarContract::new(artifact, vec![]);
-    let mut provider = MockProvider::testnet();
+    let mut provider = MockProvider::always_ack("testnet");
     let mock_addr = "0".repeat(20);
     let signer = MockSigner::new();
     let _ = &mock_addr;
@@ -86,7 +86,7 @@ fn call_rejects_oversized_current_utxo_script() {
     };
     let mut contract = RunarContract::from_utxo(artifact, &utxo);
 
-    let mut provider = MockProvider::testnet();
+    let mut provider = MockProvider::always_ack("testnet");
     let mock_addr = "0".repeat(20);
     let signer = MockSigner::new();
     let _ = &mock_addr;
@@ -109,7 +109,7 @@ fn call_rejects_oversized_current_utxo_script() {
 
 #[test]
 fn mock_provider_get_utxos_rejects_oversized_script() {
-    let mut provider = MockProvider::testnet();
+    let mut provider = MockProvider::always_ack("testnet");
     provider.add_utxo("addr", Utxo {
         txid: "b".repeat(64),
         output_index: 0,
@@ -124,7 +124,7 @@ fn mock_provider_get_utxos_rejects_oversized_script() {
 
 #[test]
 fn mock_provider_get_contract_utxo_rejects_oversized_script() {
-    let mut provider = MockProvider::testnet();
+    let mut provider = MockProvider::always_ack("testnet");
     provider.add_contract_utxo("script-hash", Utxo {
         txid: "c".repeat(64),
         output_index: 0,
@@ -137,7 +137,7 @@ fn mock_provider_get_contract_utxo_rejects_oversized_script() {
 
 #[test]
 fn at_limit_script_passes_provider_guard() {
-    let mut provider = MockProvider::testnet();
+    let mut provider = MockProvider::always_ack("testnet");
     provider.add_utxo("addr", Utxo {
         txid: "d".repeat(64),
         output_index: 0,

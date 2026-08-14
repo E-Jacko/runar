@@ -19,6 +19,10 @@ pub const ECUnit = struct {
         runar.assert(runar.ecOnCurve(doubled));
         const sum = runar.ecAdd(g, g);
         runar.assert(runar.ecOnCurve(sum));
+        // P + (-P) is the point at infinity: ecAdd returns the all-zero blob
+        // from a SUCCESSFUL script, and ecOnCurve must reject it.
+        const infPt = runar.ecAdd(g, neg);
+        runar.assert(!runar.ecOnCurve(infPt));
         const x = runar.ecPointX(g);
         const y = runar.ecPointY(g);
         const rebuilt = runar.ecMakePoint(x, y);

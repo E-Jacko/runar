@@ -1874,7 +1874,7 @@ def evalValue (s : State) : ANFValue → EvalResult (Value × State)
       -- Private-method calls require a per-program method-resolution
       -- table that the verification lead will wire in Phase 3.
       .error (.unsupported "method_call: per-program method dispatch deferred to Phase 3")
-  | .ifVal cond thenBs elseBs => do
+  | .ifVal cond thenBs elseBs _ => do
       let cv ← lookupRef s cond
       match cv with
       | .vBool true  =>
@@ -2149,7 +2149,7 @@ def evalValueP (methods : List ANFMethod) (s : State) : ANFValue → EvalResult 
       -- The ONLY divergence from the core evaluator: resolve + inline the
       -- callee via wave-52's `evalMethodCall` instead of erroring.
       evalMethodCall methods s obj method args
-  | .ifVal cond thenBs elseBs => do
+  | .ifVal cond thenBs elseBs _ => do
       let cv ← lookupRef s cond
       match cv with
       | .vBool true  =>
@@ -2259,7 +2259,7 @@ mutual
 through `ifVal` branches and `loop` bodies). -/
 def noMethodCallValue : ANFValue → Bool
   | .methodCall _ _ _ => false
-  | .ifVal _ thenBs elseBs => noMethodCallBindings thenBs && noMethodCallBindings elseBs
+  | .ifVal _ thenBs elseBs _ => noMethodCallBindings thenBs && noMethodCallBindings elseBs
   | .loop _ body _ => noMethodCallBindings body
   | _ => true
 
@@ -2284,7 +2284,7 @@ theorem evalValueP_eq_evalValue_of_noMethodCall
     cases v with
     | methodCall obj method args =>
         intro hNo; simp only [noMethodCallValue] at hNo; exact absurd hNo (by decide)
-    | ifVal cond thenBs elseBs =>
+    | ifVal cond thenBs elseBs _ =>
         intro hNo
         simp only [noMethodCallValue, Bool.and_eq_true] at hNo
         obtain ⟨hThen, hElse⟩ := hNo

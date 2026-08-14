@@ -19,6 +19,10 @@ module ECUnit {
         assert!(ecOnCurve(doubled), 0);
         let sum: Point = ecAdd(g, g);
         assert!(ecOnCurve(sum), 0);
+        // P + (-P) is the point at infinity: ecAdd returns the all-zero blob
+        // from a SUCCESSFUL script, and ecOnCurve must reject it.
+        let infPt: Point = ecAdd(g, neg);
+        assert!(!ecOnCurve(infPt), 0);
         let x: bigint = ecPointX(g);
         let y: bigint = ecPointY(g);
         let rebuilt: Point = ecMakePoint(x, y);

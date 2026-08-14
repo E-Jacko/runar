@@ -48,7 +48,7 @@ def _artifact(src: str, file_name: str) -> RunarArtifact:
 
 def _funded_provider(address: str, satoshis: int = 500_000) -> MockProvider:
     from runar.sdk.types import Utxo
-    provider = MockProvider("testnet")
+    provider = MockProvider.always_ack('testnet')
     provider.add_utxo(address, Utxo(
         txid="00" * 32, output_index=0, satoshis=satoshis,
         script="76a914" + "00" * 20 + "88ac",

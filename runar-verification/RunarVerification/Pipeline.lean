@@ -2997,7 +2997,7 @@ def valueOperandsNodupB : ANFValue → Bool
   | .addOutput sat vals pre => nodupRefsB ((sat :: vals) ++ [pre])
   | .addRawOutput a b => a != b
   | .addDataOutput a b => a != b
-  | .ifVal _ thn els => noAliasedOperandsB thn && noAliasedOperandsB els
+  | .ifVal _ thn els _ => noAliasedOperandsB thn && noAliasedOperandsB els
   | .loop _ body _ => noAliasedOperandsB body
   | _ => true
 
@@ -3011,7 +3011,7 @@ mutual
 /-- The value contains a `loop` anywhere (recursing into branch bodies). -/
 def valueUsesLoopB : ANFValue → Bool
   | .loop _ _ _ => true
-  | .ifVal _ thn els => bindingsUseLoopB thn || bindingsUseLoopB els
+  | .ifVal _ thn els _ => bindingsUseLoopB thn || bindingsUseLoopB els
   | _ => false
 
 /-- Some binding in the body contains a `loop`. NOTE: does NOT chase
@@ -3065,7 +3065,7 @@ def valueLoopMapNeutralB (progMethods : List ANFMethod) (props : List ANFPropert
       !bindingsUseLoopB body
         && !Lower.listContains smNF iterVar && !Lower.listContains smF iterVar
         && smNF == sm && smF == sm
-  | .ifVal _ thn els => !(bindingsUseLoopB thn || bindingsUseLoopB els)
+  | .ifVal _ thn els _ => !(bindingsUseLoopB thn || bindingsUseLoopB els)
   | _ => true
 
 /-- Body-level loop map-neutrality: every binding's value passes
@@ -3093,7 +3093,7 @@ theorem valueLoopMapNeutralB_of_no_loop
     valueLoopMapNeutralB progMethods props budget constInts sm v = true := by
   cases v with
   | loop count body iterVar => simp [valueUsesLoopB] at h
-  | ifVal cond thn els =>
+  | ifVal cond thn els _ =>
       simp only [valueUsesLoopB] at h
       simp [valueLoopMapNeutralB, h]
   | _ => rfl
@@ -3197,10 +3197,10 @@ localBindings, and narrows `bodyOuterRefs` to the TS set. Byte-parity
 evidence: the `bounded-loop` conformance golden still matches
 byte-exactly; the canonical accumulator shape (`loopOk*` below) and a
 nested-loop probe produce hex IDENTICAL to the production TS compiler
-(`compileFromANF`, fold/EC-optimizer off); shapes the TS reference
-REJECTS ("Value not found on stack" — outer non-param locals read as
-raw operands across iterations) are now REJECTED by `compileSafe` too
-(`OP_RUNAR_UNRESOLVED_*` sentinels — `loopCx_ts_aligned_rejects`).
+(`compileFromANF`, fold/EC-optimizer off). Outer non-param locals read
+as raw operands across iterations are PROTECTED, matching the widened
+`outerRefs` of the current TS reference, so those shapes compile rather
+than emitting `OP_RUNAR_UNRESOLVED_*` (`loopCx_ts_aligned_accepts`).
 
 The guards stay (see the axiom comments for the honest residual
 classes): `bodyLoopMapNeutralB` on the loop axiom and
@@ -3237,26 +3237,30 @@ theorem loopCx_anf_succeeds :
       { params := [("p", .vBigint 5)] } loopCxM.body).toOption.isSome = true := by
   native_decide
 
-/-- DIVERGENCE GONE (replaces the retired `loopCx_stack_fails`): under
-the FAITHFUL per-iteration loop arm (loop-fidelity rewrite 2026-06-11)
-the model REJECTS this program at compile time, exactly like the TS
-reference. The body reads the outer non-param local `c50` (and the
-method param `p`) as RAW binop operands with no `load_param` binding;
-the faithful (narrow) `bodyOuterRefs` does not protect them, so
-iteration 0 consumes them at their natural last-use and iteration 1
-fails to resolve them — TS errors with "Value 'c50' not found on stack"
-(verified against `compileFromANF` on the production compiler
-2026-06-11), and the model emits `OP_RUNAR_UNRESOLVED_*` sentinels that
-`validateStackProgram` rejects. ANF-vs-bytes agreement is restored
-VACUOUSLY for this program: there are no deployed bytes to disagree
-with (`hSafe : compileSafe p = .ok bytes` is unsatisfiable). Note this
-exact ANF is NOT frontend-reachable (frontends emit `load_param` /
-in-body `load_const` bindings for such reads — see `loopOk*` below for
-the frontend-shaped accumulator that now compiles AND agrees). -/
-theorem loopCx_ts_aligned_rejects :
+/-- The accumulator loop COMPILES, and the model agrees with the real
+compilers.
+
+This pin previously asserted REJECTION. The body reads the outer non-param
+local `c50` (and the param `p`) as RAW binop operands, and the then-narrow
+`bodyOuterRefs` did not protect them, so iteration 0 consumed them and
+iteration 1 could not resolve them. That matched the TS reference at the
+time ("Value 'c50' not found on stack", verified against `compileFromANF`
+2026-06-11).
+
+TS has since widened `outerRefs` to `collectRefs(b.value)` over every body
+binding, excluding the DEEP bound-name set and adding loop-carried
+rebinds — its own comment records the same defect ("a const defined before
+the loop and referenced only inside an if-branch was consumed by the first
+iteration, making iteration 2 fail"). `bodyOuterRefs` now mirrors that, so
+the program compiles.
+
+Verified against an INDEPENDENT tier, not against this model: the Go
+compiler accepts the equivalent ANF (`--ir ... --hex` emits
+`0132016400785379a2697c5379935178547aa2697c537a937777`). -/
+theorem loopCx_ts_aligned_accepts :
     (match compileSafe loopCxProg with
-     | .ok _ => false
-     | .error _ => true) = true := by
+     | .ok _ => true
+     | .error _ => false) = true := by
   native_decide
 
 /-- The program is WF and NON-ALIASED — the old `hNoAlias` guard does NOT
@@ -3283,8 +3287,8 @@ theorem loopCx_structural_accepts :
 /-- The retained map-neutrality guard REJECTS the counterexample (the
 loop body leaves the iteration variable alive on the lowered map) —
 kept as a regression pin for the guard definition itself; the program
-is in any case now rejected by `compileSafe`
-(`loopCx_ts_aligned_rejects`). -/
+itself now COMPILES (`loopCx_ts_aligned_accepts`), so the guard is what
+excludes it here, not a compile failure. -/
 theorem loopCx_guard_rejects :
     bodyLoopMapNeutralB loopCxProg.methods loopCxProg.properties
       Lower.defaultInlineBudget
@@ -3738,9 +3742,9 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     -- @ `start = 7`). Under the acceptance bit those very instances
     -- AGREE (`termCx_acceptAgrees`, `loopOk_start7_acceptAgrees` —
     -- native_decide probes), the loop arm itself is byte-faithful
-    -- (`loopOk_hex_matches_ts`, bounded-loop golden), and the divergent
-    -- `loopCx` shape is rejected by `compileSafe` outright
-    -- (`loopCx_ts_aligned_rejects`). No known falsifier class remains.
+    -- (`loopOk_hex_matches_ts`, bounded-loop golden), and the `loopCx`
+    -- shape now compiles in both the model and the real tiers
+    -- (`loopCx_ts_aligned_accepts`). No known falsifier class remains.
     --
     -- Value-terminated-body guard (NEW, same repair): for a body that
     -- does NOT end in assert (hand-IR corner cases only — the TS
@@ -4488,7 +4492,7 @@ theorem arithOnlyBody_of_emittableArithChainReadyNoDblNeg
       | loadConst _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
       | call _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
       | methodCall _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
-      | ifVal _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | ifVal _ _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
       | loop _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
       | assert _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
       | updateProp _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
@@ -4617,7 +4621,7 @@ theorem noMethodCallBindings_true_of_mathByteNoLen :
       | .binOp op l r rt => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
       | .unaryOp op o rt => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
       | .methodCall n a r => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
-      | .ifVal c t e => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e _ => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
       | .loop a b c => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
       | .assert r => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
       | .updateProp n r => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
@@ -8221,7 +8225,7 @@ private theorem ifval_consume_completion
     (bn cond : String) (k : Agrees.SlotKind)
     (thn els : List ANFBinding) (src : Option SourceLoc)
     (branchTsm : Agrees.TaggedStackMap)
-    (hBodyEq : anfM.body = [.mk bn (.ifVal cond thn els) src])
+    (hBodyEq : anfM.body = [.mk bn (.ifVal cond thn els []) src])
     (hAgrees :
       Agrees.agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack)
     (hFrag :
@@ -8443,7 +8447,7 @@ theorem compileSafe_observational_correct_ifval_consume
     (bn cond : String) (k : Agrees.SlotKind)
     (thn els : List ANFBinding) (src : Option SourceLoc)
     (branchTsm : Agrees.TaggedStackMap)
-    (hBodyEq : anfM.body = [.mk bn (.ifVal cond thn els) src])
+    (hBodyEq : anfM.body = [.mk bn (.ifVal cond thn els []) src])
     (hAgrees :
       Agrees.agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack)
     (hFrag :
@@ -9130,7 +9134,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- the single-`.ifVal` body shape it is vacuous for non-if_val families.
     (hIfValTyped :
       ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
-        anfM.body = [.mk bn (.ifVal cond thn els) src] →
+        anfM.body = [.mk bn (.ifVal cond thn els []) src] →
         ∃ (k : Agrees.SlotKind) (branchTsm : Agrees.TaggedStackMap),
           tsm = (cond, k) :: branchTsm ∧
           RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond ∧
@@ -9701,11 +9705,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               have hShape :
                   ∃ (bn cond : String) (thn els : List ANFBinding)
                     (src : Option SourceLoc),
-                    anfM.body = [.mk bn (.ifVal cond thn els) src] := by
+                    anfM.body = [.mk bn (.ifVal cond thn els []) src] := by
                 revert hFrag
                 match h : anfM.body with
-                | [.mk bn (.ifVal cond thn els) src] =>
+                | [.mk bn (.ifVal cond thn els []) src] =>
                     intro _; exact ⟨bn, cond, thn, els, src, rfl⟩
+                | [.mk _ (.ifVal _ _ _ (_ :: _)) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
                 | [] => intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
                 | [.mk _ (.loadParam _) _] =>
                     intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
@@ -10038,7 +10044,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       Agrees.entryTsmArithTyped Γ tsm)
     (hIfValTyped :
       ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
-        anfM.body = [.mk bn (.ifVal cond thn els) src] →
+        anfM.body = [.mk bn (.ifVal cond thn els []) src] →
         ∃ (k : Agrees.SlotKind) (branchTsm : Agrees.TaggedStackMap),
           tsm = (cond, k) :: branchTsm ∧
           RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond ∧

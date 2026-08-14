@@ -182,6 +182,153 @@ test "non-zero-start for-loop matches the TS reference hex (#121)" {
     );
 }
 
+// A loop-carried local REASSIGNED and then READ AGAIN in the same iteration.
+// The rebinding shadows the incoming slot under the same name; the later read
+// was its last body use, so it consumed the UPDATED value and left the dead
+// incoming one for the next iteration to resolve. `wacc` came out as `step*N`
+// instead of `step*N*(N+1)/2` — silently in a stateless contract, and as a
+// permanently unspendable UTXO in a stateful one. The expected hex is
+// byte-identical to the TypeScript reference compiler's output. Real-VM proof:
+// packages/runar-testing/src/__tests__/loop-carried-local-read-after-reassign-vm.test.ts
+test "loop-carried local read after reassignment matches the TS reference hex" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\class LoopCarriedRebind extends SmartContract {
+        \\  readonly expected: bigint;
+        \\
+        \\  constructor(expected: bigint) {
+        \\    super(expected);
+        \\    this.expected = expected;
+        \\  }
+        \\
+        \\  public verify(step: bigint) {
+        \\    let acc = 0n;
+        \\    let wacc = 0n;
+        \\    for (let i = 0n; i < 2n; i++) {
+        \\      acc = acc + step;
+        \\      wacc = wacc + acc;
+        \\    }
+        \\    assert(wacc === this.expected);
+        \\  }
+        \\}
+    ;
+    const hex = try compile(source, "LoopCarriedRebind.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(
+        "000000537953797c937b789351557a53797c937b7c93009c77777777",
+        hex,
+    );
+}
+
+// Control for the test above: the same loop with a single self-accumulating
+// carrier — no read after the rebinding. Its bytes must NOT move, or the
+// carried-rebind fix has been written too wide and every shipped
+// BoundedLoop-shaped contract pays.
+test "plain accumulator loop is untouched by the carried-rebind fix" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\class LoopPlainAccumulator extends SmartContract {
+        \\  readonly expected: bigint;
+        \\
+        \\  constructor(expected: bigint) {
+        \\    super(expected);
+        \\    this.expected = expected;
+        \\  }
+        \\
+        \\  public verify(step: bigint) {
+        \\    let acc = 0n;
+        \\    for (let i = 0n; i < 2n; i++) {
+        \\      acc = acc + step;
+        \\    }
+        \\    assert(acc === this.expected);
+        \\  }
+        \\}
+    ;
+    const hex = try compile(source, "LoopPlainAccumulator.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(
+        "000052797b7c9351537a7b7c93009c7777",
+        hex,
+    );
+}
+
+// The same cross-read one loop deeper. The predicate keys on the body's
+// TOP-LEVEL binding names, and at the OUTER level `acc` is bound only inside
+// the nested loop — so it was neither an outer ref nor a carried rebind, and
+// every outer iteration restarted from the slot the previous one left behind.
+// `wacc` came out 24 where the source says 30 (step = 3). The expected hex is
+// byte-identical to the TypeScript reference compiler's output. Real-VM proof:
+// packages/runar-testing/src/__tests__/nested-loop-carried-local-vm.test.ts
+test "nested loop-carried local read after reassignment matches the TS reference hex" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\class LoopNestedCarriedRebind extends SmartContract {
+        \\  readonly expected: bigint;
+        \\
+        \\  constructor(expected: bigint) {
+        \\    super(expected);
+        \\    this.expected = expected;
+        \\  }
+        \\
+        \\  public verify(step: bigint) {
+        \\    let acc = 0n;
+        \\    let wacc = 0n;
+        \\    for (let i = 0n; i < 2n; i++) {
+        \\      for (let j = 0n; j < 2n; j++) {
+        \\        acc = acc + step;
+        \\        wacc = wacc + acc;
+        \\      }
+        \\    }
+        \\    assert(wacc === this.expected);
+        \\  }
+        \\}
+    ;
+    const hex = try compile(source, "LoopNestedCarriedRebind.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(
+        "00000000547954797c93537a789351567953797c937b78935100597954797c93537a7893515b7a53797c937b7c93009c77777777777777777777",
+        hex,
+    );
+}
+
+// Control for the test above: NESTED loops with a single self-accumulating
+// carrier. The flatten step fires here (the body does contain a nested loop)
+// but the predicate still says "not carried", so the bytes must NOT move —
+// that is what keeps nesting itself from costing anything.
+test "nested plain accumulator loop is untouched by the nested carried-rebind fix" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\class LoopNestedPlainAccumulator extends SmartContract {
+        \\  readonly expected: bigint;
+        \\
+        \\  constructor(expected: bigint) {
+        \\    super(expected);
+        \\    this.expected = expected;
+        \\  }
+        \\
+        \\  public verify(step: bigint) {
+        \\    let acc = 0n;
+        \\    for (let i = 0n; i < 2n; i++) {
+        \\      for (let j = 0n; j < 2n; j++) {
+        \\        acc = acc + step;
+        \\      }
+        \\    }
+        \\    assert(acc === this.expected);
+        \\  }
+        \\}
+    ;
+    const hex = try compile(source, "LoopNestedPlainAccumulator.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(
+        "0000005379537a7c935154797b7c9351005679537a7c9351577a7b7c93009c777777777777",
+        hex,
+    );
+}
+
 // D10 — bitwise & | ^ ~ on bigint.
 test "bitwise operators on bigint emit OP_AND / OP_OR / OP_XOR / OP_INVERT" {
     const source =

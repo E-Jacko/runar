@@ -583,19 +583,58 @@ module RunarCompiler
         # are selected and the single expensive field_inv still runs once.
         # rx and ry below are already correct for doubling.
         #
-        #   cond = (px == qx)
+        #   cond = (px == qx) AND (py == qy)   1 when doubling, else 0
         #   num  = cond ? 3*px^2 : (qy - py)
         #   den  = cond ? 2*py   : (qx - px)
         #
         # selected as `b + cond*(a - b)`, which needs no branch and keeps the
         # emitted op sequence identical on both paths.
         #
-        # NOT handled: P == -Q, whose true result is the point at infinity,
-        # which affine coordinates cannot represent.
+        # THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx
+        # ALONE sends it down the tangent path and returns 2P -- an on-curve,
+        # entirely plausible, WRONG point. Before the doubling fix the chord
+        # path ran there, divided by zero (ec_field_inv is Fermat, inv(0) = 0)
+        # and produced an OFF-curve blob, so `assert(ecOnCurve(ecAdd(a, b)))`
+        # -- the idiom this codegen tells authors to write -- happened to
+        # reject it. Selecting on px alone would have silently disarmed that.
+        #
+        # P + (-P) is the point at infinity, which affine x||y cannot
+        # represent. This codegen already has a representation for O: the
+        # ALL-ZERO blob, which is what `ecMul(P, 0n)` returns and what the
+        # `ec-mulgen-linear` rewrite in optimizer/ec-rules.json produces for
+        # k1 + k2 == 0 (mod n). So return that, by masking the result with
+        # `notinf = NOT(px == qx AND NOT cond)`:
+        #
+        #   - it agrees with the rewrite, so the same source cannot give two
+        #     answers depending on whether the optimizer fired;
+        #   - O is not on the curve (0^2 != 0^3 + 7), so the on-curve gate
+        #     rejects it and the idiom above works again;
+        #   - it adds no failure channel to what is a pure value-producing
+        #     expression, the same reason ec_emit_scalar_reduce reduces
+        #     instead of rejecting.
+        #
+        # The mask is a bare OP_MUL with no reduction: rx, ry are already in
+        # [0, p) and notinf is 0 or 1, so the product is canonical either way.
         t.copy_to_top("px", "_px_eq")
         t.copy_to_top("qx", "_qx_eq")
-        t.raw_block(["_px_eq", "_qx_eq"], "_cond",
+        t.raw_block(["_px_eq", "_qx_eq"], "_xeq",
                     ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+        t.copy_to_top("py", "_py_eq")
+        t.copy_to_top("qy", "_qy_eq")
+        t.raw_block(["_py_eq", "_qy_eq"], "_yeq",
+                    ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+        t.copy_to_top("_xeq", "_xeq_c")
+        t.to_top("_yeq")
+        t.raw_block(["_xeq_c", "_yeq"], "_cond",
+                    ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_BOOLAND")) })
+        # notinf = NOT(xeq - cond): xeq - cond is 1 exactly when px == qx and
+        # the points are not equal, i.e. exactly the P == -Q case.
+        t.to_top("_xeq")
+        t.copy_to_top("_cond", "_cond_c")
+        t.raw_block(["_xeq", "_cond_c"], "_notinf", ->(e) {
+          e.call(make_stack_op(op: "opcode", code: "OP_SUB"))
+          e.call(make_stack_op(op: "opcode", code: "OP_NOT"))
+        })
 
         # chord numerator / denominator
         t.copy_to_top("qy", "_qy1")
@@ -656,6 +695,16 @@ module RunarCompiler
         t.drop
         t.to_top("qy")
         t.drop
+
+        # P == -Q -> force the all-zero point (see the header comment).
+        t.to_top("rx")
+        t.copy_to_top("_notinf", "_notinf_x")
+        t.raw_block(["rx", "_notinf_x"], "rx",
+                    ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_MUL")) })
+        t.to_top("ry")
+        t.to_top("_notinf")
+        t.raw_block(["ry", "_notinf"], "ry",
+                    ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_MUL")) })
       end
 
       # =================================================================
@@ -755,8 +804,17 @@ module RunarCompiler
       # @param t [ECTracker]
       def self.ec_build_jacobian_add_affine_inline(e, t)
         # Create inner tracker with cloned stack state
-        it = ECTracker.new(t.nm.dup, e)
+        ec_jacobian_add_affine_body(ECTracker.new(t.nm.dup, e), false)
+      end
 
+      # The mixed-add itself, emitting through a tracker the caller owns.
+      #
+      # +keep_hr+ additionally leaves copies of H and R on the stack. They are
+      # the exception detector: H = U2 - X1 and R = S2 - Y1 are both zero
+      # exactly when the Jacobian accumulator is the same curve point as the
+      # affine operand, the one case these formulas cannot compute (see
+      # ec_build_jacobian_add_or_double_inline).
+      def self.ec_jacobian_add_affine_body(it, keep_hr)
         # Save copies of values that get consumed but are needed later
         it.copy_to_top("jz", "_jz_for_z1cu")   # consumed by Z1sq, needed for Z1cu
         it.copy_to_top("jz", "_jz_for_z3")     # needed for Z3
@@ -783,6 +841,11 @@ module RunarCompiler
 
         # R = S2 - jy
         ec_field_sub(it, "_S2", "jy", "_R")
+
+        if keep_hr
+          it.copy_to_top("_H", "_H_keep")
+          it.copy_to_top("_R", "_R_keep")
+        end
 
         # Save copies of H (consumed by H2 sqr, needed for H3 and Z3)
         it.copy_to_top("_H", "_H_for_h3")
@@ -830,6 +893,127 @@ module RunarCompiler
         it.rename("jz")
       end
 
+      # Branchless select of one Jacobian coordinate: +add + cond*(dbl - add)+.
+      # Same shape as the numerator/denominator select in ec_affine_add, so both
+      # paths emit the identical op sequence and the tracker's static stack
+      # model holds. Consumes add_name, dbl_name and cond_name.
+      def self.ec_select_coord(t, add_name, dbl_name, cond_name, result_name)
+        t.copy_to_top(add_name, "_sel_add_c")
+        ec_field_sub(t, dbl_name, "_sel_add_c", "_sel_diff")
+        ec_field_mul(t, "_sel_diff", cond_name, "_sel_scaled")
+        ec_field_add(t, add_name, "_sel_scaled", result_name)
+      end
+
+      # The ladder's LAST conditional step: mixed-add, but correct when the
+      # accumulator already equals the point being added.
+      #
+      # The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when
+      # the two operands are the same curve point H = 0, so Z3 = Z1*H = 0 -- the
+      # point at infinity -- and since ec_field_inv is Fermat (inv(0) = 0),
+      # ec_jacobian_to_affine turns that into the ALL-ZERO point instead of 2P.
+      # ecMul(P, 2n) and ecMulGen(2n) returned 64 zero bytes.
+      #
+      # WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+      # c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+      # (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the
+      # degenerate cases are exactly c_i == 2 (mod n) -- accumulator == P -- and
+      # c_i == 0 or 1 (mod n) -- accumulator == -P or O. c_i ranges over a
+      # CONTIGUOUS interval determined only by i, so this is decidable by
+      # interval arithmetic rather than by sampling, and over the whole domain
+      # k in [0, n-1] only two steps qualify, both at i = 0:
+      #
+      #   k = 2  -> c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P.
+      #   k = 0  -> c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+      #             true result the point at infinity, which affine coordinates
+      #             cannot represent; it stays the all-zero point, as before.
+      #
+      # At i >= 1, c_i lies in [3n>>i, (4n-1)>>i] -- the lower bound is 3n, not
+      # 3n+1, because the reduce puts k = 0 in the domain -- and that interval
+      # contains no value == 0, 1 or 2 (mod n) that is also odd; c_256 = 2 is
+      # even, so no add runs. Handling H == 0 at every one of the 257 steps
+      # would cost ~70% more script bytes; handling it here costs 0.26%.
+      #
+      # THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true
+      # because emit_ec_mul reduces k mod n before adding 3n. That reduce landed
+      # one commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS
+      # OWN IS UNSOUND: a last-step-only select while the scalar is still
+      # unbounded leaves c_i free to hit 0, 1 or 2 (mod n) at other steps. The
+      # two commits must land together and must never be bisected,
+      # cherry-picked or reverted apart.
+      #
+      # The interval argument does 100% of the work; there is no defence in
+      # depth here. In particular c_i == 1 (mod n) -- a pre-add accumulator of
+      # O -- is UNREACHABLE, not handled: were it reachable the select would
+      # still take the ADD path, because O is carried as Z1 = 0, which makes
+      # U2 = 0 and H = -X1 != 0. Anything that changes the +3n offset, the
+      # iteration count or the reduce must redo the interval check, not assume
+      # this still holds.
+      #
+      # This is NOT a "no honest input hits it" argument: the operand P is
+      # caller-supplied but cannot move the exception, because the condition
+      # depends only on c_i mod ord(P) and ord(P) = n for every point on the
+      # curve. Points that are NOT on the curve carry no such guarantee -- gate
+      # untrusted input on ecOnCurve first.
+      #
+      # Stack layout: [..., ax, ay, _k, jx, jy, jz] -- same in and out.
+      def self.ec_build_jacobian_add_or_double_inline(e, t)
+        it = ECTracker.new(t.nm.dup, e)
+
+        # Keep the pre-add accumulator: it is what must be DOUBLED in the
+        # exceptional case, and the add below consumes jx/jy/jz.
+        it.copy_to_top("jx", "_sx")
+        it.copy_to_top("jy", "_sy")
+        it.copy_to_top("jz", "_sz")
+
+        ec_jacobian_add_affine_body(it, true)
+
+        # cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+        # accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+        # signals the point at infinity.
+        it.to_top("_H_keep")
+        it.push_int("_zero_h", 0)
+        it.raw_block(["_H_keep", "_zero_h"], "_h_is0",
+                     ->(e2) { e2.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+        it.to_top("_R_keep")
+        it.push_int("_zero_r", 0)
+        it.raw_block(["_R_keep", "_zero_r"], "_r_is0",
+                     ->(e2) { e2.call(make_stack_op(op: "opcode", code: "OP_NUMEQUAL")) })
+        it.to_top("_h_is0")
+        it.to_top("_r_is0")
+        it.raw_block(["_h_is0", "_r_is0"], "_cond",
+                     ->(e2) { e2.call(make_stack_op(op: "opcode", code: "OP_BOOLAND")) })
+
+        # Move the add result aside so ec_jacobian_double can work on jx/jy/jz
+        # again, this time holding the saved accumulator.
+        it.to_top("jx")
+        it.rename("_add_x")
+        it.to_top("jy")
+        it.rename("_add_y")
+        it.to_top("jz")
+        it.rename("_add_z")
+        it.to_top("_sx")
+        it.rename("jx")
+        it.to_top("_sy")
+        it.rename("jy")
+        it.to_top("_sz")
+        it.rename("jz")
+        ec_jacobian_double(it)
+        it.to_top("jx")
+        it.rename("_dbl_x")
+        it.to_top("jy")
+        it.rename("_dbl_y")
+        it.to_top("jz")
+        it.rename("_dbl_z")
+
+        it.copy_to_top("_cond", "_cond_x")
+        ec_select_coord(it, "_add_x", "_dbl_x", "_cond_x", "jx")
+        it.copy_to_top("_cond", "_cond_y")
+        ec_select_coord(it, "_add_y", "_dbl_y", "_cond_y", "jy")
+        it.to_top("_cond")
+        it.rename("_cond_z")
+        ec_select_coord(it, "_add_z", "_dbl_z", "_cond_z", "jz")
+      end
+
       # =================================================================
       # Public entry points (called from stack lowerer)
       # =================================================================
@@ -848,6 +1032,32 @@ module RunarCompiler
         ec_compose_point(t, "rx", "ry", "_result")
       end
 
+      # Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+      #
+      # OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in
+      # (-n, n); the `+ n, mod n` normalises the negative half. One push of n
+      # covers both reductions -- the same shape as `emit_ec_mod_reduce`.
+      #
+      # Without it, `emit_ec_mul`'s ladder is only correct while
+      # 2^257 <= k + 3n < 2^258: a scalar >= ~n sets bit 258, the 257-iteration
+      # loop never sees it, and the ladder returns a DIFFERENT multiple of P
+      # rather than failing. Scalars are contract input, so that is
+      # attacker-chosen. Reducing costs 1 push + 8 opcodes (42 bytes) against a
+      # ~429 KB script, and makes k >= n, k < 0 and k = 0 all well defined.
+      def self.ec_emit_scalar_reduce(t, k_name, result_name, curve_n)
+        t.push_big_int("_n_red", curve_n)
+        t.raw_block([k_name, "_n_red"], result_name, lambda { |e|
+          e.call(make_stack_op(op: "opcode", code: "OP_2DUP"))
+          e.call(make_stack_op(op: "opcode", code: "OP_MOD"))
+          e.call(make_stack_op(op: "rot"))
+          e.call(make_stack_op(op: "drop"))
+          e.call(make_stack_op(op: "over"))
+          e.call(make_stack_op(op: "opcode", code: "OP_ADD"))
+          e.call(make_stack_op(op: "swap"))
+          e.call(make_stack_op(op: "opcode", code: "OP_MOD"))
+        })
+      end
+
       # Perform scalar multiplication P * k.
       #
       # Stack in: [point, scalar] (scalar on top)
@@ -864,10 +1074,14 @@ module RunarCompiler
         # k' = k + 3n: guarantees bit 257 is set.
         # k in [1, n-1], so k+3n in [3n+1, 4n-1]. Since 3n > 2^257, bit 257
         # is always 1. Adding 3n (= 0 mod n) preserves the EC point: k*G = (k+3n)*G.
+        #
+        # "k in [1, n-1]" is a PRECONDITION the caller cannot enforce -- the
+        # scalar is usually an unlock argument -- so reduce it first.
         curve_n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141
         t.to_top("_k")
+        ec_emit_scalar_reduce(t, "_k", "_kr", curve_n)
         t.push_big_int("_n", curve_n)
-        t.raw_block(["_k", "_n"], "_kn", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
+        t.raw_block(["_kr", "_n"], "_kn", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
         t.push_big_int("_n2", curve_n)
         t.raw_block(["_kn", "_n2"], "_kn2", ->(e) { e.call(make_stack_op(op: "opcode", code: "OP_ADD")) })
         t.push_big_int("_n3", curve_n)
@@ -905,7 +1119,14 @@ module RunarCompiler
           t.nm.pop # _bit consumed by IF
           add_ops = []
           add_emit = ->(op) { add_ops.push(op) }
-          ec_build_jacobian_add_affine_inline(add_emit, t)
+          # Only the final step can be handed two equal operands -- see
+          # ec_build_jacobian_add_or_double_inline for why, and for what it
+          # costs not to.
+          if bit.zero?
+            ec_build_jacobian_add_or_double_inline(add_emit, t)
+          else
+            ec_build_jacobian_add_affine_inline(add_emit, t)
+          end
           emit.call(make_stack_op(op: "if", then: add_ops, else_ops: []))
         end
 

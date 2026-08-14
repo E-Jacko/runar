@@ -1,0 +1,85 @@
+{
+  "case": "bytes-75",
+  "contract": "SlotMatrix",
+  "valueClass": "ByteString 75 bytes → 0x4b + data, the top of the direct-push range (< vs <= the 0x4c PUSHDATA1 boundary)",
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "7"
+    },
+    {
+      "type": "ByteString",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "codePartByteLength": 229,
+  "slots": [
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 0,
+      "byteOffset": 0,
+      "byteLength": 76,
+      "headerBytes": 1,
+      "valueByteOffset": 1,
+      "valueByteLength": 75,
+      "encoding": "data",
+      "pushedHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "count",
+      "paramIndex": 0,
+      "templateByteOffset": 3,
+      "byteOffset": 78,
+      "byteLength": 1,
+      "headerBytes": 0,
+      "valueByteOffset": 78,
+      "valueByteLength": 1,
+      "encoding": "scriptnum",
+      "pushedHex": "07"
+    },
+    {
+      "name": "tag",
+      "paramIndex": 1,
+      "templateByteOffset": 6,
+      "byteOffset": 81,
+      "byteLength": 76,
+      "headerBytes": 1,
+      "valueByteOffset": 82,
+      "valueByteLength": 75,
+      "encoding": "data",
+      "pushedHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 7,
+      "byteOffset": 157,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 158,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "name": "owner",
+      "paramIndex": 2,
+      "templateByteOffset": 11,
+      "byteOffset": 194,
+      "byteLength": 34,
+      "headerBytes": 1,
+      "valueByteOffset": 195,
+      "valueByteLength": 33,
+      "encoding": "data",
+      "pushedHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ],
+  "templateCodeSeparators": [],
+  "deployedCodeSeparators": [],
+  "codeSepSlotValues": []
+}

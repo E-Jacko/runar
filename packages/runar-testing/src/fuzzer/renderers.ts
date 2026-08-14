@@ -12,6 +12,7 @@ import type {
   GeneratedMethod as _GeneratedMethod,
   Expr,
   Stmt,
+  ForStmt,
   RuinarType,
 } from './contract-ir.js';
 import {
@@ -21,14 +22,38 @@ import {
   collectUsedTypes,
 } from './contract-ir.js';
 
-// `ForStmt` is exec-oracle-only (issue #124): the tri-modal execution oracle
-// generates loops + byte-ops and renders them to TypeScript only. The native
-// cross-tier `--ir` renderers deliberately do NOT emit loops (that would force
-// 7-compiler byte-identical loop parity, out of #124's scope), so they reject
-// a ForStmt loudly rather than emit unverified per-language loop syntax.
+// ---------------------------------------------------------------------------
+// Loop rendering — the CROSS-TIER SUBSET
+// ---------------------------------------------------------------------------
+//
+// Until 2026-08 the six non-TS renderers refused every `ForStmt`: loops were
+// exec-oracle-only (issue #124, TypeScript-rendered), so the `--ir` cross-tier
+// parity fuzzer had never compiled a single loop in any tier. A lowering fix
+// that moved bytes identically across all seven tiers was therefore invisible
+// to it. They now render loops — but only the form EVERY surface syntax can
+// express losslessly, which is narrower than `ForStmt` itself:
+//
+//   * Rust DSL loops are `for i in start..end` (`parser_rustmacro.rs`) — a
+//     half-open ascending range. There is no `.rev()` and no `..=`, so
+//     countdowns and `<=` bounds have NO Rust surface form.
+//   * Zig loops are `var i: i64 = S; while (i < N) : (i += 1)`, and the
+//     `var` decl must IMMEDIATELY precede the `while` for `parse_zig.zig`'s
+//     parseBlock to merge the two into one ForStmt.
+//
+// So the native renderers accept `step: 1` + `op: '<'` and reject anything
+// else loudly, rather than emit per-language loop syntax whose 7-tier parity
+// has never been demonstrated. The exec-oracle shapes that need a countdown or
+// an inclusive bound are still TypeScript-only.
 const FOR_STMT_UNSUPPORTED =
-  'ForStmt is exec-oracle-only (issue #124); render loop contracts to ' +
-  'TypeScript via renderTypeScript, not the native cross-tier renderers.';
+  'ForStmt form is exec-oracle-only (issue #124): the native cross-tier ' +
+  'renderers express only ascending unit-step half-open loops ' +
+  "(step: 1, op: '<'). Render this contract to TypeScript via " +
+  'renderTypeScript instead.';
+
+/** Throw unless `stmt` is in the cross-tier-renderable loop subset. */
+function requireNativeLoopForm(stmt: ForStmt): void {
+  if (stmt.step !== 1 || stmt.op !== '<') throw new Error(FOR_STMT_UNSUPPORTED);
+}
 
 // ---------------------------------------------------------------------------
 // TypeScript renderer (.runar.ts)
@@ -84,11 +109,40 @@ function tsStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'add_output': {
+      const args = [`${stmt.satoshis}n`, ...stmt.values.map(tsExpr)].join(', ');
+      return `${indent}this.addOutput(${args});`;
+    }
     case 'expr':
       return `${indent}${tsExpr(stmt.expr)};`;
   }
 }
 
+// ---------------------------------------------------------------------------
+// READONLY PARITY — every renderer must carry `GeneratedProperty.readonly`
+// ---------------------------------------------------------------------------
+//
+// A property's readonly-ness is not cosmetic: on a StatefulSmartContract it
+// decides whether the property joins the serialized state or is baked into the
+// code part, which changes the emitted script BYTES. Under `--render native`
+// each tier compiles its OWN rendered source, so a renderer that drops the
+// marker hands that tier a semantically DIFFERENT contract, and the resulting
+// "cross-tier divergence" is a fuzzer artifact rather than a compiler bug.
+//
+// Until 2026-08 exactly that was true: renderPython, renderZig and renderRuby
+// emitted every property as mutable. The three-way split it produced
+// ({ts,go,rust,java} vs {python,ruby} vs {zig} — Zig differing again because
+// `01-parse-zig.ts` INFERS readonly for stateful properties no method mutates)
+// was invisible because the `--ir` PR gate ran without `--hex`. Each renderer
+// now emits its format's marker whenever `prop.readonly` is set:
+//
+//   TypeScript  `readonly x: bigint`        Go      `X int64 \`runar:"readonly"\``
+//   Rust        `#[readonly]`               Python  `x: Readonly[Bigint]`
+//   Zig         `x: runar.Readonly(i64)`    Ruby    `prop :x, Bigint, readonly: true`
+//   Java        `@Readonly long x`
+//
+// Stateless contracts mark every property readonly in every frontend anyway, so
+// the marker is redundant (never wrong) there.
 export function renderTypeScript(contract: GeneratedContract): string {
   const usedFns = collectUsedFunctions(contract);
   const usedTypes = collectUsedTypes(contract);
@@ -225,8 +279,20 @@ function goStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      const lines = [
+        `${indent}for ${stmt.iterVar} := runar.Int(${stmt.start}); ` +
+          `${stmt.iterVar} < ${stmt.bound}; ${stmt.iterVar}++ {`,
+      ];
+      for (const s of stmt.body) lines.push(goStmt(s, indent + '\t'));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(goExpr)].join(', ');
+      return `${indent}c.AddOutput(${args})`;
+    }
     case 'expr':
       return `${indent}${goExpr(stmt.expr)}`;
   }
@@ -321,8 +387,17 @@ function rsStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      const lines = [`${indent}for ${stmt.iterVar} in ${stmt.start}..${stmt.bound} {`];
+      for (const s of stmt.body) lines.push(rsStmt(s, indent + '    '));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(rsExpr)].join(', ');
+      return `${indent}self.add_output(${args});`;
+    }
     case 'expr':
       return `${indent}${rsExpr(stmt.expr)};`;
   }
@@ -425,8 +500,17 @@ function pyStmt(stmt: Stmt, indent: string): string {
       }
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      const lines = [`${indent}for ${toSnakeCase(stmt.iterVar)} in range(${stmt.start}, ${stmt.bound}):`];
+      for (const s of stmt.body) lines.push(pyStmt(s, indent + '    '));
+      if (stmt.body.length === 0) lines.push(`${indent}    pass`);
+      return lines.join('\n');
+    }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(pyExpr)].join(', ');
+      return `${indent}self.add_output(${args})`;
+    }
     case 'expr':
       return `${indent}${pyExpr(stmt.expr)}`;
   }
@@ -453,6 +537,7 @@ export function renderPython(contract: GeneratedContract): string {
   if (usedFns.has('len')) imports.push('len');
   if (usedFns.has('cat')) imports.push('cat');
   imports.push('public');
+  if (contract.properties.some((p) => p.readonly)) imports.push('Readonly');
 
   for (const t of usedTypes) {
     if (t !== 'boolean') imports.push(pyType(t));
@@ -465,9 +550,11 @@ export function renderPython(contract: GeneratedContract): string {
   const base = isStateful ? 'StatefulSmartContract' : 'SmartContract';
   lines.push(`class ${contract.name}(${base}):`);
 
-  // Properties
+  // Properties. `Readonly[T]` must be rendered whenever the IR marks the
+  // property readonly — see the READONLY PARITY note above `renderTypeScript`.
   for (const prop of contract.properties) {
-    lines.push(`    ${toSnakeCase(prop.name)}: ${pyType(prop.type)}`);
+    const t = prop.readonly ? `Readonly[${pyType(prop.type)}]` : pyType(prop.type);
+    lines.push(`    ${toSnakeCase(prop.name)}: ${t}`);
   }
   lines.push('');
 
@@ -567,8 +654,23 @@ function zigStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      // `parse_zig.zig`'s parseBlock merges a `var <iter>` decl into the
+      // FOLLOWING `while` only when the two are adjacent in the same block, so
+      // the declaration is emitted here rather than hoisted.
+      const lines = [
+        `${indent}var ${stmt.iterVar}: i64 = ${stmt.start};`,
+        `${indent}while (${stmt.iterVar} < ${stmt.bound}) : (${stmt.iterVar} += 1) {`,
+      ];
+      for (const s of stmt.body) lines.push(zigStmt(s, indent + '    '));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
+    case 'add_output': {
+      const args = [String(stmt.satoshis), ...stmt.values.map(zigExpr)].join(', ');
+      return `${indent}self.addOutput(${args});`;
+    }
     case 'expr':
       return `${indent}${zigExpr(stmt.expr)};`;
   }
@@ -586,10 +688,12 @@ export function renderZig(contract: GeneratedContract): string {
   lines.push(`    pub const Contract = ${contractType};`);
   lines.push('');
 
-  // Fields
+  // Fields. `runar.Readonly(T)` must be rendered whenever the IR marks the
+  // property readonly — see the READONLY PARITY note above `renderTypeScript`.
   for (const prop of contract.properties) {
     const init = prop.initializer ? ` = ${zigExpr(prop.initializer)}` : '';
-    lines.push(`    ${prop.name}: ${zigType(prop.type)}${init},`);
+    const t = prop.readonly ? `runar.Readonly(${zigType(prop.type)})` : zigType(prop.type);
+    lines.push(`    ${prop.name}: ${t}${init},`);
   }
   lines.push('');
 
@@ -672,8 +776,20 @@ function rbStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}end`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      // `...` is Ruby's EXCLUSIVE range — matches the half-open `<` bound.
+      const lines = [`${indent}for ${toSnakeCase(stmt.iterVar)} in ${stmt.start}...${stmt.bound}`];
+      for (const s of stmt.body) lines.push(rbStmt(s, indent + '  '));
+      lines.push(`${indent}end`);
+      return lines.join('\n');
+    }
+    case 'add_output': {
+      // Ruby's surface form is a BARE call — `add_output(...)`, no `self.`
+      // receiver (see examples/ruby/add-raw-output/RawOutputTest.runar.rb).
+      const args = [String(stmt.satoshis), ...stmt.values.map(rbExpr)].join(', ');
+      return `${indent}add_output(${args})`;
+    }
     case 'expr':
       return `${indent}${rbExpr(stmt.expr)}`;
   }
@@ -689,9 +805,11 @@ export function renderRuby(contract: GeneratedContract): string {
 
   lines.push(`class ${contract.name} < ${base}`);
 
-  // Properties
+  // Properties. `readonly: true` must be rendered whenever the IR marks the
+  // property readonly — see the READONLY PARITY note above `renderTypeScript`.
   for (const prop of contract.properties) {
-    lines.push(`  prop :${toSnakeCase(prop.name)}, ${rbType(prop.type)}`);
+    const ro = prop.readonly ? ', readonly: true' : '';
+    lines.push(`  prop :${toSnakeCase(prop.name)}, ${rbType(prop.type)}${ro}`);
   }
   lines.push('');
 
@@ -931,8 +1049,28 @@ function javaStmt(
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
-    case 'for':
-      throw new Error(FOR_STMT_UNSUPPORTED);
+    case 'for': {
+      requireNativeLoopForm(stmt);
+      // The loop variable is a bigint in scope for the whole body.
+      bigintVars.add(stmt.iterVar);
+      const lines = [
+        `${indent}for (Bigint ${stmt.iterVar} = ${javaBigintLiteral(stmt.start)}; ` +
+          `${stmt.iterVar}.lt(${javaBigintLiteral(stmt.bound)}); ` +
+          `${stmt.iterVar} = ${stmt.iterVar}.plus(Bigint.ONE)) {`,
+      ];
+      for (const s of stmt.body) lines.push(javaStmt(s, indent + '    ', bigintVars, boolVars));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
+    case 'add_output': {
+      // The satoshi amount is a plain `long` in the Java surface, NOT a Bigint
+      // wrapper (see examples/.../RawOutputTest.runar.java).
+      const args = [
+        `${stmt.satoshis}L`,
+        ...stmt.values.map((v) => javaExpr(v, bigintVars, boolVars)),
+      ].join(', ');
+      return `${indent}this.addOutput(${args});`;
+    }
     case 'expr':
       return `${indent}${javaExpr(stmt.expr, bigintVars, boolVars)};`;
   }

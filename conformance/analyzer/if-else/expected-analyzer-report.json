@@ -1,6 +1,6 @@
 {
-  "script": "007c637c0093677c00946800a077",
-  "scriptSize": 14,
+  "script": "007c637c00937677677c0094767768517a7500a0",
+  "scriptSize": 20,
   "findings": [
     {
       "severity": "warning",
@@ -55,6 +55,6 @@
     "pathsWithCheckSig": 0,
     "pathsWithoutCheckSig": 2,
     "maxStackDepth": 0,
-    "scriptSizeBytes": 14
+    "scriptSizeBytes": 20
   }
 }

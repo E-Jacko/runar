@@ -431,19 +431,58 @@ public final class Ec {
         // are selected and the single expensive fieldInv still runs once.
         // rx and ry below are already correct for doubling.
         //
-        //   cond = (px == qx)
-        //   num  = cond ? 3*px^2 : (qy - py)
-        //   den  = cond ? 2*py   : (qx - px)
+        //   cond   = (px == qx) AND (py == qy)   1 when doubling, else 0
+        //   num    = cond ? 3*px^2 : (qy - py)
+        //   den    = cond ? 2*py   : (qx - px)
         //
         // selected as `b + cond*(a - b)`, which needs no branch and keeps the
         // emitted op sequence identical on both paths.
         //
-        // NOT handled: P == -Q, whose true result is the point at infinity,
-        // which affine coordinates cannot represent.
+        // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx
+        // ALONE sends it down the tangent path and returns 2P — an on-curve,
+        // entirely plausible, WRONG point. Before the doubling fix the chord
+        // path ran there, divided by zero (fieldInv is Fermat, inv(0) = 0) and
+        // produced an OFF-curve blob, so `assert(ecOnCurve(ecAdd(a, b)))` —
+        // the idiom this codegen tells authors to write — happened to reject
+        // it. Selecting on px alone would have silently disarmed that.
+        //
+        // P + (-P) is the point at infinity, which affine x||y cannot
+        // represent. This codegen already has a representation for O: the
+        // ALL-ZERO blob, which is what `ecMul(P, 0n)` returns and what the
+        // `ec-mulgen-linear` rewrite in optimizer/ec-rules.json produces for
+        // k1 + k2 == 0 (mod n). So return that, by masking the result with
+        // `notinf = NOT(px == qx AND NOT cond)`:
+        //
+        //   - it agrees with the rewrite, so the same source cannot give two
+        //     answers depending on whether the optimizer fired;
+        //   - O is not on the curve (0^2 != 0^3 + 7), so the on-curve gate
+        //     rejects it and the idiom above works again;
+        //   - it adds no failure channel to what is a pure value-producing
+        //     expression, the same reason emitScalarReduce reduces instead of
+        //     rejecting.
+        //
+        // The mask is a bare OP_MUL with no reduction: rx, ry are already in
+        // [0, p) and notinf is 0 or 1, so the product is canonical either way.
         t.copyToTop("px", "_px_eq");
         t.copyToTop("qx", "_qx_eq");
-        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_cond",
+        t.rawBlock(List.of("_px_eq", "_qx_eq"), "_xeq",
             e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("py", "_py_eq");
+        t.copyToTop("qy", "_qy_eq");
+        t.rawBlock(List.of("_py_eq", "_qy_eq"), "_yeq",
+            e -> e.accept(new OpcodeOp("OP_NUMEQUAL")));
+        t.copyToTop("_xeq", "_xeq_c");
+        t.toTop("_yeq");
+        t.rawBlock(List.of("_xeq_c", "_yeq"), "_cond",
+            e -> e.accept(new OpcodeOp("OP_BOOLAND")));
+        // notinf = NOT(xeq - cond): xeq - cond is 1 exactly when px == qx and
+        // the points are not equal, i.e. exactly the P == -Q case.
+        t.toTop("_xeq");
+        t.copyToTop("_cond", "_cond_c");
+        t.rawBlock(List.of("_xeq", "_cond_c"), "_notinf", e -> {
+            e.accept(new OpcodeOp("OP_SUB"));
+            e.accept(new OpcodeOp("OP_NOT"));
+        });
 
         // chord numerator / denominator
         t.copyToTop("qy", "_qy1");
@@ -500,6 +539,16 @@ public final class Ec {
         t.toTop("py"); t.drop();
         t.toTop("qx"); t.drop();
         t.toTop("qy"); t.drop();
+
+        // P == -Q -> force the all-zero point (see the header comment).
+        t.toTop("rx");
+        t.copyToTop("_notinf", "_notinf_x");
+        t.rawBlock(List.of("rx", "_notinf_x"), "rx",
+            e -> e.accept(new OpcodeOp("OP_MUL")));
+        t.toTop("ry");
+        t.toTop("_notinf");
+        t.rawBlock(List.of("ry", "_notinf"), "ry",
+            e -> e.accept(new OpcodeOp("OP_MUL")));
     }
 
     // ==================================================================
@@ -578,8 +627,18 @@ public final class Ec {
      * Stack: [..., ax, ay, _k, jx, jy, jz]
      */
     private static void buildJacobianAddAffineInline(Consumer<StackOp> e, ECTracker t) {
-        ECTracker it = new ECTracker(t.nm, e);
+        jacobianAddAffineBody(new ECTracker(t.nm, e), false);
+    }
 
+    /**
+     * The mixed-add itself, emitting through an ECTracker the caller owns.
+     *
+     * <p>{@code keepHR} additionally leaves copies of H and R on the stack. They are the
+     * exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when the
+     * Jacobian accumulator is the same curve point as the affine operand, the one case
+     * these formulas cannot compute (see buildJacobianAddOrDoubleInline).
+     */
+    private static void jacobianAddAffineBody(ECTracker it, boolean keepHR) {
         // Save copies of values consumed but needed later
         it.copyToTop("jz", "_jz_for_z1cu");
         it.copyToTop("jz", "_jz_for_z3");
@@ -606,6 +665,11 @@ public final class Ec {
 
         // R = S2 - jy
         fieldSub(it, "_S2", "jy", "_R");
+
+        if (keepHR) {
+            it.copyToTop("_H", "_H_keep");
+            it.copyToTop("_R", "_R_keep");
+        }
 
         // Save copies of H
         it.copyToTop("_H", "_H_for_h3");
@@ -650,6 +714,118 @@ public final class Ec {
         it.toTop("_Z3"); it.rename("jz");
     }
 
+    /**
+     * Branchless select of one Jacobian coordinate: {@code add + cond*(dbl - add)}.
+     * Same shape as the numerator/denominator select in affineAdd, so both paths emit
+     * the identical op sequence and the tracker's static stack model holds.
+     * Consumes addName, dblName and condName.
+     */
+    private static void selectCoord(ECTracker t, String addName, String dblName,
+                                    String condName, String resultName) {
+        t.copyToTop(addName, "_sel_add_c");
+        fieldSub(t, dblName, "_sel_add_c", "_sel_diff");
+        fieldMul(t, "_sel_diff", condName, "_sel_scaled");
+        fieldAdd(t, addName, "_sel_scaled", resultName);
+    }
+
+    /**
+     * The ladder's LAST conditional step: mixed-add, but correct when the accumulator
+     * already equals the point being added.
+     *
+     * <p>The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the two
+     * operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at infinity —
+     * and since fieldInv is Fermat (inv(0) = 0), jacobianToAffine turns that into the
+     * ALL-ZERO point instead of 2P. {@code ecMul(P, 2n)} and {@code ecMulGen(2n)}
+     * returned 64 zero bytes.
+     *
+     * <p>WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+     * c_i = k' &gt;&gt; i and k' = k + 3n, so the conditional step adds P to (c_i - 1)*P.
+     * secp256k1 has cofactor 1, so P has order n and the degenerate cases are exactly
+     * c_i == 2 (mod n) — accumulator == P — and c_i == 0 or 1 (mod n) — accumulator == -P
+     * or O. c_i ranges over a CONTIGUOUS interval determined only by i, so this is
+     * decidable by interval arithmetic rather than by sampling, and over the whole domain
+     * k in [0, n-1] only two steps qualify, both at i = 0:
+     *
+     * <pre>
+     *   k = 2  -&gt;  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P.  &lt;- bug
+     *   k = 0  -&gt;  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+     *              true result the point at infinity, which affine coordinates
+     *              cannot represent; it stays the all-zero point, as before.
+     * </pre>
+     *
+     * <p>At i &gt;= 1, c_i lies in [3n&gt;&gt;i, (4n-1)&gt;&gt;i] — the lower bound is 3n,
+     * not 3n+1, because the reduce puts k = 0 in the domain — and that interval contains
+     * no value == 0, 1 or 2 (mod n) that is also odd; c_256 = 2 is even, so no add runs.
+     * Handling H == 0 at every one of the 257 steps would cost ~70% more script bytes;
+     * handling it here costs 0.26%. The operand P is caller-supplied but cannot move the
+     * exception, because the condition depends only on c_i mod ord(P) and ord(P) = n for
+     * every point on the curve. Points that are NOT on the curve carry no such guarantee —
+     * gate untrusted input on {@code ecOnCurve} first.
+     *
+     * <p>THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true because
+     * {@code emitEcMul} reduces k mod n before adding 3n. That reduce landed one commit
+     * AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS UNSOUND: a
+     * last-step-only select while the scalar is still unbounded leaves c_i free to hit
+     * 0, 1 or 2 (mod n) at other steps. The two commits must land together and must never
+     * be bisected, cherry-picked or reverted apart.
+     *
+     * <p>The interval argument does 100% of the work; there is no defence in depth here.
+     * In particular c_i == 1 (mod n) — a pre-add accumulator of O — is UNREACHABLE, not
+     * handled: were it reachable the select would still take the ADD path, because O is
+     * carried as Z1 = 0, which makes U2 = 0 and H = -X1 != 0. Anything that changes the
+     * +3n offset, the iteration count or the reduce must redo the interval check, not
+     * assume this still holds.
+     *
+     * <p>Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+     */
+    private static void buildJacobianAddOrDoubleInline(Consumer<StackOp> e, ECTracker t) {
+        ECTracker it = new ECTracker(t.nm, e);
+
+        // Keep the pre-add accumulator: it is what must be DOUBLED in the
+        // exceptional case, and the add below consumes jx/jy/jz.
+        it.copyToTop("jx", "_sx");
+        it.copyToTop("jy", "_sy");
+        it.copyToTop("jz", "_sz");
+
+        jacobianAddAffineBody(it, true);
+
+        // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+        // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+        // signals the point at infinity.
+        it.toTop("_H_keep");
+        it.pushInt("_zero_h", 0);
+        it.rawBlock(List.of("_H_keep", "_zero_h"), "_h_is0",
+                e2 -> e2.accept(new OpcodeOp("OP_NUMEQUAL")));
+        it.toTop("_R_keep");
+        it.pushInt("_zero_r", 0);
+        it.rawBlock(List.of("_R_keep", "_zero_r"), "_r_is0",
+                e2 -> e2.accept(new OpcodeOp("OP_NUMEQUAL")));
+        it.toTop("_h_is0");
+        it.toTop("_r_is0");
+        it.rawBlock(List.of("_h_is0", "_r_is0"), "_cond",
+                e2 -> e2.accept(new OpcodeOp("OP_BOOLAND")));
+
+        // Move the add result aside so jacobianDouble can work on jx/jy/jz again,
+        // this time holding the saved accumulator.
+        it.toTop("jx"); it.rename("_add_x");
+        it.toTop("jy"); it.rename("_add_y");
+        it.toTop("jz"); it.rename("_add_z");
+        it.toTop("_sx"); it.rename("jx");
+        it.toTop("_sy"); it.rename("jy");
+        it.toTop("_sz"); it.rename("jz");
+        jacobianDouble(it);
+        it.toTop("jx"); it.rename("_dbl_x");
+        it.toTop("jy"); it.rename("_dbl_y");
+        it.toTop("jz"); it.rename("_dbl_z");
+
+        it.copyToTop("_cond", "_cond_x");
+        selectCoord(it, "_add_x", "_dbl_x", "_cond_x", "jx");
+        it.copyToTop("_cond", "_cond_y");
+        selectCoord(it, "_add_y", "_dbl_y", "_cond_y", "jy");
+        it.toTop("_cond"); it.rename("_cond_z");
+        selectCoord(it, "_add_z", "_dbl_z", "_cond_z", "jz");
+    }
+
     // ==================================================================
     // Public entry points
     // ==================================================================
@@ -662,14 +838,46 @@ public final class Ec {
         composePoint(t, "rx", "ry", "_result");
     }
 
+    /**
+     * Reduces a scalar to [0, n-1]: ((k mod n) + n) mod n.
+     *
+     * <p>OP_MOD takes the sign of the DIVIDEND, so {@code k mod n} alone lands in
+     * (-n, n); the {@code + n, mod n} normalises the negative half. One push of n
+     * covers both reductions — the same shape as {@code emitEcModReduce}.
+     *
+     * <p>Without it, {@link #emitEcMul}'s ladder is only correct while
+     * 2^257 &lt;= k + 3n &lt; 2^258: a scalar &gt;= ~n sets bit 258, the
+     * 257-iteration loop never sees it, and the ladder returns a DIFFERENT
+     * multiple of P rather than failing. Scalars are contract input, so that is
+     * attacker-chosen. Reducing costs 1 push + 8 opcodes (42 bytes) against a
+     * ~429 KB script, and makes k &gt;= n, k &lt; 0 and k = 0 all well defined.
+     */
+    private static void emitScalarReduce(ECTracker t, String kName, String resultName) {
+        t.pushBigInt("_n_red", EC_CURVE_N);
+        t.rawBlock(List.of(kName, "_n_red"), resultName, e -> {
+            e.accept(new OpcodeOp("OP_2DUP"));
+            e.accept(new OpcodeOp("OP_MOD"));
+            e.accept(new RotOp());
+            e.accept(new DropOp());
+            e.accept(new OverOp());
+            e.accept(new OpcodeOp("OP_ADD"));
+            e.accept(new SwapOp());
+            e.accept(new OpcodeOp("OP_MOD"));
+        });
+    }
+
     public static void emitEcMul(Consumer<StackOp> emit) {
         ECTracker t = new ECTracker(List.of("_pt", "_k"), emit);
         decomposePoint(t, "_pt", "ax", "ay");
 
         // k' = k + 3n
+        //
+        // "k in [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar
+        // is usually an unlock argument — so reduce it first.
         t.toTop("_k");
+        emitScalarReduce(t, "_k", "_kr");
         t.pushBigInt("_n", EC_CURVE_N);
-        t.rawBlock(List.of("_k", "_n"), "_kn", e -> e.accept(new OpcodeOp("OP_ADD")));
+        t.rawBlock(List.of("_kr", "_n"), "_kn", e -> e.accept(new OpcodeOp("OP_ADD")));
         t.pushBigInt("_n2", EC_CURVE_N);
         t.rawBlock(List.of("_kn", "_n2"), "_kn2", e -> e.accept(new OpcodeOp("OP_ADD")));
         t.pushBigInt("_n3", EC_CURVE_N);
@@ -706,7 +914,13 @@ public final class Ec {
             t.toTop("_bit");
             t.nm.remove(t.nm.size() - 1); // _bit consumed by IF
             List<StackOp> addOps = new ArrayList<>();
-            buildJacobianAddAffineInline(addOps::add, t);
+            // Only the final step can be handed two equal operands — see
+            // buildJacobianAddOrDoubleInline for why, and for what it costs not to.
+            if (bit == 0) {
+                buildJacobianAddOrDoubleInline(addOps::add, t);
+            } else {
+                buildJacobianAddAffineInline(addOps::add, t);
+            }
             emit.accept(new IfOp(addOps, List.of()));
         }
 

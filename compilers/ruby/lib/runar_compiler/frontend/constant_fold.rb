@@ -412,47 +412,50 @@ module RunarCompiler
         return value if kind == "method_call"
 
         if kind == "if"
-          cond_const = env[value.cond]
-          if cond_const && cond_const[0] == "bool"
-            cond_val = cond_const[1]
-            if cond_val
-              then_env = env.dup
-              folded_then = fold_bindings(value.then || [], then_env)
-              # Merge constants from taken branch back into env
-              folded_then.each do |b|
-                cv = anf_value_to_const(b.value)
-                env[b.name] = cv unless cv.nil?
-              end
-              new_v = IR::ANFValue.new(kind: "if")
-              new_v.cond = value.cond
-              new_v.then = folded_then
-              new_v.else_ = []
-              return new_v
-            else
-              else_env = env.dup
-              folded_else = fold_bindings(value.else_ || [], else_env)
-              folded_else.each do |b|
-                cv = anf_value_to_const(b.value)
-                env[b.name] = cv unless cv.nil?
-              end
-              new_v = IR::ANFValue.new(kind: "if")
-              new_v.cond = value.cond
-              new_v.then = []
-              new_v.else_ = folded_else
-              return new_v
-            end
-          else
-            # Condition not known -- fold both branches independently
-            then_env = env.dup
-            else_env = env.dup
-            folded_then = fold_bindings(value.then || [], then_env)
-            folded_else = fold_bindings(value.else_ || [], else_env)
-            new_v = IR::ANFValue.new(kind: "if")
-            new_v.cond = value.cond
-            new_v.then = folded_then
-            new_v.else_ = folded_else
-            return new_v
-          end
+          # Fold both arms independently, ALWAYS -- including when the
+          # condition is a compile-time constant.
+          #
+          # This pass used to "optimise" a statically-known condition by
+          # blanking the untaken arm (else_ = []) while LEAVING the `if` node
+          # itself in place, and by propagating the taken arm's constants into
+          # the enclosing env.  Both halves were unsound:
+          #
+          #   * An arm is not a free-floating binding list -- it carries a
+          #     STACK-SHAPE CONTRACT that ANF lowering establishes and stack
+          #     lowering depends on.  For two or more branch-merged locals both
+          #     arms end with the identical __merge$<i> result block, which is
+          #     how lower_if learns K and adopts the K results by name.
+          #     Blanking one arm makes the merged-result count 0, the N>=2
+          #     name-matched reconcile cannot fire, and ONE stack slot is
+          #     registered for K physical results -- every post-branch operand
+          #     then resolves one or more slots off.  At K=2 that miscompiled
+          #     SILENTLY: the deployed script accepted spends the source
+          #     rejects and rejected spends the source accepts.  At K=1 it
+          #     surfaced as "value not found on stack", a compile-time
+          #     rejection of source that compiles with folding disabled.
+          #   * Propagating the taken arm's constants outward is only sound if
+          #     the other arm is really gone.  The `if` node survives this
+          #     pass, so both arms are still emitted and either can run.
+          #
+          # Correct dead-arm elimination would have to delete the `if` and
+          # splice the live arm into the parent, re-establishing the parent's
+          # shape.  That is a lowering-level rewrite, not a fold, so it does
+          # not live here.  The bytes given up are the statically-dead arm's
+          # ops, which never execute.
+          then_env = env.dup
+          else_env = env.dup
+          folded_then = fold_bindings(value.then || [], then_env)
+          folded_else = fold_bindings(value.else_ || [], else_env)
+          new_v = IR::ANFValue.new(kind: "if")
+          new_v.cond = value.cond
+          new_v.then = folded_then
+          new_v.else_ = folded_else
+          # The declared result list survives folding untouched: folding an
+          # arm's bindings cannot change WHICH slots the arm leaves, and
+          # dropping the list would silently return the +if+ to the
+          # single-result reconcile it was migrated off.
+          new_v.results = value.results
+          return new_v
         end
 
         if kind == "loop"

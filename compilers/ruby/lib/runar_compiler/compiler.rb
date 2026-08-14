@@ -1093,6 +1093,7 @@ module RunarCompiler
       d["cond"] = v.cond unless v.cond.nil?
       d["then"] = v.then.map { |b| ser_binding.call(b) } unless v.then.nil?
       d["else"] = v.else_.map { |b| ser_binding.call(b) } unless v.else_.nil?
+      d["results"] = v.results unless v.results.nil? || v.results.empty?
       d["count"] = v.count unless v.count.nil?
       d["iterVar"] = v.iter_var unless v.iter_var.nil?
       # Loop start/step (#121). Match the TS reference byte-for-byte: start is

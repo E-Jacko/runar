@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url';
 import {
   executeOnChainAuthoritative,
   AssertionFailureError,
-} from 'runar-sdk';
-import type { ANFProgram } from 'runar-ir-schema';
+} from '../../packages/runar-sdk/src/index.js';
+import type { ANFProgram } from '../../packages/runar-ir-schema/src/index.js';
 
 // Real-crypto counterpart to cross-interpreter.test.ts and
 // cross-interpreter-strict.test.ts.

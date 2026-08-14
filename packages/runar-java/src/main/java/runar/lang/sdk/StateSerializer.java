@@ -47,10 +47,10 @@ public final class StateSerializer {
                     Object elem = values.containsKey(synth)
                         ? values.get(synth)
                         : (flatFromArr != null && i < flatFromArr.size() ? flatFromArr.get(i) : null);
-                    sb.append(encodeStateValue(elem, leafType));
+                    sb.append(encodeStateValue(elem, leafType, synth));
                 }
             } else {
-                sb.append(encodeStateValue(values.get(f.name()), f.type()));
+                sb.append(encodeStateValue(values.get(f.name()), f.type(), f.name()));
             }
         }
         return sb.toString();
@@ -96,9 +96,9 @@ public final class StateSerializer {
     // Encoding — matches Go encodeStateValue
     // ------------------------------------------------------------------
 
-    static String encodeStateValue(Object value, String fieldType) {
+    static String encodeStateValue(Object value, String fieldType, String label) {
         return switch (fieldType) {
-            case "int", "bigint" -> encodeNum2Bin(toBigInteger(value), 8);
+            case "int", "bigint" -> encodeNum2Bin(toBigInteger(value), 8, label);
             case "bool" -> Boolean.TRUE.equals(value) ? "01" : "00";
             case "PubKey", "Addr", "Ripemd160", "Sha256", "Point" -> String.valueOf(value);
             default -> {
@@ -109,8 +109,41 @@ public final class StateSerializer {
         };
     }
 
-    /** Encodes a BigInteger as {@code width}-byte little-endian sign-magnitude (OP_NUM2BIN). */
-    static String encodeNum2Bin(BigInteger n, int width) {
+    /**
+     * Encodes a BigInteger as {@code width}-byte little-endian sign-magnitude (OP_NUM2BIN).
+     *
+     * <p>FAILS CLOSED on an out-of-range magnitude. {@code width} bytes of sign-magnitude
+     * hold {@code 8*width - 1} magnitude bits — the top bit of the last byte is the sign.
+     * The copy below writes the low {@code width} bytes and drops everything above, then
+     * ORs the sign bit in on top of whatever landed there, so an oversized value used to
+     * serialise to a plausible but WRONG word:
+     *
+     * <pre>
+     * 2^63      -&gt; 0000000000000080   reads back as 0   (negative zero)
+     * 2^63 + 5  -&gt; 0500000000000080   reads back as -5  (sign flip)
+     * 2^64      -&gt; 0000000000000000   reads back as 0
+     * </pre>
+     *
+     * <p>The deploy then succeeded and the UTXO was unspendable: the covenant rebuilds the
+     * continuation with the compiler's own OP_NUM2BIN {@code width}, which cannot produce
+     * those bytes from that number, so hash256(outputs) never matches. Throwing here is the
+     * only place a runtime-computed state value can be stopped —
+     * {@code ±(2^(8*width-1) - 1)} remains representable and is unaffected.
+     *
+     * @throws IllegalArgumentException if the magnitude does not fit the state word
+     */
+    static String encodeNum2Bin(BigInteger n, int width, String label) {
+        BigInteger limit = BigInteger.ONE.shiftLeft(8 * width - 1);
+        if (n.abs().compareTo(limit) >= 0) {
+            throw new IllegalArgumentException(
+                "serializeState: bigint state field \"" + label + "\" = " + n
+                    + " does not fit the fixed " + width
+                    + "-byte sign-magnitude state word (magnitude must be < 2^"
+                    + (8 * width - 1) + "). Serializing it would write a different number into"
+                    + " the state section than the contract's on-chain OP_NUM2BIN " + width
+                    + " rebuilds, leaving the output unspendable.");
+        }
+
         boolean negative = n.signum() < 0;
         BigInteger abs = n.abs();
         byte[] buf = new byte[width];

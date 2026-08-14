@@ -5,6 +5,51 @@ All notable changes to Rúnar are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Testing architecture — six standing requirements for reviewers
+
+Two 2026-08 fund-safety bugs (`23ef2d2b` / merge `e7221a7b`) produced
+**unspendable or silently wrong** contracts while large parts of CI stayed
+green: branch-merged locals (all seven compilers, byte-identical and
+byte-identically wrong) and the state-section framing regression (all seven
+SDKs co-changed encoder and decoder, so every round-trip passed and **zero
+goldens moved**).
+
+The post-mortem produced six ranked testing-architecture requirements. They are
+**requirements, not preferences** — any change to the test suite must preserve
+them, and reviewers should load them before assessing a coverage claim. The
+authoritative list, with rationale and plan IDs, is
+[`docs/audit/2026-08-testing-gap-remediation-plan.md`](docs/audit/2026-08-testing-gap-remediation-plan.md)
+**§0.1**:
+
+1. **Broadcast validation is on by default.** Permissiveness is the allowlisted
+   exception, not the default — `MockProvider` validates through the real
+   `@bsv/sdk` `Spend` interpreter, and always-ack usage is machine-checked and
+   ratcheted (`packages/runar-sdk/src/__tests__/always-ack-allowlist.json`).
+2. **Coverage is counted in constructs, not fixtures.** A machine-checked
+   construct ledger (`conformance/construct-ledger.json`) makes empty cells
+   visible; both bugs were empty cells while the fixture count was healthy.
+3. **A wire-format change must move a golden.** A serializer change that moves
+   zero pinned bytes is untested by definition and blocks CI
+   (`conformance/scripts/wire-format-pr-audit.ts`).
+4. **Round-trip tests are never sufficient.** Every fund-critical wire
+   primitive needs ≥1 assertion against the *other* implementation of the
+   format, not its own inverse (`conformance/wire-primitives.json`).
+5. **Parity must be vertical, not only horizontal.** Seven-compiler agreement
+   and seven-SDK agreement do not substitute for a compiler↔SDK pin
+   (`conformance/sdk-vertical/`).
+6. **Fuzzing needs an absolute oracle.** Tier-vs-tier differential fuzz is
+   horizontal; `conformance/fuzzer --spend-oracle` grades against a real
+   `Spend` plus an independent state model.
+
+The one-line version, which the rest follows from: **horizontal agreement
+proves agreement, not correctness.** See
+[`docs/testing-guide.md`](docs/testing-guide.md) ⇒ "Layers of assurance" for
+the worked examples and which gate now catches which bug, and
+[`conformance/README.md`](conformance/README.md) for the provenance-discipline
+and weak-coverage-kind policies.
+
 ## [1.0.0-rc.1] — 2026-06-22
 
 First release candidate for 1.0.0. All seven compiler and SDK tiers are unified

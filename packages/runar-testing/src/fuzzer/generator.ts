@@ -856,20 +856,390 @@ function arbVarDeclStmtIR(
   }));
 }
 
-function arbIfStmtIR(
+// ---------------------------------------------------------------------------
+// Branch SHAPES (the 2026-08 branch-merged-locals blind spot)
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THESE EXIST
+ * ---------------
+ * Until 2026-08 `arbIfStmtIR` could emit exactly ONE branch shape: `then` and
+ * `else_` were each a single statement drawn from `arbAssertStmtIR`. A branch
+ * arm that REASSIGNS anything was not merely unlikely, it was OUTSIDE THE
+ * REACHABLE SPACE of `arbGeneratedContract` — and so was every local
+ * reassignment anywhere in it, because `arbVarDeclStmtIR` hard-coded
+ * `mutable: false` and no other statement generator emitted an `assign` with
+ * `isProperty: false`.
+ *
+ * That is exactly the shape of the confirmed branch-merged-local miscompile
+ * (PALMER-1, `conformance/tests/branch-merged-locals/`): two locals seeded
+ * from state, the arms of an `if` rebinding DIFFERENT ones, both read after
+ * the branch. It compiled cleanly, passed the ANF-interpreter tests, and was
+ * rejected by the real Script interpreter — a permanently unspendable contract
+ * from idiomatic source. The generator that drives BOTH the 7-tier `--ir`
+ * parity fuzzer and the `--execute` absolute oracle could never have produced
+ * it, at any seed or budget.
+ *
+ * The family below is the fix for the SPACE. `assert-only` is the historical
+ * shape, kept verbatim so no existing coverage is lost; every other member
+ * declares its carriers as MUTABLE locals before the branch and ends with an
+ * assert that READS every carrier, so a mis-resolved post-branch reference
+ * changes the spend verdict instead of being dead.
+ */
+export type BranchShape =
+  /** Historical shape: both arms are a single `assert`, nothing is rebound. */
+  | 'assert-only'
+  /** No branch at all: a mutable local rebound in STRAIGHT-LINE code, then
+   *  read. Before 2026-08 the only `assign` with `isProperty: false` in the
+   *  whole IR generator lived inside the exec-oracle's loop bodies. */
+  | 'straight-line-rebind'
+  /** One arm (no `else`) rebinds ONE local, which is read after the branch. */
+  | 'rebind-read-after'
+  /** BOTH arms rebind the SAME single local, which is read after the branch —
+   *  the k=1 merge. `both-arms-rebind-both` is its k=2 sibling; the pair is
+   *  what tells a k-sensitive merge bug apart from a general one, and that
+   *  distinction has already paid: forcing this shape on 2026-08-06 found the
+   *  k=1 branch-merge defect the 2026-08-05 k>=2 fix had not covered (see
+   *  `packages/runar-testing/src/__tests__/fuzzer-branch-shapes.test.ts`). */
+  | 'both-arms-rebind-one'
+  /** One arm rebinds >= 2 locals; the other only asserts. */
+  | 'multi-rebind-one-arm'
+  /** The PALMER-1 shape: `then` rebinds `merge0`, `else` rebinds `merge1`. */
+  | 'asymmetric-rebind'
+  /** Both arms rebind BOTH locals — the balanced control for the above. */
+  | 'both-arms-rebind-both'
+  /** A PROPERTY write inside an arm (stateful contracts only). */
+  | 'prop-write-in-arm';
+
+/** Branch shapes reachable in a stateless `SmartContract` (no property writes:
+ *  every property is readonly there). */
+export const BRANCH_SHAPES: readonly BranchShape[] = [
+  'assert-only',
+  'straight-line-rebind',
+  'rebind-read-after',
+  'both-arms-rebind-one',
+  'multi-rebind-one-arm',
+  'asymmetric-rebind',
+  'both-arms-rebind-both',
+];
+
+/** Branch shapes reachable in a `StatefulSmartContract` — the stateless set
+ *  plus the conditional property write (`conformance/tests/cond-write-multi-field`). */
+export const STATEFUL_BRANCH_SHAPES: readonly BranchShape[] = [
+  ...BRANCH_SHAPES,
+  'prop-write-in-arm',
+];
+
+/** The merged locals, named so the reachability test can re-derive the shape
+ *  from the IR without trusting a label. */
+const MERGE_LOCALS = ['merge0', 'merge1'] as const;
+
+/** Mutable locals a branch shape declares BEFORE its branch, in order. */
+export function branchShapeCarriers(shape: BranchShape): string[] {
+  switch (shape) {
+    case 'assert-only':
+      return [];
+    case 'straight-line-rebind':
+    case 'rebind-read-after':
+    case 'both-arms-rebind-one':
+    case 'prop-write-in-arm':
+      return [MERGE_LOCALS[0]];
+    case 'multi-rebind-one-arm':
+    case 'asymmetric-rebind':
+    case 'both-arms-rebind-both':
+      return [...MERGE_LOCALS];
+  }
+}
+
+/** `target = <bigint expr>` over a local. */
+function arbLocalRebind(target: string, bigintVars: string[]): fc.Arbitrary<Stmt> {
+  return arbBigintExprIR(bigintVars, 1).map((value): Stmt => ({
+    kind: 'assign',
+    target,
+    value,
+    isProperty: false,
+  }));
+}
+
+/**
+ * A terminal assert that READS every carrier. Without it a rebound local is
+ * dead after the branch, so a post-branch reference resolved to the wrong slot
+ * would not change any engine's verdict and no oracle downstream could see it.
+ */
+function arbCarrierReadClause(
+  carriers: string[],
+  bigintVars: string[],
+): fc.Arbitrary<Stmt> {
+  return fc
+    .tuple(
+      ...carriers.map((c) =>
+        fc
+          .tuple(
+            fc.constantFrom('===' as const, '!==' as const, '<' as const, '>' as const,
+              '<=' as const, '>=' as const),
+            arbBigintExprIR(bigintVars, 1),
+          )
+          .map(([op, right]): Expr => ({
+            kind: 'binary',
+            op,
+            left: { kind: 'var_ref', name: c },
+            right,
+          })),
+      ),
+    )
+    .map((clauses): Stmt => ({
+      kind: 'assert',
+      condition: (clauses as Expr[]).reduce((left, right): Expr => ({
+        kind: 'binary',
+        op: '&&',
+        left,
+        right,
+      })),
+    }));
+}
+
+/**
+ * A branch block of the requested shape: carrier declarations, the branch (or
+ * straight-line rebind), and the carrier read. `mutableProps` is the list of
+ * writable bigint property names — empty for a stateless contract, which is
+ * why `prop-write-in-arm` is stateful-only.
+ */
+function arbBranchBlockIR(
+  shape: BranchShape,
   bigintVars: string[],
   boolVars: string[],
-): fc.Arbitrary<Stmt> {
-  return fc.tuple(
-    arbBoolExprIR(bigintVars, boolVars, 1),
-    arbAssertStmtIR(bigintVars, boolVars),
-    fc.option(arbAssertStmtIR(bigintVars, boolVars)),
-  ).map(([condition, thenStmt, elseStmt]): Stmt => ({
-    kind: 'if',
-    condition,
-    then: [thenStmt],
-    else_: elseStmt ? [elseStmt] : undefined,
-  }));
+  mutableProps: string[],
+): fc.Arbitrary<Stmt[]> {
+  if (shape === 'assert-only') {
+    // Byte-for-byte the pre-2026-08 shape, so the historical corpus stays
+    // reachable rather than being replaced by the widened family.
+    return fc
+      .tuple(
+        arbBoolExprIR(bigintVars, boolVars, 1),
+        arbAssertStmtIR(bigintVars, boolVars),
+        fc.option(arbAssertStmtIR(bigintVars, boolVars)),
+      )
+      .map(([condition, thenStmt, elseStmt]): Stmt[] => [
+        {
+          kind: 'if',
+          condition,
+          then: [thenStmt],
+          else_: elseStmt ? [elseStmt] : undefined,
+        },
+      ]);
+  }
+
+  const carriers = branchShapeCarriers(shape);
+  // The carriers are in scope for the rebind expressions and the read clause,
+  // so an arm can read the other merged local as well as write its own.
+  const inner = [...carriers, ...bigintVars];
+
+  return fc
+    .tuple(
+      // Carrier initialisers.
+      fc.tuple(...carriers.map(() => arbBigintExprIR(bigintVars, 1))),
+      arbBoolExprIR(bigintVars, boolVars, 1),
+      // Enough rebinds for the widest shape (both arms rebind both locals).
+      fc.tuple(
+        arbLocalRebind(carriers[0]!, inner),
+        arbLocalRebind(carriers[carriers.length - 1]!, inner),
+        arbLocalRebind(carriers[0]!, inner),
+        arbLocalRebind(carriers[carriers.length - 1]!, inner),
+      ),
+      arbAssertStmtIR(inner, boolVars),
+      mutableProps.length > 0
+        ? fc
+            .tuple(fc.constantFrom(...mutableProps), arbBigintExprIR(inner, 1))
+            .map(([target, value]): Stmt => ({
+              kind: 'assign',
+              target,
+              value,
+              isProperty: true,
+            }))
+        : fc.constant<Stmt | null>(null),
+      arbCarrierReadClause(carriers, inner),
+    )
+    .map(([inits, condition, rebinds, elseAssert, propWrite, readClause]): Stmt[] => {
+      const decls: Stmt[] = carriers.map((name, i) => ({
+        kind: 'var_decl',
+        name,
+        type: 'bigint',
+        value: inits[i]!,
+        mutable: true,
+      }));
+      const [r0, r1, r2, r3] = rebinds;
+      let branch: Stmt;
+      switch (shape) {
+        case 'straight-line-rebind':
+          // No branch at all — the straight-line local reassignment that had
+          // no representation anywhere in this generator.
+          return [...decls, r0, readClause];
+        case 'rebind-read-after':
+          branch = { kind: 'if', condition, then: [r0], else_: undefined };
+          break;
+        case 'both-arms-rebind-one':
+          branch = { kind: 'if', condition, then: [r0], else_: [r1] };
+          break;
+        case 'multi-rebind-one-arm':
+          branch = { kind: 'if', condition, then: [r0, r1], else_: [elseAssert] };
+          break;
+        case 'asymmetric-rebind':
+          branch = { kind: 'if', condition, then: [r0], else_: [r1] };
+          break;
+        case 'both-arms-rebind-both':
+          branch = { kind: 'if', condition, then: [r0, r1], else_: [r2, r3] };
+          break;
+        case 'prop-write-in-arm':
+          // A conditional STATE write beside a local rebind — the shape of
+          // `conformance/tests/cond-write-multi-field`. Stateful-only: a
+          // stateless contract has no writable property, so `propWrite` is
+          // null there. Say so instead of building a statement list with a
+          // hole in it, which surfaces as `Cannot read properties of null`
+          // from inside a renderer, several frames from the real mistake.
+          if (!propWrite) {
+            throw new Error(
+              "branch shape 'prop-write-in-arm' needs a writable bigint property: " +
+              'draw it from arbGeneratedStatefulContractWithShape, not the ' +
+              'stateless generator.',
+            );
+          }
+          branch = { kind: 'if', condition, then: [propWrite, r0], else_: [r1] };
+          break;
+      }
+      return [...decls, branch, readClause];
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Loop SHAPES for the cross-tier `--ir` generator
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THESE EXIST
+ * ---------------
+ * `arbMethodIR` / `arbStatefulMethodIR` never emitted a `ForStmt`, so the
+ * 7-tier `--ir` parity fuzzer had NEVER compiled a loop in any tier — and the
+ * native renderers refused one outright. The 2026-08 loop-carried-local
+ * miscompile moved bytes identically across all seven tiers; a cross-tier
+ * parity fuzzer would not have caught it either way, but it also could not
+ * have caught a tier that lowered the FIX differently, because it had no loop
+ * in its reachable space at all.
+ *
+ * The shapes are deliberately narrow: ascending, unit-step, half-open bounds —
+ * the only loop form all nine surface syntaxes express losslessly (the Rust
+ * DSL has `for i in a..b` and nothing else; see `requireNativeLoopForm` in
+ * `renderers.ts`). Bodies stay additive and small because a bounded loop is
+ * UNROLLED, so the body is emitted `count` times in every tier.
+ */
+export type IrLoopShape =
+  /** One carried local, self-accumulating. */
+  | 'single-carrier'
+  /** Two carried locals; the first is rebound then READ by the second in the
+   *  same iteration — the confirmed 2026-08 miscompile topology. */
+  | 'k2-cross-read'
+  /** The same cross-read one scope deeper, inside a NESTED loop. */
+  | 'nested-cross-read';
+
+export const IR_LOOP_SHAPES: readonly IrLoopShape[] = [
+  'single-carrier',
+  'k2-cross-read',
+  'nested-cross-read',
+];
+
+/** The loop-carried locals a shape declares, in order. */
+export function irLoopShapeCarriers(shape: IrLoopShape): string[] {
+  return shape === 'single-carrier' ? ['sum0'] : ['sum0', 'sum1'];
+}
+
+/**
+ * An accumulate term. Prefers a runtime bigint (property or parameter) so the
+ * body survives constant folding — a bounded loop is unrolled, and a body over
+ * literals and the loop counter alone is folded away before stack lowering, so
+ * the shape would be in the corpus and still never reach the code under test.
+ * Falls back to the loop counter when the method has no bigint in scope.
+ */
+function arbLoopTermIR(runtimeVars: string[], iterVars: string[]): fc.Arbitrary<Expr> {
+  const pool = runtimeVars.length > 0 ? runtimeVars : iterVars;
+  return fc.constantFrom(...pool).map((name): Expr =>
+    name.startsWith('this.')
+      ? { kind: 'property_ref', name: name.slice(5) }
+      : { kind: 'var_ref', name },
+  );
+}
+
+/** `target = target <op> <term>`. */
+function accumulateStmtIR(target: string, op: '+' | '-', term: Expr): Stmt {
+  return {
+    kind: 'assign',
+    target,
+    value: { kind: 'binary', op, left: { kind: 'var_ref', name: target }, right: term },
+    isProperty: false,
+  };
+}
+
+/**
+ * A loop block of the requested shape: carrier declarations, the (possibly
+ * nested) loop, and a terminal assert reading every carrier so the loop result
+ * decides the spend verdict.
+ */
+function arbIrLoopBlock(
+  shape: IrLoopShape,
+  bigintVars: string[],
+): fc.Arbitrary<Stmt[]> {
+  const carriers = irLoopShapeCarriers(shape);
+  const nested = shape === 'nested-cross-read';
+  const iterVars = nested ? ['k0', 'k1'] : ['k0'];
+  // The iteration variables are scoped to the loop, so only the carriers and
+  // the method's own props/params may appear in the POST-loop read clause.
+  const afterLoop = [...carriers, ...bigintVars];
+
+  return fc
+    .tuple(
+      fc.tuple(...carriers.map(() => arbBigintExprIR(bigintVars, 1))),
+      // Bounds: ascending, unit step, half-open — the cross-tier subset.
+      fc.tuple(fc.integer({ min: 0, max: 2 }), fc.integer({ min: 1, max: 3 })),
+      fc.tuple(fc.integer({ min: 0, max: 2 }), fc.integer({ min: 1, max: 2 })),
+      fc.constantFrom('+' as const, '-' as const),
+      fc.constantFrom('+' as const, '-' as const),
+      arbLoopTermIR(bigintVars, iterVars),
+      arbCarrierReadClause(carriers, afterLoop),
+    )
+    .map(([inits, outerB, innerB, accOp, crossOp, term, readClause]): Stmt[] => {
+      const decls: Stmt[] = carriers.map((name, i) => ({
+        kind: 'var_decl',
+        name,
+        type: 'bigint',
+        value: inits[i]!,
+        mutable: true,
+      }));
+      const body: Stmt[] =
+        shape === 'single-carrier'
+          ? [accumulateStmtIR('sum0', accOp, term)]
+          : [
+              accumulateStmtIR('sum0', accOp, term),
+              // `sum0` was just rebound and is READ here, in the same iteration.
+              accumulateStmtIR('sum1', crossOp, { kind: 'var_ref', name: 'sum0' }),
+            ];
+      const innerLoop: Stmt = {
+        kind: 'for',
+        iterVar: 'k1',
+        start: BigInt(innerB[0]),
+        bound: BigInt(innerB[0] + innerB[1]),
+        op: '<',
+        step: 1,
+        body,
+      };
+      const loop: Stmt = {
+        kind: 'for',
+        iterVar: 'k0',
+        start: BigInt(outerB[0]),
+        bound: BigInt(outerB[0] + outerB[1]),
+        op: '<',
+        step: 1,
+        body: nested ? [innerLoop] : body,
+      };
+      return [...decls, loop, readClause];
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +1249,8 @@ function arbIfStmtIR(
 function arbMethodIR(
   properties: GeneratedProperty[],
   config: GeneratorConfig,
+  forceBranchShape?: BranchShape,
+  forceLoopShape?: IrLoopShape,
 ): fc.Arbitrary<GeneratedMethod> {
   return fc.tuple(
     fc.integer({ min: 0, max: 9 }).map((n) => `method${n}`),
@@ -908,14 +1280,30 @@ function arbMethodIR(
       ...params.filter((p) => p.type === 'boolean').map((p) => p.name),
     ];
 
+    // Stateless contracts have no writable properties, so no property write
+    // can appear in a branch arm here — that shape is stateful-only.
+    const branchBlock = fc
+      .constantFrom(...(forceBranchShape ? [forceBranchShape] : BRANCH_SHAPES))
+      .chain((shape) => arbBranchBlockIR(shape, bigintVars, boolVars, []));
+    const loopBlock = fc
+      .constantFrom(...(forceLoopShape ? [forceLoopShape] : IR_LOOP_SHAPES))
+      .chain((shape) => arbIrLoopBlock(shape, bigintVars));
+
     return fc.tuple(
       fc.array(arbVarDeclStmtIR(bigintVars), { minLength: 0, maxLength: 2 }),
-      fc.array(arbIfStmtIR(bigintVars, boolVars), { minLength: 0, maxLength: 1 }),
+      fc.array(branchBlock, {
+        minLength: forceBranchShape ? 1 : 0,
+        maxLength: 1,
+      }),
+      // At most ONE loop per method: a bounded loop is unrolled, so each extra
+      // one multiplies the emitted Stack IR in all seven tiers.
+      fc.array(loopBlock, { minLength: forceLoopShape ? 1 : 0, maxLength: 1 }),
       fc.array(arbAssertStmtIR(bigintVars, boolVars), { minLength: 1, maxLength: 2 }),
-    ).map(([decls, ifs, asserts]): GeneratedMethod => {
+    ).map(([decls, branches, loops, asserts]): GeneratedMethod => {
       const body: Stmt[] = [
         ...decls.map((d) => d.stmt),
-        ...ifs,
+        ...branches.flat(),
+        ...loops.flat(),
         ...asserts,
       ];
 
@@ -933,6 +1321,8 @@ function arbMethodIR(
 function arbStatefulMethodIR(
   properties: GeneratedProperty[],
   config: GeneratorConfig,
+  forceBranchShape?: BranchShape,
+  forceLoopShape?: IrLoopShape,
 ): fc.Arbitrary<GeneratedMethod> {
   const mutableProps = properties.filter((p) => !p.readonly);
 
@@ -960,11 +1350,24 @@ function arbStatefulMethodIR(
     ];
     const boolVars = properties.filter((p) => p.type === 'boolean').map((p) => `this.${p.name}`);
 
+    const mutableBigintProps = mutableProps
+      .filter((p) => p.type === 'bigint')
+      .map((p) => p.name);
+    // `prop-write-in-arm` needs a writable bigint property; drop it when the
+    // drawn contract has none (every mutable property could be non-bigint).
+    const shapePool = mutableBigintProps.length > 0 ? STATEFUL_BRANCH_SHAPES : BRANCH_SHAPES;
+    const branchBlock = fc
+      .constantFrom(...(forceBranchShape ? [forceBranchShape] : shapePool))
+      .chain((shape) => arbBranchBlockIR(shape, bigintVars, boolVars, mutableBigintProps));
+    const loopBlock = fc
+      .constantFrom(...(forceLoopShape ? [forceLoopShape] : IR_LOOP_SHAPES))
+      .chain((shape) => arbIrLoopBlock(shape, bigintVars));
+
     return fc.tuple(
       // State mutations
       fc.array(
         fc.tuple(
-          fc.constantFrom(...mutableProps.filter((p) => p.type === 'bigint').map((p) => p.name)),
+          fc.constantFrom(...mutableBigintProps),
           arbBigintExprIR(bigintVars, 1),
         ).map(([target, value]): Stmt => ({
           kind: 'assign',
@@ -975,20 +1378,83 @@ function arbStatefulMethodIR(
         { minLength: 1, maxLength: Math.min(2, mutableProps.length) },
       ),
       fc.array(arbAssertStmtIR(bigintVars, boolVars), { minLength: 0, maxLength: 1 }),
-    ).map(([mutations, asserts]): GeneratedMethod => ({
+      fc.array(branchBlock, { minLength: forceBranchShape ? 1 : 0, maxLength: 1 }),
+      fc.array(loopBlock, { minLength: forceLoopShape ? 1 : 0, maxLength: 1 }),
+      // The multi-output intrinsic (`this.addOutput(sats, ...)`). Drawn as a
+      // 0-or-1 element array so roughly half the methods carry an EXPLICIT
+      // continuation and the rest keep the compiler-injected implicit one —
+      // both paths then have to agree across every tier.
+      arbAddOutputStmt(mutableProps),
+    ).map(([mutations, asserts, branches, loops, addOutputs]): GeneratedMethod => ({
       name,
       visibility: 'public',
       params,
-      body: [...asserts, ...mutations],
+      // `add_output` goes LAST: its operands are the post-mutation property
+      // values, which is the shape every checked-in example uses.
+      body: [...asserts, ...branches.flat(), ...loops.flat(), ...mutations, ...addOutputs],
       mutatesState: true,
     }));
   });
 }
 
 /**
- * Generate a random stateless GeneratedContract IR.
+ * `this.addOutput(satoshis, ...values)` — the multi-output intrinsic.
+ *
+ * Until 2026-08 `contract-ir.ts` had no node for it, so the intrinsic was
+ * unreachable from EVERY IR-based generator and its cross-tier parity was
+ * untested: `conformance/fuzzer/spend-shapes.ts` exercised it under the
+ * absolute post-state oracle, but that harness is TypeScript-only and proves
+ * nothing about the other six frontends.
+ *
+ * `values` is positional against the MUTABLE properties in DECLARATION ORDER,
+ * so the arity is fixed by the contract, not drawn. Passing each property's own
+ * post-mutation value makes the explicit continuation semantically equal to the
+ * implicit one the compiler would otherwise inject — any tier that disagrees
+ * about the state layout produces different bytes and fails the `--hex` gate.
  */
-export const arbGeneratedContract: fc.Arbitrary<GeneratedContract> = fc
+function arbAddOutputStmt(
+  mutableProps: GeneratedProperty[],
+): fc.Arbitrary<Stmt[]> {
+  if (mutableProps.length === 0) return fc.constant([]);
+  return fc.option(
+    fc.constantFrom(0n, 1n, 1000n).map((satoshis): Stmt => ({
+      kind: 'add_output',
+      satoshis,
+      values: mutableProps.map((p) => ({ kind: 'property_ref', name: p.name })),
+    })),
+    { nil: undefined },
+  ).map((s) => (s ? [s] : []));
+}
+
+/**
+ * Method names are drawn independently per method (`method0`..`method9`), so a
+ * contract with several methods can draw the same name twice. The surface
+ * languages do NOT agree on what that means: TypeScript and Ruby take the LAST
+ * definition and discard the first, while Java sees two different parameter
+ * lists and treats them as an OVERLOAD, keeping both. The same
+ * `GeneratedContract` therefore renders to genuinely different PROGRAMS per
+ * tier, and the "cross-tier divergence" that follows is a generator artifact,
+ * not a compiler bug. (Seed 987654 at `--num 200` hit it: {ts,go,rust,python}
+ * vs {java,ruby}, 2 bytes apart.)
+ *
+ * Uniquify with the same `X`-suffix convention the property and parameter draws
+ * already use.
+ */
+function dedupeMethodNames(methods: GeneratedMethod[]): GeneratedMethod[] {
+  const seen = new Set<string>();
+  return methods.map((m) => {
+    let name = m.name;
+    while (seen.has(name)) name += 'X';
+    seen.add(name);
+    return name === m.name ? m : { ...m, name };
+  });
+}
+
+function arbGeneratedContractOf(
+  forceBranchShape?: BranchShape,
+  forceLoopShape?: IrLoopShape,
+): fc.Arbitrary<GeneratedContract> {
+  return fc
   .tuple(
     fc.integer({ min: 0, max: 99 }).map((n) => `FuzzContract${n}`),
     fc.array(
@@ -1009,7 +1475,7 @@ export const arbGeneratedContract: fc.Arbitrary<GeneratedContract> = fc
     }
 
     return fc
-      .array(arbMethodIR(properties, DEFAULT_CONFIG), {
+      .array(arbMethodIR(properties, DEFAULT_CONFIG, forceBranchShape, forceLoopShape), {
         minLength: 1,
         maxLength: DEFAULT_CONFIG.maxMethods,
       })
@@ -1017,14 +1483,34 @@ export const arbGeneratedContract: fc.Arbitrary<GeneratedContract> = fc
         name,
         parentClass: 'SmartContract',
         properties,
-        methods,
+        methods: dedupeMethodNames(methods),
       }));
   });
+}
 
 /**
- * Generate a random stateful GeneratedContract IR.
+ * Generate a random stateless GeneratedContract IR.
  */
-export const arbGeneratedStatefulContract: fc.Arbitrary<GeneratedContract> = fc
+export const arbGeneratedContract: fc.Arbitrary<GeneratedContract> = arbGeneratedContractOf();
+
+/**
+ * The same generator with the branch topology and/or the loop topology PINNED.
+ * Only tests use these: they turn "every shape is reachable" from a probability
+ * argument into a deterministic, per-shape assertion (the same device
+ * `arbExecCaseWithLoopShape` provides for the exec-oracle corpus).
+ */
+export function arbGeneratedContractWithShape(
+  branch?: BranchShape,
+  loop?: IrLoopShape,
+): fc.Arbitrary<GeneratedContract> {
+  return arbGeneratedContractOf(branch, loop);
+}
+
+function arbGeneratedStatefulContractOf(
+  forceBranchShape?: BranchShape,
+  forceLoopShape?: IrLoopShape,
+): fc.Arbitrary<GeneratedContract> {
+  return fc
   .tuple(
     fc.integer({ min: 0, max: 99 }).map((n) => `FuzzStateful${n}`),
     // At least one mutable bigint property
@@ -1054,17 +1540,35 @@ export const arbGeneratedStatefulContract: fc.Arbitrary<GeneratedContract> = fc
     }
 
     return fc
-      .array(arbStatefulMethodIR(properties, DEFAULT_CONFIG), {
-        minLength: 1,
-        maxLength: DEFAULT_CONFIG.maxMethods,
-      })
+      .array(
+        arbStatefulMethodIR(properties, DEFAULT_CONFIG, forceBranchShape, forceLoopShape),
+        {
+          minLength: 1,
+          maxLength: DEFAULT_CONFIG.maxMethods,
+        },
+      )
       .map((methods): GeneratedContract => ({
         name,
         parentClass: 'StatefulSmartContract',
         properties,
-        methods,
+        methods: dedupeMethodNames(methods),
       }));
   });
+}
+
+/**
+ * Generate a random stateful GeneratedContract IR.
+ */
+export const arbGeneratedStatefulContract: fc.Arbitrary<GeneratedContract> =
+  arbGeneratedStatefulContractOf();
+
+/** The stateful generator with its branch / loop topology PINNED (tests only). */
+export function arbGeneratedStatefulContractWithShape(
+  branch?: BranchShape,
+  loop?: IrLoopShape,
+): fc.Arbitrary<GeneratedContract> {
+  return arbGeneratedStatefulContractOf(branch, loop);
+}
 
 // ===========================================================================
 // Tri-modal execution-oracle generator (issue #124)
@@ -1079,6 +1583,12 @@ export const arbGeneratedStatefulContract: fc.Arbitrary<GeneratedContract> = fc
 //   1. `for` loops with a NON-ZERO start counting up AND countdown loops.
 //   2. `substr` / `cat` / `len` byte-ops over ByteString PARAMETERS.
 //   3. post-loop parameter reads (a param referenced after a loop body).
+//
+// Since 2026-08 it also spans the loop-body TOPOLOGIES in `ExecLoopShape`:
+// bodies carrying two locals with an intra-iteration cross-read (the confirmed
+// fund-safety miscompile), its read-before-reassign control, and nested loops.
+// See the `ExecLoopShape` doc comment for why a single-accumulator body was a
+// REACHABILITY hole rather than bad luck.
 //
 // Every generated case is rendered to TypeScript ONLY (via `renderTypeScript`)
 // and carries its own concrete constructor + method inputs, so fast-check
@@ -1098,6 +1608,13 @@ export interface ExecCase {
   method: string;
   constructorArgs: Record<string, ExecArg>;
   args: ExecArg[]; // positional, in method-parameter order
+  /**
+   * The loop topology this case was drawn for, or `null` when it has no loop.
+   * Reported on findings so a divergence names its construct family. It is a
+   * LABEL, not a promise: the reachability test re-derives the shape from the
+   * generated IR and fails if the two disagree.
+   */
+  loopShape: ExecLoopShape | null;
 }
 
 /** Fixed ByteString length for all generated params/props — lets the byte-op
@@ -1203,60 +1720,257 @@ function arbBytesExpr(
   );
 }
 
-/** A bounded `for` loop (non-zero start counting up OR a countdown), body
- *  accumulating additively into `accVar`. */
-function arbForLoop(accVar: string, bigintVars: string[]): fc.Arbitrary<ForStmt> {
-  const iterVar = 'k';
-  const upShape = fc
+// ---------------------------------------------------------------------------
+// Loop-body SHAPES (the 2026-08 loop-carried-locals blind spot)
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THESE EXIST
+ * ---------------
+ * Until 2026-08 this generator could emit exactly ONE loop-body shape: every
+ * generated body statement targeted the SAME accumulator (`acc = acc <op>
+ * term`), and the term was drawn from a variable list that never contained
+ * `acc` itself. A loop body carrying TWO locals — one reassigned and then READ
+ * by a DIFFERENT statement in the same iteration — was therefore not merely
+ * unlikely, it was OUTSIDE THE GENERATOR'S REACHABLE SPACE: no seed, no time
+ * budget and no number of runs could ever produce it.
+ *
+ * That is precisely the shape of the confirmed 2026-08-06 fund-safety
+ * miscompile (`packages/runar-testing/src/__tests__/
+ * loop-carried-local-read-after-reassign-vm.test.ts`): a bounded loop that
+ * rebinds a carried local and reads it again in the same iteration compiled to
+ * a script computing `step*N` instead of `step*N*(N+1)/2` — silently and
+ * byte-identically in all seven tiers. Three bug-hunting waves missed it
+ * because the reachable space was the gap, not the runtime.
+ *
+ * The family below is the fix for the SPACE. Each shape is a body topology, not
+ * a value class; the accumulate terms, bounds, direction and surrounding
+ * clauses still vary randomly around it. `arbExecCaseWithLoopShape` pins one
+ * shape so a seeded unit test can PROVE each is produced rather than argue from
+ * probability.
+ *
+ * Both nested shapes were defects when this family was written on 2026-08-06:
+ * `nested-inner-cross-read` miscompiled silently (source `wacc = 30`, script
+ * `24`, all seven tiers) and `nested-outer-read` failed to compile at all
+ * ("Value 'acc' not found on stack"). Both are fixed; both stay in the corpus
+ * as the regression guard.
+ */
+export type ExecLoopShape =
+  /** Historical shape: ONE carried local, every body statement targets it. */
+  | 'single-carrier'
+  /** Two carried locals, neither reading the other — the accepting control. */
+  | 'k2-independent'
+  /** Two carried locals; `acc` is rebound, then READ by the next statement in
+   *  the same iteration. The confirmed-miscompile shape. */
+  | 'k2-cross-read'
+  /** Two carried locals; `acc` is READ BEFORE it is rebound. The known-safe
+   *  control — the generator must reach both so it can tell them apart. */
+  | 'k2-read-before-reassign'
+  /** NESTED loops with the cross-read in the INNER body, so at the outer level
+   *  the carried local is bound only inside the nested loop. */
+  | 'nested-inner-cross-read'
+  /** NESTED loops where the carried local is rebound only in the INNER body and
+   *  read at the OUTER level, after the inner loop closes. */
+  | 'nested-outer-read';
+
+/** Every loop shape the exec-oracle corpus must be able to reach. */
+export const EXEC_LOOP_SHAPES: readonly ExecLoopShape[] = [
+  'single-carrier',
+  'k2-independent',
+  'k2-cross-read',
+  'k2-read-before-reassign',
+  'nested-inner-cross-read',
+  'nested-outer-read',
+];
+
+/** The primary accumulator, carried across every loop shape. */
+const EXEC_ACC = 'acc';
+/** The second carried local — present in every shape except `single-carrier`. */
+const EXEC_WACC = 'wacc';
+
+/** Mutable locals a shape needs declared BEFORE its loop, in declaration order. */
+export function loopShapeCarriers(shape: ExecLoopShape): string[] {
+  return shape === 'single-carrier' ? [EXEC_ACC] : [EXEC_ACC, EXEC_WACC];
+}
+
+interface LoopBounds {
+  start: number;
+  bound: number;
+  op: '<' | '<=' | '>' | '>=';
+  step: 1 | -1;
+}
+
+/** Bounds for a bounded loop: NON-ZERO start counting up, OR a countdown. */
+function arbLoopBounds(maxCount: number): fc.Arbitrary<LoopBounds> {
+  const up = fc
     .record({
       start: fc.integer({ min: 0, max: 4 }),
-      count: fc.integer({ min: 1, max: 6 }),
+      count: fc.integer({ min: 1, max: maxCount }),
       op: fc.constantFrom('<' as const, '<=' as const),
     })
-    .map(({ start, count, op }) => ({
+    .map(({ start, count, op }): LoopBounds => ({
       start,
       bound: op === '<' ? start + count : start + count - 1,
       op,
-      step: 1 as const,
+      step: 1,
     }));
-  const downShape = fc
+  const down = fc
     .record({
       start: fc.integer({ min: 1, max: 8 }),
-      countRaw: fc.integer({ min: 1, max: 6 }),
+      countRaw: fc.integer({ min: 1, max: maxCount }),
       op: fc.constantFrom('>' as const, '>=' as const),
     })
-    .map(({ start, countRaw, op }) => {
+    .map(({ start, countRaw, op }): LoopBounds => {
       const count = Math.min(countRaw, start); // keep 1 <= count <= start
       return {
         start,
         bound: op === '>' ? start - count : start - count + 1,
         op,
-        step: -1 as const,
+        step: -1,
       };
     });
-  return fc.oneof(upShape, downShape).chain((shape) => {
-    const loopVars = [...bigintVars, iterVar];
+  return fc.oneof(up, down);
+}
+
+/** `target = target <op> <term>` over a local. */
+function accumulateStmt(target: string, op: '+' | '-', term: Expr): Stmt {
+  return {
+    kind: 'assign',
+    target,
+    value: { kind: 'binary', op, left: { kind: 'var_ref', name: target }, right: term },
+    isProperty: false,
+  };
+}
+
+/** `target = target <op> <otherLocal>` — the cross-read statement. */
+function crossReadStmt(target: string, op: '+' | '-', source: string): Stmt {
+  return accumulateStmt(target, op, { kind: 'var_ref', name: source });
+}
+
+/**
+ * An accumulate term that always references a RUNTIME bigint (a parameter or a
+ * property) when one is in scope.
+ *
+ * A bounded loop is UNROLLED at compile time, so a body built only from
+ * literals and the loop counter is entirely constant-folded before stack
+ * lowering ever sees it: the loop shape would be in the corpus and still never
+ * reach the code under test. `runtimeVars` is the props/params list — never a
+ * carrier, so the shape alone decides whether a carrier is cross-read.
+ */
+function arbAccumulateTerm(runtimeVars: string[], loopVars: string[]): fc.Arbitrary<Expr> {
+  if (runtimeVars.length === 0) return arbAdditiveExpr(loopVars, 1);
+  const runtimeRef = fc.constantFrom(...runtimeVars).map(bigintVarRef);
+  return fc.oneof(
+    runtimeRef,
+    fc
+      .tuple(runtimeRef, fc.constantFrom('+' as const, '-' as const), arbBigintAtom(loopVars))
+      .map(([left, op, right]): Expr => ({ kind: 'binary', op, left, right })),
+  );
+}
+
+/** The 1..2 self-accumulating statements of the historical single-carrier body. */
+function arbSingleCarrierBody(runtimeVars: string[], loopVars: string[]): fc.Arbitrary<Stmt[]> {
+  return fc.array(
+    fc
+      .tuple(fc.constantFrom('+' as const, '-' as const), arbAccumulateTerm(runtimeVars, loopVars))
+      .map(([op, term]) => accumulateStmt(EXEC_ACC, op, term)),
+    { minLength: 1, maxLength: 2 },
+  );
+}
+
+/** The two-carrier body for a given topology. `loopVars` never contains a
+ *  carrier, so only the shape itself decides whether a carrier is cross-read. */
+function arbK2Body(
+  shape: 'k2-independent' | 'k2-cross-read' | 'k2-read-before-reassign',
+  runtimeVars: string[],
+  loopVars: string[],
+): fc.Arbitrary<Stmt[]> {
+  return fc
+    .tuple(
+      fc.constantFrom('+' as const, '-' as const),
+      arbAccumulateTerm(runtimeVars, loopVars),
+      fc.constantFrom('+' as const, '-' as const),
+      arbAccumulateTerm(runtimeVars, loopVars),
+    )
+    .map(([accOp, accTerm, waccOp, waccTerm]): Stmt[] => {
+      const rebindAcc = accumulateStmt(EXEC_ACC, accOp, accTerm);
+      switch (shape) {
+        case 'k2-independent':
+          return [rebindAcc, accumulateStmt(EXEC_WACC, waccOp, waccTerm)];
+        case 'k2-cross-read':
+          // acc is rebound, then read again in the SAME iteration.
+          return [rebindAcc, crossReadStmt(EXEC_WACC, waccOp, EXEC_ACC)];
+        case 'k2-read-before-reassign':
+          // acc is read BEFORE its rebind — the accepting control.
+          return [crossReadStmt(EXEC_WACC, waccOp, EXEC_ACC), rebindAcc];
+      }
+    });
+}
+
+/**
+ * A bounded `for` loop of the requested body topology. `bigintVars` are the
+ * props/params in scope (never a carrier), so the carriers appear in the body
+ * only where the shape puts them.
+ */
+function arbForLoop(shape: ExecLoopShape, bigintVars: string[]): fc.Arbitrary<ForStmt> {
+  const iterVar = 'k';
+  if (shape === 'nested-inner-cross-read' || shape === 'nested-outer-read') {
+    const innerVar = 'k2';
+    const nestedVars = [...bigintVars, iterVar, innerVar];
+    // Both counts are small: a bounded loop is UNROLLED, so the nested body is
+    // emitted outer*inner times.
     return fc
-      .array(
-        fc
-          .tuple(fc.constantFrom('+' as const, '-' as const), arbAdditiveExpr(loopVars, 1))
-          .map(([op, term]): Stmt => ({
-            kind: 'assign',
-            target: accVar,
-            value: { kind: 'binary', op, left: { kind: 'var_ref', name: accVar }, right: term },
-            isProperty: false,
-          })),
-        { minLength: 1, maxLength: 2 },
+      .tuple(
+        arbLoopBounds(3),
+        arbLoopBounds(3),
+        shape === 'nested-inner-cross-read'
+          ? arbK2Body('k2-cross-read', bigintVars, nestedVars)
+          : fc
+              .tuple(fc.constantFrom('+' as const, '-' as const), arbAccumulateTerm(bigintVars, nestedVars))
+              .map(([op, term]): Stmt[] => [accumulateStmt(EXEC_ACC, op, term)]),
+        fc.constantFrom('+' as const, '-' as const),
       )
-      .map((body): ForStmt => ({
-        kind: 'for',
-        iterVar,
-        start: BigInt(shape.start),
-        bound: BigInt(shape.bound),
-        op: shape.op,
-        step: shape.step,
-        body,
-      }));
+      .map(([outer, inner, innerBody, outerOp]): ForStmt => {
+        const innerLoop: Stmt = {
+          kind: 'for',
+          iterVar: innerVar,
+          start: BigInt(inner.start),
+          bound: BigInt(inner.bound),
+          op: inner.op,
+          step: inner.step,
+          body: innerBody,
+        };
+        return {
+          kind: 'for',
+          iterVar,
+          start: BigInt(outer.start),
+          bound: BigInt(outer.bound),
+          op: outer.op,
+          step: outer.step,
+          // `nested-outer-read`: `acc` is bound ONLY inside the inner loop and
+          // read here, one scope out.
+          body:
+            shape === 'nested-outer-read'
+              ? [innerLoop, crossReadStmt(EXEC_WACC, outerOp, EXEC_ACC)]
+              : [innerLoop],
+        };
+      });
+  }
+  return arbLoopBounds(6).chain((bounds) => {
+    const loopVars = [...bigintVars, iterVar];
+    const body =
+      shape === 'single-carrier'
+        ? arbSingleCarrierBody(bigintVars, loopVars)
+        : arbK2Body(shape, bigintVars, loopVars);
+    return body.map((stmts): ForStmt => ({
+      kind: 'for',
+      iterVar,
+      start: BigInt(bounds.start),
+      bound: BigInt(bounds.bound),
+      op: bounds.op,
+      step: bounds.step,
+      body: stmts,
+    }));
   });
 }
 
@@ -1320,11 +2034,61 @@ function arbExtraClause(bigintVars: string[], bytesVars: BytesVar[]): fc.Arbitra
   return fc.oneof(numeric, bytesEq);
 }
 
-/** Generate the body of the single exec-oracle method for the given props/params. */
+/**
+ * A boolean clause that GUARANTEES a read of EVERY loop carrier after the
+ * loop. Without it a body could accumulate into `wacc` and never look at it,
+ * so a wrong `wacc` would not change the spend verdict and the tri-modal
+ * oracle would see nothing. Conjoined into the terminal assert, so the carrier
+ * values are what the script's accept/reject actually turns on.
+ *
+ * `bigintVars` INCLUDES the carriers, and that is load-bearing: this oracle
+ * compares VERDICTS, so a carrier that is off by some iterations' worth of
+ * accumulation is invisible unless the comparison's threshold falls between
+ * the right and wrong values. Carrier-relative comparisons (`wacc <cmp> acc *
+ * 2`) are the ones that do; an absolute threshold drawn from a fixed literal
+ * range almost never does, because a carrier that accumulated over N
+ * iterations is an order of magnitude away from it. Measured on a source-level
+ * emulation of the confirmed miscompile (the intra-iteration read of `acc`
+ * resolving to the dead pre-loop slot), 9.3% of generated `k2-cross-read`
+ * cases flip their verdict with this comparator; adding a wide absolute
+ * literal arm DROPPED that to 3.3% by diluting the carrier-relative draws.
+ */
+function arbCarrierClause(carriers: string[], bigintVars: string[]): fc.Arbitrary<Expr> {
+  const rhs = arbBoundedBigintExpr(bigintVars, 1);
+  return fc
+    .tuple(
+      ...carriers.map((c) =>
+        fc
+          .tuple(fc.constantFrom(...EXEC_CMP_OPS), rhs)
+          .map(([op, right]): Expr => ({
+            kind: 'binary',
+            op,
+            left: { kind: 'var_ref', name: c },
+            right,
+          })),
+      ),
+    )
+    .map((clauses) =>
+      (clauses as Expr[]).reduce((left, right): Expr => ({
+        kind: 'binary',
+        op: '&&',
+        left,
+        right,
+      })),
+    );
+}
+
+/**
+ * Generate the body of the single exec-oracle method for the given
+ * props/params. `forceLoopShape` pins the loop topology (and forces a loop to
+ * be present) — used by `arbExecCaseWithLoopShape` so a seeded test can prove
+ * each shape is produced instead of arguing from probability.
+ */
 function arbExecMethodBody(
   props: GeneratedProperty[],
   params: GeneratedParam[],
-): fc.Arbitrary<Stmt[]> {
+  forceLoopShape?: ExecLoopShape,
+): fc.Arbitrary<{ body: Stmt[]; loopShape: ExecLoopShape | null }> {
   const bigintPropParamVars = [
     ...props.filter((p) => p.type === 'bigint').map((p) => `this.${p.name}`),
     ...params.filter((p) => p.type === 'bigint').map((p) => p.name),
@@ -1341,8 +2105,14 @@ function arbExecMethodBody(
   return fc
     .record({
       accInit: arbAdditiveExpr(bigintPropParamVars, 1),
-      includeLoop: fc.boolean(),
-      loopBuilder: arbForLoop('acc', bigintPropParamVars),
+      waccInit: arbAdditiveExpr(bigintPropParamVars, 1),
+      includeLoop: forceLoopShape !== undefined ? fc.constant(true) : fc.boolean(),
+      loop: (forceLoopShape !== undefined
+        ? fc.constant(forceLoopShape)
+        : fc.constantFrom(...EXEC_LOOP_SHAPES)
+      ).chain((shape) =>
+        arbForLoop(shape, bigintPropParamVars).map((stmt) => ({ shape, stmt })),
+      ),
       numByteDecls: bytesBase.length > 0 ? fc.integer({ min: 0, max: 2 }) : fc.constant(0),
       byteExprs: fc.array(arbBytesExpr(bytesBase.length > 0 ? bytesBase : [{ ref: { kind: 'bigint_literal', value: 0n }, minLen: 0 }], 2), {
         minLength: 0,
@@ -1355,11 +2125,30 @@ function arbExecMethodBody(
     })
     .chain((cfg) => {
       const body: Stmt[] = [];
-      // Accumulator local (mutable so the loop can update it).
-      body.push({ kind: 'var_decl', name: 'acc', type: 'bigint', value: cfg.accInit, mutable: true });
-      const bigintVars = ['acc', ...bigintPropParamVars];
+      // Carried locals (mutable so the loop can update them). `acc` is always
+      // declared; `wacc` only for the multi-carrier shapes, so no shape leaves
+      // a local that nothing in the method ever touches.
+      const loopShape = cfg.includeLoop ? cfg.loop.shape : null;
+      const carriers = loopShape === null ? [EXEC_ACC] : loopShapeCarriers(loopShape);
+      body.push({
+        kind: 'var_decl',
+        name: EXEC_ACC,
+        type: 'bigint',
+        value: cfg.accInit,
+        mutable: true,
+      });
+      if (carriers.includes(EXEC_WACC)) {
+        body.push({
+          kind: 'var_decl',
+          name: EXEC_WACC,
+          type: 'bigint',
+          value: cfg.waccInit,
+          mutable: true,
+        });
+      }
+      const bigintVars = [...carriers, ...bigintPropParamVars];
 
-      if (cfg.includeLoop) body.push(cfg.loopBuilder);
+      if (cfg.includeLoop) body.push(cfg.loop.stmt);
 
       // Optional byte-op locals (only meaningful when ByteString vars exist).
       const bytesVars = [...bytesBase];
@@ -1373,14 +2162,24 @@ function arbExecMethodBody(
         }
       }
 
-      // Terminal assert: a guaranteed param read, optionally &&/|| an extra clause.
+      // Terminal assert: a guaranteed param read, optionally &&/|| an extra
+      // clause, AND — whenever a loop ran — a guaranteed read of every carrier
+      // so the loop's result decides the spend verdict.
       const param = params[Math.min(cfg.paramIdx, params.length - 1)]!;
-      return arbParamClause(param, bigintVars, bytesVars).map((clause): Stmt[] => {
-        const condition: Expr = cfg.useExtra
-          ? { kind: 'binary', op: cfg.logicalOp, left: clause, right: cfg.extra }
-          : clause;
-        return [...body, { kind: 'assert', condition }];
-      });
+      return fc
+        .tuple(
+          arbParamClause(param, bigintVars, bytesVars),
+          arbCarrierClause(carriers, bigintVars),
+        )
+        .map(([clause, carrierClause]): { body: Stmt[]; loopShape: ExecLoopShape | null } => {
+          const base: Expr = cfg.useExtra
+            ? { kind: 'binary', op: cfg.logicalOp, left: clause, right: cfg.extra }
+            : clause;
+          const condition: Expr = cfg.includeLoop
+            ? { kind: 'binary', op: '&&', left: base, right: carrierClause }
+            : base;
+          return { body: [...body, { kind: 'assert', condition }], loopShape };
+        });
     });
 }
 
@@ -1397,8 +2196,15 @@ function arbExecValue(type: RuinarType): fc.Arbitrary<ExecArg> {
 const EXEC_PROP_TYPES = ['bigint', 'ByteString'] as const;
 const EXEC_PARAM_TYPES = ['bigint', 'boolean', 'ByteString'] as const;
 
+interface ExecStructure {
+  contract: GeneratedContract;
+  method: GeneratedMethod;
+  loopShape: ExecLoopShape | null;
+}
+
 /** Generate the structural shell (contract + its single method). */
-const arbExecStructure: fc.Arbitrary<{ contract: GeneratedContract; method: GeneratedMethod }> = fc
+function arbExecStructure(forceLoopShape?: ExecLoopShape): fc.Arbitrary<ExecStructure> {
+  return fc
   .record({
     name: fc.integer({ min: 0, max: 9999 }).map((n) => `ExecFuzz${n}`),
     propDefs: fc.array(
@@ -1430,7 +2236,14 @@ const arbExecStructure: fc.Arbitrary<{ contract: GeneratedContract; method: Gene
       paramSeen.add(name);
       params.push({ name, type });
     }
-    return arbExecMethodBody(properties, params).map((body) => {
+    // Guarantee ONE runtime bigint. Bounded loops are unrolled, so a case with
+    // no bigint prop and no bigint param has a loop body of pure literals that
+    // the constant folder erases before stack lowering — the loop shape would
+    // be in the corpus and never reach the code under test.
+    const hasBigint =
+      properties.some((p) => p.type === 'bigint') || params.some((p) => p.type === 'bigint');
+    if (!hasBigint) params[0]!.type = 'bigint';
+    return arbExecMethodBody(properties, params, forceLoopShape).map(({ body, loopShape }) => {
       const method: GeneratedMethod = {
         name: s.methodName,
         visibility: 'public',
@@ -1444,9 +2257,34 @@ const arbExecStructure: fc.Arbitrary<{ contract: GeneratedContract; method: Gene
         properties,
         methods: [method],
       };
-      return { contract, method };
+      return { contract, method, loopShape };
     });
   });
+}
+
+function arbExecCaseOf(forceLoopShape?: ExecLoopShape): fc.Arbitrary<ExecCase> {
+  return arbExecStructure(forceLoopShape).chain(({ contract, method, loopShape }) => {
+    const ctorEntries = contract.properties.map(
+      (p) => [p.name, arbExecValue(p.type)] as const,
+    );
+    const ctorArb: fc.Arbitrary<Record<string, ExecArg>> =
+      ctorEntries.length === 0
+        ? fc.constant({})
+        : fc.record(Object.fromEntries(ctorEntries) as Record<string, fc.Arbitrary<ExecArg>>);
+    const argArbs = method.params.map((p) => arbExecValue(p.type));
+    const argsArb: fc.Arbitrary<ExecArg[]> =
+      argArbs.length === 0 ? fc.constant([]) : fc.tuple(...argArbs);
+    return fc.tuple(ctorArb, argsArb).map(
+      ([constructorArgs, args]): ExecCase => ({
+        contract,
+        method: method.name,
+        constructorArgs,
+        args,
+        loopShape,
+      }),
+    );
+  });
+}
 
 /**
  * A fully-concrete tri-modal execution-oracle case: a stateless contract with
@@ -1454,23 +2292,14 @@ const arbExecStructure: fc.Arbitrary<{ contract: GeneratedContract; method: Gene
  * inputs. fast-check property mode shrinks both the structure and the inputs to
  * a minimal repro on any tri-modal disagreement.
  */
-export const arbExecCase: fc.Arbitrary<ExecCase> = arbExecStructure.chain(({ contract, method }) => {
-  const ctorEntries = contract.properties.map(
-    (p) => [p.name, arbExecValue(p.type)] as const,
-  );
-  const ctorArb: fc.Arbitrary<Record<string, ExecArg>> =
-    ctorEntries.length === 0
-      ? fc.constant({})
-      : fc.record(Object.fromEntries(ctorEntries) as Record<string, fc.Arbitrary<ExecArg>>);
-  const argArbs = method.params.map((p) => arbExecValue(p.type));
-  const argsArb: fc.Arbitrary<ExecArg[]> =
-    argArbs.length === 0 ? fc.constant([]) : fc.tuple(...argArbs);
-  return fc.tuple(ctorArb, argsArb).map(
-    ([constructorArgs, args]): ExecCase => ({
-      contract,
-      method: method.name,
-      constructorArgs,
-      args,
-    }),
-  );
-});
+export const arbExecCase: fc.Arbitrary<ExecCase> = arbExecCaseOf();
+
+/**
+ * The same generator with the loop topology PINNED. Only a test uses this: it
+ * turns "every shape is reachable" from a probability argument into a
+ * deterministic, per-shape assertion (the fast-check analogue of the
+ * round-robin family draw in `conformance/fuzzer/spend-shapes.ts`).
+ */
+export function arbExecCaseWithLoopShape(shape: ExecLoopShape): fc.Arbitrary<ExecCase> {
+  return arbExecCaseOf(shape);
+}

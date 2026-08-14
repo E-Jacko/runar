@@ -205,6 +205,7 @@ def _lower_properties(contract: ContractNode) -> list[ANFProperty]:
         )
         if prop.initializer is not None:
             anf_prop.initial_value = _extract_literal_value(prop.initializer)
+            _check_state_bigint_magnitude(anf_prop)
         # Propagate synthetic FixedArray chain (set by expand_fixed_arrays)
         # so the artifact assembler can iteratively re-group synthetic runs.
         chain = getattr(prop, "synthetic_array_chain", None)
@@ -215,6 +216,46 @@ def _lower_properties(contract: ContractNode) -> list[ANFProperty]:
             ]
         result.append(anf_prop)
     return result
+
+
+# Magnitude a bigint state field gets: ``num2bin-le8`` is a fixed 8-byte
+# little-endian SIGN-MAGNITUDE word, so bytes 0..6 plus the low 7 bits of byte
+# 7 carry the magnitude and 0x80 of byte 7 carries the sign.
+_STATE_BIGINT_MAGNITUDE_LIMIT = 1 << 63
+
+
+def _check_state_bigint_magnitude(prop: ANFProperty) -> None:
+    """Reject a MUTABLE bigint property initialised beyond the 8-byte state word.
+
+    The state section writes every bigint field with OP_NUM2BIN 8, which cannot
+    represent a magnitude of 2**63 or more. Nothing used to check: the compiler
+    stamped ``encoding: "num2bin-le8"`` on the field and carried the initializer
+    verbatim, the SDK wrote the low 8 bytes of it into the deployed state
+    section, and the covenant then rebuilt the continuation with its own
+    OP_NUM2BIN 8 -- which produces different bytes -- so hash256(outputs) never
+    matched and the UTXO was permanently unspendable. It deployed cleanly, with
+    no diagnostic at compile time or deploy time.
+
+    This catches the statically-known half. Values that only exist at call time
+    are stopped by the SDK serializer (packages/runar-py/runar/sdk/state.py).
+
+    READONLY properties are deliberately exempt: they are baked into the locking
+    script as script-number pushes, never into the state section, and BSV script
+    numbers are arbitrary-precision after Genesis.
+    """
+    if prop.readonly or prop.type not in ("bigint", "int"):
+        return
+    value = prop.initial_value
+    if not isinstance(value, int) or isinstance(value, bool):
+        return
+    if -_STATE_BIGINT_MAGNITUDE_LIMIT < value < _STATE_BIGINT_MAGNITUDE_LIMIT:
+        return
+    raise ValueError(
+        f"Cannot compile state property '{prop.name}' initialised to {value}: it "
+        "does not fit the fixed 8-byte sign-magnitude state word (magnitude must "
+        "be < 2^63). Reduce the value, or make the property readonly if it is a "
+        "constant rather than state."
+    )
 
 
 def _flatten_add_output_args(args: list[Expression]) -> list[Expression]:
@@ -595,6 +636,10 @@ class _LowerCtx:
         # binds under the same mode as the method's declared sighash. ``None`` =
         # default ALL|FORKID, keeping the pinned binding blob unchanged.
         self.sighash_flag: int | None = None
+        # True in every context produced by ``sub_context()`` -- inside an if
+        # arm, a loop body, or an inlined helper's block -- and False only in
+        # the context a method's own body is lowered into.
+        self.nested: bool = False
         # Method-scoped parameter type table. Populated once per
         # method/constructor (and for auto-injected continuation params)
         # before its body is lowered. Mirrors the TS reference's
@@ -775,6 +820,11 @@ class _LowerCtx:
         sub._param_types = self._param_types
         sub._local_aliases = dict(self._local_aliases)
         sub._local_byte_vars = set(self._local_byte_vars)
+        # ``_lift_branch_update_props`` walks ``method.body`` and does NOT
+        # recurse, so an ``if`` its recogniser accepts is only actually
+        # REWRITTEN at method top level. ``lower_if_statement`` needs the same
+        # distinction before it defers to that pass.
+        sub.nested = True
         return sub
 
     def sync_counter(self, sub: _LowerCtx) -> None:
@@ -785,7 +835,14 @@ class _LowerCtx:
     # Statement lowering
     # -------------------------------------------------------------------
 
-    def lower_statements(self, stmts: list[Statement]) -> None:
+    def lower_statements(
+        self, stmts: list[Statement], reads_after_block: frozenset[str] = frozenset()
+    ) -> None:
+        """Lower a statement block, threading down the set of identifiers the
+        enclosing blocks still read after this block ends. Only the
+        block-forming statements (if / for) consume it; see
+        ``_reads_after_statement``.
+        """
         for i, stmt in enumerate(stmts):
             # Early-return nesting: when an if-statement's then-block ends with a
             # return and there is no else-branch, the remaining statements after the
@@ -803,11 +860,19 @@ class _LowerCtx:
                     then=stmt.then,
                     else_=remaining,
                 )
-                self.lower_statement(modified_if)
+                self.lower_statement(modified_if, reads_after_block)
                 return
-            self.lower_statement(stmt)
+            # Only the block-forming statements need to know what the code after
+            # them still reads; computing it for every statement would be
+            # quadratic for no benefit.
+            reads_after: frozenset[str] = frozenset()
+            if isinstance(stmt, (IfStmt, ForStmt)):
+                reads_after = _reads_after_statement(stmts, i, reads_after_block)
+            self.lower_statement(stmt, reads_after)
 
-    def lower_statement(self, stmt: Statement) -> None:
+    def lower_statement(
+        self, stmt: Statement, reads_after: frozenset[str] = frozenset()
+    ) -> None:
         # Propagate source location to emitted ANF bindings
         stmt_loc = getattr(stmt, "source_location", None)
         if stmt_loc is not None:
@@ -820,9 +885,9 @@ class _LowerCtx:
         elif isinstance(stmt, AssignmentStmt):
             self._lower_assignment(stmt)
         elif isinstance(stmt, IfStmt):
-            self._lower_if_statement(stmt)
+            self._lower_if_statement(stmt, reads_after)
         elif isinstance(stmt, ForStmt):
-            self._lower_for_statement(stmt)
+            self._lower_for_statement(stmt, reads_after)
         elif isinstance(stmt, ExpressionStmt):
             self.lower_expr_to_ref(stmt.expr)
         elif isinstance(stmt, ReturnStmt):
@@ -863,18 +928,20 @@ class _LowerCtx:
         # For other targets, lower the target expression
         self.lower_expr_to_ref(stmt.target)
 
-    def _lower_if_statement(self, stmt: IfStmt) -> None:
+    def _lower_if_statement(
+        self, stmt: IfStmt, reads_after: frozenset[str] = frozenset()
+    ) -> None:
         cond_ref = self.lower_expr_to_ref(stmt.condition)
 
         # Lower then-block into sub-context
         then_ctx = self.sub_context()
-        then_ctx.lower_statements(stmt.then)
+        then_ctx.lower_statements(stmt.then, reads_after)
         self.sync_counter(then_ctx)
 
         # Lower else-block into sub-context
         else_ctx = self.sub_context()
         if stmt.else_:
-            else_ctx.lower_statements(stmt.else_)
+            else_ctx.lower_statements(stmt.else_, reads_after)
         self.sync_counter(else_ctx)
 
         # 2026-04-30 audit finding F2: when a branch contains output
@@ -892,9 +959,11 @@ class _LowerCtx:
             or bool(then_ctx.get_add_data_output_refs() or else_ctx.get_add_data_output_refs())
         )
 
+        then_output_bytes = ""
+        else_output_bytes = ""
         if branch_has_outputs:
-            _append_branch_output_concat(then_ctx)
-            _append_branch_output_concat(else_ctx)
+            then_output_bytes = _append_branch_output_concat(then_ctx)
+            else_output_bytes = _append_branch_output_concat(else_ctx)
 
         # Branch-merged locals (2 or more). An ``if`` expression carries exactly
         # ONE value, so the alias below can only rewire post-branch references
@@ -908,21 +977,108 @@ class _LowerCtx:
         # Fix: give both arms the SAME result set in the SAME order by appending
         # an explicit rebind of every merged local to each arm.
         merged_locals = self._collect_branch_merged_locals(then_ctx, else_ctx)
-        if len(merged_locals) >= 2:
-            if branch_has_outputs:
-                # The arms' single value is already spoken for: it is the output
-                # concat the continuation hash consumes. Refuse at compile time
-                # rather than emit the unspendable script this used to produce.
+
+        if branch_has_outputs:
+            reason = _branch_output_rejection_reason(
+                then_ctx, else_ctx, then_output_bytes, else_output_bytes,
+                merged_locals, reads_after,
+            )
+            if reason is not None:
                 raise ValueError(
                     "Cannot compile conditional that both declares outputs and "
-                    f"merges {len(merged_locals)} local variables "
-                    f"({', '.join(merged_locals)}). Move the addOutput/"
-                    "addRawOutput/addDataOutput call after the if-statement, or "
-                    "give each branch its own complete addOutput."
+                    f"{reason}. Move the addOutput/addRawOutput/addDataOutput "
+                    "call after the if-statement."
                 )
-            _append_merged_local_results(then_ctx, merged_locals)
+
+        # The ``if``'s multi-result contract. Locals first, in the canonical
+        # merge order both arms agree on, then the properties either arm
+        # writes, in contract declaration order -- so all seven tiers derive the
+        # same list from the same source. ``results[0]`` is the deepest slot.
+        arm_props: list[str] = []
+        _collect_updated_props(then_ctx.bindings, arm_props)
+        _collect_updated_props(else_ctx.bindings, arm_props)
+        result_names = list(merged_locals) + [
+            p.name for p in self._contract.properties if p.name in arm_props
+        ]
+
+        # The result list is keyed by NAME everywhere downstream, so a local
+        # that shares a contract property's name appears TWICE and both entries
+        # take the PROPERTY path -- the local's value is silently replaced by
+        # the property's, and the layout assertion cannot see it because both
+        # slots are legitimately named the same. Refuse the exact collision
+        # only; shadowing a property is otherwise fine.
+        for _name in merged_locals:
+            if _name in arm_props:
+                raise ValueError(
+                    f"Local variable '{_name}' shadows contract property "
+                    f"'this.{_name}', and the conditional assigns both. The "
+                    f"branch's result slots are identified by name, so the two "
+                    f"cannot be told apart and the local's value would be "
+                    f"silently replaced by the property's. Rename the local."
+                )
+
+        # When to materialise the contract instead of leaving the arms to the
+        # stack-lowerer's inference:
+        #
+        #   - two or more merged locals -- the pre-existing normalisation. Kept
+        #     on exactly its old trigger so the four ``__merge$`` goldens do not
+        #     move.
+        #   - any result at all when the ELSE arm carries code. This is the new
+        #     case, and it is where every measured miscompile lives: one arm
+        #     rebinds its local IN PLACE (net depth 0) while the other pushes a
+        #     fresh slot (net +1), or an arm writes a property beside a rebound
+        #     local, or the two arms write the same properties in a different
+        #     order. The arms then leave different LAYOUTS, which no depth or
+        #     liveness predicate can see.
+        #
+        # An ``if`` WITHOUT an else keeps the preserve-the-old-value path in
+        # ``lower_if`` (phase 3 copies each missing slot's same-named parent
+        # value), which already produces exactly these results by construction
+        # -- deliberately left intact. An arm that emits outputs is excluded:
+        # its single value is the serialised output bytes, and
+        # ``_branch_output_rejection_reason`` above already refuses every
+        # combination that would need a second result.
+        #
+        # EXCLUDED: an ``if`` that ``_lift_branch_update_props`` will rewrite.
+        # That pass (deep-review finding C20) turns a
+        # conditional-property-assignment chain into one flat single-valued
+        # ``if`` per property plus a top-level ``update_prop``, so the surviving
+        # ``if``s carry no property result and need no declaration. Appending
+        # the normalisation block first would ALSO silently disable that pass:
+        # its recogniser requires the arm's last binding to be the
+        # ``update_prop`` with everything before it side-effect free, and the
+        # block adds a second ``update_prop`` behind it. TicTacToe's position
+        # dispatch is exactly that shape, and losing the lift there produced an
+        # unspendable ``move`` script.
+        #
+        # The exclusion must be exactly "the lift WILL rewrite this ``if``",
+        # which is narrower than "the lift's recogniser accepts it" in TWO ways
+        # -- both were live defects producing an unspendable UTXO: the lift only
+        # rewrites chains of TWO OR MORE branches (``_collect_update_branches``
+        # returns a ONE-element list for the assert-false-else guard), and it
+        # only walks ``method.body``, passing loop bodies and surviving arms
+        # through untouched, while ``declares_results`` is evaluated at EVERY
+        # nesting depth.
+        #
+        # A chain's DEEPEST ``if`` is never at top level, so it now declares
+        # results and carries a normalisation block -- which is why
+        # ``_collect_update_branches`` strips a declared block before matching
+        # (``_strip_declared_results``).
+        lifted = _collect_update_branches(
+            cond_ref, then_ctx.bindings, else_ctx.bindings
+        )
+        will_be_lifted = (
+            not self.nested and lifted is not None and len(lifted) >= 2
+        )
+        declares_results = not branch_has_outputs and not will_be_lifted and (
+            len(merged_locals) >= 2
+            or (len(result_names) >= 1 and bool(else_ctx.bindings))
+        )
+
+        if declares_results:
+            _append_branch_results(then_ctx, result_names, arm_props)
             self.sync_counter(then_ctx)
-            _append_merged_local_results(else_ctx, merged_locals)
+            _append_branch_results(else_ctx, result_names, arm_props)
             self.sync_counter(else_ctx)
 
         if_name = self.emit(ANFValue(
@@ -930,6 +1086,7 @@ class _LowerCtx:
             cond=cond_ref,
             then=then_ctx.bindings,
             else_=else_ctx.bindings,
+            results=list(result_names) if declares_results else None,
         ))
 
         if branch_has_outputs:
@@ -954,10 +1111,10 @@ class _LowerCtx:
         # If both branches end by reassigning the same single local variable,
         # alias that variable to the if-expression result.
         #
-        # Skipped when the arms were normalised above: there the ``if`` has N
-        # results, not one, and each merged local keeps its OWN name through the
+        # Skipped when the arms were normalised above: there the ``if``
+        # DECLARES its results, and each one keeps its OWN name through the
         # reconcile in the stack lowerer.
-        if len(merged_locals) < 2 and then_ctx.bindings and else_ctx.bindings:
+        if not declares_results and then_ctx.bindings and else_ctx.bindings:
             then_last = then_ctx.bindings[-1]
             else_last = else_ctx.bindings[-1]
             if then_last.name == else_last.name and self.is_local(then_last.name):
@@ -987,15 +1144,22 @@ class _LowerCtx:
                 merged.append(name)
         return merged
 
-    def _lower_for_statement(self, stmt: ForStmt) -> None:
+    def _lower_for_statement(
+        self, stmt: ForStmt, reads_after: frozenset[str] = frozenset()
+    ) -> None:
         # Resolve the loop's compile-time shape: start value, step direction,
         # and iteration count. Rúnar requires bounded loops, so all three must
         # be statically determinable (issue #121).
         start, step, count = _extract_loop_shape(stmt)
 
-        # Lower body into sub-context
+        # Lower body into sub-context. The body repeats, so every read anywhere
+        # in it is a read that happens after any given statement inside it.
+        body_reads = set(reads_after)
+        for s in stmt.body:
+            _collect_statement_reads(s, body_reads)
+
         body_ctx = self.sub_context()
-        body_ctx.lower_statements(stmt.body)
+        body_ctx.lower_statements(stmt.body, frozenset(body_reads))
         self.sync_counter(body_ctx)
 
         self.emit(ANFValue(
@@ -1626,29 +1790,38 @@ def _make_call(func_name: str, args: list[str]) -> ANFValue:
     )
 
 
-def _append_merged_local_results(branch_ctx, merged_locals: list[str]) -> None:
-    """Append the canonical merged-local result block to one arm of an
-    if-statement: a copy of every merged local, in canonical order, rebound
-    under the local's own name.
+def _append_branch_results(
+    branch_ctx, result_names: list[str], props: list[str]
+) -> None:
+    """Append the canonical result block to one arm of an if-statement: a copy
+    of every declared result, in the declared order, rebound under its own
+    name. This is what makes the ``if`` node's ``results`` contract true rather
+    than hoped-for.
 
-    Two passes on purpose. Pass 1 always COPIES: ``@ref:<local>`` resolves to
-    the arm's own new value if it rebound one, else to the enclosing scope's
-    value, and either way stack lowering picks (never rolls) it, because a local
-    live after the ``if`` is outer-protected. Pass 2 always CONSUMES, because
-    the temps are bound in this arm and this is their last use. The arm's stack
-    effect is therefore exactly +K regardless of which of the K locals it
-    reassigned.
+    Two passes on purpose. Pass 1 always COPIES: for a LOCAL, ``@ref:<local>``
+    resolves to the arm's own new value if it rebound one, else to the
+    enclosing scope's value; for a PROPERTY, ``load_prop`` picks the arm's
+    updated slot when the arm wrote it and otherwise the enclosing value.
+    Either way stack lowering picks (never rolls) it, because a declared result
+    is outer-protected. Pass 2 always CONSUMES, because the temps are bound in
+    this arm and this is their last use. The arm's stack effect is therefore
+    exactly +N regardless of which of the N results it assigned.
+
+    Semantically a no-op for the off-chain ANF interpreters: every binding is
+    an ordinary read-then-write of a value the arm already holds.
     """
-    for i, name in enumerate(merged_locals):
-        branch_ctx.emit_named(
-            f"{MERGED_LOCAL_TEMP_PREFIX}{i}",
-            _make_load_const_string(f"@ref:{name}"),
-        )
-    for i, name in enumerate(merged_locals):
-        branch_ctx.emit_named(
-            name,
-            _make_load_const_string(f"@ref:{MERGED_LOCAL_TEMP_PREFIX}{i}"),
-        )
+    for i, name in enumerate(result_names):
+        temp = f"{MERGED_LOCAL_TEMP_PREFIX}{i}"
+        if name in props:
+            branch_ctx.emit_named(temp, ANFValue(kind="load_prop", name=name))
+        else:
+            branch_ctx.emit_named(temp, _make_load_const_string(f"@ref:{name}"))
+    for i, name in enumerate(result_names):
+        temp = f"{MERGED_LOCAL_TEMP_PREFIX}{i}"
+        if name in props:
+            branch_ctx.emit(_make_update_prop(name, temp))
+        else:
+            branch_ctx.emit_named(name, _make_load_const_string(f"@ref:{temp}"))
 
 
 def _append_branch_output_concat(branch_ctx: "_LowerCtx") -> str:
@@ -1668,6 +1841,179 @@ def _append_branch_output_concat(branch_ctx: "_LowerCtx") -> str:
     for ref in all_refs[1:]:
         accumulated = branch_ctx.emit(_make_call("cat", [accumulated, ref]))
     return accumulated
+
+
+def _reads_after_statement(
+    stmts: list[Statement], index: int, reads_after_block: frozenset[str]
+) -> frozenset[str]:
+    """The identifiers still readable once statement ``index`` of this block has
+    run: everything the following statements in this block read, plus whatever
+    the enclosing blocks read after this block.
+
+    Used by ``_lower_if_statement`` to tell a branch-merged local that is dead
+    after the ``if`` (safe) from one that is still live (not representable
+    alongside a branch output -- see ``_branch_output_rejection_reason``).
+    """
+    reads = set(reads_after_block)
+    for stmt in stmts[index + 1:]:
+        _collect_statement_reads(stmt, reads)
+    return frozenset(reads)
+
+
+def _collect_statement_reads(stmt: Statement, out: set[str]) -> None:
+    """Collect every identifier a statement READS. The ``x`` in ``x = expr`` is
+    a write, not a read, so a plain identifier assignment target is skipped;
+    every other target form can still read locals.
+    """
+    if isinstance(stmt, VariableDeclStmt):
+        _collect_expression_reads(stmt.init, out)
+    elif isinstance(stmt, AssignmentStmt):
+        if not isinstance(stmt.target, Identifier):
+            _collect_expression_reads(stmt.target, out)
+        _collect_expression_reads(stmt.value, out)
+    elif isinstance(stmt, IfStmt):
+        _collect_expression_reads(stmt.condition, out)
+        for inner in stmt.then:
+            _collect_statement_reads(inner, out)
+        for inner in stmt.else_ or []:
+            _collect_statement_reads(inner, out)
+    elif isinstance(stmt, ForStmt):
+        if stmt.init is not None:
+            _collect_statement_reads(stmt.init, out)
+        _collect_expression_reads(stmt.condition, out)
+        if stmt.update is not None:
+            _collect_statement_reads(stmt.update, out)
+        for inner in stmt.body:
+            _collect_statement_reads(inner, out)
+    elif isinstance(stmt, ReturnStmt):
+        _collect_expression_reads(stmt.value, out)
+    elif isinstance(stmt, ExpressionStmt):
+        _collect_expression_reads(stmt.expr, out)
+
+
+def _collect_expression_reads(expr: Expression | None, out: set[str]) -> None:
+    """Collect every identifier an expression reads."""
+    if expr is None:
+        return
+    if isinstance(expr, Identifier):
+        out.add(expr.name)
+    elif isinstance(expr, BinaryExpr):
+        _collect_expression_reads(expr.left, out)
+        _collect_expression_reads(expr.right, out)
+    elif isinstance(expr, UnaryExpr):
+        _collect_expression_reads(expr.operand, out)
+    elif isinstance(expr, CallExpr):
+        _collect_expression_reads(expr.callee, out)
+        for a in expr.args:
+            _collect_expression_reads(a, out)
+    elif isinstance(expr, MemberExpr):
+        _collect_expression_reads(expr.object, out)
+    elif isinstance(expr, TernaryExpr):
+        _collect_expression_reads(expr.condition, out)
+        _collect_expression_reads(expr.consequent, out)
+        _collect_expression_reads(expr.alternate, out)
+    elif isinstance(expr, IndexAccessExpr):
+        _collect_expression_reads(expr.object, out)
+        _collect_expression_reads(expr.index, out)
+    elif isinstance(expr, (IncrementExpr, DecrementExpr)):
+        _collect_expression_reads(expr.operand, out)
+    elif isinstance(expr, ArrayLiteralExpr):
+        for e in expr.elements:
+            _collect_expression_reads(e, out)
+    # Literals and ``this.x`` property access read no locals.
+
+
+def _branch_output_rejection_reason(
+    then_ctx: "_LowerCtx",
+    else_ctx: "_LowerCtx",
+    then_output_bytes: str,
+    else_output_bytes: str,
+    merged_locals: list[str],
+    reads_after: frozenset[str],
+) -> str | None:
+    """Why an ``if`` whose arms declare outputs cannot be represented -- or
+    ``None`` when it can. The result is the reason clause the diagnostic embeds.
+
+    An ``if`` expression carries exactly ONE value, and when an arm emits an
+    output that value is already spoken for: it is the output bytes the
+    continuation hash consumes (``_append_branch_output_concat``). Anything ELSE
+    the arm leaves behind breaks one of two invariants nothing downstream
+    enforces:
+
+    INV-A
+        the parent registers the if-expression's value as the branch's
+        contribution to the continuation hash, so "the branch's output bytes"
+        really means "whatever the arm's LAST binding is". A binding that lands
+        after the output -- a rebound local, a property write -- silently
+        replaces the serialized output with an unrelated value, and the residue
+        drain then physically drops the real output because it is no longer on
+        top.
+    INV-B
+        an arm that emits an output AND leaves any other slot the parent can
+        still name -- a property write anywhere in the arm, or a rebound local
+        that is still read after the ``if`` -- leaves 2+ results against the ONE
+        stackMap name the stack lowerer registers, desyncing the parent stack by
+        a slot from there on. The residue drain cannot save it: it filters BY
+        NAME and those names are all pre-``if`` names.
+
+    Neither is visible off-chain, so both shipped as permanently unspendable
+    locking scripts. Refuse at compile time rather than emit one. See
+    packages/runar-testing/src/__tests__/branch-output-terminal-value-vm.test.ts
+    for the real-Script-VM proof of each shape.
+
+    The clauses are checked in a fixed order so all seven tiers report the same
+    reason for a source that trips more than one.
+    """
+    # 1. Two or more merged locals: normalising them would need a multi-result
+    #    ``if`` node, and the arms' single value is already the output concat.
+    if len(merged_locals) >= 2:
+        return (
+            f"merges {len(merged_locals)} local variables "
+            f"({', '.join(merged_locals)})"
+        )
+
+    arms = (("then", then_ctx, then_output_bytes), ("else", else_ctx, else_output_bytes))
+
+    # 2. INV-A: the arm's terminal binding must BE its output bytes.
+    for label, branch_ctx, output_bytes in arms:
+        if not branch_ctx.bindings or branch_ctx.bindings[-1].name != output_bytes:
+            return f"continues past its output in the {label}-branch"
+
+    # 3. INV-B: a property write leaves a slot the parent can still name,
+    #    wherever in the arm it sits.
+    written_props: list[str] = []
+    for _, branch_ctx, _ in arms:
+        _collect_updated_props(branch_ctx.bindings, written_props)
+    if written_props:
+        return (
+            f"assigns contract properties ({', '.join(written_props)}) "
+            "inside the branch"
+        )
+
+    # 4. INV-B: a rebound local that survives the ``if`` is protected from being
+    #    rolled away, so the arm ends one slot deeper than lowerIf accounts for.
+    live_merged = [name for name in merged_locals if name in reads_after]
+    if live_merged:
+        return f"reassigns local variables read after it ({', '.join(live_merged)})"
+
+    return None
+
+
+def _collect_updated_props(bindings: list[ANFBinding], out: list[str]) -> None:
+    """Append every property name an ANF binding list assigns, including the
+    ones nested inside an ``if`` arm or a ``loop`` body -- a nested write is just
+    as much a named slot the enclosing arm leaves behind.
+    """
+    for binding in bindings:
+        value = binding.value
+        if value.kind == "update_prop":
+            if value.name not in out:
+                out.append(value.name)
+        elif value.kind == "if":
+            _collect_updated_props(value.then or [], out)
+            _collect_updated_props(value.else_ or [], out)
+        elif value.kind == "loop":
+            _collect_updated_props(value.body or [], out)
 
 
 def _make_assert(value_ref: str) -> ANFValue:
@@ -2075,6 +2421,25 @@ def _is_assert_false_else(bindings: list[ANFBinding]) -> bool:
     return False
 
 
+def _strip_declared_results(
+    bindings: list[ANFBinding], results: list[str] | None
+) -> list[ANFBinding]:
+    """An arm with its declared-results block removed.
+
+    ``_append_branch_results`` adds exactly ``2 * len(results)`` trailing
+    bindings to each arm of an ``if`` that declares results. They are a
+    materialisation mechanism, not program logic, and they hide the arm's real
+    shape from this pass. A dispatch chain's deepest ``if`` is nested by
+    definition, so it declares results; without this the enclosing chain stops
+    being recognised and TicTacToe's position dispatch loses the C20 lift (an
+    unspendable ``move`` script).
+    """
+    n = len(results) if results else 0
+    if n == 0:
+        return bindings
+    return bindings[: max(0, len(bindings) - 2 * n)]
+
+
 def _collect_update_branches(
     if_cond: str,
     then_bindings: list[ANFBinding],
@@ -2109,8 +2474,8 @@ def _collect_update_branches(
 
         inner_branches = _collect_update_branches(
             last_else.value.cond or "",
-            last_else.value.then or [],
-            last_else.value.else_ or [],
+            _strip_declared_results(last_else.value.then or [], last_else.value.results),
+            _strip_declared_results(last_else.value.else_ or [], last_else.value.results),
         )
         if inner_branches is None:
             return None
@@ -2228,8 +2593,8 @@ def _lift_branch_update_props(bindings: list[ANFBinding]) -> list[ANFBinding]:
         if_val = binding.value
         branches = _collect_update_branches(
             if_val.cond or "",
-            if_val.then or [],
-            if_val.else_ or [],
+            _strip_declared_results(if_val.then or [], if_val.results),
+            _strip_declared_results(if_val.else_ or [], if_val.results),
         )
 
         if branches is None or len(branches) < 2:

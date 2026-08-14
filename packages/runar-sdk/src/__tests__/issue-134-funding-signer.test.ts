@@ -96,7 +96,7 @@ describe('#134 — deploy() funding inputs honor fundingSigner', () => {
     const fundingSigner = new LocalSigner(FUNDING_KEY);
     const fundingScript = buildP2PKHScript(await fundingSigner.getPublicKey());
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     await fundingCoinUnderMethodAddress(provider, methodSigner, fundingScript, 100_000, 'a1');
 
     const contract = new RunarContract(TRIVIAL_ARTIFACT, []);
@@ -113,7 +113,7 @@ describe('#134 — deploy() funding inputs honor fundingSigner', () => {
     const fundingSigner = new LocalSigner(FUNDING_KEY);
     const fundingScript = buildP2PKHScript(await fundingSigner.getPublicKey());
 
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet', { validateBroadcasts: false });
     await fundingCoinUnderMethodAddress(provider, methodSigner, fundingScript, 100_000, 'a1');
 
     const contract = new RunarContract(TRIVIAL_ARTIFACT, []);
@@ -132,7 +132,7 @@ describe('#134 — call() funding inputs honor fundingSigner', () => {
     const fundingScript = buildP2PKHScript(await fundingSigner.getPublicKey());
 
     // ---- without fundingSigner: funding input signed by methodSigner ----
-    const provA = new MockProvider();
+    const provA = new MockProvider('testnet', { validateBroadcasts: false });
     await fundingCoinUnderMethodAddress(provA, methodSigner, fundingScript, 100_000, 'b2');
     const contractA = new RunarContract(artifact, [0n]);
     await contractA.deploy(provA, methodSigner, { satoshis: 1_000 });
@@ -142,7 +142,7 @@ describe('#134 — call() funding inputs honor fundingSigner', () => {
     expect(trySpend(callTxA, 1, fundingScript, 100_000)).toBe(false);
 
     // ---- with fundingSigner: funding input signed by fundingSigner ----
-    const provB = new MockProvider();
+    const provB = new MockProvider('testnet', { validateBroadcasts: false });
     await fundingCoinUnderMethodAddress(provB, methodSigner, fundingScript, 100_000, 'b2');
     const contractB = new RunarContract(artifact, [0n]);
     await contractB.deploy(provB, methodSigner, { satoshis: 1_000 });

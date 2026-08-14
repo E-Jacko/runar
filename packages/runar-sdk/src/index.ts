@@ -15,6 +15,13 @@ export type {
 } from './types.js';
 
 // Providers
+// The never-validate MockProvider factory in providers/mock.ts (see the
+// comment above its declaration) is deliberately NOT re-exported here
+// (testing-gap remediation P1-3): it is test-only surface, gated by the
+// machine-checked always-ack allowlist (`src/__tests__/always-ack-
+// allowlist.test.ts`) — publishing it on the public barrel would let any
+// downstream consumer import an unvalidated broadcast provider ungated.
+// Tests import it directly from `../providers/mock.js`.
 export { WhatsOnChainProvider, MockProvider, RPCProvider, WalletProvider, GorillaPoolProvider } from './providers/index.js';
 export type { Provider, RPCProviderOptions, WalletProviderOptions, InscriptionInfo, InscriptionDetail } from './providers/index.js';
 

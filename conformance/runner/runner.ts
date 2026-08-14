@@ -2467,7 +2467,7 @@ function discoverFormats(testDir: string, testName: string): { ext: string; sour
     );
   }
   for (const ext of parserSkip) {
-    if (!allExts.includes(ext)) {
+    if (!(allExts as readonly string[]).includes(ext)) {
       throw new Error(
         `Conformance fixture '${testName}': source.json "parserSkip" lists ` +
         `unknown extension '${ext}'. Allowed values: ${allExts.join(', ')}.`,

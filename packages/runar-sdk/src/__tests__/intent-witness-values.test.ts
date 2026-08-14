@@ -17,18 +17,22 @@ import { describe, it, expect } from 'vitest';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { WitnessValueMissingError } from '../errors.js';
 import type { RunarArtifact, StateField } from 'runar-ir-schema';
 import type { UTXO } from '../types.js';
 
 const PRIV_KEY = '0000000000000000000000000000000000000000000000000000000000000001';
+// Every test in this file signs with PRIV_KEY, so the funding UTXO script is
+// fixed for the whole file — derive it once from the real signer's pubkey.
+const FUNDING_SCRIPT = buildP2PKHScript(await new LocalSigner(PRIV_KEY).getPublicKey());
 
 function makeFundingUtxo(satoshis: number, index = 0): UTXO {
   return {
     txid: 'aabbccdd'.repeat(8),
     outputIndex: index,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: FUNDING_SCRIPT,
   };
 }
 
@@ -96,7 +100,11 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('does NOT count _prevOutScript_<i> or _serialisedOutputs in the user-facing arg count', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      // This artifact's on-chain script is a bare OP_TRUE (see
+      // makeArtifactWithIntentWitness docstring) that never consumes the
+      // witness pushes the call unlocking script carries, so a real Spend
+      // trips the clean-stack rule — structure-only, not a fund-path spend.
+      const provider = new MockProvider('testnet', { validateBroadcasts: false });
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [0, 1], serialised: true });
@@ -127,7 +135,7 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('still rejects user-arg count mismatches for non-auto-injected params', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      const provider = new MockProvider('testnet');
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [0], serialised: true });
@@ -156,7 +164,7 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('throws when a `_prevOutScript_<i>` witness is not set', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      const provider = new MockProvider('testnet');
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [0], serialised: false });
@@ -180,7 +188,7 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('throws when `_serialisedOutputs` is not set', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      const provider = new MockProvider('testnet');
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [], serialised: true });
@@ -207,7 +215,11 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('appends `_prevOutScript_*` witnesses (multi-input) in ABI order', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      // Structure-only (see the arg-count-filter test above): the OP_TRUE
+      // stub script doesn't consume these witness pushes, so real Spend
+      // trips clean-stack — this test asserts wire byte POSITIONS, not
+      // spendability.
+      const provider = new MockProvider('testnet', { validateBroadcasts: false });
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [0, 1], serialised: false });
@@ -238,7 +250,8 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('appends both `_prevOutScript_<i>` and `_serialisedOutputs` with prevOuts FIRST', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      // Structure-only — see comment on the previous test in this block.
+      const provider = new MockProvider('testnet', { validateBroadcasts: false });
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [0], serialised: true });
@@ -265,7 +278,8 @@ describe('R-6 — intent-intrinsic witness values', () => {
     it('accepts witness values as Uint8Array', async () => {
       const signer = new LocalSigner(PRIV_KEY);
       const address = await signer.getAddress();
-      const provider = new MockProvider();
+      // Structure-only — see comment on the first test in this block.
+      const provider = new MockProvider('testnet', { validateBroadcasts: false });
       provider.addUtxo(address, makeFundingUtxo(100_000));
 
       const artifact = makeArtifactWithIntentWitness({ prevOutInputs: [0], serialised: false });

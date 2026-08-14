@@ -360,6 +360,11 @@ fn emitBoolAndOpcode(t: *ECTracker) !void {
     try t.emitOpcode("OP_BOOLAND");
 }
 
+fn emitSubNotSequence(t: *ECTracker) !void {
+    try t.emitOpcode("OP_SUB");
+    try t.emitOpcode("OP_NOT");
+}
+
 fn emitFieldModSequence(t: *ECTracker) !void {
     try t.emitOpcode("OP_2DUP");
     try t.emitOpcode("OP_MOD");
@@ -580,18 +585,51 @@ fn affineAdd(t: *ECTracker) !void {
     // selected and the single expensive fieldInv still runs exactly once.
     // rx and ry below are already correct for doubling.
     //
-    //   cond = (px == qx)
-    //   num  = cond ? 3*px^2 : (qy - py)
-    //   den  = cond ? 2*py   : (qx - px)
+    //   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+    //   num    = cond ? 3*px^2 : (qy - py)
+    //   den    = cond ? 2*py   : (qx - px)
     //
     // selected as `b + cond*(a - b)`, which needs no branch and keeps the
     // emitted op sequence identical on both paths.
     //
-    // NOT handled: P == -Q, whose true result is the point at infinity, which
-    // affine coordinates cannot represent.
+    // THE THIRD CASE, P == -Q: px == qx but py != qy. Testing px == qx ALONE
+    // sends it down the tangent path and returns 2P — an on-curve, entirely
+    // plausible, WRONG point. Before the doubling fix the chord path ran there,
+    // divided by zero (fieldInv is Fermat, inv(0) = 0) and produced an OFF-curve
+    // blob, so `assert(ecOnCurve(ecAdd(a, b)))` — the idiom this codegen tells
+    // authors to write — happened to reject it. Selecting on px alone would have
+    // silently disarmed that.
+    //
+    // P + (-P) is the point at infinity, which affine x||y cannot represent. This
+    // codegen already has a representation for O: the ALL-ZERO blob, which is
+    // what `ecMul(P, 0n)` returns and what the `ec-mulgen-linear` rewrite in
+    // ec_optimizer.zig produces for k1 + k2 == 0 (mod n). So return that, by
+    // masking the result with `notinf = NOT(px == qx AND NOT cond)`:
+    //
+    //   - it agrees with the rewrite, so the same source cannot give two answers
+    //     depending on whether the optimizer fired;
+    //   - O is not on the curve (0^2 != 0^3 + 7), so the on-curve gate rejects it
+    //     and the idiom above works again;
+    //   - it adds no failure channel to what is a pure value-producing
+    //     expression, the same reason emitScalarReduce reduces instead of
+    //     rejecting.
+    //
+    // The mask is a bare OP_MUL with no reduction: rx, ry are already in [0, p)
+    // and notinf is 0 or 1, so the product is canonical either way.
     try t.copyToTop("px", "_px_eq");
     try t.copyToTop("qx", "_qx_eq");
-    try t.rawBlock(2, "_cond", emitNumEqualOpcode);
+    try t.rawBlock(2, "_xeq", emitNumEqualOpcode);
+    try t.copyToTop("py", "_py_eq");
+    try t.copyToTop("qy", "_qy_eq");
+    try t.rawBlock(2, "_yeq", emitNumEqualOpcode);
+    try t.copyToTop("_xeq", "_xeq_c");
+    try t.toTop("_yeq");
+    try t.rawBlock(2, "_cond", emitBoolAndOpcode);
+    // notinf = NOT(xeq - cond): xeq - cond is 1 exactly when px == qx and the
+    // points are not equal, i.e. exactly the P == -Q case.
+    try t.toTop("_xeq");
+    try t.copyToTop("_cond", "_cond_c");
+    try t.rawBlock(2, "_notinf", emitSubNotSequence);
 
     try t.copyToTop("qy", "_qy1");
     try t.copyToTop("py", "_py1");
@@ -645,6 +683,14 @@ fn affineAdd(t: *ECTracker) !void {
     try t.drop();
     try t.toTop("qy");
     try t.drop();
+
+    // P == -Q -> force the all-zero point (see the header comment).
+    try t.toTop("rx");
+    try t.copyToTop("_notinf", "_notinf_x");
+    try t.rawBlock(2, "rx", emitMulOpcode);
+    try t.toTop("ry");
+    try t.toTop("_notinf");
+    try t.rawBlock(2, "ry", emitMulOpcode);
 }
 
 fn jacobianDouble(t: *ECTracker) !void {
@@ -708,49 +754,65 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     var inner = try ECTracker.init(allocator, base_names);
     errdefer inner.deinit();
 
+    try jacobianAddAffineBody(&inner, false);
+    return inner.takeBundle();
+}
+
+/// The mixed-add itself, emitting through a tracker the caller owns.
+///
+/// `keep_hr` additionally leaves copies of H and R on the stack. They are the
+/// exception detector: H = U2 - X1 and R = S2 - Y1 are both zero exactly when
+/// the Jacobian accumulator is the same curve point as the affine operand, the
+/// one case these formulas cannot compute (see buildJacobianAddOrDoubleInline).
+fn jacobianAddAffineBody(inner: *ECTracker, keep_hr: bool) !void {
     try inner.copyToTop("jz", "_jz_for_z1cu");
     try inner.copyToTop("jz", "_jz_for_z3");
     try inner.copyToTop("jy", "_jy_for_y3");
     try inner.copyToTop("jx", "_jx_for_u1h2");
 
-    try fieldSqr(&inner, "jz", "_Z1sq");
+    try fieldSqr(inner, "jz", "_Z1sq");
     try inner.copyToTop("_Z1sq", "_Z1sq_for_u2");
-    try fieldMul(&inner, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
+    try fieldMul(inner, "_jz_for_z1cu", "_Z1sq", "_Z1cu");
 
     try inner.copyToTop("ax", "_ax_c");
-    try fieldMul(&inner, "_ax_c", "_Z1sq_for_u2", "_U2");
+    try fieldMul(inner, "_ax_c", "_Z1sq_for_u2", "_U2");
 
     try inner.copyToTop("ay", "_ay_c");
-    try fieldMul(&inner, "_ay_c", "_Z1cu", "_S2");
+    try fieldMul(inner, "_ay_c", "_Z1cu", "_S2");
 
-    try fieldSub(&inner, "_U2", "jx", "_H");
-    try fieldSub(&inner, "_S2", "jy", "_R");
+    try fieldSub(inner, "_U2", "jx", "_H");
+    try fieldSub(inner, "_S2", "jy", "_R");
+
+    if (keep_hr) {
+        try inner.copyToTop("_H", "_H_keep");
+        try inner.copyToTop("_R", "_R_keep");
+    }
 
     try inner.copyToTop("_H", "_H_for_h3");
     try inner.copyToTop("_H", "_H_for_z3");
 
-    try fieldSqr(&inner, "_H", "_H2");
+    try fieldSqr(inner, "_H", "_H2");
     try inner.copyToTop("_H2", "_H2_for_u1h2");
 
-    try fieldMul(&inner, "_H_for_h3", "_H2", "_H3");
-    try fieldMul(&inner, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
+    try fieldMul(inner, "_H_for_h3", "_H2", "_H3");
+    try fieldMul(inner, "_jx_for_u1h2", "_H2_for_u1h2", "_U1H2");
 
     try inner.copyToTop("_R", "_R_for_y3");
     try inner.copyToTop("_U1H2", "_U1H2_for_y3");
     try inner.copyToTop("_H3", "_H3_for_y3");
 
-    try fieldSqr(&inner, "_R", "_R2");
-    try fieldSub(&inner, "_R2", "_H3", "_x3_tmp");
-    try fieldMulConst(&inner, "_U1H2", 2, "_2U1H2");
-    try fieldSub(&inner, "_x3_tmp", "_2U1H2", "_X3");
+    try fieldSqr(inner, "_R", "_R2");
+    try fieldSub(inner, "_R2", "_H3", "_x3_tmp");
+    try fieldMulConst(inner, "_U1H2", 2, "_2U1H2");
+    try fieldSub(inner, "_x3_tmp", "_2U1H2", "_X3");
 
     try inner.copyToTop("_X3", "_X3_c");
-    try fieldSub(&inner, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
-    try fieldMul(&inner, "_R_for_y3", "_u_minus_x", "_r_tmp");
-    try fieldMul(&inner, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
-    try fieldSub(&inner, "_r_tmp", "_jy_h3", "_Y3");
+    try fieldSub(inner, "_U1H2_for_y3", "_X3_c", "_u_minus_x");
+    try fieldMul(inner, "_R_for_y3", "_u_minus_x", "_r_tmp");
+    try fieldMul(inner, "_jy_for_y3", "_H3_for_y3", "_jy_h3");
+    try fieldSub(inner, "_r_tmp", "_jy_h3", "_Y3");
 
-    try fieldMul(&inner, "_jz_for_z3", "_H_for_z3", "_Z3");
+    try fieldMul(inner, "_jz_for_z3", "_H_for_z3", "_Z3");
 
     try inner.toTop("_X3");
     inner.renameTop("jx");
@@ -758,6 +820,129 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
     inner.renameTop("jy");
     try inner.toTop("_Z3");
     inner.renameTop("jz");
+}
+
+/// Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+/// Same shape as the numerator/denominator select in affineAdd, so both paths
+/// emit the identical op sequence and the tracker's static stack model holds.
+/// Consumes add_name, dbl_name and cond_name.
+fn selectCoord(
+    t: *ECTracker,
+    add_name: []const u8,
+    dbl_name: []const u8,
+    cond_name: []const u8,
+    result_name: []const u8,
+) !void {
+    try t.copyToTop(add_name, "_sel_add_c");
+    try fieldSub(t, dbl_name, "_sel_add_c", "_sel_diff");
+    try fieldMul(t, "_sel_diff", cond_name, "_sel_scaled");
+    try fieldAdd(t, add_name, "_sel_scaled", result_name);
+}
+
+/// The ladder's LAST conditional step: mixed-add, but correct when the
+/// accumulator already equals the point being added.
+///
+/// The Jacobian mixed-add cannot double. It computes H = U2 - X1, and when the
+/// two operands are the same curve point H = 0, so Z3 = Z1*H = 0 — the point at
+/// infinity — and since fieldInv is Fermat (inv(0) = 0), jacobianToAffine turns
+/// that into the ALL-ZERO point instead of 2P. ecMul(P, 2n) and ecMulGen(2n)
+/// returned 64 zero bytes.
+///
+/// WHY ONLY THE LAST STEP. After step i the accumulator holds c_i*P where
+/// c_i = k' >> i and k' = k + 3n, so the conditional step adds P to
+/// (c_i - 1)*P. secp256k1 has cofactor 1, so P has order n and the degenerate
+/// cases are exactly c_i == 2 (mod n) — accumulator == P — and c_i == 0 or 1
+/// (mod n) — accumulator == -P or O. c_i ranges over a CONTIGUOUS interval
+/// determined only by i, so this is decidable by interval arithmetic rather
+/// than by sampling, and over the whole domain k in [0, n-1] only two steps
+/// qualify, both at i = 0:
+///
+///   k = 2  ->  c_0 = 3n+2 == 2, odd, so the add runs: accumulator == P. <- bug
+///   k = 0  ->  c_0 = 3n   == 0, odd, so the add runs: accumulator == -P,
+///              true result the point at infinity, which affine coordinates
+///              cannot represent; it stays the all-zero point, as before.
+///
+/// At i >= 1, c_i lies in [3n>>i, (4n-1)>>i] — the lower bound is 3n, not 3n+1,
+/// because the reduce puts k = 0 in the domain — and that interval contains no
+/// value == 0, 1 or 2 (mod n) that is also odd; c_256 = 2 is even, so no add
+/// runs. Handling H == 0 at every one of the 257 steps would cost ~70% more
+/// script bytes; handling it here costs 0.26%.
+///
+/// THE ENTIRE ARGUMENT IS CONDITIONED ON k in [0, n-1], which is only true
+/// because emitEcMul reduces k mod n before adding 3n. That reduce landed one
+/// commit AFTER this select (03f50d48 then f16790a9). 03f50d48 ON ITS OWN IS
+/// UNSOUND: a last-step-only select while the scalar is still unbounded leaves
+/// c_i free to hit 0, 1 or 2 (mod n) at other steps. The two commits must land
+/// together and must never be bisected, cherry-picked or reverted apart.
+///
+/// The interval argument does 100% of the work; there is no defence in depth
+/// here. In particular c_i == 1 (mod n) — a pre-add accumulator of O — is
+/// UNREACHABLE, not handled: were it reachable the select would still take the
+/// ADD path, because O is carried as Z1 = 0, which makes U2 = 0 and
+/// H = -X1 != 0. Anything that changes the +3n offset, the iteration count or
+/// the reduce must redo the interval check, not assume this still holds.
+///
+/// This is NOT a "no honest input hits it" argument: the operand P is caller-
+/// supplied and cannot move the exception, because the condition depends only
+/// on c_i mod ord(P) and ord(P) = n for every point on the curve. Points that
+/// are NOT on the curve carry no such guarantee — gate untrusted input on
+/// ecOnCurve first.
+///
+/// Stack layout: [..., ax, ay, _k, jx, jy, jz] — same in and out.
+fn buildJacobianAddOrDoubleInline(allocator: Allocator, base_names: []const ?[]const u8) !EcOpBundle {
+    var inner = try ECTracker.init(allocator, base_names);
+    errdefer inner.deinit();
+
+    // Keep the pre-add accumulator: it is what must be DOUBLED in the
+    // exceptional case, and the add below consumes jx/jy/jz.
+    try inner.copyToTop("jx", "_sx");
+    try inner.copyToTop("jy", "_sy");
+    try inner.copyToTop("jz", "_sz");
+
+    try jacobianAddAffineBody(&inner, true);
+
+    // cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+    // accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+    // signals the point at infinity.
+    try inner.toTop("_H_keep");
+    try inner.pushInt("_zero_h", 0);
+    try inner.rawBlock(2, "_h_is0", emitNumEqualOpcode);
+    try inner.toTop("_R_keep");
+    try inner.pushInt("_zero_r", 0);
+    try inner.rawBlock(2, "_r_is0", emitNumEqualOpcode);
+    try inner.toTop("_h_is0");
+    try inner.toTop("_r_is0");
+    try inner.rawBlock(2, "_cond", emitBoolAndOpcode);
+
+    // Move the add result aside so jacobianDouble can work on jx/jy/jz again,
+    // this time holding the saved accumulator.
+    try inner.toTop("jx");
+    inner.renameTop("_add_x");
+    try inner.toTop("jy");
+    inner.renameTop("_add_y");
+    try inner.toTop("jz");
+    inner.renameTop("_add_z");
+    try inner.toTop("_sx");
+    inner.renameTop("jx");
+    try inner.toTop("_sy");
+    inner.renameTop("jy");
+    try inner.toTop("_sz");
+    inner.renameTop("jz");
+    try jacobianDouble(&inner);
+    try inner.toTop("jx");
+    inner.renameTop("_dbl_x");
+    try inner.toTop("jy");
+    inner.renameTop("_dbl_y");
+    try inner.toTop("jz");
+    inner.renameTop("_dbl_z");
+
+    try inner.copyToTop("_cond", "_cond_x");
+    try selectCoord(&inner, "_add_x", "_dbl_x", "_cond_x", "jx");
+    try inner.copyToTop("_cond", "_cond_y");
+    try selectCoord(&inner, "_add_y", "_dbl_y", "_cond_y", "jy");
+    try inner.toTop("_cond");
+    inner.renameTop("_cond_z");
+    try selectCoord(&inner, "_add_z", "_dbl_z", "_cond_z", "jz");
 
     return inner.takeBundle();
 }
@@ -769,10 +954,31 @@ fn emitEcAdd(t: *ECTracker) !void {
     try composePoint(t, "rx", "ry", "_result");
 }
 
+/// Reduce a scalar to [0, n-1]: ((k mod n) + n) mod n.
+///
+/// OP_MOD takes the sign of the DIVIDEND, so `k mod n` alone lands in (-n, n);
+/// the `+ n, mod n` normalises the negative half. One push of n covers both
+/// reductions — the same shape as fieldMod / ecModReduce.
+///
+/// Without it, emitEcMul's ladder is only correct while 2^257 <= k + 3n < 2^258:
+/// a scalar >= ~n sets bit 258, the 257-iteration loop never sees it, and the
+/// ladder returns a DIFFERENT multiple of P rather than failing. Scalars are
+/// contract input, so that is attacker-chosen. Reducing costs 1 push + 8 opcodes
+/// (42 bytes) against a ~429 KB script, and makes k >= n, k < 0 and k = 0 all
+/// well defined.
+fn emitScalarReduce(t: *ECTracker, k_name: []const u8, result_name: []const u8) !void {
+    try t.toTop(k_name);
+    try pushCurveNNum(t, "_n_red");
+    try t.rawBlock(2, result_name, emitFieldModSequence);
+}
+
 fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !void {
     try decomposePoint(t, point_name, "ax", "ay");
 
+    // "k in [1, n-1]" is a PRECONDITION the caller cannot enforce — the scalar is
+    // usually an unlock argument — so reduce it first. See emitScalarReduce.
     try t.toTop(scalar_name);
+    try emitScalarReduce(t, scalar_name, "_kr");
     try t.pushStaticBytes("_3n", curve_3n_script_num_le[0..]);
     try t.rawBlock(2, "_kn3", emitAddOpcode);
     t.renameTop("_k");
@@ -802,7 +1008,12 @@ fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !vo
         try t.toTop("_bit");
         t.popNames(1);
 
-        var add_bundle = try buildJacobianAddAffineInline(t.allocator, t.names.items);
+        // Only the final step can be handed two equal operands — see
+        // buildJacobianAddOrDoubleInline for why, and for what it costs not to.
+        var add_bundle = if (bit == 0)
+            try buildJacobianAddOrDoubleInline(t.allocator, t.names.items)
+        else
+            try buildJacobianAddAffineInline(t.allocator, t.names.items);
         errdefer add_bundle.deinit();
 
         try t.owned_bytes.appendSlice(t.allocator, add_bundle.owned_bytes);
@@ -923,31 +1134,64 @@ test "ec add helper emits affine split and compose flow" {
 // regression in `buildBuiltinOps` surfaces here as a localized failure
 // rather than only as a cross-tier hex mismatch from the golden harness.
 //
-// The counts diverge from the Python/Java peers because the Zig tier
-// represents control flow at the helper level as a single `.@"if"` op
-// (containing nested `.then` / `.else` slices), whereas Python/Java
-// flatten if-bodies into separate ops. Final compiled hex is byte-
-// identical (enforced by the conformance harness).
+// The counts are op-TREE sizes (if bodies included, see countOpTree) and
+// still diverge slightly from the Python/Java peers because the Zig tier
+// bundles some sequences differently at the helper level. Final compiled hex
+// is byte-identical (enforced by the conformance harness).
 // ---------------------------------------------------------------------------
 
+/// Total number of StackOps in `ops`, INCLUDING the bodies of `.@"if"` ops.
+///
+/// A flat `ops.len` cannot see inside a branch, so any emitter whose work sits
+/// in an if body — the scalar ladders emit 257 / 385 conditional additions —
+/// reports a count that barely moves no matter what the branch contains.
+/// Adding +1.3 KB of script inside the ladder's last step left the p256Mul /
+/// p384Mul goldens byte-identical. Recursing is what makes the golden a gate.
+fn countOpTree(ops: []const StackOp) usize {
+    var total: usize = 0;
+    for (ops) |op| {
+        total += 1;
+        switch (op) {
+            .@"if" => |stack_if| {
+                total += countOpTree(stack_if.then);
+                if (stack_if.@"else") |else_ops| total += countOpTree(else_ops);
+            },
+            else => {},
+        }
+    }
+    return total;
+}
+
 test "ec helper op-count goldens" {
+    // ecAdd 8183 -> 8199 (+16): affineAdd now detects P == -Q (px == qx but
+    // py != qy) and masks the result to the all-zero point, instead of taking
+    // the tangent and returning an on-curve, plausible, WRONG 2P. The 16 ops
+    // are the (py == qy) conjunct (2 picks + OP_NUMEQUAL), the AND that builds
+    // cond (pick + swap + OP_BOOLAND), notinf (swap + over + OP_SUB + OP_NOT)
+    // and the rx/ry mask (3 rolls + 1 pick + 2 OP_MUL). +21 script BYTES.
+    //
+    // The TS/Go/Rust/Python/Ruby/Java peers book the same change as +21 OPS:
+    // they emit a deep pick/roll as two ops (push depth, then OP_PICK/OP_ROLL)
+    // where this tracker models it as one `.pick` / `.roll` StackOp, and 5 of
+    // the 16 movements here are deep. Same bytes, different counting point.
     const cases = .{
-        .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8183) },
-        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 59707) },
-        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 59709) },
+        .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8199) },
+        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 119671) },
+        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 119673) },
         .{ registry.CryptoBuiltin.ec_negate, "ecNegate", @as(usize, 945) },
         .{ registry.CryptoBuiltin.ec_on_curve, "ecOnCurve", @as(usize, 530) },
     };
     inline for (cases) |c| {
         var bundle = try buildBuiltinOps(std.testing.allocator, c[0]);
         defer bundle.deinit();
-        if (bundle.ops.len != c[2]) {
+        const got = countOpTree(bundle.ops);
+        if (got != c[2]) {
             std.debug.print(
                 "{s}: op-count drift — got {d}, want {d}\n",
-                .{ c[1], bundle.ops.len, c[2] },
+                .{ c[1], got, c[2] },
             );
         }
-        try std.testing.expectEqual(c[2], bundle.ops.len);
+        try std.testing.expectEqual(c[2], got);
     }
 }
 

@@ -377,37 +377,127 @@ def collect_deep_binding_names(bindings: list[ANFBinding]) -> set[str]:
     return names
 
 
-def count_merged_local_results(
-    then_bindings: list[ANFBinding], else_bindings: list[ANFBinding]
-) -> int:
-    """How many branch-merged locals an if-statement's two arms carry as results.
+def collect_loop_carried_rebinds(body: list[ANFBinding]) -> set[str]:
+    """Locals a loop body REBINDS and then READS AGAIN in the same iteration.
 
-    ANF lowering's ``_append_merged_local_results`` ends both arms with the same
-    K-binding block -- ``<local> = @ref:__merge$<i>`` for i in 0..K-1 -- so the
-    merged values sit on top in the same canonical order whichever branch runs.
-    Counting the trailing block is how stack lowering learns K: it must trim
-    each arm down to exactly those K slots before the N>=2 reconcile compares
-    the arms, since everything beneath them is the arm's own (dead, and
-    arm-specific) working values.
+    ``compute_last_uses`` maps a name to the MAXIMUM index that references it,
+    so for a body like::
 
-    Returns 0 unless BOTH arms end with a block of the same size -- anything
-    else is not a normalised merge and must not be trimmed.
+        t3   = acc + step     (index 1 -- reads the value carried in)
+        acc  = @ref:t3        (index 2 -- rebinds: renames t3's slot to `acc`)
+        t4   = wacc + acc     (index 3 -- reads the value just rebound)
+
+    ``acc`` gets last-use 3. Index 1 is therefore NOT a last use and copies
+    (PICK) instead of consuming, leaving the incoming slot on the stack under
+    the same name as the rebound one; index 3 then IS the last use, and
+    ``find_depth`` resolves to the topmost match -- so it consumes the UPDATED
+    value and leaves the dead incoming one. The next iteration reads that dead
+    slot, and every iteration recomputes from the pre-loop value:
+    ``for (let i = 0n; i < N; i++) { acc = acc + step; wacc = wacc + acc; }``
+    produced ``wacc = step*N`` where the source says ``step*N*(N+1)/2`` --
+    silently in a stateless contract, and as a permanently unspendable UTXO in
+    a stateful one (the covenant commits to a continuation the SDK never
+    builds). ``outer_refs`` does not cover it: ``acc`` is excluded there
+    precisely because the body binds it.
+
+    The value these names hold at the end of an iteration is live at the start
+    of the next one, so ``_lower_loop`` protects them from consumption exactly
+    like an outer ref. The incoming slot each rebinding shadows is left behind
+    and drained with the rest of the frame at method exit -- a name always
+    resolves to its newest slot, so the reads stay correct.
+
+    Both halves of the predicate are load-bearing:
+
+    - read BEFORE the first rebinding: the name is carried IN from the
+      enclosing scope, rather than being a body-private temp that merely
+      happens to be read after it is bound;
+    - read AFTER the last rebinding: without it the rebound value is dead at
+      the end of the iteration and consuming it is correct. This is what keeps
+      every shipped accumulator (``sum = sum + i``, ``off = off + len``)
+      byte-for-byte unchanged.
+
+    NESTED loops: the scan runs over ``flatten_nested_loop_bodies(body)``, not
+    over ``body`` itself. A name rebound only inside an INNER loop is bound at
+    no top-level index of the outer body, so the raw scan classified it as
+    neither an outer ref (``collect_deep_binding_names`` excludes it -- the
+    body does bind it, deeply) nor a carried rebind, and the outer loop never
+    marked it live. The inner loop's final iteration then consumed it, because
+    ``used_after_loop`` asks the enclosing scope and the enclosing scope had
+    not been told either, so every outer iteration restarted from the slot the
+    previous one left behind:
+    ``for (i<2) { for (j<2) { acc = acc + step; wacc = wacc + acc; } }`` with
+    step = 3 produced ``wacc = 24`` where the source says 30. Splicing the
+    inner body in at the loop's position preserves the read/rebind/read
+    ordering the inner level already sees, so the outer level draws the same
+    conclusion.
     """
-    prefix = f"@ref:{MERGED_LOCAL_TEMP_PREFIX}"
+    flat = flatten_nested_loop_bodies(body)
 
-    def trailing(bindings: list[ANFBinding]) -> int:
-        n = 0
-        for b in reversed(bindings):
-            v = b.value
-            if v.kind != "load_const" or not isinstance(v.const_string, str):
-                break
-            if not v.const_string.startswith(prefix):
-                break
-            n += 1
-        return n
+    first_bind: dict[str, int] = {}
+    last_bind: dict[str, int] = {}
+    for i, b in enumerate(flat):
+        if b.name not in first_bind:
+            first_bind[b.name] = i
+        last_bind[b.name] = i
 
-    then_count = trailing(then_bindings)
-    return then_count if then_count > 0 and then_count == trailing(else_bindings) else 0
+    read_before_bind: set[str] = set()
+    read_after_bind: set[str] = set()
+    for i, b in enumerate(flat):
+        for ref in collect_refs(b.value):
+            first = first_bind.get(ref)
+            if first is not None and i < first:
+                read_before_bind.add(ref)
+            last = last_bind.get(ref)
+            if last is not None and i > last:
+                read_after_bind.add(ref)
+
+    return read_before_bind & read_after_bind
+
+
+def flatten_nested_loop_bodies(body: list[ANFBinding]) -> list[ANFBinding]:
+    """The binding sequence with every nested ``loop`` binding -- and every
+    ``if`` binding -- replaced, in place, by its own (recursively flattened)
+    body.
+
+    Only ``collect_loop_carried_rebinds`` uses this, and only to order reads
+    against rebindings. Neither replaced binding contributes a stack slot that
+    predicate reasons about, so dropping it loses nothing; splicing the sub-body
+    in at its position is what lets an enclosing loop see a rebinding one level
+    down.
+
+    ``if`` arms ARE spliced, in ``then ++ else`` order, even though they are
+    alternatives rather than a sequence. The predicate asks only "is this name
+    read, then rebound, then read again", and treating the arms as a sequence
+    can only ADD names to the carried set, never remove one -- conservative in
+    the safe direction. Without it a local rebound ONLY inside an ``if`` arm was
+    bound at no index the predicate could see: neither an outer ref
+    (``collect_deep_binding_names`` excludes it, since the body does bind it,
+    deeply) nor a carried rebind. The loop consumed it and the next iteration
+    had nothing to read, so ``for (i<2) { if (i<5) { acc = acc + step; }
+    wacc = wacc + acc; }`` was REJECTED outright with
+    ``Value 'acc' not found on stack`` -- the loud face of the same gap the
+    merged-local protection in ``_lower_if`` fixes silently at K>=2.
+
+    The ``if`` binding itself is NOT re-appended after its arms. Appending it
+    would count the arms' reads a second time at an index past every arm
+    rebinding, making a local that BOTH arms rebind look "read after its last
+    rebinding" -- which protected a K=1 alias that must stay consumable.
+
+    A body with no nested loop and no ``if`` is returned entry-for-entry
+    unchanged, which is what makes this byte-neutral for every flat loop.
+    """
+    if not any(b.value.kind in ("loop", "if") for b in body):
+        return body
+    flat: list[ANFBinding] = []
+    for b in body:
+        if b.value.kind == "loop":
+            flat.extend(flatten_nested_loop_bodies(b.value.body))
+        elif b.value.kind == "if":
+            flat.extend(flatten_nested_loop_bodies(b.value.then))
+            flat.extend(flatten_nested_loop_bodies(b.value.else_))
+        else:
+            flat.append(b)
+    return flat
 
 
 def collect_refs(value: ANFValue) -> list[str]:
@@ -1014,6 +1104,7 @@ class _LoweringContext:
                 self._lower_if(
                     binding.name, binding.value.cond,
                     binding.value.then, binding.value.else_,
+                    binding.value.results or [],
                     i, last_uses, True,
                 )
             else:
@@ -1057,7 +1148,8 @@ class _LoweringContext:
         elif kind == "method_call":
             self._lower_method_call(name, value.object, value.method, value.args, binding_index, last_uses)
         elif kind == "if":
-            self._lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
+            self._lower_if(name, value.cond, value.then, value.else_,
+                           value.results or [], binding_index, last_uses)
         elif kind == "loop":
             self._lower_loop(name, value.count, value.body, value.iter_var,
                              value.start, value.step, binding_index, last_uses)
@@ -1596,8 +1688,51 @@ class _LoweringContext:
 
     def _lower_if(self, binding_name: str, cond: str,
                   then_bindings: list[ANFBinding], else_bindings: list[ANFBinding],
+                  results: list[str],
                   binding_index: int, last_uses: dict[str, int],
                   terminal_assert: bool = False) -> None:
+        """``results`` is the ``if`` node's declared result slots, deepest
+        first (see ``ANFValue.results``).  Empty for an ``if`` that carries at
+        most one result, and then every path below behaves exactly as it did
+        before the multi-result contract existed.
+        """
+        # The ANF wire format has no version field, and ``--ir`` / ``--ir-parity``
+        # are documented surfaces that feed a checked-in ANF JSON straight into
+        # this pass. An ANF produced BEFORE the multi-result node carries the
+        # trailing ``__merge$`` block WITHOUT ``results`` -- back then the block
+        # was a naming CONVENTION this pass recognised, and no tier recognises
+        # it any more. It deserialises cleanly, the declared count is 0, and the
+        # result count falls back to ``then_depth - parent_depth``, which counts
+        # the arm's untrimmed block residue as results. Refuse it: the block can
+        # only be emitted by ``_append_branch_results``, which only runs for an
+        # ``if`` that declares ``results``. Emits no opcodes.
+        if not results:
+            for _b in list(then_bindings) + list(else_bindings):
+                if _b.name.startswith(MERGED_LOCAL_TEMP_PREFIX):
+                    raise ValueError(
+                        f"ANF produced by a pre-multi-result compiler: the "
+                        f"conditional's arm carries a '{MERGED_LOCAL_TEMP_PREFIX}' "
+                        f"block but the node declares no results (binding "
+                        f"'{_b.name}'). That block used to be a naming convention "
+                        f"this pass inferred results from; it is now a declared "
+                        f"contract, and no tier reads the convention any more. "
+                        f"Recompile the source with the current compiler instead "
+                        f"of reusing the stored ANF. binding='{binding_name}'."
+                    )
+
+        # Result slots are identified BY NAME -- two identically-named results
+        # are indistinguishable, so the layout assertion would be satisfied by
+        # coincidence while one value silently replaced the other. ANF lowering
+        # refuses the source shape; this guards the ``--ir`` path, where the
+        # list arrives as data.
+        if len(results) > 1 and len(set(results)) != len(results):
+            raise ValueError(
+                f"Internal codegen error: the conditional declares duplicate "
+                f"result names [{', '.join(results)}]. Result slots are matched "
+                f"by name, so duplicates cannot be told apart and one value "
+                f"would silently replace the other. binding='{binding_name}'."
+            )
+
         is_last = self._is_last_use(cond, binding_index, last_uses)
         self.bring_to_top(cond, is_last)
         self.sm.pop()  # OP_IF consumes the condition
@@ -1607,6 +1742,43 @@ class _LoweringContext:
         for ref, last_idx in last_uses.items():
             if last_idx > binding_index and self.sm.has(ref):
                 protected_refs.add(ref)
+
+        # The K>=2 merged-local block reads every merged local in BOTH arms, and
+        # that read is RECONCILIATION, not a use: it is what makes each arm
+        # leave exactly K equally-named result slots for the N>=2 reconcile
+        # below to adopt. So the merged locals must be copied, never consumed --
+        # regardless of whether the ENCLOSING scope reads them again.
+        #
+        # ``_append_merged_local_results`` (ANF lowering) states that as its
+        # premise: "pass 1 always COPIES ... because a local live after the
+        # ``if`` is in ``outer_protected_refs``". Enclosing-scope liveness is
+        # the wrong question, and the premise silently failed for every merged
+        # local whose last enclosing use IS this ``if`` -- which is EVERY merged
+        # local of an ``if`` in a loop body, since the body's last-use map ends
+        # at the ``if`` itself.
+        #
+        # What happened then: pass 1 ROLLED instead of picking, the arm's stack
+        # effect stopped being +K, the arms ended at different depths, phase 3
+        # padded the shortfall with EMPTY pushes, the N-result layout check saw
+        # an unnamed slot where it needed the merged name, and control fell
+        # through to the single-slot fallback ``push(binding_name)`` -- ONE
+        # stackMap name registered for K physical results, with ``acc``/``wacc``
+        # still naming the dead pre-``if`` slots.
+        # ``for (i<2) { if (i<5) { acc = acc + step; wacc = wacc + acc; } }``
+        # with step = 3 produced wacc = 3 where the source says 9: silently in a
+        # stateless contract, and as a permanently unspendable UTXO in a
+        # stateful one.
+        #
+        # Byte-neutral for every program whose merged locals were already live
+        # after the ``if``: those names are already protected above, which is
+        # precisely why those programs compiled correctly.
+        #
+        # Now driven by the node's DECLARED results instead of by recognising a
+        # trailing ``__merge$`` block, so an arm-written property is protected
+        # on the same footing as a rebound local.
+        for name in results:
+            if self.sm.has(name):
+                protected_refs.add(name)
 
         # Snapshot parent stackMap names before branches run
         pre_if_names = self.sm.named_slots()
@@ -1712,17 +1884,46 @@ class _LoweringContext:
         #
         # Runs AFTER the phase-2 consumption drops, so both arms have given up
         # the same parent slots and share one base depth.
-        merged_result_count = count_merged_local_results(then_bindings, else_bindings)
-        if merged_result_count >= 2:
+        n_declared = len(results)
+        if n_declared >= 1:
             still_held = then_ctx.sm.named_slots()
             consumed_from_parent = sum(
                 1 for name in pre_if_names
                 if name not in still_held and self.sm.has(name)
             )
-            target_depth = self.sm.depth() - consumed_from_parent + merged_result_count
+            target_depth = self.sm.depth() - consumed_from_parent + n_declared
             for arm_ctx in (then_ctx, else_ctx):
                 while arm_ctx.sm.depth() > target_depth:
-                    arm_ctx.drop_slot_at_depth(merged_result_count)
+                    arm_ctx.drop_slot_at_depth(n_declared)
+
+            # The declared contract, checked rather than assumed: after the
+            # trim, each arm's top N slots must BE the declared results, in the
+            # declared order (``results[0]`` deepest).  ``_append_branch_results``
+            # is what makes this true; if it ever stops being true the arms
+            # disagree on layout, which is precisely the failure that produced
+            # the 2026-08 miscompile family.  Emits no opcodes.
+            for label, arm_ctx in (("then", then_ctx), ("else", else_ctx)):
+                if arm_ctx.sm.depth() != target_depth:
+                    raise RuntimeError(
+                        "internal codegen error: branch result layout mismatch "
+                        f"— the {label}-arm of the conditional ends at depth "
+                        f"{arm_ctx.sm.depth()}, but its {n_declared} declared "
+                        f"result(s) require depth {target_depth}; "
+                        f"binding={binding_name!r}"
+                    )
+                for i in range(n_declared):
+                    want = results[n_declared - 1 - i]
+                    got = arm_ctx.sm.peek_at_depth(i)
+                    if got != want:
+                        raise RuntimeError(
+                            "internal codegen error: branch result layout "
+                            f"mismatch — the {label}-arm of the conditional "
+                            f"holds {got!r} where the node declares {want!r} "
+                            f"(slot {n_declared - 1 - i} of "
+                            f"[{', '.join(results)}]); every later operand "
+                            "would resolve to the wrong slot; "
+                            f"binding={binding_name!r}"
+                        )
 
         # Phase 3: depth-balance reconciliation after ALL drops.
         #
@@ -1774,6 +1975,14 @@ class _LoweringContext:
             if_op.else_ops = else_ops
         self.emit_op(if_op)
 
+        # Physical slots this method drops AFTER OP_ENDIF, while reconciling the
+        # parent stackMap against the arms' results.  Counted because the
+        # invariant at the end of lower_if cannot compare the two depths
+        # directly: the post-ENDIF reconcile legitimately ROLL/DROPs stale slots
+        # out from under the results, so those drops have to be added back
+        # before comparing.
+        post_endif_drops = 0
+
         # Reconcile parent stackMap: remove items consumed by the branches.
         post_branch_names = then_ctx.sm.named_slots()
         for name in pre_if_names:
@@ -1807,7 +2016,39 @@ class _LoweringContext:
         )
 
         # The if expression may produce a result value on top.
-        if (then_ctx.sm.depth() > self.sm.depth()
+        if n_declared >= 1:
+            # DECLARED RESULTS.  Both arms were normalised by
+            # ``_append_branch_results`` and the layout check above proved they
+            # hold exactly ``results``, so the parent adopts them BY THE
+            # DECLARED ORDER -- no counting of trailing ``__merge$`` bindings,
+            # no comparison of arm depths, no inference of which names are still
+            # live.  ``results[0]`` is the deepest slot, matching the order pass
+            # 2 of the normalisation rebound them in.
+            #
+            # Then each parent slot the block shadows (the pre-``if`` binding of
+            # a merged local, the stale value of a written property) is
+            # physically rolled out from under the results, exactly as the
+            # pre-existing N>=2 reconcile did -- which is why the four
+            # ``__merge$`` goldens keep their bytes.
+            for name in results:
+                self.sm.push(name)
+            for i in range(n_declared - 1, -1, -1):
+                name = results[i]
+                d = n_declared
+                while d < self.sm.depth():
+                    if self.sm.peek_at_depth(d) == name:
+                        self.emit_op(StackOp(op="push", value=big_int_push(d)))
+                        self.sm.push("")
+                        self.emit_op(StackOp(op="roll", depth=d + 1))
+                        self.sm.pop()
+                        rolled = self.sm.remove_at_depth(d)
+                        self.sm.push(rolled)
+                        self.emit_op(StackOp(op="drop"))
+                        self.sm.pop()
+                        post_endif_drops += 1
+                        break
+                    d += 1
+        elif (then_ctx.sm.depth() > self.sm.depth()
                 and n_results >= 2
                 and (not else_bindings or else_matches_then_n_result_layout)):
             # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
@@ -1833,6 +2074,7 @@ class _LoweringContext:
                         self.sm.push(rolled)
                         self.emit_op(StackOp(op="drop"))
                         self.sm.pop()
+                        post_endif_drops += 1
                         break
                     d += 1
         elif then_ctx.sm.depth() > self.sm.depth():
@@ -1857,6 +2099,7 @@ class _LoweringContext:
                             self.sm.push(rolled)
                             self.emit_op(StackOp(op="drop"))
                             self.sm.pop()
+                        post_endif_drops += 1
                         break
             elif (then_top and not is_property and len(else_bindings) == 0
                     and then_top != binding_name and self.sm.has(then_top)):
@@ -1878,6 +2121,7 @@ class _LoweringContext:
                             self.sm.push(rolled)
                             self.emit_op(StackOp(op="drop"))
                             self.sm.pop()
+                        post_endif_drops += 1
                         break
             else:
                 self.sm.push(binding_name)
@@ -1885,6 +2129,44 @@ class _LoweringContext:
             self.sm.push(binding_name)
         else:
             pass  # Void if — don't push phantom
+
+        # Layer C — branch result-depth invariant.
+        #
+        # The stackMap is the compiler's ONLY model of the stack, so a stackMap
+        # that names FEWER slots than the arms physically left is not detectable
+        # anywhere downstream: every later operand silently resolves N slots
+        # off.  That single failure mode produced the whole 2026-08 branch/loop
+        # miscompile family -- wrong-but-accepted state continuations at best,
+        # and scripts the interpreter rejects outright (locked funds) at worst.
+        #
+        # What must hold when lower_if returns: the parent stackMap describes
+        # exactly the physical stack.  Both arms ended at arm_depth (the
+        # branch-balance guard above proves they agree), OP_ENDIF changes
+        # nothing, and the only physical effect after it is the
+        # post_endif_drops stale-slot drops the reconcile emitted.  So:
+        #
+        #     self.sm.depth() + post_endif_drops == arm_depth
+        #
+        # The naive self.sm.depth() == arm_depth is WRONG -- the reconcile
+        # legitimately ROLL/DROPs stale slots out from under the results, which
+        # is exactly what post_endif_drops counts.
+        #
+        # A failure here is always a codegen bug, never a user error.  Emits no
+        # opcodes: byte-neutral by construction.  Same genre as the
+        # branch-balance guard (#99), added for the same reason.
+        arm_depth = then_ctx.sm.depth()
+        if self.sm.depth() + post_endif_drops != arm_depth:
+            raise RuntimeError(
+                "internal codegen error: branch result depth mismatch — the "
+                "parent stack model does not describe the physical stack after "
+                f"OP_ENDIF (stackMap depth {self.sm.depth()} + "
+                f"{post_endif_drops} post-ENDIF drop(s) != arm depth "
+                f"{arm_depth}); the arms leave "
+                f"{arm_depth - self.sm.depth() - post_endif_drops} more "
+                "physical slot(s) than the compiler recorded, so every later "
+                "operand would resolve to the wrong slot and the script would "
+                f"be wrong or unspendable; binding={binding_name!r}"
+            )
 
         self._track_depth()
 
@@ -1927,6 +2209,16 @@ class _LoweringContext:
             for ref in collect_refs(b.value):
                 if ref != iter_var and ref not in deep_body_binding_names:
                     outer_refs.add(ref)
+
+        # A local the body REBINDS and then READS AGAIN in the same iteration
+        # is carried across iterations through the rebound slot, so it must
+        # survive the body exactly like an outer ref. deep_body_binding_names
+        # above excludes it precisely because the body binds it -- which is
+        # what made the updated value consumable. See
+        # collect_loop_carried_rebinds.
+        for ref in collect_loop_carried_rebinds(body):
+            if ref != iter_var:
+                outer_refs.add(ref)
 
         # Temporarily extend localBindings with body binding names
         prev_local_bindings = self.local_bindings

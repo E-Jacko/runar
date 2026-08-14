@@ -11,11 +11,15 @@ import { InputLimits } from 'runar-ir-schema';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { ScriptSizeExceededError } from '../errors.js';
 import type { RunarArtifact, UTXO } from '../index.js';
 
 const PRIV_KEY =
   '0000000000000000000000000000000000000000000000000000000000000001';
+// Every test in this file signs with PRIV_KEY — derive the funding script
+// once from the real signer's pubkey.
+const FUNDING_SCRIPT = buildP2PKHScript(await new LocalSigner(PRIV_KEY).getPublicKey());
 
 function makeArtifact(scriptHex: string): RunarArtifact {
   return {
@@ -38,7 +42,7 @@ function makeFundingUtxo(satoshis: number): UTXO {
     txid: 'aa'.repeat(32),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: FUNDING_SCRIPT,
   };
 }
 
@@ -61,7 +65,7 @@ describe('Item 8 — ScriptSizeExceededError at SDK entry points', () => {
   it('deploy: rejects a locking script over MAX_SCRIPT_BYTES with typed error', async () => {
     const signer = await setupSigner();
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo(address, makeFundingUtxo(100_000));
 
     const contract = new RunarContract(makeArtifact(oversizedScriptHex()), []);
@@ -86,7 +90,7 @@ describe('Item 8 — ScriptSizeExceededError at SDK entry points', () => {
   it('deploy: a script exactly at MAX_SCRIPT_BYTES passes the size guard', async () => {
     const signer = await setupSigner();
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     // Large funding to cover the giant deploy script's fee.
     provider.addUtxo(address, makeFundingUtxo(50_000_000));
 
@@ -110,7 +114,7 @@ describe('Item 8 — ScriptSizeExceededError at SDK entry points', () => {
   it('call: rejects a current locking script over MAX_SCRIPT_BYTES BEFORE signing', async () => {
     const signer = await setupSigner();
     const address = await signer.getAddress();
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo(address, makeFundingUtxo(100_000));
 
     // Use a minimal artifact (small script) so deploy succeeds, then manually
@@ -151,7 +155,7 @@ describe('Item 8 — ScriptSizeExceededError at SDK entry points', () => {
   // -------------------------------------------------------------------------
 
   it('MockProvider.getUtxos: rejects oversized UTXO script with typed error', async () => {
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo('addr', {
       txid: 'bb'.repeat(32),
       outputIndex: 0,
@@ -173,7 +177,7 @@ describe('Item 8 — ScriptSizeExceededError at SDK entry points', () => {
   });
 
   it('MockProvider.getContractUtxo: rejects oversized contract UTXO script', async () => {
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addContractUtxo('script-hash', {
       txid: 'cc'.repeat(32),
       outputIndex: 0,
@@ -194,7 +198,7 @@ describe('Item 8 — ScriptSizeExceededError at SDK entry points', () => {
   });
 
   it('MockProvider.getUtxos: at-limit script passes', async () => {
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     provider.addUtxo('addr', {
       txid: 'dd'.repeat(32),
       outputIndex: 0,

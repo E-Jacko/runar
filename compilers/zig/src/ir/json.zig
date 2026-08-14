@@ -474,11 +474,22 @@ fn parseIf(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) Bi
     else
         try allocator.alloc(types.ANFBinding, 0);
 
+    var results: []const []const u8 = &.{};
+    if (obj.get("results")) |results_val| {
+        const items = results_val.array.items;
+        const out = try allocator.alloc([]const u8, items.len);
+        for (items, 0..) |item, i| {
+            out[i] = try allocator.dupe(u8, item.string);
+        }
+        results = out;
+    }
+
     const if_expr = try allocator.create(types.ANFIf);
     if_expr.* = .{
         .cond = try allocator.dupe(u8, cond),
         .then = then_bindings,
         .@"else" = else_bindings,
+        .results = results,
     };
 
     return .{ .@"if" = if_expr };
@@ -1007,6 +1018,20 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writer.writeAll(": ");
             try writeJsonString(writer, "if");
             try writer.writeAll(",\n");
+
+            if (if_e.results.len > 0) {
+                try writeIndent(writer, depth + 1);
+                try writeJsonString(writer, "results");
+                try writer.writeAll(": [\n");
+                for (if_e.results, 0..) |name, ri| {
+                    try writeIndent(writer, depth + 2);
+                    try writeJsonString(writer, name);
+                    if (ri + 1 < if_e.results.len) try writer.writeByte(',');
+                    try writer.writeByte('\n');
+                }
+                try writeIndent(writer, depth + 1);
+                try writer.writeAll("],\n");
+            }
 
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "then");

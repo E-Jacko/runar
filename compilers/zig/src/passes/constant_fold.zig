@@ -421,56 +421,56 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
         .method_call => return value,
 
         .@"if" => |if_node| {
-            const cond_const = env.get(if_node.cond);
-            if (cond_const != null and cond_const.? == .boolean) {
-                const cond_val = cond_const.?.boolean;
-                if (cond_val) {
-                    // Condition is true -- fold the then-branch, eliminate else
-                    var branch_env = try cloneEnv(allocator, env);
-                    defer branch_env.deinit();
-                    const folded_then = try foldBindings(allocator, if_node.then, &branch_env);
-                    // Merge constants from taken branch back
-                    mergeEnv(env, &branch_env);
+            // Fold both arms independently, ALWAYS -- including when the
+            // condition is a compile-time constant.
+            //
+            // This pass used to "optimise" a statically-known condition by
+            // blanking the untaken arm (.@"else" = &.{}) while LEAVING the
+            // `if` node itself in place, and by propagating the taken arm's
+            // constants into the enclosing env. Both halves were unsound:
+            //
+            //   * An arm is not a free-floating binding list -- it carries a
+            //     STACK-SHAPE CONTRACT that ANF lowering establishes and stack
+            //     lowering depends on. For two or more branch-merged locals
+            //     both arms end with the identical __merge$<i> result block,
+            //     which is how lowerIf learns K and adopts the K results by
+            //     name. Blanking one arm makes the merged-result count 0, the
+            //     N>=2 name-matched reconcile cannot fire, and ONE stack slot
+            //     is registered for K physical results -- every post-branch
+            //     operand then resolves one or more slots off. At K=2 that
+            //     miscompiled SILENTLY: the deployed script accepted spends
+            //     the source rejects and rejected spends the source accepts.
+            //     At K=1 it surfaced as "value not found on stack", a
+            //     compile-time rejection of source that compiles with folding
+            //     disabled.
+            //   * Propagating the taken arm's constants outward is only sound
+            //     if the other arm is really gone. The `if` node survives this
+            //     pass, so both arms are still emitted and either can run.
+            //
+            // Correct dead-arm elimination would have to delete the `if` and
+            // splice the live arm into the parent, re-establishing the
+            // parent's shape. That is a lowering-level rewrite, not a fold, so
+            // it does not live here. The bytes given up are the
+            // statically-dead arm's ops, which never execute.
+            var then_env = try cloneEnv(allocator, env);
+            defer then_env.deinit();
+            var else_env = try cloneEnv(allocator, env);
+            defer else_env.deinit();
+            const folded_then = try foldBindings(allocator, if_node.then, &then_env);
+            const folded_else = try foldBindings(allocator, if_node.@"else", &else_env);
 
-                    const new_if = try allocator.create(types.ANFIf);
-                    new_if.* = .{
-                        .cond = if_node.cond,
-                        .then = folded_then,
-                        .@"else" = &.{},
-                    };
-                    return .{ .@"if" = new_if };
-                } else {
-                    // Condition is false -- fold the else-branch, eliminate then
-                    var branch_env = try cloneEnv(allocator, env);
-                    defer branch_env.deinit();
-                    const folded_else = try foldBindings(allocator, if_node.@"else", &branch_env);
-                    mergeEnv(env, &branch_env);
-
-                    const new_if = try allocator.create(types.ANFIf);
-                    new_if.* = .{
-                        .cond = if_node.cond,
-                        .then = &.{},
-                        .@"else" = folded_else,
-                    };
-                    return .{ .@"if" = new_if };
-                }
-            } else {
-                // Condition not known -- fold both branches independently
-                var then_env = try cloneEnv(allocator, env);
-                defer then_env.deinit();
-                var else_env = try cloneEnv(allocator, env);
-                defer else_env.deinit();
-                const folded_then = try foldBindings(allocator, if_node.then, &then_env);
-                const folded_else = try foldBindings(allocator, if_node.@"else", &else_env);
-
-                const new_if = try allocator.create(types.ANFIf);
-                new_if.* = .{
-                    .cond = if_node.cond,
-                    .then = folded_then,
-                    .@"else" = folded_else,
-                };
-                return .{ .@"if" = new_if };
-            }
+            const new_if = try allocator.create(types.ANFIf);
+            new_if.* = .{
+                .cond = if_node.cond,
+                .then = folded_then,
+                .@"else" = folded_else,
+                // The declared result list survives folding untouched: folding
+                // an arm's bindings cannot change WHICH slots the arm leaves,
+                // and dropping the list would silently return the `if` to the
+                // single-result reconcile it was migrated off.
+                .results = if_node.results,
+            };
+            return .{ .@"if" = new_if };
         },
 
         .loop => |loop_node| {
@@ -1089,7 +1089,18 @@ test "fold builtin percentOf(5000, 200) = 100" {
 
 // --- If-expression folding ---
 
-test "fold if with known true condition: dead branch elimination" {
+// A statically-known condition must NOT blank the untaken arm.
+//
+// The folder used to return an empty arm while leaving the `if` node itself in
+// place. An arm is not a free-floating binding list -- it carries the
+// stack-shape contract ANF lowering builds (the __merge$<i> result block for
+// K>=2 merged locals) and stack lowering consumes. Erasing one arm made
+// lowerIfExprImpl register ONE stack slot for K physical results, which at K=2
+// silently miscompiled the guard (the deployed script accepted spends the
+// source rejects) and at K=1 rejected source that compiles with folding
+// disabled.
+
+test "fold if with known true condition keeps BOTH arms" {
     const allocator = testing.allocator;
     var env = ConstEnv.init(allocator);
     defer env.deinit();
@@ -1111,10 +1122,10 @@ test "fold if with known true condition: dead branch elimination" {
     };
     const result = try foldBindings(allocator, &bindings, &env);
     defer {
-        // Free the newly allocated if-node from folding
         switch (result[1].value) {
             .@"if" => |new_if| {
                 allocator.free(new_if.then);
+                allocator.free(new_if.@"else");
                 allocator.destroy(new_if);
             },
             else => {},
@@ -1122,17 +1133,16 @@ test "fold if with known true condition: dead branch elimination" {
         allocator.free(result);
     }
 
-    // The if should have then-branch populated and else-branch empty
     switch (result[1].value) {
         .@"if" => |folded_if| {
             try testing.expectEqual(@as(usize, 1), folded_if.then.len);
-            try testing.expectEqual(@as(usize, 0), folded_if.@"else".len);
+            try testing.expectEqual(@as(usize, 1), folded_if.@"else".len);
         },
         else => return error.TestExpectedEqual,
     }
 }
 
-test "fold if with known false condition: dead branch elimination" {
+test "fold if with known false condition keeps BOTH arms" {
     const allocator = testing.allocator;
     var env = ConstEnv.init(allocator);
     defer env.deinit();
@@ -1156,6 +1166,7 @@ test "fold if with known false condition: dead branch elimination" {
     defer {
         switch (result[1].value) {
             .@"if" => |new_if| {
+                allocator.free(new_if.then);
                 allocator.free(new_if.@"else");
                 allocator.destroy(new_if);
             },
@@ -1166,11 +1177,51 @@ test "fold if with known false condition: dead branch elimination" {
 
     switch (result[1].value) {
         .@"if" => |folded_if| {
-            try testing.expectEqual(@as(usize, 0), folded_if.then.len);
+            try testing.expectEqual(@as(usize, 1), folded_if.then.len);
             try testing.expectEqual(@as(usize, 1), folded_if.@"else".len);
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+// A statically-known condition must not leak an arm's constants into the
+// enclosing environment either: the `if` survives the pass, so both arms are
+// still emitted and either can run.
+test "fold if with known condition does not propagate the taken arm's constants" {
+    const allocator = testing.allocator;
+    var env = ConstEnv.init(allocator);
+    defer env.deinit();
+
+    var then_bindings = [_]ANFBinding{
+        makeBinding("x", makeLoadConst(.{ .integer = 42 })),
+    };
+    var else_bindings = [_]ANFBinding{
+        makeBinding("x", makeLoadConst(.{ .integer = 99 })),
+    };
+
+    const if_node = try allocator.create(types.ANFIf);
+    defer allocator.destroy(if_node);
+    if_node.* = .{ .cond = "cond", .then = &then_bindings, .@"else" = &else_bindings };
+
+    const bindings = [_]ANFBinding{
+        makeBinding("cond", makeLoadConst(.{ .boolean = true })),
+        makeBinding("result", .{ .@"if" = if_node }),
+        makeBinding("after", .{ .bin_op = .{ .op = "+", .left = "x", .right = "x" } }),
+    };
+    const result = try foldBindings(allocator, &bindings, &env);
+    defer {
+        switch (result[1].value) {
+            .@"if" => |new_if| {
+                allocator.free(new_if.then);
+                allocator.free(new_if.@"else");
+                allocator.destroy(new_if);
+            },
+            else => {},
+        }
+        allocator.free(result);
+    }
+
+    try testing.expect(result[2].value == .bin_op);
 }
 
 // --- Constant propagation ---

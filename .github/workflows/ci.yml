@@ -5,6 +5,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main, 'release/v*']
+  # A queued merge is the last point at which a change can still be blocked: it
+  # is re-tested against the CURRENT base, which a green PR run never saw.
+  merge_group:
   workflow_dispatch:
     inputs:
       run_teranode:
@@ -114,6 +117,92 @@ jobs:
         # golden change and passes a justified one, so the gate can't silently
         # rot into a no-op that greenlights everything.
         run: node conformance/scripts/check-golden-provenance.mjs --self-test
+
+  wire-format-must-move-golden:
+    # MUST-MOVE-A-GOLDEN GATE (testing-gap plan §0.1 reviewer #3 / §3 Phase F1,
+    # finding TG-011). Complement of the golden-provenance gate above: that one
+    # asks "you changed a golden — prove the new bytes are right"; this one asks
+    # "you changed a wire ENCODER and no golden moved — then nothing checked the
+    # bytes at all".
+    #
+    # Why it exists: in 2026-08 a change altered the state-section wire framing
+    # in ALL SEVEN SDK serializers and moved ZERO pinned bytes. Every suite was
+    # green, because the encoder and decoder were co-changed and every test was a
+    # round-trip — `deserialize(serialize(x)) === x` holds for any self-consistent
+    # framing, including a wrong one. The result was a state section the compiler
+    # no longer agreed with. A wire-format change that moves no pinned bytes is
+    # untested by definition, so it blocks instead of reassuring.
+    #
+    # Runs on pull_request, on merge_group, AND on push to main / release/*.
+    # bd7ec284 — the commit this gate exists for — is on main's FIRST-PARENT
+    # chain: pushed directly, never a PR (only 5 of the last 100 commits
+    # reachable from main are PR merges). A pull_request-only gate would have
+    # watched it go straight past.
+    #
+    # Security note: the only github.event.* values consumed are the base branch
+    # NAME and base commit SHAs, passed via `env:` (never interpolated into the
+    # shell) and used solely as git refs for the merge-base diff.
+    name: Lint — wire-format must-move-a-golden gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history AND every remote branch, so `origin/<base branch>` is
+          # present for the run-time merge-base resolution below.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # conformance/ is standalone npm (not a pnpm workspace member); its
+      # devDependencies provide the tsx used to run the gate.
+      - run: cd conformance && npm ci
+      - name: Self-test the gate (glob liveness + #110 regression)
+        # Runs on EVERY event, not just pull_request: the liveness assertions
+        # prove each wire glob still matches a real file, so a rename on main
+        # that turns a glob into a permanent no-op is caught the moment it
+        # lands. A gate whose globs match nothing is worse than no gate — it
+        # reports green forever.
+        run: pnpm run wire-format-audit:self-test
+      - name: Wire-format audit (changed set vs merge-base)
+        # Fail mode (the plan allows a one-PR warn phase via `--warn-only`; the
+        # flag exists on the script but CI is wired to fail).
+        env:
+          # A base REF, not a pinned SHA. `pull_request.base.sha` is the base tip
+          # as of the PR's last sync, while the checkout is refs/pull/N/merge
+          # against the CURRENT base — so diffing from that SHA sweeps in every
+          # golden other PRs merged in between, and one of THOSE satisfies this
+          # gate for a PR that moved nothing. The script resolves
+          # `git merge-base <ref> HEAD` at run time instead.
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          # push: the tip before this push. Falls back to HEAD^ (the merge's
+          # first parent) when it is unavailable, e.g. a force-push or a tag.
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE_REF:-}" ]; then
+            base="origin/${PR_BASE_REF}"
+            # fetch-depth: 0 already creates this ref; fetch it explicitly if a
+            # future checkout change ever stops doing so, so the gate keeps
+            # working instead of hard-failing every PR.
+            git rev-parse --verify -q "${base}^{commit}" >/dev/null \
+              || git fetch --no-tags origin "+refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+          elif [ -n "${MERGE_GROUP_BASE:-}" ]; then
+            base="${MERGE_GROUP_BASE}"
+          elif [ -n "${PUSH_BEFORE:-}" ] \
+            && [ "${PUSH_BEFORE}" != "0000000000000000000000000000000000000000" ] \
+            && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            base="${PUSH_BEFORE}"
+          else
+            # --verify -q so a root commit (no HEAD^) prints nothing instead of
+            # echoing the unresolved "HEAD^" into $base.
+            base="$(git rev-parse --verify -q HEAD^ || git rev-parse --verify HEAD)"
+          fi
+          echo "wire-format gate base ref: ${base}"
+          WIRE_FORMAT_GATE_BASE="${base}" pnpm run wire-format-audit
 
   sdk-envelope-fixtures:
     # Guards the signed-envelope wire protocol's cross-tier fixture. The
@@ -660,6 +749,15 @@ jobs:
       # that import tsx from REPO_ROOT/conformance/node_modules, so install its
       # deps explicitly before the multi-format step.
       - run: cd conformance && npm ci
+      - name: Typecheck conformance/ (runner, fuzzer, fuzz-regressions, tests, scripts)
+        # conformance/ is a standalone npm project, not a pnpm workspace member,
+        # so it is invisible to `turbo run typecheck` (workspace packages only)
+        # and had never been typechecked — conformance/tsconfig.json's rootDir
+        # didn't account for the fuzzer's relative imports into sibling
+        # packages/runar-*/src, so every run failed before reaching a single
+        # real error. Fixed in conformance/tsconfig.json; this step keeps it
+        # from rotting back to unchecked.
+        run: pnpm run conformance:typecheck
       - name: Run IR -> hex cross-tier parity (all 6 non-TS compilers)
         # Compiles every fixture's checked-in expected-ir.json with all six
         # non-TS tiers and requires byte-identical hex plus equality with
@@ -721,6 +819,50 @@ jobs:
         # neither witnessed nor listed in the coverage ledger
         # (conformance/witnesses/coverage-ledger.json).
         run: cd conformance && npx vitest run witnesses/
+      - name: Construct ledger gate
+        # Reviewer point #2 / TG-003 / TG-015 (plan Phase D0). Coverage above is
+        # counted in FIXTURES; this gate counts it in fund-critical CONSTRUCTS —
+        # language shapes and wire value classes. Both 2026-08 fund-safety bugs
+        # (branch-merged locals with >=2 merged locals; a 1-byte OP_N-range
+        # ByteString state value) were EMPTY CELLS in that matrix while every
+        # fixture-counted gate above was green.
+        #
+        # Eight gates, one `it` each. Fails if a row has neither evidence nor an
+        # honest `status: "UNCOVERED"` + `issue`; if a claimed `coveredBy[].path`
+        # does not exist on disk OR exists but is EMPTY (so deleting a witness
+        # turns its construct red instead of silently decaying into a false
+        # claim); if an id in the test file's hard-coded REQUIRED_CONSTRUCTS set
+        # has no row; if an id, `category`, `severity` or `kind` breaks the
+        # closed enums; if a `coveredBy[].kind` does not MATCH THE SHAPE of the
+        # path it claims (a `real-crypto-witness` pointing at a doc used to pass
+        # every gate); if a row is backed only by a round-trip test from
+        # ROUND_TRIP_ONLY_PATHS (reviewer point #4 — a self-inverse cannot catch
+        # a change that moves both sides together); if a ROUND_TRIP_ONLY_PATHS
+        # entry no longer names a real file (a rename silently turns the denylist
+        # into a no-op); or if REQUIRED_CONSTRUCTS falls below the committed
+        # MIN_REQUIRED_CONSTRUCTS floor or stops being a bijection with the
+        # ledger's row ids (the reverse direction — a construct demoted by
+        # deleting one line while its row stays put).
+        # See conformance/README.md ⇒ "Construct ledger".
+        run: cd conformance && npx vitest run construct-ledger.test.ts
+      - name: Mutation corpus staleness guard
+        # A mutant is a patch against a specific line of a specific compiler
+        # source file. When that code is refactored the patch either stops
+        # applying (silent no-op) or starts hitting DEAD code (silent survival),
+        # and a survivor is indistinguishable from a genuine hole in the net.
+        # That is not hypothetical: 4b0f688f moved the branch-merge decision,
+        # both PALMER-1 mutants kept applying to lines that no longer gate
+        # anything, and conformance/mutation/baseline.json went on recording
+        # them as CAUGHT. The only check that would have noticed is the
+        # baseline-regression step in fuzzer-nightly.yml, which is nightly-only
+        # and had not run since.
+        #
+        # This step runs no gates and mutates nothing — it just asserts every
+        # mutant's find string still occurs EXACTLY ONCE in the file it patches
+        # (milliseconds), so "the corpus no longer describes the code" fails
+        # loudly on the PR that moves the code, not weeks later as a mystery
+        # survivor. See conformance/mutation/__tests__/mutant-staleness.test.ts.
+        run: npx vitest run conformance/mutation
 
   conformance-anf-parity:
     # Cross-interpreter parity for the ANF lenient interpreter shipped by
@@ -1040,6 +1182,14 @@ jobs:
         run: cd conformance/sdk-output/tools/java-driver && gradle fatJar --no-daemon
       - name: Run SDK output conformance (all contracts x 7 SDKs)
         run: cd conformance/sdk-output && npx tsx runner/sdk-runner.ts
+      - name: Run vertical compiler<->SDK pins (constructorSlots + codeSeparator offsets)
+        # Horizontal parity (the step above) proves the seven SDKs agree; it
+        # cannot prove they are right. This gate compares each tier's deployed
+        # locking script against an independent derivation from the compiler's
+        # own artifact, and checks the artifact's constructorSlots /
+        # codeSeparatorIndices against an opcode walk of the script it ships.
+        # Reuses the SDK drivers built above. See conformance/sdk-vertical/README.md.
+        run: cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts
 
   script-execution:
     # S1 execution oracle (TS-GAP-003): compile every conformance contract to

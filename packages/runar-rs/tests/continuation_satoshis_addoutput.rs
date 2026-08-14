@@ -21,6 +21,7 @@
 //! (post-fix) emits 1000.
 
 use runar_lang::sdk::types::RunarArtifact;
+use runar_lang::sdk::script_utils::build_p2pkh_script;
 use runar_lang::sdk::{
     DeployOptions, LocalSigner, MockProvider, RunarContract, SdkValue, Signer, Utxo,
 };
@@ -65,7 +66,7 @@ fn deploy() -> (RunarContract, MockProvider, LocalSigner) {
         txid: "aa".repeat(32),
         output_index: 0,
         satoshis: 500_000,
-        script: format!("76a914{}88ac", "00".repeat(20)),
+        script: build_p2pkh_script(&address),
     });
 
     let mut contract = RunarContract::new(compile_sat_counter(), vec![SdkValue::Int(5)]);
@@ -85,8 +86,13 @@ fn deploy() -> (RunarContract, MockProvider, LocalSigner) {
         txid: "bb".repeat(32),
         output_index: 1,
         satoshis: 500_000,
-        script: format!("76a914{}88ac", "00".repeat(20)),
+        script: build_p2pkh_script(&address),
     });
+    // The call spends the deploy's contract output. Teach the FRESH call
+    // provider about that outpoint, otherwise its fail-closed broadcast gate
+    // would have nothing to check and would (correctly) refuse the ack.
+    let contract_utxo = contract.get_utxo().expect("deploy tracks a contract UTXO").clone();
+    call_provider.add_contract_utxo(&contract_utxo.script.clone(), contract_utxo);
 
     (contract, call_provider, signer)
 }

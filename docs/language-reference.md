@@ -504,11 +504,11 @@ On-chain elliptic curve operations over the secp256k1 curve. These are synthesiz
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `ecAdd` | `(a: Point, b: Point) => Point` | Affine point addition |
-| `ecMul` | `(p: Point, k: bigint) => Point` | Scalar multiplication (256-iteration double-and-add, Jacobian coordinates internally) |
+| `ecAdd` | `(a: Point, b: Point) => Point` | Affine point addition. `a + (-a)` is the point at infinity and evaluates to the **all-zero point** |
+| `ecMul` | `(p: Point, k: bigint) => Point` | Scalar multiplication (256-iteration double-and-add, Jacobian coordinates internally). `k` is reduced mod `n` first, so any scalar is accepted |
 | `ecMulGen` | `(k: bigint) => Point` | Scalar multiplication by the hardcoded generator point G |
 | `ecNegate` | `(p: Point) => Point` | Point negation: `(x, p - y)` |
-| `ecOnCurve` | `(p: Point) => boolean` | Verify point satisfies `y^2 === x^3 + 7 (mod p)` |
+| `ecOnCurve` | `(p: Point) => boolean` | Verify point satisfies `y^2 === x^3 + 7 (mod p)` **and** that both coordinates are canonical (`x < p`, `y < p`) |
 | `ecModReduce` | `(value: bigint, mod: bigint) => bigint` | Modular reduction: `((value % mod) + mod) % mod` |
 | `ecEncodeCompressed` | `(p: Point) => ByteString` | Encode point as 33-byte compressed public key (02/03 prefix + x) |
 | `ecMakePoint` | `(x: bigint, y: bigint) => Point` | Construct a 64-byte Point from x and y coordinates |
@@ -539,7 +539,70 @@ Exported from `runar-lang`:
 
 These can be combined with bitwise OR (e.g., `SigHash.ALL | SigHash.FORKID` = `0x41`).
 
-> **Note on `ecMul` and `ecMulGen`:** These use a 256-iteration double-and-add loop with Jacobian coordinates internally for efficiency, converting back to affine at the end. Each call generates substantial Bitcoin Script (~50-100 KB). For scalar multiplication by the generator G, prefer `ecMulGen(k)` over `ecMul(EC_G, k)` as the generator point is hardcoded, avoiding the need to push 64 bytes of point data.
+> **Note on `ecMul` and `ecMulGen`:** These use a 256-iteration double-and-add loop with Jacobian coordinates internally for efficiency, converting back to affine at the end. Each call generates **~429 KB** of Bitcoin Script — see [Script size and relay policy](#script-size-and-relay-policy) before assuming a contract with more than one of them will relay. For scalar multiplication by the generator G, prefer `ecMulGen(k)` over `ecMul(EC_G, k)` as the generator point is hardcoded, avoiding the need to push 64 bytes of point data.
+
+> **Note on the scalar domain:** the scalar is reduced to `[0, n-1]` before the ladder, so `k >= n` behaves as `k mod n` and a negative `k` as `((k mod n) + n) mod n`. `k ≡ 0 (mod n)` is the point at infinity, which the affine `x‖y` encoding cannot represent — it evaluates to the **all-zero point**, and a contract taking an untrusted scalar must treat that result as a rejection. The same applies to `p256Mul` / `p384Mul` and their `*MulGen` forms.
+
+> **Note on the point at infinity (`O`):** `O` has no affine `x‖y` encoding, so every operation that would produce it returns the **all-zero point** instead, from a script that SUCCEEDS. Three inputs do this: `ecMul(P, 0n)`, `ecMulGen(0n)` (and any `k ≡ 0 mod n`), and `ecAdd(P, ecNegate(P))` (and any `ecAdd(P, Q)` with `P.x == Q.x` and `P.y != Q.y`). The return value alone does not distinguish `O` from a real point — **`ecOnCurve` is the detector**, and it returns `false` for the all-zero point on all three curves (`0² ≠ 0³ + b`). Any contract that adds or scales caller-supplied points must gate the RESULT:
+>
+> ```ts
+> const r = ecAdd(a, b);
+> assert(ecOnCurve(r));   // rejects O, and rejects an off-curve result
+> ```
+>
+> This is also why `ecAdd(P, -P)` returns `O` rather than the tangent's `2P`: the answer must agree with the `ec-mulgen-linear` optimizer rewrite, which turns `ecAdd(ecMulGen(k1), ecMulGen(k2))` with `k1 + k2 ≡ 0 (mod n)` into `ecMulGen(0)` — the all-zero point. The same source must not compile to two different answers depending on whether the optimizer fired.
+>
+> **`O` is a sentinel, not a group identity — never feed it back in.** `ecAdd` / `p256Add` / `p384Add` implement the chord-and-tangent formulas, which have no case for an operand at infinity: `ecAdd(O, Q)` compares `0 == Q.x`, takes the chord path, and returns an **off-curve blob**, not `Q`. Likewise `ecMul(O, k)` is meaningless. The all-zero point is only ever a value to *test and reject*, so put the `assert(ecOnCurve(...))` immediately after the operation that could produce it, before the result reaches another EC builtin.
+
+> **Note on `ecOnCurve` / `p256OnCurve` / `p384OnCurve`:** these also reject **non-canonical** coordinates (`x >= p` or `y >= p`). Coordinates decode as unsigned integers and the field arithmetic reduces mod `p`, so `(x + p)‖y` would otherwise be a second accepted encoding of the same point — and `ecAdd` / `pNNNAdd` detect doubling by comparing the *raw* x-coordinates, so two accepted encodings of one point take the chord path and return an off-curve result. Gate every untrusted `Point` on the on-curve check before doing arithmetic with it.
+
+### Elliptic Curve (NIST P-256 / P-384)
+
+The same construction over the two NIST prime curves, `secp256r1` and `secp384r1`. Both have curve parameter `a = -3`, so the curve equation is `y² = x³ - 3x + b (mod p)`. `P256Point` is a 64-byte `ByteString` subtype (`x[32] || y[32]`) and `P384Point` a 96-byte one (`x[48] || y[48]`), both big-endian unsigned with no prefix byte.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `p256Add` / `p384Add` | `(a, b) => Point` | Affine point addition. `a + (-a)` evaluates to the **all-zero point** |
+| `p256Mul` / `p384Mul` | `(p, k: bigint) => Point` | Scalar multiplication; `k` is reduced mod `n` first, so any scalar is accepted |
+| `p256MulGen` / `p384MulGen` | `(k: bigint) => Point` | Scalar multiplication by the hardcoded generator |
+| `p256Negate` / `p384Negate` | `(p) => Point` | Point negation: `(x, p - y)` |
+| `p256OnCurve` / `p384OnCurve` | `(p) => boolean` | Curve equation **and** coordinate canonicity (`x < p`, `y < p`) |
+| `p256EncodeCompressed` / `p384EncodeCompressed` | `(p) => ByteString` | 33- / 49-byte compressed encoding (`02`/`03` prefix + x) |
+| `verifyECDSA_P256` | `(msg, sig, pubkey) => boolean` | ECDSA verify: 64-byte `sig` = `r[32]‖s[32]`, 33-byte compressed `pubkey` |
+| `verifyECDSA_P384` | `(msg, sig, pubkey) => boolean` | ECDSA verify: 96-byte `sig` = `r[48]‖s[48]`, 49-byte compressed `pubkey` |
+
+#### `verifyECDSA_*` argument validation
+
+Both verifiers are **total**: every input returns a boolean, none aborts the script, so `verifyECDSA_P256(...) || fallback` is writable. They return `false` — never `true`, never an abort — for all of:
+
+- `sig` that is not exactly `2 × coordBytes` long, or `pubkey` not exactly `coordBytes + 1`. Trailing bytes are **not** ignored: `sig ‖ junk` is rejected, so signature bytes are safe to use as a nullifier or dedup key.
+- `r == 0`, `s == 0`, `r >= n`, or `s >= n` (SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2). **An all-zero signature used to verify for any message under any public key** — see [`docs/audit/2026-08-ec-degenerate-cases.md`](audit/2026-08-ec-degenerate-cases.md).
+- a `pubkey` prefix byte other than `0x02` or `0x03` (SEC1 §2.3.4).
+- a `pubkey` whose `x` is `>= p`, or whose `x³ - 3x + b` is a quadratic non-residue (the decompressed point would be off the curve, on the twist).
+
+> **`verifyECDSA_P384` hashes with SHA-256, not SHA-384.** The message is hashed with `OP_SHA256` on both curves, because SHA-384 is SHA-512-based and 64-bit word arithmetic is not expressible in Bitcoin Script (see issue #137). Two consequences: a signer using the standard `SHA384withECDSA` / `ecdsa-with-SHA384` algorithm identifier produces signatures that **can never verify** here — it must sign `SHA-256(msg)` explicitly; and the effective collision resistance of the scheme is 128-bit, not the 192-bit the P-384 group size suggests. Choose P-384 for group-size or compliance reasons, not for hash strength.
+
+> **Signatures are malleable: no low-S normalisation.** `(r, s)` and `(r, n - s)` both verify, as they do in unmodified ECDSA — this is deliberate. Enforcing low-S (BIP-62 style) would reject conforming FIPS 186-5 signatures from standard signers: OpenSSL does not produce low-S, and WebAuthn authenticators routinely emit high-S. On a NIST-curve second factor that turns an interop detail into an unspendable output, which is exactly the liveness regression the totality rule above exists to avoid. If a contract needs a *unique* identifier for a signing event, derive it from the message or from `r` alone, not from the whole signature blob.
+
+<a id="script-size-and-relay-policy"></a>
+#### Script size and relay policy
+
+These primitives are synthesized from base opcodes, so they are **large** — large enough that the binding constraint is usually the node's relay policy, not correctness. Measured with `emitMethod` on the emitter alone (fold-OFF), 2026-08:
+
+| Builtin | Script bytes | vs. 500,000 B default policy |
+|---|---:|---|
+| `ecAdd` | 25,426 | 5% |
+| `p256Add` | 19,906 | 4% |
+| `p384Add` | 46,710 | 9% |
+| `ecMul` / `ecMulGen` | 428,676 / 428,742 | 86% |
+| `p256Mul` / `p256MulGen` | 459,746 / 459,812 | 92% |
+| `p384Mul` / `p384MulGen` | 927,350 / 927,449 | **1.85× over** |
+| `verifyECDSA_P256` | 974,024 | **1.95× over** |
+| `verifyECDSA_P384` | 1,987,394 | **3.97× over** |
+
+The BSV node default is `DEFAULT_MAX_SCRIPT_SIZE_POLICY_AFTER_GENESIS = 500 * ONE_KILOBYTE` (500,000 B), applied **per script** — the locking script and each unlocking script are checked separately (`src/policy/policy.h`). So a single `verifyECDSA_P256` call puts the locking script over the default on its own, before any contract logic; `verifyECDSA_P384` puts it 4× over. Even one `ecMul` plus modest surrounding logic will exceed it. There is no consensus limit in play here (`maxscriptsizepolicy` is unlimited within consensus, and `maxtxsizepolicy` defaults to 10 MB), so acceptance depends entirely on the receiving miner: a node on stock policy rejects the transaction as non-standard, a node running `maxscriptsizepolicy ≥ 2 MB` accepts and mines it. Coordinate with the target pool before the first mainnet broadcast, the same way [`docs/fri-verifier-measurements.md`](fri-verifier-measurements.md) does for the SP1 FRI verifier.
+
+> **The in-tree on-chain evidence does not test this.** `integration/regtest.sh` starts its node with `maxscriptsizepolicy=0` (unlimited), so every regtest broadcast these primitives have ever passed was against a node with the limit **disabled**. Broadcast success in the integration suite is evidence that the script is *valid*, not that it is *relayable*.
 
 ---
 

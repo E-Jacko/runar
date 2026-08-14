@@ -8,6 +8,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, UnlockingScript, Transaction, Hash, Utils } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -32,7 +33,7 @@ async function setupWallet(provider: MockProvider, privKey: string, satoshis: nu
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(pubKeyHex),
   });
   return { signer, pubKeyHex };
 }
@@ -125,7 +126,7 @@ describe('Complex stateful contract with private methods', () => {
 
   it('start (method 0) should pass script validation', async () => {
     const artifact = compileSource(gameSource, 'Game.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [wallet.pubKeyHex, 0n, 0n, 0n, 0n, 0n, 0n, 0n]);
 
@@ -143,7 +144,7 @@ describe('Complex stateful contract with private methods', () => {
 
   it('play (method 1, with private method call) should pass script validation', async () => {
     const artifact = compileSource(gameSource, 'Game.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [wallet.pubKeyHex, 0n, 0n, 0n, 0n, 0n, 0n, 0n]);
 
@@ -194,7 +195,7 @@ describe('Stateful two-method contract script validation', () => {
 
   it('first method (increment) should pass script validation', async () => {
     const artifact = compileSource(source, 'Counter.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [0n]);
 
@@ -210,7 +211,7 @@ describe('Stateful two-method contract script validation', () => {
 
   it('second method (reset) should pass script validation', async () => {
     const artifact = compileSource(source, 'Counter.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [5n]);
 
@@ -226,7 +227,7 @@ describe('Stateful two-method contract script validation', () => {
 
   it('increment then reset should both pass', async () => {
     const artifact = compileSource(source, 'Counter.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [0n]);
 
@@ -271,7 +272,7 @@ describe('Bug #1: update_prop old-value removal — multiple property mutations'
 
   it('three consecutive update_prop should pass script validation', async () => {
     const artifact = compileSource(source, 'ThreeProp.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [1n, 2n, 3n]);
 
@@ -349,7 +350,7 @@ describe('Bug #5: void-if — assertion-only branches should not push phantom', 
 
   it('assertion-only private method + turn flip should pass script validation', async () => {
     const artifact = compileSource(source, 'VoidIfGame.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     // Initialize with turn=1n so assertCorrectPlayer's then-branch runs
     // (player === owner succeeds when we use the same key)
@@ -413,7 +414,7 @@ class PayoutContract extends StatefulSmartContract {
 
   it('activate (state-mutating) should pass script validation', async () => {
     const artifact = compileSource(source, 'PayoutContract.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const betAmount = 1000n;
     const contract = new RunarContract(artifact, [wallet.pubKeyHex, betAmount]);
@@ -430,7 +431,10 @@ class PayoutContract extends StatefulSmartContract {
 
   it('claim (terminal with extractOutputHash) should pass script validation', async () => {
     const artifact = compileSource(source, 'PayoutContract.runar.ts');
-    const provider = new MockProvider();
+    // Terminal `claim` pays out the full contract balance with no feeUtxo
+    // (fee 0, the pre-#118 shape) — opt out of P1-2's fee floor only; Spend
+    // still runs via validateSpend() below.
+    const provider = new MockProvider('testnet', { enforceFeeFloor: false });
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const betAmount = 1000n;
     const contract = new RunarContract(artifact, [wallet.pubKeyHex, betAmount]);
@@ -486,7 +490,10 @@ describe('TicTacToe full game with terminal moveAndWin', () => {
 
   it('full game: deploy → join → 4 moves → moveAndWin', async () => {
     const artifact = compileSource(tttSource, 'TicTacToe.runar.ts');
-    const provider = new MockProvider();
+    // moveAndWin pays out the full pot with no feeUtxo (fee 0, the pre-#118
+    // shape) — opt out of P1-2's fee floor only; Spend still runs via
+    // validateSpend() below.
+    const provider = new MockProvider('testnet', { enforceFeeFloor: false });
     const betAmount = 1000;
 
     // Setup playerX wallet
@@ -497,7 +504,7 @@ describe('TicTacToe full game with terminal moveAndWin', () => {
       txid: PLAYER_X_KEY.slice(0, 64),
       outputIndex: 0,
       satoshis: 500_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: buildP2PKHScript(playerXPub),
     });
 
     // Setup playerO wallet
@@ -508,7 +515,7 @@ describe('TicTacToe full game with terminal moveAndWin', () => {
       txid: PLAYER_O_KEY.slice(0, 64),
       outputIndex: 0,
       satoshis: 500_000,
-      script: '76a914' + '00'.repeat(20) + '88ac',
+      script: buildP2PKHScript(playerOPub),
     });
 
     // Deploy with playerX
@@ -647,7 +654,7 @@ class WinCheck extends StatefulSmartContract {
 
   it('activate + 2 places + winMove should pass validation', async () => {
     const artifact = compileSource(source, 'WinCheck.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [wallet.pubKeyHex]);
 
@@ -739,7 +746,7 @@ describe('Nested private method calls (assertCellEmpty from placeMove)', () => {
 
   it('start should pass script validation', async () => {
     const artifact = compileSource(source, 'Game4.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [wallet.pubKeyHex, 0n, 0n, 0n, 0n, 0n, 0n]);
 
@@ -756,7 +763,7 @@ describe('Nested private method calls (assertCellEmpty from placeMove)', () => {
 
   it('play (nested private methods) should pass script validation', async () => {
     const artifact = compileSource(source, 'Game4.runar.ts');
-    const provider = new MockProvider();
+    const provider = new MockProvider('testnet');
     const wallet = await setupWallet(provider, SIGNER_KEY, 500_000);
     const contract = new RunarContract(artifact, [wallet.pubKeyHex, 0n, 0n, 0n, 0n, 0n, 0n]);
 

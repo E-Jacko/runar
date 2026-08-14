@@ -29,6 +29,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, Transaction, PrivateKey, BigNumber, ECDSA, Hash } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -128,9 +129,16 @@ const SRC = `
   }
 `;
 
-async function deployOwnerBump() {
+/**
+ * @param alwaysAck - Only for the "control" test below, which deliberately
+ *   broadcasts a script-invalid call tx (wrong-digest signature) to prove
+ *   the digests differ at the script layer, independent of the SDK's own
+ *   `dryRun` guard. A validating provider would refuse that broadcast before
+ *   the test can inspect it, so that one test opts out explicitly.
+ */
+async function deployOwnerBump(alwaysAck = false) {
   const artifact = compileSource(SRC, 'OwnerBump.runar.ts');
-  const provider = new MockProvider();
+  const provider = new MockProvider('testnet', alwaysAck ? { validateBroadcasts: false } : undefined);
   const signer = new LocalSigner(SIGNER_KEY);
   const address = await signer.getAddress();
   const pubKeyHex = await signer.getPublicKey();
@@ -138,7 +146,7 @@ async function deployOwnerBump() {
     txid: SIGNER_KEY.slice(0, 64),
     outputIndex: 0,
     satoshis: 500_000,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(pubKeyHex),
   });
   const contract = new RunarContract(artifact, [pubKeyHex, 0n]);
   contract.connect(provider, signer);
@@ -195,7 +203,11 @@ describe('C19 — PreparedCall.sighash must be the double-SHA256 BIP-143 digest'
     // `spendRejects` could never observe the script-level rejection this test
     // exists to prove. The sibling test below asserts that interception
     // directly; this one isolates the DIGEST difference at the script layer.
-    const { contract, provider, signer, deployTx } = await deployOwnerBump();
+    // `deployOwnerBump(true)`: the provider must ACK the script-invalid call
+    // tx so this test can inspect it — MockProvider's own broadcast
+    // validation would otherwise refuse it before `spendRejects` gets a
+    // chance to prove the rejection independently.
+    const { contract, provider, signer, deployTx } = await deployOwnerBump(true);
     const prepared = await contract.prepareCall('bump', [null]);
     const preimageBytes = Buffer.from(prepared.preimage, 'hex');
     const wrongDigest = Buffer.from(Hash.sha256(Array.from(preimageBytes))).toString('hex');

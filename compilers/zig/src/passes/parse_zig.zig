@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const readonly_inference = @import("../frontend/readonly_inference.zig");
 
 const Allocator = std.mem.Allocator;
 const Expression = types.Expression;
@@ -452,6 +453,11 @@ const Parser = struct {
                 prop.readonly = !has_default;
             }
         }
+
+        // Rule 3: a field with no default that a method body ASSIGNS is state,
+        // not a constructor constant. Without this the no-default shape was
+        // inferred fully-readonly and the stateful continuation was dropped.
+        readonly_inference.applyMutationInference(self.allocator, pc, properties.items, methods.items, explicit_readonly_fields.items);
 
         return ContractNode{
             .name = name_tok.text, .parent_class = pc, .properties = properties.items,

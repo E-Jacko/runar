@@ -20,6 +20,10 @@ contract ECUnit is SmartContract {
         require(ecOnCurve(doubled));
         Point sum = ecAdd(g, g);
         require(ecOnCurve(sum));
+        // P + (-P) is the point at infinity: ecAdd returns the all-zero blob
+        // from a SUCCESSFUL script, and ecOnCurve must reject it.
+        Point infPt = ecAdd(g, neg);
+        require(!ecOnCurve(infPt));
         bigint x = ecPointX(g);
         bigint y = ecPointY(g);
         Point rebuilt = ecMakePoint(x, y);

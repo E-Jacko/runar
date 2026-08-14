@@ -193,6 +193,49 @@
           "name": "t14",
           "value": {
             "args": [
+              "g",
+              "neg"
+            ],
+            "func": "ecAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "infPt",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t14"
+          }
+        },
+        {
+          "name": "t15",
+          "value": {
+            "args": [
+              "infPt"
+            ],
+            "func": "ecOnCurve",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t16",
+          "value": {
+            "kind": "unary_op",
+            "op": "!",
+            "operand": "t15"
+          }
+        },
+        {
+          "name": "t17",
+          "value": {
+            "kind": "assert",
+            "value": "t16"
+          }
+        },
+        {
+          "name": "t18",
+          "value": {
+            "args": [
               "g"
             ],
             "func": "ecPointX",
@@ -203,11 +246,11 @@
           "name": "x",
           "value": {
             "kind": "load_const",
-            "value": "@ref:t14"
+            "value": "@ref:t18"
           }
         },
         {
-          "name": "t15",
+          "name": "t19",
           "value": {
             "args": [
               "g"
@@ -220,11 +263,11 @@
           "name": "y",
           "value": {
             "kind": "load_const",
-            "value": "@ref:t15"
+            "value": "@ref:t19"
           }
         },
         {
-          "name": "t16",
+          "name": "t20",
           "value": {
             "args": [
               "x",
@@ -238,11 +281,11 @@
           "name": "rebuilt",
           "value": {
             "kind": "load_const",
-            "value": "@ref:t16"
+            "value": "@ref:t20"
           }
         },
         {
-          "name": "t17",
+          "name": "t21",
           "value": {
             "args": [
               "rebuilt"
@@ -252,14 +295,14 @@
           }
         },
         {
-          "name": "t18",
+          "name": "t22",
           "value": {
             "kind": "assert",
-            "value": "t17"
+            "value": "t21"
           }
         },
         {
-          "name": "t19",
+          "name": "t23",
           "value": {
             "args": [
               "g"
@@ -272,11 +315,11 @@
           "name": "compressed",
           "value": {
             "kind": "load_const",
-            "value": "@ref:t19"
+            "value": "@ref:t23"
           }
         },
         {
-          "name": "t20",
+          "name": "t24",
           "value": {
             "args": [
               "compressed"
@@ -286,40 +329,40 @@
           }
         },
         {
-          "name": "t21",
+          "name": "t25",
           "value": {
             "kind": "load_const",
             "value": 33
           }
         },
         {
-          "name": "t22",
+          "name": "t26",
           "value": {
             "kind": "bin_op",
-            "left": "t20",
+            "left": "t24",
             "op": "===",
-            "right": "t21"
+            "right": "t25"
           }
         },
         {
-          "name": "t23",
+          "name": "t27",
           "value": {
             "kind": "assert",
-            "value": "t22"
+            "value": "t26"
           }
         },
         {
-          "name": "t24",
+          "name": "t28",
           "value": {
             "kind": "load_const",
             "value": true
           }
         },
         {
-          "name": "t25",
+          "name": "t29",
           "value": {
             "kind": "assert",
-            "value": "t24"
+            "value": "t28"
           }
         }
       ],

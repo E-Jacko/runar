@@ -17,10 +17,29 @@ export {
 } from './generator.js';
 export type { GeneratorConfig } from './generator.js';
 
+// Branch / loop SHAPE families reachable from the IR-based generators, plus
+// the shape-pinned variants a seeded test uses to PROVE each is produced
+// (see `packages/runar-testing/src/__tests__/fuzzer-branch-shapes.test.ts`).
+export {
+  BRANCH_SHAPES,
+  STATEFUL_BRANCH_SHAPES,
+  IR_LOOP_SHAPES,
+  branchShapeCarriers,
+  irLoopShapeCarriers,
+  arbGeneratedContractWithShape,
+  arbGeneratedStatefulContractWithShape,
+} from './generator.js';
+export type { BranchShape, IrLoopShape } from './generator.js';
+
 // Tri-modal execution-oracle generator (issue #124): loops + byte-ops +
 // post-loop param reads, with concrete inputs for fast-check property shrinking.
-export { arbExecCase } from './generator.js';
-export type { ExecCase, ExecArg } from './generator.js';
+export {
+  arbExecCase,
+  arbExecCaseWithLoopShape,
+  loopShapeCarriers,
+  EXEC_LOOP_SHAPES,
+} from './generator.js';
+export type { ExecCase, ExecArg, ExecLoopShape } from './generator.js';
 
 // Contract IR types
 export type {

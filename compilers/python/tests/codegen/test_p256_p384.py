@@ -17,39 +17,64 @@ from runar_compiler.codegen.p256_p384 import (
 from runar_compiler.codegen.stack import StackOp
 
 
+def _count_op_tree(ops: list[StackOp]) -> int:
+    """Total StackOps in ``ops``, INCLUDING the bodies of ``if`` ops.
+
+    A flat ``len(ops)`` cannot see inside a branch, so any emitter whose work
+    sits in an ``if`` body -- the scalar ladders emit 257 / 385 conditional
+    additions, WOTS+ and SLH-DSA are almost entirely conditional -- reports a
+    count that barely moves no matter what the branch contains. Adding +1.3 KB
+    of script inside the ladder's last step left the ``p256Mul`` / ``p384Mul``
+    goldens byte-identical. Recursing is what makes the golden a gate.
+    """
+    total = 0
+    for op in ops:
+        total += 1
+        if op.op == "if":
+            total += _count_op_tree(op.then)
+            total += _count_op_tree(op.else_ops)
+    return total
+
+
 # ---------------------------------------------------------------------------
-# P-256 op-count goldens
+# P-256 op-count goldens (op-TREE sizes: `if` bodies included)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("p256Add",              emit_p256_add,               6505),
-    ("p256Mul",              emit_p256_mul,              73306),
-    ("p256MulGen",           emit_p256_mul_gen,          73308),
+    ("p256Add",              emit_p256_add,               6663),
+    ("p256Mul",              emit_p256_mul,             140036),
+    ("p256MulGen",           emit_p256_mul_gen,         140038),
     ("p256Negate",           emit_p256_negate,             945),
-    ("p256OnCurve",          emit_p256_on_curve,           546),
-    ("p256EncodeCompressed", emit_p256_encode_compressed,   14),
-    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    163589),
+    ("p256OnCurve",          emit_p256_on_curve,           559),
+    ("p256EncodeCompressed", emit_p256_encode_compressed,   16),
+    # 297273 -> 297331 (+58): the ECDSA verifier gained its argument-validation
+    # gates -- two length gates on `_sig` / `_pk`, the 1 <= r,s <= n-1 range
+    # gate, the SEC1 prefix-byte check inside decompression, and the ANDs that
+    # fold all of it into one `_input_ok` flag.
+    ("verifyECDSA_P256",     emit_verify_ecdsa_p256,    297331),
 ])
 def test_p256_op_count(name, fn, expected):
     ops: list[StackOp] = []
     fn(ops.append)
-    assert len(ops) == expected, f"{name} op count drift: got {len(ops)} want {expected}"
+    got = _count_op_tree(ops)
+    assert got == expected, f"{name} op count drift: got {got} want {expected}"
 
 
 # ---------------------------------------------------------------------------
-# P-384 op-count goldens
+# P-384 op-count goldens (op-TREE sizes: `if` bodies included)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name,fn,expected", [
-    ("p384Add",              emit_p384_add,              11311),
-    ("p384Mul",              emit_p384_mul,             111424),
-    ("p384MulGen",           emit_p384_mul_gen,         111426),
+    ("p384Add",              emit_p384_add,              11469),
+    ("p384Mul",              emit_p384_mul,             211178),
+    ("p384MulGen",           emit_p384_mul_gen,         211180),
     ("p384Negate",           emit_p384_negate,            1393),
 ])
 def test_p384_op_count(name, fn, expected):
     ops: list[StackOp] = []
     fn(ops.append)
-    assert len(ops) == expected, f"{name} op count drift: got {len(ops)} want {expected}"
+    got = _count_op_tree(ops)
+    assert got == expected, f"{name} op count drift: got {got} want {expected}"
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,7 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": ".",
+    "noEmit": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noUncheckedIndexedAccess": false,
@@ -13,9 +12,34 @@
     "baseUrl": "."
   },
   "include": [
-    "runner/**/*.ts",
-    "fuzzer/**/*.ts",
-    "fuzz-regressions/*.ts",
-    "tests/**/*.runar.ts"
+    "**/*.ts"
+  ],
+  // `fuzz-findings*` holds RUNTIME OUTPUT, not sources: every fuzz mode dumps a
+  // repro tree there on a divergence, and several of those trees contain
+  // generated `.runar.ts` contracts. Without this exclusion the widened
+  // `include` above typechecks them, so FINDING A BUG BREAKS THE TYPECHECK —
+  // the one moment the build must not also fail for an unrelated reason.
+  //
+  // The glob deliberately covers every suffix rather than listing them, so a
+  // new fuzz mode's findings directory is excluded the day it is added.
+  // Directories currently written: fuzz-findings (differential.ts),
+  // -ir, -anf, -canonical, -execute, -trimodal, -spend, -metamorphic.
+  // `.tmp/` (the per-tier scratch sources) needs no entry — TypeScript's
+  // include globs never match dot-directories.
+  // `fuzz-regressions/entries/*/contract.runar.ts` is the same category as the
+  // findings trees above, one step further along: a finding PROMOTED to a
+  // permanent regression fixture. The contracts are fuzzer output — Rúnar
+  // source read as TEXT by replay.ts (`readFileSync`), never imported as a
+  // module — and the generator emits shapes that are valid Rúnar but not
+  // idiomatic TypeScript. The 2026-08-06 branch-k1 entry pins
+  // `if ((-72n !== 13n))`, a constant-true guard that is the whole point of the
+  // reduction and that tsc rejects as TS2367 "no overlap". Typechecking these
+  // would mean PROMOTING A REGRESSION BREAKS THE BUILD, for the same reason the
+  // exclusion above exists — and editing the contract to placate tsc would
+  // destroy the very shape being pinned.
+  "exclude": [
+    "node_modules",
+    "fuzz-findings*",
+    "fuzz-regressions/entries/*/contract.runar.ts"
   ]
 }

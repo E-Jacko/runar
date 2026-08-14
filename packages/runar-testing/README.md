@@ -6,6 +6,45 @@ This package provides everything needed to verify that compiled Rúnar contracts
 
 ---
 
+## Read this first: interpreter tests ≠ spendability
+
+`TestContract` and `RunarInterpreter` are **AST interpreters with mocked
+ECDSA**. They walk the parsed contract, not the compiled Bitcoin Script, and
+`checkSig` / `checkMultiSig` / `checkPreimage` / `verifyRabinSig` always return
+`true`.
+
+> **An interpreter test proves business logic. It never proves the contract is
+> spendable.** A green `TestContract` suite is silent about whether the
+> compiled locking script can be spent on-chain at all — and about whether an
+> accepted spend commits the *right* continuation state.
+
+That is not a defect; it is what makes these tools usable without managing keys
+and sighashes. It just means they cannot be the *only* evidence for a
+fund-critical claim. The paths that do prove spendability:
+
+| Path | What it proves | Where |
+|---|---|---|
+| `ScriptVM` | Compiled script bytes execute; **real** `OP_CHECKSIG` (real secp256k1, real BIP-143 sighash) | this package, `src/vm/script-vm.ts` |
+| `runDifferentialExecution` | Interpreter and the `@bsv/sdk` engine agree — **on the verdict only** | `src/oracle/differential-execution.ts` |
+| `runStatefulSpend` / `runStatelessSigned` | Real deploy→call→`Spend` with real signatures, **plus** a hand-authored post-spend state pin | `src/oracle/real-crypto-execution.ts`, driven by `conformance/witnesses/real-crypto/*.json` |
+| `MockProvider` deploy/call | Whole-transaction acceptance through the real `Spend` engine | `runar-sdk` — **validation is ON by default** |
+| Regtest integration | A real node | `integration/{ts,go,rust,python,ruby,zig,java}` |
+
+**`MockProvider` now validates broadcasts by default.** Since the 2026-08
+testing-gap remediation (Phase A1), `runar-sdk`'s `MockProvider` replays every
+input it knows the UTXO for through `@bsv/sdk`'s production `Spend`
+interpreter, fails closed when *no* input could be validated, and enforces a
+fee floor. `broadcast()` throws rather than returning a fake txid. An SDK test
+that deploys and calls is therefore an assertion that the script really runs.
+Opting out (`{ validateBroadcasts: false }`, `disableBroadcastValidation()`,
+`newAlwaysAckMockProvider()`) requires an entry in the machine-checked
+`packages/runar-sdk/src/__tests__/always-ack-allowlist.json`.
+
+Full context, including which gate catches which past fund-safety bug:
+[`docs/testing-guide.md`](../../docs/testing-guide.md) ⇒ "Layers of assurance".
+
+---
+
 ## Installation
 
 ```bash
@@ -42,8 +81,16 @@ The package exports the following from `runar-testing`:
 | `expectStackTop` | function | Assert specific value on stack top |
 | `expectStackTopNum` | function | Assert specific numeric value on stack top |
 | `VMResult` | type | VM execution result (success, stack, altStack, error, opsExecuted, maxStackDepth) |
-| `VMOptions` | type | VM configuration options (maxOps, maxStackSize, maxScriptSize, flags, checkSigCallback) |
-| `VMFlags` | type | VM behavioural flags (enableSighashForkId, enableOpCodes, strictEncoding) |
+| `VMOptions` | type | VM configuration options (maxOps, maxStackSize, maxScriptSize, flags) |
+| `VMFlags` | type | VM behavioural flags (`strictEncoding`) |
+| `StepResult` | type | One opcode of step-mode execution (offset, opcode, mainStack, altStack, error, context) |
+| `runDifferentialExecution` | function | Source-vs-script oracle: interpreter vs `ScriptVM`, **verdict only** |
+| `runTriModalExecution` | function | Adds a strict full-consensus `Spend.validate()` leg |
+| `runFoldEquivalence` | function | fold-ON vs fold-OFF execution equivalence |
+| `runStatelessSigned` / `runStatefulSpend` | function | Real-crypto execution: real DER signatures, real BIP-143 preimage, post-spend state |
+| `buildWitness` | function | Build an unlocking script from typed witness args |
+| `testKey`, `TEST_KEYS`, `ALICE`…`JUDY` | function / const | Deterministic test keypairs |
+| `signTestMessage`, `verifyTestMessageSig` | function | Real ECDSA over the fixed `TEST_MESSAGE` digest |
 | `RunarValue` | type | Interpreter value type |
 | `InterpreterResult` | type | Interpreter execution result |
 | `TestCallResult` | type | Result from `TestContract.call()` |
@@ -55,7 +102,28 @@ The package exports the following from `runar-testing`:
 
 ## Bitcoin Script VM
 
-The `ScriptVM` executes raw Bitcoin Script bytecode. It implements the BSV instruction set including all re-enabled opcodes (post-Genesis).
+`ScriptVM` executes raw Bitcoin Script bytecode. It is **not a custom VM**: the
+execution core is the upstream `@bsv/sdk` `Spend` interpreter — the same
+production engine that validates real BSV transactions — driven one opcode at a
+time via `Spend.step()`. `ScriptVM` only builds a synthetic single-input
+transaction context so bare scripts can run, applies the harness-level DoS
+bounds, and shapes the result. Nothing here reimplements an opcode.
+
+> **Signatures are real; there is no mock checksig.** `OP_CHECKSIG` /
+> `OP_CHECKMULTISIG` perform real secp256k1 verification against the BIP-143
+> sighash of that synthetic context. The old hand-rolled VM took a
+> `checkSigCallback` that defaulted to `() => true` — fail-open — and it is
+> **gone**. A script whose only guard is a signature check now only succeeds
+> when the caller supplies a genuinely valid signature (see
+> `src/oracle/real-crypto-execution.ts`, which builds exactly such witnesses).
+
+`success` means "no evaluation error and a truthy top-of-stack", so bare opcode
+fragments that legitimately leave several items on the stack remain runnable.
+The three consensus rules `Spend.validate()` layers on top of evaluation —
+push-only unlocking scripts, clean-stack, and minimal-push / low-S encoding —
+are applied by `oracle/tri-modal-execution.ts` and
+`oracle/real-crypto-execution.ts`, not here. Pass `flags.strictEncoding` to
+turn the encoding rules back on for this VM.
 
 ### Basic Usage
 
@@ -82,15 +150,19 @@ import type { VMOptions, VMFlags } from 'runar-testing';
 const vm = new ScriptVM({
   maxOps: 500_000,              // max non-push opcodes (default 500_000)
   maxStackSize: 800,            // max main + alt stack items (default 1_000)
-  maxScriptSize: 10_000_000,   // max script size in bytes (default unlimited)
-  flags: {                      // behavioural flags
-    enableSighashForkId: false,
-    enableOpCodes: true,        // BSV re-enabled opcodes (default true)
+  maxScriptSize: 10_000_000,    // max script size in bytes (default unlimited)
+  flags: {
+    // Apply the upstream engine's strict-encoding consensus rules: minimally
+    // encoded pushes, minimally encoded script numbers, low-S signatures.
+    // Default false (relaxed), so hand-written opcode fragments still run.
     strictEncoding: false,
   },
-  checkSigCallback: (sig, pubkey) => true,  // optional; mock mode by default
 });
 ```
+
+There is no `checkSigCallback` option, and no `enableSighashForkId` /
+`enableOpCodes` flag — signature verification is real and non-overridable, and
+the BSV post-Genesis opcode set is whatever the pinned `@bsv/sdk` implements.
 
 ---
 
@@ -116,7 +188,10 @@ console.log(result.success);
 
 ## TestContract API
 
-The recommended way to test contracts. Uses the interpreter (not the VM), with mocked crypto (`checkSig` always true, `checkPreimage` always true).
+The fastest way to test contract **business logic**. Uses the interpreter (not
+the VM), with mocked crypto (`checkSig` always true, `checkPreimage` always
+true) — so it proves state transitions and assertion logic, and proves nothing
+about spendability. See [Read this first](#read-this-first-interpreter-tests--spendability).
 
 ```typescript
 import { TestContract } from 'runar-testing';

@@ -155,16 +155,27 @@ function dryRunContractInput(
 ): { valid: boolean; error?: string } {
   const input = tx.inputs[inputIndex];
   if (!input) return { valid: false, error: `no input at index ${inputIndex}` };
-  // `otherInputs` feeds BIP-143's hashPrevouts/hashSequence, so its SHAPE
-  // matters: passing the raw `tx.inputs` objects through yields a different
-  // sighash than the one the signer actually signed, and the input's
-  // OP_CHECKSIG(VERIFY) then fails for a perfectly valid transaction. That is a
-  // false rejection, which for a fail-closed pre-broadcast gate is worse than
-  // the hole C8 closes — it would block legitimate calls. Normalize to exactly
-  // the projection the proven harnesses use (`validateSpend` in the SDK spend
-  // tests and `runStatefulSpend` in runar-testing's real-crypto oracle, both of
-  // which agree with the network): re-index around the removed input and stub
-  // the fields Spend does not read for the other inputs.
+  // `otherInputs` feeds BIP-143's hashPrevouts/hashSequence, so what it
+  // contains matters: it must be exactly the OTHER inputs (current one
+  // excluded), in their original relative order, or the input's
+  // OP_CHECKSIG(VERIFY) fails for a perfectly valid transaction — a false
+  // rejection, which for a fail-closed pre-broadcast gate is worse than the
+  // hole C8 closes. Normalize to exactly the projection the proven harnesses
+  // use (`validateSpend` in the SDK spend tests and `runStatefulSpend` in
+  // runar-testing's real-crypto oracle, both of which agree with the
+  // network).
+  //
+  // P2 (testing-gap remediation): the per-entry stubbing below
+  // (`unlockingScript`/`sourceSatoshis`/`lockingScript`, and each entry's
+  // own re-indexed `inputIndex`) is belt-and-braces, not load-bearing for
+  // the sighash — `TransactionSignature.formatBip143` (the function `Spend`
+  // delegates to) only ever reads `sourceTXID`, `sourceOutputIndex`, and
+  // `sequence` off each `otherInputs` entry. Verified equivalent to
+  // `providers/mock.ts`'s `validateBroadcastTx`, which passes the raw
+  // filtered `tx.inputs` slice straight through with none of this stubbing —
+  // both produce an identical sighash as long as the filter excludes exactly
+  // the current input and preserves order, which both do. Keep both thin
+  // wrappers in sync if `TransactionSignature`'s field usage ever changes.
   const otherInputs = tx.inputs
     .filter((_, i) => i !== inputIndex)
     .map((inp, idx) => ({
@@ -190,6 +201,11 @@ function dryRunContractInput(
       inputSequence: input.sequence ?? 0xffffffff,
       lockTime: tx.lockTime,
     });
+    // P2: @bsv/sdk's `Spend.validate()` never actually returns `false` —
+    // every failure path throws `ScriptEvaluationError` instead, so this
+    // line always returns `{ valid: true }` when reached; every rejection
+    // exits through the `catch` below. The `!!` is defensive belt-and-
+    // braces in case a future @bsv/sdk version reverts to a boolean.
     return { valid: !!spend.validate() };
   } catch (e) {
     return { valid: false, error: e instanceof Error ? e.message : String(e) };

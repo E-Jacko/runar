@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./AssertFalseGuard.runar.ts",
+    ".runar.sol": "./AssertFalseGuard.runar.sol",
+    ".runar.move": "./AssertFalseGuard.runar.move",
+    ".runar.go": "./AssertFalseGuard.runar.go",
+    ".runar.rs": "./AssertFalseGuard.runar.rs",
+    ".runar.py": "./AssertFalseGuard.runar.py",
+    ".runar.zig": "./AssertFalseGuard.runar.zig",
+    ".runar.rb": "./AssertFalseGuard.runar.rb",
+    ".runar.java": "./AssertFalseGuard.runar.java"
+  }
+}

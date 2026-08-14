@@ -26,49 +26,188 @@ harness would need a per-mutant rebuild; they do not today.)
 |---|---|---|
 | `differential-witness` | `cd conformance && npx vitest run witnesses/differential.test.ts` | source-semantics (ANF interpreter) vs script-semantics (`@bsv/sdk` `ScriptVM`) disagreement on any fold-ON deployed contract, over declared accept + near-miss witnesses |
 | `fold-equivalence` | `cd conformance && npx vitest run witnesses/fold-equivalence.test.ts` | fold-OFF vs fold-ON execution divergence per witnessed fixture |
+| `fold-execution` | `cd conformance && npx vitest run witnesses/fold-execution.test.ts` | accept/reject verdict that depends on a folded all-constant subexpression (closes the `constantfold-add-to-sub` hole — see below) |
 | `peephole-exhaustive` | `cd packages/runar-compiler && npx vitest run src/__tests__/peephole-exhaustive.test.ts` | any peephole rule whose `pattern` ≠ `replacement` in stack effect over the CScriptNum edge domain |
+| `branch-merged-locals-vm` | `npx vitest run packages/runar-testing/src/__tests__/branch-merged-locals-vm.test.ts` | branch-merged locals (≥2, or asymmetric arms) deployed and called through the real `@bsv/sdk` `Spend`, asserting `expectedState` — not just accept/reject (PALMER-1, `23ef2d2b`) |
+| `branch-result-depth-invariant` | `npx vitest run packages/runar-compiler/src/__tests__/branch-result-depth-invariant.test.ts` | Layer C of `lowerIf` (`7b888035`): the parent `stackMap` must describe the physical stack after `OP_ENDIF`. Registered so the branch-merge mutants can **measure** whether it fires — for a depth-preserving, name-corrupting defect it does **not** |
+| `real-crypto-branch-merged-locals` | `cd conformance && npx vitest run witnesses/real-crypto-execution.test.ts -t branch-merged-locals` | the `branch-merged-locals` witness replayed through the real `@bsv/sdk` `Spend` (2 accepts + 1 tamper-reject), not the interpreter |
+| `state-push-framing-vm` | `npx vitest run packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts` | state-section `<len><data>` framing through a deployed continuation and the real Script VM, over the full 1-byte value-class matrix (PALMER-2, `23ef2d2b`) |
+| `c28-state-strict` | `npx vitest run packages/runar-sdk/src/__tests__/c28-state-strict.test.ts` | `deserializeState` strictness unit pins, including a direct malformed-input case (`deserializeState(fields, '55')` must throw `/is not a push opcode/`) — the gate that actually detects a *decoder*-only OP_N regression (see Phase E1 below) |
+| `sdk-vertical-constructor-slots` | `cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter bigint-0` | TS SDK's constructor-slot splice (`buildCodeScript()` in `contract.ts`) against the independently-derived code part in `conformance/sdk-vertical` (Phase C3 / TG-016) |
+| `sdk-vertical-codeseparator` | `cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter codesep-tag-zero` | TS SDK's `codeSepIndexSlots` resolution (`_resolvedCodeSepSlotValues()` in `contract.ts`) against the independently-derived code part for the `CodeSepMatrix` fixture (Phase C4 / TG-016) |
 
 `execute-fuzz` (`cd conformance && npx tsx fuzzer/index.ts --execute …`) is a
 slower randomized oracle and is **not** wired into per-mutant scoring here.
 
+The two `sdk-vertical-*` gates are scoped to the **TypeScript tier only**
+(`--tiers typescript`), consistent with this corpus's existing TS-only scope,
+and to a single currently-green case each (`--filter`) for speed and
+determinism — `conformance/sdk-vertical` is a large fixture set (39 cases ×
+7 SDK tools) built out by a parallel work stream; do not widen the filter or
+drop `--tiers typescript` without first confirming the whole case set is
+green, or these gates will "catch" every mutant for a reason unrelated to the
+mutation. (The two cases previously called out as missing goldens —
+`bigint-neg1`, `multi-slot-mixed-a` — have had theirs since 2026-08-06.)
+
 ## Corpus shape
 
-`mutants.json` covers the four audit bug classes — **off-by-one stack index**,
-**swapped operands**, **dropped OP_VERIFY**, **if-without-else regression** —
-across the **stack-lower**, **emit**, **constant-fold**, and **peephole**
-stages. 15 mutants carry an `expectCaughtBy` set (they MUST be caught); 1 is a
-**documented survivor** (see below).
+`mutants.json` has 22 mutants across two groups:
+
+- 16 covering the four original audit bug classes — **off-by-one stack
+  index**, **swapped operands**, **dropped OP_VERIFY**, **if-without-else
+  regression** — across the **stack-lower**, **emit**, **constant-fold**, and
+  **peephole** stages. All 16 carry a non-empty `expectCaughtBy`.
+- 6 **Phase E1 / TG-007** (2026-08) Palmer-class additions — see below.
 
 Note on the peephole stage: `peephole-rules.ts` is the declarative mirror the
 bounded-exhaustive sweep executes rule-by-rule, so corrupting a rule's
 `replacement` into an unsound one is exactly what `peephole-exhaustive` exists
 to catch — a faithful test of that gate's detection power.
 
-## Documented survivor (a real, honest hole — not hidden)
+## Formerly a documented survivor, now closed
 
 `constantfold-add-to-sub` flips `evalBinOp('+')` in the ANF constant-fold pass.
-It **survives** both `differential-witness` and `fold-equivalence`, because no
-witnessed conformance fixture executes an all-constant subexpression through the
-fold pass (the one fixture that folds — `if-without-else-multi-temp`, folding
-`8n + 1n` — skips that path under its reject witness). Its `expectCaughtBy` is
-empty and its `finding` records the gap. This is left visible per the TS-GAP-006
-no-silence rule; do not delete it without adding a fixture whose verdict depends
-on a folded constant.
+It **used to survive** both `differential-witness` and `fold-equivalence`,
+because no witnessed conformance fixture executed an all-constant subexpression
+through the fold pass. `conformance/witnesses/fold-execution.test.ts` closed the
+hole (its accept/reject verdict depends on a folded `2n + 3n`); the mutant's
+`expectCaughtBy` is `["fold-execution"]` and its `finding` records the
+before/after. Kept as an example of the corpus's own discipline: a real hole
+was measured, named, and closed with new execution — not by relabelling.
+
+## Phase E1 additions — Palmer-class corpus (TS-GAP-007, 2026-08)
+
+Two fund-safety miscompilations (PALMER-1: branch-merged locals; PALMER-2:
+state-section MINIMALDATA framing — see `docs/audit/2026-08-testing-gap-remediation-plan.md`
+§0, fixed in `23ef2d2b`) shipped with a fully green suite because the mutation
+corpus had no mutant of either shape. These 6 mutants close that specific gap
+by **inverting the fix commit's hunks** — each is a literal reproduction of
+the historical bug, not a synthetic one:
+
+| id | file | inverts | verified caught by |
+|---|---|---|---|
+| `anflower-merge-locals-single-only` | `04-anf-lower.ts` | the canonical branch-merge list, truncated to its first entry (**re-derived 2026-08-06** — see below) | `branch-merged-locals-vm`, `real-crypto-branch-merged-locals` |
+| `stacklower-merge-locals-property-only` | `05-stack-lower.ts` | the `_properties`-only restriction on adopting the declared results by name (**re-derived 2026-08-06**) | `branch-merged-locals-vm`, `branch-result-depth-invariant`, `real-crypto-branch-merged-locals` |
+| `sdkstate-encode-minimaldata-opn` | `packages/runar-sdk/src/state.ts` | restoring the #110 MINIMALDATA short-circuit in `encodePushDataState` | `state-push-framing-vm`, `c28-state-strict` |
+| `sdkstate-decode-opn-as-length` | `packages/runar-sdk/src/state.ts` | restoring the OP_N decode branch in `decodePushData` | `c28-state-strict` **only** — see finding below |
+| `sdksplice-constructor-slot-wrong-length` | `packages/runar-sdk/src/contract.ts` | new Phase C3 family: 1 stray byte per constructor-slot substitution | `sdk-vertical-constructor-slots` |
+| `sdksplice-codeseparator-off-by-one` | `packages/runar-sdk/src/contract.ts` | new Phase C4 family: off-by-one on the baked `codeSepIndexSlots` value | `sdk-vertical-codeseparator` |
+
+### Measured finding: both PALMER-1 mutants went STALE, and the baseline said otherwise (2026-08-06)
+
+`4b0f688f` ("multi-result branch node") moved where branch merging is decided.
+Both PALMER-1 mutants kept applying — their `find` strings still occurred
+exactly once — but to lines that no longer gate the merged-local path:
+
+- `anflower-merge-locals-single-only` targeted `if (mergedLocals.length >= 2)`
+  inside `branchOutputRejectionReason`, which only runs when an `if` arm emits
+  an **output**. No branch-merged-locals fixture does.
+- `stacklower-merge-locals-property-only` targeted the `_properties` check in
+  `elseMatchesThenNResultLayout`, which after `4b0f688f` is reachable only when
+  `nDeclared === 0`. Every merged-local shape now takes the declared-results
+  path instead.
+
+Both therefore **SURVIVED**, while `baseline.json` recorded both as `caught`.
+The corpus overstated its own detection power for the flagship regression
+family, and the only check that would have said so is the baseline-regression
+step in `.github/workflows/fuzzer-nightly.yml` — nightly-only, and it had not
+run since the refactor landed.
+
+Both were re-derived against the current source and re-measured **per gate**
+(each gate run separately against the applied patch, not inferred):
+
+| mutant | `branch-merged-locals-vm` | `branch-result-depth-invariant` | `real-crypto-branch-merged-locals` |
+|---|---|---|---|
+| `anflower-merge-locals-single-only` | **FIRES** — 5/9 shapes (S3, S6, S7, S8, S9) | **silent** — 18/18 still pass | **FIRES** — 1/3 spends (the `toFirst==0` accept) |
+| `stacklower-merge-locals-property-only` | **FIRES** — 8/9 shapes (all but S2, if-without-else) | **FIRES** — 12/18 | **FIRES** — 3/3 spends |
+
+The silent cell is the point, and it is recorded rather than papered over:
+truncating the merge list is **depth-preserving and name-corrupting**, and
+Layer C only compares depths, so the invariant added in `7b888035` to make "the
+next one LOUD instead of silent" does not see that half of the family at all.
+`expectCaughtBy` lists only the gates that were observed to fire.
+
+### Guard against this recurring: stale ≠ survivor
+
+A mutant whose patch no longer applies is now reported as **STALE** — not as a
+survivor — by `run-mutation.ts` (no gate is run for it, and the run exits
+non-zero), and `__tests__/mutant-staleness.test.ts` re-checks every mutant's
+anchor in **milliseconds**, with no gates and no mutation, so a refactor that
+moves the code fails on its own PR instead of decaying into a mystery survivor
+weeks later. That test runs in the ordinary suite and in the `conformance` CI
+job. A survivor means "the net has a hole"; a stale mutant means "the corpus no
+longer describes the code" — opposite fixes, so they are reported separately.
+
+`restoreAfterMutation` also un-applies the patch against whatever the file holds
+at the end of the gate run rather than blind-writing the pre-mutation snapshot:
+this repo is worked in several checkouts at once, and a blind restore silently
+throws away anything saved during the seconds a mutated compiler source is in
+place.
+
+### Measured finding: `sdkstate-decode-opn-as-length` (execution-verified, not tuned away)
+
+This mutant restores ONLY the decode-side OP_N branch (the encoder stays
+correct). Run against `state-push-framing-vm` alone it **survives**: every
+test in that file constructs its state blob through the (correct) encoder, so
+an OP_N-framed byte sequence never reaches the decoder — the added leniency is
+dead code for every case that file exercises. `caughtBy` for this mutant is
+`["c28-state-strict"]` while `expectCaughtBy` lists both gates; the scorer's
+own `missedExpectedGates` reporting prints
+`⚠ expected gate(s) did NOT fire: state-push-framing-vm` for exactly this
+reason — the mutant is caught overall (`c28-state-strict.test.ts` has a direct
+`expect(() => deserializeState(fields, '55')).toThrow(/is not a push opcode/)`
+pin), but the gate this corpus's own Phase E1 table proposed for it does
+**not**, on its own, provide that coverage. This was verified by running the
+mutant, not asserted — it was NOT tuned to pass; the honest result is recorded
+as-is. Fix candidate (out of scope for this PR): give
+`state-push-framing-vm.test.ts` a direct malformed-input decode case, per P3
+("round-trip alone is never sufficient for a listed wire primitive").
+
+### `stateful-bytestring-op-n-state` sdk-output golden: NOT wired (documented, not invented)
+
+The Phase E1 table in the remediation plan also names the
+`conformance/sdk-output` `stateful-bytestring-op-n-state` golden as an
+intended gate for the two `sdkstate-*` mutants. It was **not** added:
+`conformance/sdk-output/runner/sdk-runner.ts`'s coverage audit currently fails
+before running any fixture (4 compiler-conformance fixtures added by a
+parallel work stream — `loop-carried-locals`, `merge-locals-prop-updates`,
+`merge-locals-shapes`, `state-bigint-edges` — are not yet registered in
+`sdk-output` or `coverage-allowlist.json`). A gate whose unmutated baseline
+already fails would "catch" every mutant for a reason that has nothing to do
+with the mutation, which is worse than not having the gate. `c28-state-strict`
+was substituted as an execution-verified alternative that exercises the same
+underlying regression. Re-add `stateful-bytestring-op-n-state` once the
+`sdk-output` coverage audit is green again.
+
+### `constructorSlots` / `codeSeparatorIndex`: wired to `conformance/sdk-vertical`
+
+`conformance/sdk-vertical` (Phase C3/C4) existed by the time this work started
+and is used directly — see the `sdk-vertical-*` gates above and their caveats
+about the in-progress case set.
 
 ## Running
 
 ```bash
 cd conformance && npx tsx mutation/run-mutation.ts     # or: npm run mutation:score
+cd conformance && npx tsx mutation/run-mutation.ts --filter merge-locals   # one family
 ```
 
 Prints a scorecard (`caught N/M`, survivors listed with class + stage) and exits
-**non-zero if any mutant with a non-empty `expectCaughtBy` survives** — i.e. the
-net weakened. `baseline.json` is the stamped reference; the nightly CI job
+**non-zero if any mutant with a non-empty `expectCaughtBy` survives** (the net
+weakened) **or if any mutant is stale** (the corpus no longer describes the
+code). `baseline.json` is the stamped reference; the nightly CI job
 (`.github/workflows/fuzzer-nightly.yml`) fails if a previously-caught mutant
-becomes a survivor.
+becomes a survivor. Current stamped score: **22/22 caught, 0 survivors, 0
+stale** (39s wall, 2026-08-06) — the same 22/22 the previous baseline claimed,
+except that two of those 22 were not actually being detected when it was
+stamped.
 
-The scorer **always reverts** every mutant (try/finally, snapshot restore), so
-the working tree is left clean; a mutated compiler source is never committed.
+`--filter <substr>` scores only the matching mutant ids. It cannot be combined
+with `--write-baseline` (a partial baseline is a lie), and it exists to keep the
+window in which a real compiler source sits mutated as short as possible.
+
+The scorer **always reverts** every mutant (try/finally), so the working tree is
+left clean; a mutated compiler source is never committed.
 
 ## Future extension
 

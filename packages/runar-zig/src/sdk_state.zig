@@ -245,13 +245,38 @@ pub fn encodePushDataState(allocator: std.mem.Allocator, data_hex: []const u8) !
 
 /// encodeNum2Bin encodes an integer as a fixed-width LE sign-magnitude byte
 /// string, matching OP_NUM2BIN behaviour.
+///
+/// FAILS CLOSED on an out-of-range magnitude with error.StateValueOutOfRange.
+/// `width` bytes of sign-magnitude hold 8*width - 1 magnitude bits — the top
+/// bit of the last byte is the sign — so -2^63 is a perfectly good i64 whose
+/// MAGNITUDE (2^63) does not fit an 8-byte word. It used to serialise as
+/// 0000000000000080, which reads back as 0 (negative zero), and the deploy then
+/// succeeded with an unspendable UTXO: the covenant rebuilds the continuation
+/// with the compiler's own OP_NUM2BIN `width`, which cannot produce those bytes
+/// from that number, so hash256(outputs) never matches.
+///
+/// The magnitude is also computed WITHOUT negating `n`: `-n` is an illegal
+/// negation for i64 minInt and panicked with "integer overflow" instead of
+/// reporting an error. ±(2^(8*width-1) - 1) is unaffected.
 pub fn encodeNum2Bin(allocator: std.mem.Allocator, n: i64, width: usize) ![]u8 {
+    const negative = n < 0;
+    // -(n + 1) + 1 keeps minInt in range; plain -n overflows.
+    const magnitude: u64 = if (negative)
+        @as(u64, @intCast(-(n + 1))) + 1
+    else
+        @intCast(n);
+
+    const magnitude_bits = 8 * width - 1;
+    if (magnitude_bits < 64) {
+        const limit = @as(u64, 1) << @intCast(magnitude_bits);
+        if (magnitude >= limit) return error.StateValueOutOfRange;
+    }
+
     var buf = try allocator.alloc(u8, width);
     defer allocator.free(buf);
     @memset(buf, 0);
 
-    const negative = n < 0;
-    var abs_val: u64 = if (negative) @intCast(-n) else @intCast(n);
+    var abs_val: u64 = magnitude;
 
     var i: usize = 0;
     while (i < width and abs_val > 0) : (i += 1) {
@@ -268,6 +293,20 @@ pub fn encodeNum2Bin(allocator: std.mem.Allocator, n: i64, width: usize) ![]u8 {
 /// encodeBigNum2Bin encodes an arbitrary-precision integer (given as a decimal
 /// string) as a fixed-width LE sign-magnitude byte string, matching OP_NUM2BIN
 /// behaviour. Used for state field serialization of values exceeding i64.
+///
+/// FAILS CLOSED on an out-of-range magnitude with error.StateValueOutOfRange.
+/// The division loop below stops at `width` bytes and drops every higher digit,
+/// then ORs the sign bit in on top of whatever landed there, so an oversized
+/// value used to serialise to a plausible but WRONG word:
+///
+///     2^63      -> 0000000000000080   reads back as 0   (negative zero)
+///     2^63 + 5  -> 0500000000000080   reads back as -5  (sign flip)
+///     2^64      -> 0000000000000000   reads back as 0
+///
+/// The deploy then succeeded and the UTXO was unspendable: the covenant
+/// rebuilds the continuation with the compiler's own OP_NUM2BIN `width`, which
+/// cannot produce those bytes from that number, so hash256(outputs) never
+/// matches. ±(2^(8*width-1) - 1) stays representable and is unaffected.
 pub fn encodeBigNum2Bin(allocator: std.mem.Allocator, decimal_str: []const u8, width: usize) ![]u8 {
     // Check for negative sign
     const negative = decimal_str.len > 0 and decimal_str[0] == '-';
@@ -301,6 +340,13 @@ pub fn encodeBigNum2Bin(allocator: std.mem.Allocator, decimal_str: []const u8, w
         buf[byte_idx] = @intCast(remainder);
         byte_idx += 1;
         work_len = new_len;
+    }
+
+    // Digits left over means the magnitude needed more than `width` bytes; the
+    // sign bit already set means it needed the 8*width-th bit, which the sign
+    // occupies. Either way the word cannot hold it.
+    if (work_len > 0 or (buf[width - 1] & 0x80) != 0) {
+        return error.StateValueOutOfRange;
     }
 
     if (negative) {

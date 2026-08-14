@@ -1,4 +1,15 @@
 /**
+ * SCOPE (testing-gap remediation, plan design principle P8): this fuzzer is
+ * HORIZONTAL — its oracle is TIER AGREEMENT, not correctness. Seven tiers that
+ * share one bug agree with each other perfectly and this mode stays green;
+ * both 2026-08 fund-safety bugs were of exactly that shape. It is necessary and
+ * it is NOT fund-safety-complete on its own. The absolute oracles are
+ * `--execute` / `--tri-modal` (stateless fragments) and `--spend-oracle`
+ * (full deploy->call transaction context + an independent post-state pin).
+ * See `conformance/fuzzer/README.md`.
+ */
+
+/**
  * IR-based differential fuzzer.
  *
  * Uses the language-neutral generator in `runar-testing/src/fuzzer/` to produce
@@ -280,13 +291,31 @@ function tsCompileRun(file: string, hex: boolean): string | null {
   try {
     const source = readFileSync(file, 'utf-8');
     const result = compile(source, { fileName: file, disableConstantFolding: true });
-    if (!result.success) return null;
-    if (hex) return result.artifact?.script ?? null;
+    // PIPELINE-DEPTH SYMMETRY (2026-08-06). The native tiers answer `--emit-ir`
+    // straight out of the frontend: their ANF is produced and printed WITHOUT
+    // ever running stack lowering or emit. `compile()` has no stop-at-ANF
+    // option, so it always runs the full pipeline — and used to return null
+    // here whenever a LATER pass failed. The result was a phantom finding:
+    // any stack-lowering defect in a generated contract was reported as
+    // "rejected by ts but accepted by go, rust, python, zig, ruby, java" even
+    // though the other six had simply never reached the failing pass.
+    // (The widened branch corpus hit this on its first run.) `compile()` does
+    // return the ANF alongside the failure, so in ANF-compare mode we use it
+    // and match the natives' depth exactly.
+    //
+    // The corollary is that ANF-compare mode gates FRONTEND parity only, in
+    // every tier. Stack lowering and emit are gated by `--hex`, which drives
+    // all seven tiers end to end.
+    if (hex) {
+      if (!result.success) return null;
+      return result.artifact?.script ?? null;
+    }
+    if (!result.anf) return null;
     // JSON.stringify can't serialise BigInt values directly (the TS ANF pass
     // emits bigint literal values as native BigInt). Match what the other
     // compilers emit on stdout — bigints as bare JSON numbers — so the
     // cross-compiler diff stays sensible.
-    return result.anf ? stringifyWithBigint(result.anf) : null;
+    return stringifyWithBigint(result.anf);
   } catch (e) {
     if (process.env.FUZZ_DEBUG) console.error('ts-compile throw:', (e as Error).message);
     return null;
@@ -313,10 +342,41 @@ function stringifyWithBigint(value: unknown): string {
 // Comparison helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Recursively sort object keys so two tiers that emit the same ANF in a
+ * different key order compare equal.
+ *
+ * The previous implementation was `JSON.stringify(obj, Object.keys(obj).sort(), 2)`.
+ * An ARRAY second argument to `JSON.stringify` is not a key ordering — it is a
+ * property ALLOW-LIST, applied at EVERY nesting depth. Seeded with the ROOT's
+ * keys (`contractName`, `methods`, `properties`), it deleted every key that did
+ * not happen to share a name with a root key, at every level: each method
+ * serialised as `{}` and each property as `{}`. ANF-compare mode was therefore
+ * asserting little beyond "the tiers agree on the contract name and on how many
+ * methods there are" — which is why it never saw the readonly-rendering split
+ * that `--hex` surfaced immediately (see the READONLY PARITY note in
+ * `packages/runar-testing/src/fuzzer/renderers.ts`).
+ */
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      // `sourceLoc` carries {file, line, column} back to the ORIGINATING source.
+      // Under `--render native` every tier compiles a DIFFERENT file, so these
+      // legitimately differ and say nothing about ANF parity. (Source-map
+      // fidelity has its own tests; it is not what this differential gates.)
+      if (k === 'sourceLoc') continue;
+      out[k] = sortKeysDeep((value as Record<string, unknown>)[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
 function canonicalizeJson(s: string): string {
   try {
-    const obj = JSON.parse(s);
-    return JSON.stringify(obj, Object.keys(obj).sort(), 2);
+    return JSON.stringify(sortKeysDeep(JSON.parse(s)), null, 2);
   } catch {
     return s;
   }
@@ -387,6 +447,13 @@ export async function runIRDifferentialFuzzing(
   const compilerMap = dispatch();
   const results: IRDifferentialResult[] = [];
   let mismatchCount = 0;
+  // Programs EVERY tier rejected. Tier agreement holds — that is why this is
+  // reported rather than failed — but the condition is otherwise invisible:
+  // an all-reject program takes the same "OK" path as one all seven compiled
+  // identically, so a generator that started emitting programs the compiler
+  // cannot build would look exactly like a clean run. Surfacing the count
+  // makes that distinguishable at a glance.
+  let allRejectedCount = 0;
 
   // Track which compilers have produced output at least once, so we can
   // separate "this compiler is not installed" from "this compiler rejected
@@ -454,6 +521,9 @@ export async function runIRDifferentialFuzzing(
         mismatchDetails = already + `rejected by ${rejected.join(', ')} but accepted by ${received.map(([n]) => n).join(', ')}`;
         match = false;
       }
+    } else if (failed.length === compilers.length && failed.every((c) => everProduced.has(c))) {
+      allRejectedCount++;
+      if (verbose) console.log(`  (rejected by every tier — tiers agree, program not compiled)`);
     }
 
     const result: IRDifferentialResult = {
@@ -476,7 +546,10 @@ export async function runIRDifferentialFuzzing(
   }
 
   console.log('');
-  console.log(`IR differential fuzzing complete: ${contracts.length} programs, ${mismatchCount} mismatches`);
+  console.log(
+    `IR differential fuzzing complete: ${contracts.length} programs, ${mismatchCount} mismatches` +
+      (allRejectedCount > 0 ? `, ${allRejectedCount} rejected by every tier` : ''),
+  );
 
   return results;
 }

@@ -22,6 +22,7 @@ import { compile } from 'runar-compiler';
 import { RunarContract } from '../contract.js';
 import { MockProvider } from '../providers/mock.js';
 import { LocalSigner } from '../signers/local.js';
+import { buildP2PKHScript } from '../script-utils.js';
 import { Spend, LockingScript, Transaction } from '@bsv/sdk';
 import type { RunarArtifact } from 'runar-ir-schema';
 
@@ -45,7 +46,7 @@ async function setupWallet(provider: MockProvider, privKey: string, satoshis: nu
     txid: privKey.slice(0, 64),
     outputIndex: 0,
     satoshis,
-    script: '76a914' + '00'.repeat(20) + '88ac',
+    script: buildP2PKHScript(await signer.getPublicKey()),
   });
   return { signer };
 }
@@ -98,7 +99,7 @@ const COUNT = 10n;
 
 async function deployRestorable() {
   const artifact = compileSource(SRC, 'Restorable.runar.ts');
-  const provider = new MockProvider();
+  const provider = new MockProvider('testnet');
   const { signer } = await setupWallet(provider, SIGNER_KEY, 500_000);
   const contract = new RunarContract(artifact, [TAG, COUNT]);
   await contract.deploy(provider, signer, {});

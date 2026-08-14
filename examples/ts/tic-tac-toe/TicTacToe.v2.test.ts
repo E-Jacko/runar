@@ -1,3 +1,6 @@
+// INTERPRETER-ONLY: spendability covered by integration/ts/tic-tac-toe.test.ts
+// (that suite spends the v1 contract on regtest; this file asserts v2 compiles to
+//  BYTE-IDENTICAL script hex, so the v1 spend covers v2's deployed bytes too).
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
