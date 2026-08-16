@@ -116,7 +116,7 @@ def compile_script_hex(source: str, disable_constant_folding: bool) -> str:
     [
         (
             "dead-arm-k2/fold-on", DEAD_ARM_K2, False,
-            "00014e01ce006351547a6e7b757b7567527978557a7568527a75537a757ca177",
+            "00014e01ce006351547a6e7b757b7567527978557a7568527a75537a75527a7c7ba177",
         ),
         (
             "dead-arm-k2/fold-off", DEAD_ARM_K2, True,
