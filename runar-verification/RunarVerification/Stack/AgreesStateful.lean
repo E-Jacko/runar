@@ -14,35 +14,41 @@ stateful prologue
     `_cp0 := check_preimage pre ;  _v := assert _cp0`
 
 (the auto-injected entry wrapper of `StatefulSmartContract` methods, with no
-user logic and no state-output epilogue).  Together with the
-`StatefulBridge` keystone (the `checkPreimage ⟷ checkSig` BIP-143 bridge)
-these discharge the stateful family's omnibus branch for the canonical
-fragment, replacing the `compileSafe_observational_correct_modulo_stateful_codegen`
-axiom with a PROVEN consume theorem (sited in `Pipeline.lean`).
+user logic and no state-output epilogue).  Together with the `StatefulBridge`
+ANF-side reduction (`gatedStatefulPrologue_isSome_eq`) these discharge the
+stateful family's omnibus branch for the canonical fragment, replacing the
+`compileSafe_observational_correct_modulo_stateful_codegen` axiom with a
+PROVEN consume theorem (sited in `Pipeline.lean`).
 
-## The constant lowering
+## The constant lowering (BUG-100)
 
 The whole method lowers to a CONSTANT op list: the preimage param is
-consumed in place (depth-0 last-use ⇒ `bringToTop` emits `[]`), the implicit
-`_opPushTxSig` swaps up, the synthetic key `G` is pushed, and the terminal
-`assert`'s `OP_VERIFY` is elided (public method, body ends in assert):
+consumed in place (depth-0 last-use ⇒ `bringToTop` emits `[]`), the
+auto-injected `check_preimage` becomes `OP_CODESEPARATOR` followed by the
+fixed 760-byte OP_PUSH_TX binding blob (one opaque `.rawBytes` op,
+`Lower.checkPreimageBindingBytes`), and the terminal `assert`'s `OP_VERIFY`
+is elided (public method, body ends in assert):
 
-    `[OP_CODESEPARATOR, .swap, .push G, OP_CHECKSIGVERIFY]`
+    `[OP_CODESEPARATOR, .rawBytes checkPreimageBindingBytes]`
 
-Its success bit on the Stack side is exactly `authBackend.checkSig sig G`;
-on the ANF side it is `Crypto.checkPreimage preimage`
-(`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the bridge axiom equates
-the two under a valid BIP-143 context.
+On the ANF side the success bit is `Crypto.checkPreimage preimage`
+(`StatefulBridge.gatedStatefulPrologue_isSome_eq`).  On the Stack side it is
+the verdict of the deployed blob, characterised by
+`runOps_checkPreimageBindingRaw_eq`: NO spender witness is loaded — the blob
+derives the ECDSA signature on-chain from `hash256(preimage)` and runs
+`OP_CHECKSIGVERIFY` against `G`, so the two bits agree BY CODEGEN rather than
+under a per-deployment BIP-143 witness assumption.
 
 Side conditions `pre ≠ "_cp0"` / `pre ≠ "_opPushTxSig"` exclude the
 name-collision corner where the lowering would shadow the auto-injected
 binding or the implicit signature slot (the classifier checks both).
 
-No `sorry`/`admit`. BUG-100 adds two opaque OP_PUSH_TX codegen→runtime
-shims (`runOps_checkPreimageBindingRaw_eq`,
-`runOps_statefulFullParsedOps_scriptAccepts`) that RETIRE the pre-BUG-100
-`StatefulBridge.exists_checkSig_witness_under_validTxContext` witness axiom
-(net +1: 70 → 71; see TRUST_MANIFEST.md). -/
+No `sorry`/`admit`. BUG-100 added the two OP_PUSH_TX codegen→runtime binding
+shims declared in this file (`runOps_checkPreimageBindingRaw_eq`,
+`runOps_statefulFullParsedOps_scriptAccepts`) and RETIRED the pre-BUG-100
+witness axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext`,
+which no longer exists — `StatefulBridge` declares zero axioms (net +1:
+70 → 71; see TRUST_MANIFEST.md). -/
 
 namespace RunarVerification.Stack.AgreesStateful
 
@@ -149,9 +155,11 @@ theorem computeLastUses_statefulPrologue (pre : String) (hne1 : pre ≠ "_cp0") 
     Lower.computeLastUses, Lower.computeLastUses.go, Lower.collectRefs,
     Lower.lastUsesUpdate, hne1]
 
-/-- The `check_preimage` binding lowers to the 4-op prologue: preimage consumed
-in place (d0 last-use), `_opPushTxSig` swapped up (d1 consume), `G` pushed,
-`OP_CHECKSIGVERIFY`. -/
+/-- The `check_preimage` binding lowers to the 2-op BUG-100 prologue
+(`statefulPrologueOps`): preimage consumed in place (d0 last-use), then
+`OP_CODESEPARATOR` and the 760-byte OP_PUSH_TX binding blob as one opaque
+`.rawBytes` op. No `_opPushTxSig` witness is swapped up and no `G` is pushed
+at this level — both live inside the blob. -/
 theorem lowerValueP_checkPreimage_statefulPrologue
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (budget : Nat) (localBindings : List String) (pre : String)
@@ -350,11 +358,12 @@ comes back as `.pick`, and int pushes above `OP_16` come back as their
 minimal-LE BYTE pushes — which is why the runtime walk needed the
 consensus CScriptNum coercion (`Eval.asNum?`) on `OP_LESSTHAN`.
 
-No `sorry`/`admit`. BUG-100 adds two opaque OP_PUSH_TX codegen→runtime
-shims (`runOps_checkPreimageBindingRaw_eq`,
-`runOps_statefulFullParsedOps_scriptAccepts`) that RETIRE the pre-BUG-100
-`StatefulBridge.exists_checkSig_witness_under_validTxContext` witness axiom
-(net +1: 70 → 71; see TRUST_MANIFEST.md). -/
+No `sorry`/`admit`. BUG-100 added the two OP_PUSH_TX codegen→runtime binding
+shims declared in this file (`runOps_checkPreimageBindingRaw_eq`,
+`runOps_statefulFullParsedOps_scriptAccepts`) and RETIRED the pre-BUG-100
+witness axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext`,
+which no longer exists — `StatefulBridge` declares zero axioms (net +1:
+70 → 71; see TRUST_MANIFEST.md). -/
 
 open RunarVerification.ANF.Eval
 
