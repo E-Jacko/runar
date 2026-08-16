@@ -279,9 +279,14 @@ func (m *MockProvider) Broadcast(tx *transaction.Transaction) (string, error) {
 	}
 	fakeTxid := mockHash64(fmt.Sprintf("mock-broadcast-%d-%s", m.broadcastCount, prefix))
 
-	// Auto-store raw hex for subsequent getRawTransaction lookups
+	// Auto-store raw hex for subsequent GetRawTransaction lookups, and register
+	// the transaction itself so GetTransaction resolves the txid this call just
+	// returned (previously only the raw hex was stored, so every post-broadcast
+	// GetTransaction reported "not found"). An already-injected TransactionData
+	// under the same txid still wins, as before.
 	if _, ok := m.transactions[fakeTxid]; !ok {
 		m.rawTransactions[fakeTxid] = rawTx
+		m.transactions[fakeTxid] = broadcastTxData(fakeTxid, tx, rawTx)
 	}
 
 	// Register this tx's own outputs as known outpoints so a chained call
@@ -295,6 +300,49 @@ func (m *MockProvider) Broadcast(tx *transaction.Transaction) (string, error) {
 	}
 
 	return fakeTxid, nil
+}
+
+// broadcastTxData converts a just-broadcast transaction into the
+// TransactionData shape GetTransaction serves, keyed by the provider's fake
+// txid.
+func broadcastTxData(txid string, tx *transaction.Transaction, rawTx string) *TransactionData {
+	inputs := make([]TxInput, len(tx.Inputs))
+	for i, in := range tx.Inputs {
+		var sourceTxid, scriptHex string
+		if in.SourceTXID != nil {
+			sourceTxid = in.SourceTXID.String()
+		}
+		if in.UnlockingScript != nil {
+			scriptHex = in.UnlockingScript.String()
+		}
+		inputs[i] = TxInput{
+			Txid:        sourceTxid,
+			OutputIndex: int(in.SourceTxOutIndex),
+			Script:      scriptHex,
+			Sequence:    in.SequenceNumber,
+		}
+	}
+
+	outputs := make([]TxOutput, len(tx.Outputs))
+	for i, out := range tx.Outputs {
+		var scriptHex string
+		if out.LockingScript != nil {
+			scriptHex = out.LockingScript.String()
+		}
+		outputs[i] = TxOutput{
+			Satoshis: int64(out.Satoshis),
+			Script:   scriptHex,
+		}
+	}
+
+	return &TransactionData{
+		Txid:     txid,
+		Version:  int(tx.Version),
+		Inputs:   inputs,
+		Outputs:  outputs,
+		Locktime: int(tx.LockTime),
+		Raw:      rawTx,
+	}
 }
 
 // GetUtxos returns UTXOs for the given address from the mock store.
