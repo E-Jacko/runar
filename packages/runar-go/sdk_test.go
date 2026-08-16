@@ -1782,6 +1782,72 @@ func TestMockProvider_Broadcast(t *testing.T) {
 	}
 }
 
+// Broadcast must register the transaction it just accepted under the fake
+// txid it returns, so a caller can immediately look it up. Before this was
+// fixed, Broadcast wrote only rawTransactions/knownOutpoints and never
+// m.transactions, so GetTransaction(txidJustBroadcast) always errored with
+// "not found".
+func TestMockProvider_BroadcastRegistersTransaction(t *testing.T) {
+	provider := NewMockProvider("testnet")
+	prevTxid := strings.Repeat("11", 32)
+	provider.AddUtxo("mock", UTXO{
+		Txid: prevTxid, OutputIndex: 0, Satoshis: 100000, Script: "51",
+	})
+
+	bcastTx := transaction.NewTransaction()
+	_ = bcastTx.AddInputFrom(prevTxid, 0, "51", 100000, nil)
+	bcastTx.Inputs[0].UnlockingScript, _ = sdkscript.NewFromHex("")
+	outLS, _ := sdkscript.NewFromHex("52")
+	bcastTx.AddOutput(&transaction.TransactionOutput{
+		Satoshis:      60000,
+		LockingScript: outLS,
+	})
+
+	txid, err := provider.Broadcast(bcastTx)
+	if err != nil {
+		t.Fatalf("Broadcast error: %v", err)
+	}
+
+	got, err := provider.GetTransaction(txid)
+	if err != nil {
+		t.Fatalf("GetTransaction after Broadcast: %v", err)
+	}
+	if got.Txid != txid {
+		t.Errorf("expected txid %s, got %s", txid, got.Txid)
+	}
+	if len(got.Inputs) != 1 {
+		t.Fatalf("expected 1 input, got %d", len(got.Inputs))
+	}
+	if got.Inputs[0].Txid != prevTxid || got.Inputs[0].OutputIndex != 0 {
+		t.Errorf("expected input outpoint %s:0, got %s:%d",
+			prevTxid, got.Inputs[0].Txid, got.Inputs[0].OutputIndex)
+	}
+	if len(got.Outputs) != 1 {
+		t.Fatalf("expected 1 output, got %d", len(got.Outputs))
+	}
+	if got.Outputs[0].Satoshis != 60000 {
+		t.Errorf("expected 60000 sats, got %d", got.Outputs[0].Satoshis)
+	}
+	if got.Outputs[0].Script != "52" {
+		t.Errorf("expected output script 52, got %s", got.Outputs[0].Script)
+	}
+	if got.Version != int(bcastTx.Version) {
+		t.Errorf("expected version %d, got %d", bcastTx.Version, got.Version)
+	}
+	if got.Locktime != int(bcastTx.LockTime) {
+		t.Errorf("expected locktime %d, got %d", bcastTx.LockTime, got.Locktime)
+	}
+	if got.Raw != bcastTx.Hex() {
+		t.Errorf("expected raw %s, got %s", bcastTx.Hex(), got.Raw)
+	}
+
+	// An unrelated txid must still be a hard error — registering the
+	// broadcast tx must not turn GetTransaction into a fail-open lookup.
+	if _, err := provider.GetTransaction(strings.Repeat("ee", 32)); err == nil {
+		t.Error("expected error for a txid that was never broadcast or injected")
+	}
+}
+
 func TestMockProvider_GetNetwork(t *testing.T) {
 	p := NewMockProvider("mainnet")
 	if p.GetNetwork() != "mainnet" {
