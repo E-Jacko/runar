@@ -1172,15 +1172,16 @@ const Parser = struct {
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
+        const is_prop = types.targetIsProperty(target);
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc, .target_is_property = is_prop } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc, .target_is_property = is_prop } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc, .target_is_property = is_prop } };
             },
         }
     }

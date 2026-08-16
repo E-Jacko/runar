@@ -409,9 +409,117 @@ public final class Validate {
             // structural args.
             validateAsmUsage(m);
 
+            // readonly properties may only be assigned in the constructor.
+            checkReadonlyWrites(m);
+
             for (Statement s : m.body()) {
                 validateStatement(s);
             }
+        }
+
+        // --------------------------------------------------------------
+        // Readonly property writes
+        // --------------------------------------------------------------
+
+        /**
+         * Report every write to a readonly contract property in a method body.
+         *
+         * <p>{@code spec/semantics.md}:
+         * {@code <this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property}
+         *
+         * <p>The constructor is exempt — that is where every contract
+         * initialises its readonly properties — so this runs per METHOD only
+         * ({@code validateConstructor} never calls in here, even though it
+         * shares {@code validateStatement}).
+         *
+         * <p>Three AST shapes reach {@code update_prop} in ANF lowering and are
+         * all covered: {@code this.p = e}, {@code this.p++} / {@code this.p--},
+         * and {@code this.arr[i] = e}.
+         */
+        private void checkReadonlyWrites(MethodNode m) {
+            Set<String> readonly = new HashSet<>();
+            for (PropertyNode p : contract.properties()) {
+                if (p.readonly()) {
+                    readonly.add(p.name());
+                }
+            }
+            if (readonly.isEmpty()) {
+                return;
+            }
+            visitReadonlyWrites(m, m.body(), readonly);
+        }
+
+        private void visitReadonlyWrites(MethodNode m, List<Statement> stmts, Set<String> readonly) {
+            for (Statement s : stmts) {
+                if (s instanceof AssignmentStatement a) {
+                    reportIfReadonly(m, writtenProperty(a.target()), readonly, a.sourceLocation());
+                    visitReadonlyMutations(m, a.target(), readonly, a.sourceLocation());
+                    visitReadonlyMutations(m, a.value(), readonly, a.sourceLocation());
+                } else if (s instanceof VariableDeclStatement v) {
+                    visitReadonlyMutations(m, v.init(), readonly, v.sourceLocation());
+                } else if (s instanceof ExpressionStatement e) {
+                    visitReadonlyMutations(m, e.expression(), readonly, e.sourceLocation());
+                } else if (s instanceof ReturnStatement r) {
+                    visitReadonlyMutations(m, r.value(), readonly, r.sourceLocation());
+                } else if (s instanceof IfStatement i) {
+                    visitReadonlyMutations(m, i.condition(), readonly, i.sourceLocation());
+                    visitReadonlyWrites(m, i.thenBody(), readonly);
+                    if (i.elseBody() != null) {
+                        visitReadonlyWrites(m, i.elseBody(), readonly);
+                    }
+                } else if (s instanceof ForStatement f) {
+                    List<Statement> head = new ArrayList<>();
+                    if (f.init() != null) head.add(f.init());
+                    if (f.update() != null) head.add(f.update());
+                    visitReadonlyWrites(m, head, readonly);
+                    visitReadonlyMutations(m, f.condition(), readonly, f.sourceLocation());
+                    visitReadonlyWrites(m, f.body(), readonly);
+                }
+            }
+        }
+
+        /** Flag {@code this.p++} / {@code this.p--} anywhere inside an expression. */
+        private void visitReadonlyMutations(
+            MethodNode m, Expression expr, Set<String> readonly, SourceLocation loc
+        ) {
+            walkExpression(expr, e -> {
+                Expression operand;
+                if (e instanceof IncrementExpr ie) {
+                    operand = ie.operand();
+                } else if (e instanceof DecrementExpr de) {
+                    operand = de.operand();
+                } else {
+                    return;
+                }
+                reportIfReadonly(m, writtenProperty(operand), readonly, loc);
+            });
+        }
+
+        private void reportIfReadonly(
+            MethodNode m, String name, Set<String> readonly, SourceLocation loc
+        ) {
+            if (name == null || !readonly.contains(name)) {
+                return;
+            }
+            error(
+                "cannot assign to readonly property '" + name + "' in method '"
+                    + m.name() + "'. readonly properties may only be assigned "
+                    + "in the constructor.",
+                loc
+            );
+        }
+
+        /**
+         * Resolve the contract property an assignment target writes to, or
+         * {@code null}. Unwraps {@code IndexAccessExpr} chains so
+         * {@code this.grid[i][j] = v} resolves to {@code grid}.
+         */
+        private static String writtenProperty(Expression target) {
+            Expression node = target;
+            while (node instanceof IndexAccessExpr ia) {
+                node = ia.object();
+            }
+            return node instanceof PropertyAccessExpr pa ? pa.property() : null;
         }
 
         // --------------------------------------------------------------

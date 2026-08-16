@@ -384,6 +384,9 @@ function validateMethod(method: MethodNode, ctx: ValidationContext): void {
   // close to the call site.
   validateAsmUsage(method, ctx);
 
+  // `readonly` properties may only be assigned in the constructor.
+  checkReadonlyWrites(method, ctx);
+
   // Validate all statements in method body
   for (const stmt of method.body) {
     validateStatement(stmt, ctx);
@@ -658,6 +661,103 @@ function isCompileTimeConstant(expr: Expression): boolean {
     return isCompileTimeConstant(expr.operand);
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Readonly property writes
+// ---------------------------------------------------------------------------
+
+/**
+ * `spec/semantics.md`:
+ *   `<this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property`
+ * `spec/grammar.md`: readonly properties "cannot be reassigned".
+ *
+ * The constructor is exempt — that is where every contract initialises its
+ * readonly properties — so this check runs per METHOD only (the constructor
+ * is validated by `validateConstructor`, which never calls in here).
+ *
+ * Three AST shapes reach `update_prop` in ANF lowering and are all covered:
+ *   `this.p = e`          — assignment with a `property_access` target
+ *   `this.p++` / `this.p--` — increment/decrement over a `property_access`
+ *   `this.arr[i] = e`     — assignment through an `index_access` rooted at a
+ *                           `property_access`
+ */
+function checkReadonlyWrites(method: MethodNode, ctx: ValidationContext): void {
+  const readonlyProps = new Set(
+    ctx.contract.properties.filter(p => p.readonly).map(p => p.name),
+  );
+  if (readonlyProps.size === 0) return;
+
+  const report = (name: string, loc: SourceLocation | undefined): void => {
+    ctx.errors.push(makeDiagnostic(
+      `Cannot assign to readonly property '${name}' in method '${method.name}'. ` +
+      `readonly properties may only be assigned in the constructor.`,
+      'error',
+      loc,
+    ));
+  };
+
+  /**
+   * Resolve the contract property an assignment target writes to, if any.
+   * Unwraps `index_access` chains so `this.grid[i][j] = v` resolves to `grid`.
+   */
+  const writtenProperty = (target: Expression): string | undefined => {
+    let node: Expression = target;
+    while (node.kind === 'index_access') node = node.object;
+    return node.kind === 'property_access' ? node.property : undefined;
+  };
+
+  const visitExpr = (expr: Expression, loc: SourceLocation | undefined): void => {
+    walkExpr(expr, (e) => {
+      if (e.kind !== 'increment_expr' && e.kind !== 'decrement_expr') return;
+      const name = writtenProperty(e.operand);
+      if (name !== undefined && readonlyProps.has(name)) {
+        report(name, e.sourceLocation ?? loc);
+      }
+    });
+  };
+
+  const visitStatements = (stmts: Statement[]): void => {
+    for (const stmt of stmts) {
+      switch (stmt.kind) {
+        case 'assignment': {
+          const name = writtenProperty(stmt.target);
+          if (name !== undefined && readonlyProps.has(name)) {
+            report(name, stmt.sourceLocation);
+          }
+          visitExpr(stmt.target, stmt.sourceLocation);
+          visitExpr(stmt.value, stmt.sourceLocation);
+          break;
+        }
+
+        case 'variable_decl':
+          visitExpr(stmt.init, stmt.sourceLocation);
+          break;
+
+        case 'expression_statement':
+          visitExpr(stmt.expression, stmt.sourceLocation);
+          break;
+
+        case 'return_statement':
+          if (stmt.value) visitExpr(stmt.value, stmt.sourceLocation);
+          break;
+
+        case 'if_statement':
+          visitExpr(stmt.condition, stmt.sourceLocation);
+          visitStatements(stmt.then);
+          if (stmt.else) visitStatements(stmt.else);
+          break;
+
+        case 'for_statement':
+          visitStatements([stmt.init, stmt.update]);
+          visitExpr(stmt.condition, stmt.sourceLocation);
+          visitStatements(stmt.body);
+          break;
+      }
+    }
+  };
+
+  visitStatements(method.body);
 }
 
 // ---------------------------------------------------------------------------

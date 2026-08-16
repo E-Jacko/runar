@@ -493,6 +493,7 @@ const Ctx = struct {
             .target = a.target,
             .value = new_val,
             .source_loc = a.source_loc,
+            .target_is_property = a.target_is_property,
         } });
     }
 

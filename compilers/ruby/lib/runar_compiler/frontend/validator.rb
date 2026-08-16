@@ -101,6 +101,27 @@ module RunarCompiler
               loc: prop.source_location
             )
           end
+
+          # Validate initializer if present. FixedArray properties accept an
+          # array literal of literal elements (recursively, for nested
+          # arrays); other properties accept a plain literal value. Mirrors
+          # the TS validator in `02-validate.ts` and the Go peer in
+          # `validator.go`.
+          next if prop.initializer.nil?
+
+          if prop.type.is_a?(FixedArrayType)
+            unless array_literal_of_literals?(prop.initializer)
+              add_error(
+                "property '#{prop.name}' initializer must be an array literal of literal values",
+                loc: prop.source_location
+              )
+            end
+          elsif !literal_expression?(prop.initializer)
+            add_error(
+              "property '#{prop.name}' initializer must be a literal value",
+              loc: prop.source_location
+            )
+          end
         end
 
         # SmartContract (and the asm-escape-hatch UnsafeSmartContract) require
@@ -228,6 +249,35 @@ module RunarCompiler
         @errors << Diagnostic.new(message: msg, severity: Severity::ERROR, loc: loc)
       end
 
+      # Resolve the contract property an assignment target writes to, if any.
+      # Unwraps IndexAccessExpr chains so `this.grid[i][j] = v` resolves to
+      # `grid`.
+      def written_property(target)
+        node = target
+        node = node.object while node.is_a?(IndexAccessExpr)
+        node.is_a?(PropertyAccessExpr) ? node.property : nil
+      end
+
+      # Whether the expression is a literal allowed as a property initializer
+      # (bigint, bool, bytestring, or a negated bigint literal). Mirrors the
+      # TS/Go validator helpers.
+      def literal_expression?(expr)
+        return true if expr.is_a?(BigIntLiteral) || expr.is_a?(BoolLiteral) || expr.is_a?(ByteStringLiteral)
+        return expr.operand.is_a?(BigIntLiteral) if expr.is_a?(UnaryExpr) && expr.op == "-"
+
+        false
+      end
+
+      # Whether the expression is an array literal whose elements are all
+      # literal values (recursively, for nested FixedArray initializers).
+      def array_literal_of_literals?(expr)
+        return false unless expr.is_a?(ArrayLiteralExpr)
+
+        expr.elements.all? do |el|
+          el.is_a?(ArrayLiteralExpr) ? array_literal_of_literals?(el) : literal_expression?(el)
+        end
+      end
+
       # -------------------------------------------------------------------
       # Property type validation (private)
       # -------------------------------------------------------------------
@@ -324,8 +374,81 @@ module RunarCompiler
           end
         end
 
+        # readonly properties may only be assigned in the constructor.
+        check_readonly_writes(method)
+
         # Validate statements
         method.body.each { |stmt| validate_statement(stmt) }
+      end
+
+      # -------------------------------------------------------------------
+      # Readonly property writes (private)
+      # -------------------------------------------------------------------
+
+      # Report every write to a readonly contract property in a method body.
+      #
+      #   spec/semantics.md:
+      #     <this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property
+      #
+      # The constructor is exempt -- that is where every contract initialises
+      # its readonly properties -- so this runs per METHOD only
+      # (validate_constructor never calls in here).
+      #
+      # Three AST shapes reach update_prop in ANF lowering and are all
+      # covered: `this.p = e`, `this.p++` / `this.p--`, and `this.arr[i] = e`.
+      def check_readonly_writes(method)
+        readonly = @contract.properties.select(&:readonly).map(&:name).to_set
+        return if readonly.empty?
+
+        report = lambda do |name, loc|
+          add_error(
+            "cannot assign to readonly property '#{name}' in method " \
+            "'#{method.name}'. readonly properties may only be assigned " \
+            "in the constructor.",
+            loc: loc
+          )
+        end
+
+        visit_expr = lambda do |expr, loc|
+          next if expr.nil?
+
+          visitor = proc do |e|
+            next unless e.is_a?(IncrementExpr) || e.is_a?(DecrementExpr)
+
+            name = written_property(e.operand)
+            report.call(name, loc) if !name.nil? && readonly.include?(name)
+          end
+          walk_expr(expr, visitor)
+        end
+
+        visit_statements = nil
+        visit_statements = lambda do |stmts|
+          stmts.each do |stmt|
+            case stmt
+            when AssignmentStmt
+              name = written_property(stmt.target)
+              report.call(name, stmt.source_location) if !name.nil? && readonly.include?(name)
+              visit_expr.call(stmt.target, stmt.source_location)
+              visit_expr.call(stmt.value, stmt.source_location)
+            when VariableDeclStmt
+              visit_expr.call(stmt.init, stmt.source_location)
+            when ExpressionStmt
+              visit_expr.call(stmt.expr, stmt.source_location)
+            when ReturnStmt
+              visit_expr.call(stmt.value, stmt.source_location)
+            when IfStmt
+              visit_expr.call(stmt.condition, stmt.source_location)
+              visit_statements.call(stmt.then)
+              visit_statements.call(stmt.else_ || [])
+            when ForStmt
+              visit_statements.call([stmt.init, stmt.update].compact)
+              visit_expr.call(stmt.condition, stmt.source_location)
+              visit_statements.call(stmt.body)
+            end
+          end
+        end
+
+        visit_statements.call(method.body)
       end
 
       # -------------------------------------------------------------------

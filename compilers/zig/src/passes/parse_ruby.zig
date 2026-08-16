@@ -1650,7 +1650,7 @@ const Parser = struct {
             // Assignment: self.field = expr
             if (self.match(.assign)) {
                 const value = self.parseExpression() orelse return null;
-                return .{ .assign = .{ .target = prop_name, .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = prop_name, .value = value, .source_loc = loc, .target_is_property = true } };
             }
 
             // Compound assignment: self.field += expr
@@ -1661,7 +1661,7 @@ const Parser = struct {
                 const bin_op = binOpFromCompoundAssign(op_kind);
                 const target_expr: Expression = .{ .property_access = .{ .object = "this", .property = prop_name } };
                 const compound_rhs = self.makeBinaryExpr(bin_op, target_expr, rhs) orelse return null;
-                return .{ .assign = .{ .target = prop_name, .value = compound_rhs, .source_loc = loc } };
+                return .{ .assign = .{ .target = prop_name, .value = compound_rhs, .source_loc = loc, .target_is_property = true } };
             }
 
             // Expression statement (property access)
@@ -1713,12 +1713,13 @@ const Parser = struct {
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression, loc: types.SourceLocation) ?Statement {
         _ = self;
+        const is_prop = types.targetIsProperty(target);
         switch (target) {
             .property_access => |pa| {
-                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = pa.property, .value = value, .source_loc = loc, .target_is_property = is_prop } };
             },
             .identifier => |id| {
-                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = id, .value = value, .source_loc = loc, .target_is_property = is_prop } };
             },
             .index_access => |ia| {
                 // @arr[idx] = value — carry the full index-access target on
@@ -1736,10 +1737,11 @@ const Parser = struct {
                     .value = value,
                     .index_target = ia,
                     .source_loc = loc,
+                    .target_is_property = is_prop,
                 } };
             },
             else => {
-                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc } };
+                return .{ .assign = .{ .target = "unknown", .value = value, .source_loc = loc, .target_is_property = is_prop } };
             },
         }
     }
