@@ -44,6 +44,8 @@ test {
     _ = @import("tests/embed_always.zig");
     _ = @import("tests/sighash_codegen.zig");
     _ = @import("tests/sighash_validate_test.zig");
+    _ = @import("tests/readonly_property_assignment.zig");
+    _ = @import("tests/property_initializer_literal.zig");
     _ = @import("compiler_api.zig");
     _ = @import("passes/helpers/koalabear_emitters.zig");
     _ = @import("passes/helpers/poseidon2_koalabear.zig");
