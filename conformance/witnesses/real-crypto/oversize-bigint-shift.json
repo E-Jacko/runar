@@ -1,0 +1,40 @@
+{
+  "fixture": "oversize-bigint-shift",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "NEW-008 / NEW-009: an ANF bigint const ABOVE 2^53 — serialised on disk as the string \"9007199254740993n\" — feeding a length-sensitive byte op. The fixture pins bytes; this spec pins what those bytes DO. `~(9007199254740993n << 8n)` is -2305843009213694209 under native BigInt semantics, but on chain 9007199254740993 is the 7-byte script number 01000000000020, OP_LSHIFT is LENGTH-PRESERVING (00000000002000, a non-minimal 7-byte 2^45, NEW-004), and OP_INVERT then flips all seven bytes to ffffffffffdfff = -35993612646875135. The expectedState pin below is that hand-derived on-chain value, NOT the BigInt one — so a tier that takes the ByteString path for an n-string operand (NEW-008), or re-minimises anywhere along shift->invert (NEW-004), or rounds the const through float64 (NEW-009), lands on a different number and fails here even though every tier still agrees on the golden bytes. Cannot be a plain witnesses/*.json differential spec: this is the only witnessed StatefulSmartContract, and that harness pushes method args only, so the compiler-injected checkPreimage finds an empty stack (OP_DUP on an empty stack) and the run diverges before reaching the shift.",
+  "constructorArgs": [
+    "0n"
+  ],
+  "spends": [
+    {
+      "method": "shift",
+      "args": [],
+      "expect": "accept",
+      "note": "the load-bearing pin: out 0 -> -35993612646875135, the 7-byte non-minimal on-chain result, not the -2305843009213694209 native BigInt would give.",
+      "expectedState": {
+        "out": "-35993612646875135n"
+      }
+    },
+    {
+      "constructorArgs": [
+        "-35993612646875135n"
+      ],
+      "method": "shift",
+      "args": [],
+      "expect": "accept",
+      "note": "re-spend from the value the previous spend committed. The shift result is deployed as an 8-byte sign-magnitude state field and spent again, so the continuation this fixture builds is proven SPENDABLE and not just constructible — the failure mode NEW-004 actually cost. Idempotent by construction (the method ignores the prior state), which is what makes the round-trip the only variable.",
+      "expectedState": {
+        "out": "-35993612646875135n"
+      }
+    },
+    {
+      "method": "shift",
+      "args": [],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output — the oversize shift result must be committed to by hashOutputs, so corrupting output 0 has to fail the checkPreimage binding (OP_CHECKSIGVERIFY) on the real Spend engine."
+    }
+  ]
+}

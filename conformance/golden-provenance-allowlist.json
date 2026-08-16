@@ -69,12 +69,12 @@
     },
     {
       "path": "conformance/script-size-baseline.json",
-      "sha256": "393e537fbab25e0301f322fcc4452f18b4d77ef999d5474f5b15569f2324127a",
+      "sha256": "7114977b44a66139e5c718963eb8fd4c57391eae8ec076d91c079d29225dbe3a",
       "verified-against": "differential-oracle",
-      "reason": "Re-stamped for ONE fixture: assert-false-guard 2019 -> 2033 bytes (+0.69%, inside the file's own 10% growth tolerance). The mechanical size consequence of the issue-#149 layout fix, whose golden change is allowlisted separately in this file. The other 70 fixture sizes are byte-unchanged and the size checker reports ok=71 warn=0 fail=0. Not a blanket re-stamp: the checker named exactly this one fixture, and the new bytes are the ones all seven compilers independently regenerate.",
-      "reviewer": "fix-session: three-way v1 audit remediation",
-      "date": "2026-08-17",
-      "review-status": "reviewed"
+      "reason": "BOTH changes to this file in one entry, because the merged tree carries both and the hash is neither side's. (1) PURE ADDITION for the new oversize-bigint-shift fixture: 71 -> 72 entries, one line added (\"oversize-bigint-shift\": 941) with no existing value touched. 941 is not a compiler self-report -- it is len(conformance/tests/oversize-bigint-shift/expected-script.hex)/2 read straight off the checked-in golden, re-verified on this tree, and it equals the 941-byte locking script that runStatefulSpend deployed and SPENT on the real @bsv/sdk Spend engine when producing conformance/witnesses/real-crypto/oversize-bigint-shift.json. (2) RE-STAMP of exactly one existing fixture: assert-false-guard 2019 -> 2033 bytes (+0.69%, inside the file's own 10% tolerance), the mechanical size consequence of the issue-#149 layout fix that ships on main as sinkBelow; the size checker named exactly that one fixture and all seven compilers independently regenerate the new bytes. No other fixture value moved. A wrong entry here is caught rather than absorbed: perturbing oversize-bigint-shift to 500 fails runner/__tests__/script-size-check.test.ts at +88.20% against the +10% tolerance.",
+      "reviewer": "gh:icellan",
+      "review-status": "reviewed",
+      "date": "2026-08-23"
     },
     {
       "path": "conformance/sdk-output/tests/assert-false-guard/expected-locking.hex",
