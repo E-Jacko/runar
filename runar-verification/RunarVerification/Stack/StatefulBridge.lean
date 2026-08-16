@@ -73,7 +73,8 @@ open RunarVerification.ANF
 open RunarVerification.ANF.Eval
 open RunarVerification.Stack.Eval
 
-/-! ## 1 — The synthetic key + the BIP-143 witness-existence axiom -/
+/-! ## 1 — The synthetic key (the BIP-143 witness-existence axiom is RETIRED;
+see §1b) -/
 
 /-- The compiler's synthetic BIP-143 key: the secp256k1 generator point `G`
 in compressed SEC form (33 bytes).  Byte-identical to the local constant in

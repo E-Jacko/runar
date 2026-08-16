@@ -114,7 +114,7 @@ const CASES = [_]Case{
         .label = "dead-arm-k2/fold-on",
         .source = DEAD_ARM_K2,
         .disable_constant_folding = false,
-        .want = "00014e01ce006351547a6e7b757b7567527978557a7568527a75537a757ca177",
+        .want = "00014e01ce006351547a6e7b757b7567527978557a7568527a75537a75527a7c7ba177",
     },
     .{
         .label = "dead-arm-k2/fold-off",

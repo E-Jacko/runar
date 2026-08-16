@@ -3965,10 +3965,11 @@ theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
 -- (`runOps_statefulPrologueOps_isSome`), the M3 peephole-identity, the M4
 -- concrete parse round-trip, and that provenance hypothesis (formerly D2.a's
 -- universal bridge axiom `checkPreimage_iff_checkSig_under_validTxContext`,
--- which forced `checkSig` constant; the surviving TCB entry is the
--- witness-existence axiom
--- `StatefulBridge.exists_checkSig_witness_under_validTxContext`, which only
--- powers the smoke).  Residual stateful
+-- which forced `checkSig` constant; its witness-existence successor
+-- `StatefulBridge.exists_checkSig_witness_under_validTxContext` was itself
+-- RETIRED by BUG-100 on 2026-07-06, so the TCB entries here are now the two
+-- `AgreesStateful` OP_PUSH_TX binding shims and `StatefulBridge` declares
+-- zero axioms).  Residual stateful
 -- bodies — user logic after the prologue, state-output epilogues
 -- (D2.b's `auto_state_output_at_method_exit_correct` is ALREADY a theorem),
 -- multi-public stateful programs — fall through to the sound crypto_call /
@@ -6929,11 +6930,15 @@ is the AUTH backend's verdict (`runOps_statefulPrologueOps_isSome`); the ANF
 success bit is the PREIMAGE backend's verdict
 (`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the two agree via the
 per-deployment sig-provenance hypothesis `hSig` carried by the keyed
-`hStatefulFrag` premise (TIGHTENED 2026-06-10 — previously a universal
-bridge axiom that forced `authBackend.checkSig` constant; the surviving
-axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext` only
-asserts a witness EXISTS per valid context, and powers the smoke).  No
-sub-omnibus axiom appears in the discharge. -/
+`hStatefulFrag` premise.  History of that hypothesis: it was a universal
+bridge axiom (which forced `authBackend.checkSig` constant), TIGHTENED
+2026-06-10 to a witness-existence axiom, and that axiom was RETIRED
+outright by BUG-100 (2026-07-06) — `StatefulBridge` now declares zero
+axioms.  The preimage↔transaction binding is ENFORCED BY CODEGEN instead,
+characterised by the two shims in `AgreesStateful`
+(`runOps_checkPreimageBindingRaw_eq`,
+`runOps_statefulFullParsedOps_scriptAccepts`).  No sub-omnibus axiom
+appears in the discharge. -/
 
 /-- The 4-pass peephole pipeline is the identity on the constant stateful
 prologue ops (BUG-100: `OP_CODESEPARATOR` followed by the opaque 760-byte
@@ -7000,12 +7005,15 @@ The bit chain is direct (no runMethod leg needed): the ANF side is
 side is `authBackend.checkSig sigV G`
 (`AgreesStateful.runOps_statefulPrologueOps_scriptAccepts`, constant
 prologue ops, M3 peephole-identity, M4 concrete parse round-trip), and
-the per-deployment sig-provenance hypothesis `hSig` (the spender's
-`_opPushTxSig` witness verifies against the synthetic key exactly when
-the preimage backend accepts — discharged per fixture by the conformance
-harness, and for the smoke by the witness
-`StatefulBridge.exists_checkSig_witness_under_validTxContext` provides)
-equates the two. -/
+the per-deployment sig-provenance hypothesis `hSig` (the signature
+verifies against the synthetic key exactly when the preimage backend
+accepts — discharged per fixture by the conformance harness) equates the
+two.  Since BUG-100 the smoke no longer draws its witness from
+`StatefulBridge.exists_checkSig_witness_under_validTxContext`: that axiom
+is RETIRED and `StatefulBridge` declares zero axioms.  The signature is
+derived on-chain from `hash256(preimage)` by the emitted binding blob, so
+the correspondence is a codegen bridge
+(`AgreesStateful.runOps_checkPreimageBindingRaw_eq`). -/
 theorem compileSafe_observational_correct_stateful_consume
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (_hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
@@ -9282,9 +9290,11 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- Keyed on the DECIDABLE classifier, it is VACUOUS for every
     -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
     -- consumer is the conformance harness, which discharges it per fixture from
-    -- the deployment context (the witness-existence axiom
-    -- `StatefulBridge.exists_checkSig_witness_under_validTxContext` shows the
-    -- bundle satisfiable for every valid context).
+    -- the deployment context.  (Pre-BUG-100 the witness-existence axiom
+    -- `StatefulBridge.exists_checkSig_witness_under_validTxContext` showed the
+    -- bundle satisfiable for every valid context; that axiom was RETIRED on
+    -- 2026-07-06 — satisfiability now comes from the emitted binding blob,
+    -- which derives the signature on-chain from `hash256(preimage)`.)
     (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)

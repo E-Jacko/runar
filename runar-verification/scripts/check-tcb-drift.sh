@@ -965,12 +965,125 @@ check "opaques"       "$real_opaques_strict" "$TARGET_OPAQUES"
 check "opaque stubs"  "$real_opaque_stubs"   "$TARGET_OPAQUE_STUBS"
 check "partial defs"  "$real_partials"       "$TARGET_PARTIALS"
 
+# ------------------------------------------------------------------
+# Per-file inventory check — TRUST_MANIFEST.md "## Axiom Inventory".
+#
+# The grand-total checks above are blind to a per-file row that
+# drifts while the total stays put (an axiom moving between files, or
+# two rows drifting in opposite directions). Worse, before 2026-08-17
+# NOTHING parsed the table at all, so every Count was unverified
+# prose — and four rows had drifted (total column summed to 96, not
+# 71). Parse the table and verify every row against the real
+# per-file count, both directions.
+#
+# Rows are `| \`RunarVerification/<path>.lean\` | N | role |`.
+# Rows that reach zero are KEPT (with Count = 0 and a discharge note)
+# so an auditor can see an entry was discharged, not dropped.
+# ------------------------------------------------------------------
+
+MANIFEST=TRUST_MANIFEST.md
+
+# Same strict regex as the grand total, applied to one file.
+AXIOM_RE='^axiom [a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*[(:]'
+
+count_file_axioms() {
+  ( grep -cE "$AXIOM_RE" "$1" || true )
+}
+
+# Slice out the table: start at the heading, take the contiguous run
+# of `|` lines, stop at the first non-`|` line after the run begins.
+manifest_rows=$(
+  awk '
+    /^## Axiom Inventory/ { intable = 1; next }
+    intable && /^\|/      { seen = 1; print; next }
+    intable && seen       { exit }
+  ' "$MANIFEST"
+)
+
+if [ -z "$manifest_rows" ]; then
+  echo "DRIFT: could not parse the '## Axiom Inventory' table in $MANIFEST" >&2
+  echo "       (heading missing, or the table no longer follows it)" >&2
+  drift=1
+fi
+
+manifest_sum=0
+manifest_files=""
+
+while IFS='|' read -r _lead col_file col_count _rest; do
+  # Strip backticks, bold markers and whitespace.
+  file=$(printf '%s' "$col_file"  | tr -d '`* ')
+  count=$(printf '%s' "$col_count" | tr -d '`* ')
+
+  # Skip the header row, the `|---|---:|---|` separator, and any
+  # non-inventory row that slipped into the slice.
+  case "$file" in
+    RunarVerification/*.lean) ;;
+    *) continue ;;
+  esac
+
+  case "$count" in
+    ''|*[!0-9]*)
+      echo "DRIFT: $MANIFEST row for $file has a non-numeric Count ('$count')" >&2
+      drift=1
+      continue
+      ;;
+  esac
+
+  manifest_files="$manifest_files $file"
+
+  if [ ! -f "$file" ]; then
+    echo "DRIFT: $MANIFEST lists $file (Count $count) but that file does not exist" >&2
+    drift=1
+    continue
+  fi
+
+  actual=$(count_file_axioms "$file")
+  manifest_sum=$((manifest_sum + count))
+
+  if [ "$actual" != "$count" ]; then
+    echo "DRIFT: $MANIFEST claims $file has $count axiom(s); the source has $actual" >&2
+    if [ "$actual" -eq 0 ]; then
+      echo "       -> the entry was discharged. Set the row's Count to 0 and" >&2
+      echo "          note the discharge; do NOT delete the row." >&2
+    fi
+    drift=1
+  fi
+done <<EOF
+$manifest_rows
+EOF
+
+# Reverse direction: an axiom-carrying file with no row at all would
+# otherwise sail past both the row loop and (if the total target were
+# bumped) the grand total.
+while IFS= read -r hit; do
+  [ -z "$hit" ] && continue
+  hit_file=${hit%:*}
+  hit_n=${hit##*:}
+  case " $manifest_files " in
+    *" $hit_file "*) ;;
+    *)
+      echo "DRIFT: $hit_file declares $hit_n axiom(s) but has NO row in the" >&2
+      echo "       '## Axiom Inventory' table of $MANIFEST" >&2
+      drift=1
+      ;;
+  esac
+done <<EOF
+$( ( grep -rEc "$AXIOM_RE" RunarVerification/ --include='*.lean' || true ) | grep -v ':0$' || true )
+EOF
+
+check "inventory sum" "$manifest_sum" "$TARGET_AXIOMS"
+
 if [ "$drift" -eq 1 ]; then
   echo "" >&2
   echo "TCB drift detected. Either:" >&2
   echo "  (a) a new axiom/opaque/partial def was added — update" >&2
   echo "      TRUST_MANIFEST.md's counts and §3/§4 inventory." >&2
   echo "  (b) the manifest is stale — refresh." >&2
+  echo "" >&2
+  echo "Per-file rows ('## Axiom Inventory' in TRUST_MANIFEST.md) are" >&2
+  echo "checked too, and must sum to TARGET_AXIOMS. A discharged entry" >&2
+  echo "keeps its row with Count = 0 and a discharge note — deleting the" >&2
+  echo "row hides the discharge from auditors." >&2
   echo "" >&2
   echo "Per remediation plan (Q1.4): no new opaque-with-stub" >&2
   echo "declarations are permitted. Convert to real def or to bare" >&2
