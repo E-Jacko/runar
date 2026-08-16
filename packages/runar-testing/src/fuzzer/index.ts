@@ -36,10 +36,14 @@ export type { BranchShape, IrLoopShape } from './generator.js';
 export {
   arbExecCase,
   arbExecCaseWithLoopShape,
+  arbExecCaseWithBranchShape,
   loopShapeCarriers,
+  branchShapeLocals,
+  branchShapeMerged,
   EXEC_LOOP_SHAPES,
+  EXEC_BRANCH_SHAPES,
 } from './generator.js';
-export type { ExecCase, ExecArg, ExecLoopShape } from './generator.js';
+export type { ExecCase, ExecArg, ExecLoopShape, ExecBranchShape } from './generator.js';
 
 // Contract IR types
 export type {
