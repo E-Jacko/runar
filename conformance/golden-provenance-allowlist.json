@@ -1715,6 +1715,38 @@
       "reviewer": "fix-session: three-way v1 audit remediation",
       "review-status": "reviewed",
       "date": "2026-08-17"
+    },
+    {
+      "path": "conformance/tests/shift-ops/expected-script.hex",
+      "sha256": "9647cf79e042fd76e10e3df3e21ba992602a8020f0a484395bb87095a357e081",
+      "verified-against": "differential-oracle",
+      "reason": "NEW-004 fund-loss fix: the compiled bytes grew 27 -> 31 by four OP_BIN2NUM (0x81), one per numeric READ of a shift result (two shifts x two reads each). The old bytes are not merely different, they are REJECTED BY THE REAL CONSENSUS ENGINE: OP_LSHIFT/OP_RSHIFT preserve the operand's byte width, so `this.a << 3n` with a 1-byte `a` leaves a non-minimal buffer ([0x00], or [0x80] when the result lands on the sign bit), and the following OP_GREATERTHANOREQUAL reads it with requireMinimal and aborts with \"non-minimally encoded script number\" -- the contract deploys and its UTXO can never be spent. Measured, not argued: runTriModalExecution over this shape reported interpreter=accept, ScriptVM=accept, Spend.validate()=REJECT in both fold modes, because ScriptVM runs the upstream engine relaxed and only Spend.validate() applies the consensus rule set. The new bytes turn all 15 RED cases in packages/runar-testing/src/__tests__/bitwise-minimality-consensus.test.ts green against Spend.validate() while the 3 width-fitting controls and the 3 PR #141 chained-shift pins (2026-07-14-chained-shift-{and,or}-*, 2026-07-12-shift-truncation) stay green -- normalisation is at the numeric CONSUMER, so byte-array operand widths are untouched. Byte-identical across all 7 tiers in both fold modes; expected-ir.json did NOT move (the repair is in stack lowering, the ANF is unchanged).",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-15"
+    },
+    {
+      "path": "conformance/tests/bitwise-ops/expected-script.hex",
+      "sha256": "04f67236d463fef4dc5cf91606603ea16f4a15b472e6f76d7051a358a81d83f5",
+      "verified-against": "differential-oracle",
+      "reason": "NEW-004 fund-loss fix, same repair as conformance/tests/shift-ops: 96 -> 108 bytes, twelve OP_BIN2NUM (0x81), one per numeric READ of a byte-array result -- six producing ops (<<, >>, &, |, ^, ~) read twice each by `assert(x >= 0n || x < 0n)`. OP_AND, OP_XOR and OP_INVERT carry the identical defect to the shifts and were confirmed the same way: `q & 4n` with q=3 gives [0x00] and `~q` with q=127 gives [0x80], and runTriModalExecution reported interpreter=accept, ScriptVM=accept, Spend.validate()=REJECT (\"non-minimally encoded script number\") for both, i.e. deployed and unspendable. OP_OR cannot make a minimal PAIR non-minimal, but it propagates non-minimality from its operands -- `(q<<10) | (q<<11)` is [0x00]|[0x00] -- so it is normalised on the same footing; that is the only one of the twelve bytes that is defensive rather than load-bearing. Same evidence, same test file, same 7-tier byte-identical result in both fold modes; expected-ir.json did not move.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-15"
+    },
+    {
+      "path": "conformance/tests/oversize-bigint-shift/expected-ir.json",
+      "sha256": "f99c105cdd6717ed62b790a02a59e787e2cc752b75c01356c29a5228d2b463c8",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture (not a regeneration): `~(9007199254740993n << 8n)` -- the first checked-in golden that feeds a past-Number.MAX_SAFE_INTEGER bigint const into a length-sensitive byte op, so it is also the first whose expected-ir.json really carries the on-disk `\"<decimal>n\"` STRING form (the runner narrows safe-integer n-strings back to JSON numbers when stamping). INDEPENDENT ORACLE, not another compiler: the locking script was deployed and spent on the real @bsv/sdk Spend engine with real secp256k1 (packages/runar-testing/src/oracle/real-crypto-execution.ts runStatefulSpend) and the continuation output's state decoded off the broadcast call tx -- byte layout only, NOT by re-running the transition -- as -35993612646875135n. That is the byte-exact script result: push 01 00 00 00 00 00 20, OP_LSHIFT 8 is length-preserving and leaves the NON-minimal 00 00 00 00 00 20 00, OP_INVERT flips all seven bytes to ff ff ff ff ff df ff. Acceptance is load-bearing, not vacuous: the same harness with tamperOutput=true REJECTS this script (\"OP_CHECKSIGVERIFY requires that a valid signature is provided\", Context: LockingScript, PC: 524), so a continuation carrying any other value is unspendable. Cross-checked a second way: before the NEW-009 fix Go's --emit-ir rounded this const to ...992 through float64, and compiling that IR with the RUST tier produced a different script (push 07 00 00 00 00 00 00 20 instead of 07 01 00 00 00 00 00 20) -- the corruption is consensus-visible. The golden is re-checked on every run by the script-semantics oracle in conformance/anf-interpreter/cross-interpreter.test.ts.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-16"
+    },
+    {
+      "path": "conformance/tests/oversize-bigint-shift/expected-script.hex",
+      "sha256": "f037651b544bffbbf154d7c71dc63fb9008c8cf671cbff87addc75a00698f84d",
+      "verified-against": "differential-oracle",
+      "reason": "NEW fixture (not a regeneration): `~(9007199254740993n << 8n)` -- the first checked-in golden that feeds a past-Number.MAX_SAFE_INTEGER bigint const into a length-sensitive byte op, so it is also the first whose expected-ir.json really carries the on-disk `\"<decimal>n\"` STRING form (the runner narrows safe-integer n-strings back to JSON numbers when stamping). INDEPENDENT ORACLE, not another compiler: the locking script was deployed and spent on the real @bsv/sdk Spend engine with real secp256k1 (packages/runar-testing/src/oracle/real-crypto-execution.ts runStatefulSpend) and the continuation output's state decoded off the broadcast call tx -- byte layout only, NOT by re-running the transition -- as -35993612646875135n. That is the byte-exact script result: push 01 00 00 00 00 00 20, OP_LSHIFT 8 is length-preserving and leaves the NON-minimal 00 00 00 00 00 20 00, OP_INVERT flips all seven bytes to ff ff ff ff ff df ff. Acceptance is load-bearing, not vacuous: the same harness with tamperOutput=true REJECTS this script (\"OP_CHECKSIGVERIFY requires that a valid signature is provided\", Context: LockingScript, PC: 524), so a continuation carrying any other value is unspendable. Cross-checked a second way: before the NEW-009 fix Go's --emit-ir rounded this const to ...992 through float64, and compiling that IR with the RUST tier produced a different script (push 07 00 00 00 00 00 00 20 instead of 07 01 00 00 00 00 00 20) -- the corruption is consensus-visible. The golden is re-checked on every run by the script-semantics oracle in conformance/anf-interpreter/cross-interpreter.test.ts.",
+      "reviewer": "gh:icellan",
+      "date": "2026-08-16"
     }
   ]
 }

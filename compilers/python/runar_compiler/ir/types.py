@@ -15,6 +15,37 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Canonical IR-JSON encoding of integers
+# ---------------------------------------------------------------------------
+
+#: ``Number.MAX_SAFE_INTEGER`` (2**53 - 1).
+JS_MAX_SAFE_INTEGER = (1 << 53) - 1
+
+
+def bigint_json_value(val: int) -> Any:
+    """Canonical IR-JSON encoding of an integer.
+
+    Returns the bare integer when a JSON *number* carries it losslessly, else
+    the canonical JS BigInt spelling: the decimal digits with a trailing
+    ``n``, as a JSON string. The suffix is also the discriminator that keeps a
+    decimal-encoded BigInt distinguishable from a hex-encoded ByteString
+    literal (which never carries it), so ``"3030"`` stays a 2-byte bytestring.
+
+    The boundary is ``Number.MAX_SAFE_INTEGER``, **not** int64: a bare JSON
+    number is read as an IEEE-754 double by every JS consumer (and by Go's
+    ``encoding/json`` when the target is ``interface{}``), so
+    ``9007199254740993`` — comfortably inside int64 — round-trips as
+    ``9007199254740992``.
+
+    Mirrors ``compilers/go/ir/types.go::BigIntToRawJSON`` and
+    ``compilers/rust/src/frontend/anf_lower.rs::bigint_to_json``.
+    """
+    if -JS_MAX_SAFE_INTEGER <= val <= JS_MAX_SAFE_INTEGER:
+        return val
+    return f"{val}n"
+
+
+# ---------------------------------------------------------------------------
 # Source location
 # ---------------------------------------------------------------------------
 

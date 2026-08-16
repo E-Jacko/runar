@@ -288,7 +288,7 @@ func (v ANFValue) MarshalJSON() ([]byte, error) {
 		if len(v.StartRaw) > 0 {
 			out["start"] = v.StartRaw
 		} else if v.Start != nil {
-			out["start"] = bigIntToRawJSON(v.Start)
+			out["start"] = BigIntToRawJSON(v.Start)
 		} else {
 			out["start"] = 0
 		}
@@ -546,15 +546,27 @@ func isDecimalBigIntLiteral(s string) bool {
 	return true
 }
 
-// bigIntToRawJSON encodes a big.Int into the canonical Rúnar IR JSON form used
-// for loop iterator starts (issue #121): a bare JSON number for values in
-// int64 range, else a quoted decimal string with the JS BigInt `n` suffix. This
-// mirrors makeLoadConstInt so the loop `start` field round-trips losslessly and
-// is byte-identical to the TypeScript ANF JSON (whose reviver collapses small
-// `Nn` strings back to plain numbers).
-func bigIntToRawJSON(val *big.Int) json.RawMessage {
+// jsMaxSafeInteger is Number.MAX_SAFE_INTEGER (2^53 - 1) — the largest integer
+// a bare JSON number survives, because every JSON consumer that decodes into a
+// JS number (or into Go's interface{}, which is float64) is an IEEE-754 double.
+var jsMaxSafeInteger = big.NewInt(9007199254740991)
+
+// IsJSSafeInteger reports whether val round-trips through a bare JSON number
+// without loss. int64 is NOT the boundary that matters: `9007199254740993`
+// fits int64 but decodes as `9007199254740992` in every double-backed reader.
+func IsJSSafeInteger(val *big.Int) bool {
+	return val.CmpAbs(jsMaxSafeInteger) <= 0
+}
+
+// BigIntToRawJSON encodes a big.Int into the canonical Rúnar IR JSON form: a
+// bare JSON number for JS-safe-integer values, else a quoted decimal string
+// with the JS BigInt `n` suffix. The suffix is also the discriminator that
+// separates a decimal-encoded BigInt from a hex-encoded ByteString literal
+// (which never carries it). Byte-identical to the TypeScript ANF JSON, whose
+// reviver collapses safe-integer `Nn` strings back to plain numbers.
+func BigIntToRawJSON(val *big.Int) json.RawMessage {
 	var raw json.RawMessage
-	if val.IsInt64() {
+	if IsJSSafeInteger(val) {
 		raw, _ = json.Marshal(val.Int64())
 	} else {
 		raw, _ = json.Marshal(val.String() + "n")

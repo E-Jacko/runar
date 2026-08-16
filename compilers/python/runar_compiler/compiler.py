@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from runar_compiler.ir.types import ANFProgram
+from runar_compiler.ir.types import ANFProgram, bigint_json_value
 from runar_compiler.frontend.sighash_directive import SIGHASH_DEFAULT as _SIGHASH_DEFAULT
 
 
@@ -974,9 +974,10 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["iterVar"] = v.iter_var
         # Loop start/step (issue #121). Emitted as plain integers to match the
         # TS reference tier after the conformance runner's bigint reviver
-        # normalizes its ``"0n"`` artifact form to a JSON number.
+        # normalizes its ``"0n"`` artifact form to a JSON number — and, past
+        # Number.MAX_SAFE_INTEGER, as the ``"<n>n"`` string the reviver keeps.
         if v.start is not None:
-            d["start"] = v.start
+            d["start"] = bigint_json_value(v.start)
         if v.step is not None:
             d["step"] = v.step
         if v.body is not None:

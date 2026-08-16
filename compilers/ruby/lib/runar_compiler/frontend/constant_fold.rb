@@ -312,9 +312,8 @@ module RunarCompiler
           # loss. Without this, fold-collapsed 256-bit values (e.g. an
           # `EC_N - 1` constant from the optimizer) would be silently
           # truncated by the consumer.
-          v.raw_value = if val.is_a?(Integer) &&
-                           (val > INT64_MAX_LOAD_CONST || val < INT64_MIN_LOAD_CONST)
-                          JSON.generate("#{val}n")
+          v.raw_value = if val.is_a?(Integer)
+                          JSON.generate(Frontend._bigint_json_value(val))
                         else
                           JSON.generate(val)
                         end

@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "./OversizeBigintShift.runar.ts",
+    ".runar.sol": "./OversizeBigintShift.runar.sol",
+    ".runar.move": "./OversizeBigintShift.runar.move",
+    ".runar.go": "./OversizeBigintShift.runar.go",
+    ".runar.rs": "./OversizeBigintShift.runar.rs",
+    ".runar.py": "./OversizeBigintShift.runar.py",
+    ".runar.zig": "./OversizeBigintShift.runar.zig",
+    ".runar.rb": "./OversizeBigintShift.runar.rb",
+    ".runar.java": "./OversizeBigintShift.runar.java"
+  }
+}
