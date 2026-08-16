@@ -25,7 +25,12 @@
  * (a) **multi-local branch merges** — >=2 locals initialised from state fields
  *     and reassigned across an `if`, including the asymmetric (arms rebind
  *     DIFFERENT locals) variant that is the PALMER-1 shape, plus k=1, k=2,
- *     k=3+, both-arms-rebind, if-without-else and nested-if.
+ *     k=3+, both-arms-rebind, if-without-else, nested-if, and — the issue-#149
+ *     shape — NESTED-SIBLING: an inner `if` that rebinds only a PREFIX of the
+ *     locals (leaving >=1 live untouched sibling in the region inherited from
+ *     the enclosing arm) under an outer `if` that has NO else. See the
+ *     `ArmStyle` comment for why BOTH halves are required and why the corpus
+ *     was blind to this shape while a fund-safety defect was open.
  * (b) **1-byte OP_N-range ByteString state** — `0x01`..`0x10` and `0x81`, plus
  *     `0x00`, empty `""`, 1-byte-outside-range and multi-byte (the PALMER-2
  *     shape), AND **negative bigint state** (`-1`, `-2`, `-128`, ...): a
@@ -83,6 +88,7 @@ export type ShapeTag =
   | 'merge-asymmetric'
   | 'merge-no-else'
   | 'merge-nested-if'
+  | 'merge-nested-sibling'
   // (b) state value classes
   | 'state-bytestring-empty'
   | 'state-bytestring-0x00'
@@ -118,6 +124,7 @@ export const REQUIRED_TAGS: readonly ShapeTag[] = [
   'merge-asymmetric',
   'merge-no-else',
   'merge-nested-if',
+  'merge-nested-sibling',
   'state-bytestring-empty',
   'state-bytestring-0x00',
   'state-bytestring-op-n',
@@ -426,7 +433,31 @@ function tsTypeName(t: ShapeType): string {
 // Shape families (round-robin primary construct)
 // ---------------------------------------------------------------------------
 
-type ArmStyle = 'both' | 'asymmetric' | 'no-else' | 'nested';
+/**
+ * `nested-sibling` is the issue-#149 shape and the reason the plain `nested`
+ * style could never reach it. Two degrees of freedom have to be drawn TOGETHER,
+ * and `nested` supplies neither:
+ *
+ *  1. the INNER `if` rebinds only a PREFIX of the locals, so >=1 sibling stays
+ *     LIVE and UNTOUCHED in the region the arm inherited from its parent. When
+ *     every local is a declared result of the inner `if` (what `nested` does)
+ *     there is no inherited slot left for an adopted result to rotate past, so
+ *     the adopt-then-remove sequence cannot disturb any layout;
+ *  2. the OUTER `if` has NO else, so only ONE outer path rearranges that region
+ *     and the two paths leave equal DEPTH with different LAYOUT. With an outer
+ *     else both paths get rearranged and the post-`OP_ENDIF` reads resolve the
+ *     same way on either.
+ *
+ * This is a MEASURED reachability claim, not a plausible-sounding one. Against
+ * the compiler as it stood before `fix(stack-lower): restore inherited slot
+ * order after adopting declared results`, the corpus WITHOUT this style
+ * reported 0 failures over 4000 cases / 11,750 spend inputs while the defect
+ * was open and reproducible by hand; WITH it, seed 20260817 at `--num 400`
+ * reports 62 failures over 2590 spend inputs (31 `reject-when-accept-intended`
+ * + 31 `interpreter-vs-spend`) — unspendable UTXOs, i.e. fund loss. The same
+ * seed and count report 0 once that fix is applied.
+ */
+type ArmStyle = 'both' | 'asymmetric' | 'no-else' | 'nested' | 'nested-sibling';
 
 /**
  * Loop-body topologies (d). `cross-read` is the confirmed 2026-08-06
@@ -489,6 +520,13 @@ const FAMILIES: readonly FamilySpec[] = [
   { name: 'merge-k4-asymmetric', k: 4, arms: 'asymmetric' },
   { name: 'merge-nested-if', k: 2, arms: 'nested' },
   { name: 'merge-k3-nested-if', k: 3, arms: 'nested' },
+  // The issue-#149 family: inner `if` rebinds a PREFIX (>=1 live untouched
+  // sibling), outer `if` has NO else. Drawn at k=2/3/4 because the number of
+  // inherited slots the adopted results have to cross — and therefore whether
+  // the rotation is observable at all — is a function of k minus the prefix.
+  { name: 'merge-k2-nested-sibling', k: 2, arms: 'nested-sibling' },
+  { name: 'merge-k3-nested-sibling', k: 3, arms: 'nested-sibling' },
+  { name: 'merge-k4-nested-sibling', k: 4, arms: 'nested-sibling' },
   { name: 'state-bytestring-op-n', k: 2, pinnedType: 'ByteString', pinnedValue: '05' },
   { name: 'state-bytestring-op-n-high', k: 2, pinnedType: 'ByteString', pinnedValue: '10' },
   { name: 'state-bytestring-op-1negate', k: 2, pinnedType: 'ByteString', pinnedValue: '81' },
@@ -715,7 +753,8 @@ function buildShape(seed: number, index: number, fam: FamilySpec, rng: () => num
   const innerTrue = condTrue && p0Value > 2000n;
 
   // ---- arm assignments ----------------------------------------------------
-  const arms = fam.arms ?? pick(rng, ['both', 'asymmetric', 'no-else', 'nested'] as ArmStyle[]);
+  const arms =
+    fam.arms ?? pick(rng, ['both', 'asymmetric', 'no-else', 'nested', 'nested-sibling'] as ArmStyle[]);
   if (fam.loop !== undefined) {
     tags.add(k === 1 ? 'loop-carried-locals-k1' : 'loop-carried-locals-k2');
     tags.add(LOOP_STYLE_TAGS[fam.loop.style]);
@@ -726,7 +765,8 @@ function buildShape(seed: number, index: number, fam: FamilySpec, rng: () => num
     if (arms === 'both') tags.add('merge-both-arms');
     else if (arms === 'asymmetric') tags.add('merge-asymmetric');
     else if (arms === 'no-else') tags.add('merge-no-else');
-    else tags.add('merge-nested-if');
+    else if (arms === 'nested') tags.add('merge-nested-if');
+    else tags.add('merge-nested-sibling');
   }
 
   /** One arm's assignments: local index -> (source expression, modelled value). */
@@ -779,6 +819,23 @@ function buildShape(seed: number, index: number, fam: FamilySpec, rng: () => num
         elseAssign.set(fi, armValue(fields[fi]!));
       }
       break;
+    case 'nested-sibling': {
+      // The #149 shape. Both inner arms rebind the same PREFIX `l0..l[m-1]`
+      // (so `m` locals are the inner `if`'s declared results), and `l[m]..`
+      // stay LIVE + UNTOUCHED in the slot region the outer arm inherited —
+      // the slots an adopted result has to cross. `elseAssign` is left EMPTY:
+      // the outer `if` renders with no else, so its fall-through path keeps
+      // the pre-`if` layout while the taken path rotates it.
+      //
+      // The inner `if` keeps a real else on purpose: the confirmed #149 inner
+      // `if` had one, and the repair must not be gated on its absence.
+      const m = k <= 1 ? 1 : intIn(rng, 1, k - 1);
+      for (let fi = 0; fi < m; fi++) {
+        innerThenAssign.set(fi, armValue(fields[fi]!));
+        innerElseAssign.set(fi, armValue(fields[fi]!));
+      }
+      break;
+    }
   }
 
   // ---- THE MODEL: post-state, decided here, not read back -----------------
@@ -794,11 +851,16 @@ function buildShape(seed: number, index: number, fam: FamilySpec, rng: () => num
   for (let fi = 0; fam.loop === undefined && fi < k; fi++) {
     const f = fields[fi]!;
     let v: ShapeValue = f.value; // pre-branch local value = the state field
-    if (arms === 'nested') {
+    if (arms === 'nested' || arms === 'nested-sibling') {
       if (condTrue) {
+        // A local outside the inner `if`'s rebound prefix has no entry in
+        // either inner map, so it correctly keeps its pre-branch value — that
+        // is precisely the untouched live sibling.
         const a = innerTrue ? innerThenAssign.get(fi) : innerElseAssign.get(fi);
         if (a) v = a.value;
       } else {
+        // `nested-sibling` has no outer else, so this map is empty and every
+        // local keeps its pre-branch value on the fall-through path.
         const a = elseAssign.get(fi);
         if (a) v = a.value;
       }
@@ -833,7 +895,11 @@ function buildShape(seed: number, index: number, fam: FamilySpec, rng: () => num
 
   // Phase E4 metamorphic variants — semantics-preserving rewrites.
   const swappable =
-    arms !== 'nested' && arms !== 'no-else' && thenAssign.size > 0 && elseAssign.size > 0;
+    arms !== 'nested' &&
+    arms !== 'nested-sibling' &&
+    arms !== 'no-else' &&
+    thenAssign.size > 0 &&
+    elseAssign.size > 0;
   const variants = {
     renameLocals: renameLocals(source),
     swapArms: swappable ? renderShape({ ...renderOpts, swapArms: true }) : null,
@@ -996,6 +1062,16 @@ function renderShape(o: RenderOptions): string {
     L.push('      }');
     L.push('    } else {');
     L.push(...assignLines(o.elseAssign, '      '));
+    L.push('    }');
+  } else if (o.arms === 'nested-sibling') {
+    // Outer `if` with NO else; inner `if`/`else` rebinds only the prefix, so
+    // the locals below it stay live and untouched inside the outer arm.
+    L.push('    if (p0 > 0n) {');
+    L.push('      if (p0 > 2000n) {');
+    L.push(...assignLines(o.innerThenAssign, '        '));
+    L.push('      } else {');
+    L.push(...assignLines(o.innerElseAssign, '        '));
+    L.push('      }');
     L.push('    }');
   } else if (o.arms === 'no-else' || o.elseAssign.size === 0) {
     L.push('    if (p0 > 0n) {');

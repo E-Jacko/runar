@@ -95,6 +95,48 @@ describe('spend-oracle shape generator (Phase E2)', () => {
     }
   });
 
+  it('(a) emits the NESTED-SIBLING merge: prefix-rebinding inner if, NO outer else', () => {
+    const sib = CORPUS.filter((s) => s.tags.includes('merge-nested-sibling'));
+    expect(sib.length).toBeGreaterThan(0);
+    // The three dedicated families must all be drawn — the number of inherited
+    // slots the adopted results cross is a function of k minus the prefix, so
+    // k=2/3/4 are genuinely different reachability, not repetition.
+    for (const fam of ['merge-k2-nested-sibling', 'merge-k3-nested-sibling', 'merge-k4-nested-sibling']) {
+      expect(sib.some((s) => s.family === fam), `family ${fam} not drawn`).toBe(true);
+    }
+    for (const s of sib) {
+      const declared = (s.source.match(/^\s+let (l\d+):/gm) ?? []).length;
+      // Degree of freedom 2: the OUTER if has no else. Exactly ONE `} else {`
+      // exists in the body and it belongs to the INNER if, which is indented
+      // one level deeper than the outer arm's statements.
+      expect(s.source, `${s.id} outer if must have no else`).not.toContain('\n    } else {');
+      expect(s.source, `${s.id} inner if must keep a real else`).toContain('\n      } else {');
+      expect(s.source).toContain('if (p0 > 0n) {');
+      expect(s.source).toContain('if (p0 > 2000n) {');
+
+      // Degree of freedom 1: the inner arms rebind only a PREFIX, so at least
+      // one declared local is LIVE (it reaches addOutput) and UNTOUCHED.
+      const rebound = new Set([...s.source.matchAll(/^\s+(l\d+) = /gm)].map((m) => m[1]!));
+      expect(rebound.size, `${s.id} inner arms must rebind something`).toBeGreaterThan(0);
+      expect(rebound.size, `${s.id} must leave >=1 untouched sibling`).toBeLessThan(declared);
+      // The prefix is contiguous from l0, and every local — touched or not —
+      // reaches the state continuation, so a rotated slot is observable.
+      for (let i = 0; i < rebound.size; i++) expect(rebound.has(`l${i}`)).toBe(true);
+      expect(s.source).toContain(
+        `this.addOutput(1000n, ${s.fields.map((_f, fi) => `l${fi}`).join(', ')});`,
+      );
+
+      // The untouched siblings' modelled post-state is their PRE-branch value —
+      // the fall-through layout the enclosing `if` preserves. (Reject-intent
+      // shapes model no post-state at all: there is no continuation.)
+      if (s.expectedState !== null) {
+        for (let i = rebound.size; i < declared; i++) {
+          expect(s.expectedState[`f${i}`]).toEqual(s.fields[i]!.value);
+        }
+      }
+    }
+  });
+
   // -------------------------------------------------------------------------
   // (b) 1-byte OP_N-range ByteString state + negative bigint state
   // -------------------------------------------------------------------------
@@ -320,7 +362,12 @@ describe('spend-oracle shape generator (Phase E2)', () => {
     }
     // The no-else / nested forms have no pure arm pair, so they correctly
     // decline the transform rather than emitting a semantically different one.
-    for (const s of CORPUS.filter((x) => x.tags.includes('merge-no-else') || x.tags.includes('merge-nested-if'))) {
+    for (const s of CORPUS.filter(
+      (x) =>
+        x.tags.includes('merge-no-else') ||
+        x.tags.includes('merge-nested-if') ||
+        x.tags.includes('merge-nested-sibling'),
+    )) {
       expect(s.variants.swapArms).toBeNull();
     }
   });
