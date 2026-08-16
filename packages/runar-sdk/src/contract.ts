@@ -6,6 +6,7 @@ import type { RunarArtifact, ABIMethod } from 'runar-ir-schema';
 import { InputLimits } from 'runar-ir-schema';
 import { assertScriptHexUnderLimit, WitnessValueMissingError } from './errors.js';
 import type { Provider } from './providers/provider.js';
+import { txToTransactionData } from './providers/provider.js';
 import type { Signer } from './signers/signer.js';
 import type { TransactionData, UTXO, DeployOptions, CallOptions, PreparedCall } from './types.js';
 import type { Inscription } from './ordinals/types.js';
@@ -530,15 +531,12 @@ export class RunarContract {
     };
 
     const txData = await provider.getTransaction(txid).catch((err) => {
+      // Audit finding C4: the fallback reports the transaction this SDK
+      // actually broadcast, not an empty `inputs: []` / `outputs: []` shell
+      // that reads as a real confirmed tx. The warn stays — this is
+      // locally-derived, unconfirmed data.
       console.warn('Failed to fetch transaction after broadcast:', err);
-      return {
-        txid,
-        version: 1,
-        inputs: [],
-        outputs: [{ satoshis: deploySatoshis, script: lockingScript }],
-        locktime: 0,
-        raw: tx.toHex(),
-      };
+      return txToTransactionData(txid, tx);
     });
 
     return { txid, tx: txData };
@@ -1782,15 +1780,9 @@ export class RunarContract {
     }
 
     const txData = await provider.getTransaction(txid).catch((err) => {
+      // Audit finding C4 — see the peer fallback in `deploy()`.
       console.warn('Failed to fetch transaction after broadcast:', err);
-      return {
-        txid,
-        version: 1,
-        inputs: [],
-        outputs: [],
-        locktime: 0,
-        raw: finalTx.toHex(),
-      };
+      return txToTransactionData(txid, finalTx);
     });
 
     return { txid, tx: txData };
