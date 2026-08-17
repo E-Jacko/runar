@@ -839,6 +839,9 @@ fn evalNode(
                     if (op_byte == '<' or op_byte == '>') {
                         // Shift count is read as a number on-chain — only `ab`'s
                         // length matters, so the count never enters the side map.
+                        // But being read AS A NUMBER means the count itself must
+                        // be minimally encoded, or the shift aborts.
+                        try assertMinimalNumericOperand(eval_ctx, bo.right, right);
                         break :blk try shiftBytes(allocator, op_byte, ab, toInt(right));
                     }
                     const bb: []const u8 = eval_ctx.script_bytes.get(bo.right) orelse
@@ -847,6 +850,17 @@ fn evalNode(
                 };
                 try eval_ctx.script_bytes.put(binding_name, rb);
                 return .{ .int = scriptNumDecode(rb) };
+            }
+            // Numeric consumers decode BOTH operands with fRequireMinimal, so a
+            // threaded non-minimal intermediate (e.g. the 1-byte [0x00] that
+            // `1 >> 1` leaves) aborts the script rather than silently
+            // re-minimising to 0. Byte-typed ops are exempt: they never carry
+            // threaded bytes and OP_CAT/OP_EQUAL impose no numeric decode.
+            const is_bytes_path = std.mem.eql(u8, bo.result_type, "bytes") or
+                (left == .bytes and right == .bytes);
+            if (isNumericConsumerOp(bo.op) and !is_bytes_path) {
+                try assertMinimalNumericOperand(eval_ctx, bo.left, left);
+                try assertMinimalNumericOperand(eval_ctx, bo.right, right);
             }
             return try evalBinOp(allocator, bo.op, left, right, bo.result_type);
         },
@@ -1156,6 +1170,38 @@ fn isNumericByteOp(op: []const u8, result_type: []const u8, left: ANFValue, righ
 fn minimalBytesArena(allocator: std.mem.Allocator, n: i64) error{OutOfMemory}![]u8 {
     var buf: [9]u8 = undefined;
     return allocator.dupe(u8, scriptNumEncode(n, &buf));
+}
+
+/// Whether a bin_op consumes its operands NUMERICALLY, i.e. lowers to an opcode
+/// that decodes them with `fRequireMinimal = true`: OP_ADD/OP_SUB/OP_MUL/OP_DIV/
+/// OP_MOD, OP_NUMEQUAL(VERIFY)/OP_NUMNOTEQUAL and the relational ops. The
+/// byte-array ops `& | ^` and a shift's VALUE operand are deliberately NOT here
+/// — they take raw bytes and only require equal length. `&&`/`||` cast to bool,
+/// which has no minimal-encoding requirement either.
+fn isNumericConsumerOp(op: []const u8) bool {
+    return std.mem.eql(u8, op, "+") or std.mem.eql(u8, op, "-") or
+        std.mem.eql(u8, op, "*") or std.mem.eql(u8, op, "/") or
+        std.mem.eql(u8, op, "%") or std.mem.eql(u8, op, "==") or
+        std.mem.eql(u8, op, "===") or std.mem.eql(u8, op, "!=") or
+        std.mem.eql(u8, op, "!==") or std.mem.eql(u8, op, "<") or
+        std.mem.eql(u8, op, "<=") or std.mem.eql(u8, op, ">") or
+        std.mem.eql(u8, op, ">=");
+}
+
+/// Abort if `ref`'s threaded stack bytes are a NON-minimal encoding of its
+/// decoded value — the exact case a numeric consumer rejects on chain
+/// ("non-minimally encoded script number"). Only byte-array ops thread bytes, so
+/// a ref absent from the side map is minimal by construction and always passes.
+///
+/// Without this, `1 >> 1` (which leaves the 1-byte `[0x00]`, NOT the empty
+/// minimal zero) would be re-minimised to `0` by the numeric path: the
+/// interpreter reports a VALID spend for a script that aborts on chain, leaving
+/// the UTXO permanently unspendable.
+fn assertMinimalNumericOperand(eval_ctx: EvalCtx, ref: []const u8, val: ANFValue) error{ScriptNumberError}!void {
+    const raw = eval_ctx.script_bytes.get(ref) orelse return;
+    var buf: [9]u8 = undefined;
+    const minimal = scriptNumEncode(toInt(val), &buf);
+    if (!std.mem.eql(u8, raw, minimal)) return error.ScriptNumberError;
 }
 
 /// Raw-byte OP_AND/OP_OR/OP_XOR. `op` is '&' | '|' | '^'. Aborts on length
