@@ -982,6 +982,17 @@ fn eval_value(
                 script_bytes.insert(binding_name.to_string(), rb);
                 Val::Int(decoded)
             } else {
+                // Every other unary op reads its operand as a script NUMBER
+                // (`-` -> OP_NEGATE) or coerces it to a boolean (`!` ->
+                // OP_NOT), both fRequireMinimal decodes. `~` never reaches
+                // here on the numeric path — it is a byte op and must keep
+                // accepting non-minimal bytes.
+                if assert_minimal_numeric_operand(script_bytes, &operand_name, &operand).is_err() {
+                    return Err(AssertionFailureError {
+                        method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                        binding_name: binding_name.to_string(),
+                    });
+                }
                 eval_unary_op(&op, &operand, result_type)
             }
         }
@@ -992,6 +1003,21 @@ fn eval_value(
             let args: Vec<Val> = arg_names.iter()
                 .map(|n| env.get(n).cloned().unwrap_or(Val::Undefined))
                 .collect();
+            // The single funnel every numeric builtin (`abs`, `min`, `max`,
+            // `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+            // operands through. Only a NUMERIC byte-op result ever carries
+            // threaded bytes, and a bigint argument is exactly what those
+            // builtins decode with fRequireMinimal on chain — a ByteString
+            // argument can never carry an entry here, so gating every argument
+            // costs nothing and cannot miss a builtin.
+            for (name, arg) in arg_names.iter().zip(args.iter()) {
+                if assert_minimal_numeric_operand(script_bytes, name, arg).is_err() {
+                    return Err(AssertionFailureError {
+                        method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                        binding_name: binding_name.to_string(),
+                    });
+                }
+            }
             // Strict mode: a `call(assert, x)` lowering path enforces the
             // predicate the same way the dedicated `assert` ANF node does.
             if let Some(ctx) = strict {
