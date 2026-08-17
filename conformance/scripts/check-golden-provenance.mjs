@@ -120,6 +120,23 @@ const VALID_VERIFIED_AGAINST = new Set([
   'intentional-spec-change',
 ]);
 
+// `review-status` is optional for legacy entries (absent == signed off by the
+// named `reviewer`), but when present it may ONLY say that the review happened.
+// Anything else — `unreviewed`, `pending`, `todo` — must not justify a golden.
+const VALID_REVIEW_STATUS = new Set(['reviewed']);
+
+// The honest self-marking convention documented in conformance/README.md: an
+// entry produced by a tool or an agent that no human has checked yet sets
+// `"reviewer": "unreviewed:<producer>"` and `"review-status": "unreviewed"`.
+// The 2026-08 audit found 27 such entries sitting in the allowlist and
+// SATISFYING the gate, because the gate only ever checked that `reviewer` was a
+// non-empty string and never read `review-status` at all — i.e. a machine-written
+// string that literally records "nobody checked this" was accepted as an
+// independent provenance justification for a self-produced golden. These two
+// patterns make that marking BLOCKING instead of decorative.
+const UNREVIEWED_REVIEWER_RE = /^unreviewed\s*:/i;
+const UNREVIEWED_STATUS = 'unreviewed';
+
 const ALLOWLIST_REL = 'conformance/golden-provenance-allowlist.json';
 
 function isGolden(relPath) {
@@ -168,6 +185,28 @@ function entryProblems(entry) {
   }
   if (typeof entry.reviewer !== 'string' || entry.reviewer.trim().length === 0) {
     problems.push('missing "reviewer" sign-off marker');
+  } else if (UNREVIEWED_REVIEWER_RE.test(entry.reviewer.trim())) {
+    problems.push(
+      `"reviewer" is the self-attested placeholder "${entry.reviewer.trim()}" — it records that ` +
+        'NOBODY has checked this golden, so it cannot be the independent justification for it. ' +
+        'Review the bytes, name the oracle you actually ran in "reason", and replace "reviewer" ' +
+        'with a real sign-off plus "review-status": "reviewed"',
+    );
+  }
+  const status = entry['review-status'];
+  if (status !== undefined) {
+    if (typeof status !== 'string' || !VALID_REVIEW_STATUS.has(status.trim().toLowerCase())) {
+      const shown = typeof status === 'string' ? status.trim() : JSON.stringify(status);
+      problems.push(
+        String(shown).toLowerCase() === UNREVIEWED_STATUS
+          ? '"review-status": "unreviewed" — this entry states on its face that the golden it ' +
+              'pins was never reviewed. A self-produced golden justified by an unreviewed entry is ' +
+              'exactly the silent self-regeneration this gate exists to catch. Review it and set ' +
+              '"review-status": "reviewed", or drop the entry so the golden fails the gate honestly'
+          : `"review-status" must be omitted or one of ${[...VALID_REVIEW_STATUS].join(' | ')} ` +
+              `(got "${shown}")`,
+      );
+    }
   }
   return problems;
 }
@@ -189,6 +228,18 @@ function checkProvenance({ changedFiles, root }) {
     if (probs.length) {
       badEntries.push({ entry, problems: probs });
       continue; // malformed entries never justify anything
+    }
+    // Two entries for one path means one of them is silently shadowed — and the
+    // shadowed one is the record a reviewer would read. Reject rather than pick.
+    if (byPath.has(entry.path)) {
+      badEntries.push({
+        entry,
+        problems: [
+          'duplicate "path" — another entry already pins this golden, so one of the two ' +
+            'sign-offs would be silently ignored. Keep exactly one entry per path',
+        ],
+      });
+      continue;
     }
     byPath.set(entry.path, entry);
   }
@@ -301,15 +352,32 @@ function printHumanReport(res, { asError }) {
   const log = asError ? console.error : console.log;
 
   if (badEntries.length) {
-    log('');
-    log('✗ Malformed entries in conformance/golden-provenance-allowlist.json:');
+    console.error('');
+    console.error(
+      `✗ GOLDEN-PROVENANCE ALLOWLIST REJECTED — ${badEntries.length} unusable entr` +
+        `${badEntries.length === 1 ? 'y' : 'ies'} in ${ALLOWLIST_REL}:`,
+    );
+    console.error('');
     for (const b of badEntries) {
-      log(`    path=${b.entry.path ?? '(none)'} → ${b.problems.join('; ')}`);
+      console.error(`  ✗ ${b.entry.path ?? '(no path)'}`);
+      for (const p of b.problems) console.error(`      ${p}`);
     }
+    console.error('');
+    console.error('A rejected entry justifies NOTHING: the golden it names is treated as if the');
+    console.error('entry were absent. Fix or remove every entry above — the allowlist is the');
+    console.error('record of who checked a self-produced golden, so an entry that says nobody');
+    console.error('checked it is not a record, it is a rubber stamp.');
+    console.error('');
   }
 
   if (goldenChanges.length === 0) {
-    console.log('✓ Golden-provenance gate: no golden/vector files changed — nothing to justify.');
+    if (badEntries.length === 0) {
+      console.log('✓ Golden-provenance gate: no golden/vector files changed — nothing to justify.');
+    } else {
+      console.error(
+        'Golden-provenance gate: no golden/vector files changed, but the allowlist itself is invalid (see above).',
+      );
+    }
     return;
   }
 
@@ -476,6 +544,79 @@ function selfTest() {
     const r = checkProvenance({ changedFiles: [goldenRel], root: tmp });
     record('b1-neg) golden change, stale allowlist sha256', true, r.unjustified.length > 0,
       r.unjustified.map((u) => u.reason.split(' —')[0]).join(','));
+  }
+
+  // (b1-unreviewed-reviewer) allowlist entry whose `reviewer` is the self-attested
+  //   `unreviewed:` placeholder → REJECT. The 2026-08 audit hole: 27 entries carried
+  //   exactly this value and satisfied the gate, because it only checked non-emptiness.
+  writeAllowlist([
+    {
+      path: goldenRel,
+      sha256: goldenHash,
+      'verified-against': 'differential-oracle',
+      reason: 'machine-written entry that nobody has actually checked',
+      reviewer: 'unreviewed:generated-by-agent',
+    },
+  ]);
+  {
+    const r = checkProvenance({ changedFiles: [goldenRel], root: tmp });
+    record('b1-unreviewed-reviewer) reviewer starts with "unreviewed:"', true,
+      r.unjustified.length > 0 || r.badEntries.length > 0,
+      r.badEntries.map((b) => b.problems[0].split(' —')[0]).join(','));
+  }
+
+  // (b1-unreviewed-status) same, flagged only via `review-status` → REJECT.
+  writeAllowlist([
+    {
+      path: goldenRel,
+      sha256: goldenHash,
+      'verified-against': 'differential-oracle',
+      reason: 'plausible reviewer handle, but the entry admits it was never reviewed',
+      reviewer: 'gh:somebody',
+      'review-status': 'unreviewed',
+    },
+  ]);
+  {
+    const r = checkProvenance({ changedFiles: [goldenRel], root: tmp });
+    record('b1-unreviewed-status) review-status is "unreviewed"', true,
+      r.unjustified.length > 0 || r.badEntries.length > 0,
+      r.badEntries.map((b) => b.problems[0].split(' —')[0]).join(','));
+  }
+
+  // (b1-status-typo) an unrecognised `review-status` must not slip through either.
+  writeAllowlist([
+    {
+      path: goldenRel,
+      sha256: goldenHash,
+      'verified-against': 'differential-oracle',
+      reason: 'invents a status value the gate does not know about',
+      reviewer: 'gh:somebody',
+      'review-status': 'pending',
+    },
+  ]);
+  {
+    const r = checkProvenance({ changedFiles: [goldenRel], root: tmp });
+    record('b1-status-typo) unrecognised review-status value', true,
+      r.unjustified.length > 0 || r.badEntries.length > 0,
+      r.badEntries.map((b) => b.problems[0].split(' (')[0]).join(','));
+  }
+
+  // (b1-reviewed) the same entry, actually signed off → PASS.
+  writeAllowlist([
+    {
+      path: goldenRel,
+      sha256: goldenHash,
+      'verified-against': 'differential-oracle',
+      reason: 'demo: bytes re-derived and confirmed by the differential oracle',
+      reviewer: 'gh:selftest',
+      'review-status': 'reviewed',
+    },
+  ]);
+  {
+    const r = checkProvenance({ changedFiles: [goldenRel], root: tmp });
+    record('b1-reviewed) explicit review-status: reviewed', false,
+      r.unjustified.length > 0 || r.badEntries.length > 0,
+      `justified via ${r.justified.map((j) => j.via).join(',')}`);
   }
 
   // (b2) golden change + witness co-change that CONTENT-PINS the new golden → PASS
