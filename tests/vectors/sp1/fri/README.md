@@ -1,67 +1,69 @@
 # SP1 STARK / FRI test vectors
 
-Consumed by the on-chain `runar.VerifySP1FRI` verifier (see
-`docs/sp1-fri-verifier.md`) and by the Go reference verifier once it
-lands. Fixtures are *regeneratable* — this directory ships READMEs
-describing the exact commands to produce each file; the bytes
-themselves land in a follow-up PR alongside the verifier codegen
-body.
+Consumed by the off-chain Go reference verifier (`packages/runar-go/sp1fri`)
+and by the on-chain `runar.VerifySP1FRI` codegen (see
+`docs/sp1-fri-verifier.md`).
 
 ## Layout
 
 ```text
 tests/vectors/sp1/fri/
-  minimal-guest/            # PoC fixture — Plonky3 fib_air, KoalaBear
-    proof.bin               # bincode-encoded Plonky3 FriProof
-    public_values.hex       # lowercase hex, no 0x prefix
-    vk_hash.hex             # 64 hex chars (keccak256 of the VK)
+  minimal-guest/            # PoC fixture — Plonky3 fib_air, KoalaBear, 8-row trace
+    proof.postcard          # postcard-encoded p3_uni_stark::Proof<MyConfig>
+    public_values.hex       # lowercase hex, no 0x prefix; little-endian u32s
     README.md               # trace width, degree_bits, params, regen cmd
-  evm-guest/                # Phase 2 fixture — real SP1 EVM-guest
-    ...same four files...
-  corruptions/
-    bad_merkle/proof.bin    # one byte flipped in a sibling hash
-    bad_folding/proof.bin   # one FRI query evaluation mutated
-    bad_final_poly/proof.bin
-    wrong_public_values/public_values.hex
-    bad_vk/vk_hash.hex
-    truncated/proof.bin
-    wrong_program/proof.bin # proof for minimal-guest + VK for evm-guest
-    all_zeros/proof.bin     # 200 KB of 0x00
+    regen/                  # Rust fixture generator (outside the Go workspace)
+  evm-guest/                # production-parameter fixture — 1024-row trace
+    ...same shape...
+  corruptions/              # negative fixtures, derived from minimal-guest/
+    gen.go                  # deterministic generator (stdlib-only, no module)
+    README.md               # corruption matrix + measured detection points
+    bad_merkle/             # proof.postcard + public_values.hex + README.md
+    bad_folding/
+    bad_final_poly/
+    wrong_public_values/
+    bad_vk/                 # README.md only — see below
+    truncated/
+    wrong_program/
+    all_zeros/
 ```
+
+**There is no `proof.bin` and no `vk_hash.hex`.** Earlier drafts of this file
+described a bincode-encoded `proof.bin` plus a per-fixture `vk_hash.hex`;
+neither ever landed. The proofs are postcard-encoded, and neither guest
+fixture is wrapped in an SP1 outer proof, so no verifying key — and therefore
+no VK hash — exists for them. `corruptions/bad_vk/` is a README explaining why
+that one corruption cannot be produced.
 
 ## Status
 
-**Phase 1 (current):** directory + READMEs only. Actual proof bytes land
-with the verifier codegen body. The verifier is not end-to-end
-runnable until both arrive together.
+- **minimal-guest** — committed. Accepted end-to-end by the Go reference
+  verifier (`sp1fri.TestVerifyMinimalGuest`) and by the compiled PoC covenant
+  through the go-sdk script interpreter.
+- **evm-guest** — committed at the production parameter tuple
+  (`num_queries=100`, `log_blowup=1`, `degreeBits=10`). Accepted by
+  `sp1fri.TestVerifyEvmGuest`.
+- **corruptions** — 7 of the 8 documented corruptions are committed and
+  asserted by the negative tests listed in `corruptions/README.md`. The 8th
+  (`bad_vk`) is documented as impossible at the current parameter set.
 
-**Phase 2:** minimal-guest fixture committed; Go reference verifier
-validates it; Bitcoin Script codegen emits deterministic script bytes
-for that fixture. Corruption fixtures committed and rejected by the
-Go reference verifier.
-
-**Phase 3:** evm-guest fixture committed; script-size / stack-depth /
-execution-time measurements recorded in
-`docs/fri-verifier-measurements.md`.
+The corruption suite records a real divergence: the off-chain reference
+verifier rejects all seven, but the **currently emitted locking script accepts
+three of them** (`bad_merkle`, `bad_folding`, `bad_final_poly`) because the
+per-query Merkle / fold / final-poly chain is not emitted. See
+`corruptions/README.md` ⇒ "On-chain coverage is narrower than off-chain" and
+`docs/sp1-fri-verifier.md` §6.
 
 ## Regeneration summary
 
 See each subdirectory's `README.md` for exact commands. High-level:
 
-- `minimal-guest` is the **Plonky3 `fib_air.rs` test proof** with
-  configuration pinned to match SP1 v6.0.2's DuplexChallenger +
-  TwoAdicFriPcs + KoalaBear base field. Regeneration requires a
-  checkout of Plonky3 at the SP1-pinned commit and a small test
-  harness that serializes the generated proof.
-- `evm-guest` is a real SP1 v6.0.2 STARK proof of the revm EVM guest
-  in `../bsv-evm/guest/`. Regeneration requires a working SP1 SDK
-  toolchain (`sp1up`) and is expensive (tens of minutes, large proof
-  file ~100 KB+).
-- Corruption fixtures are produced programmatically from the base
-  `minimal-guest/proof.bin` + `vk_hash.hex` + `public_values.hex` by
-  byte-level mutation. A small Go regen script under
-  `tests/vectors/sp1/fri/corruptions/gen.go` produces all of them
-  from the base fixture (see its companion README).
+- `minimal-guest` and `evm-guest` are Plonky3 `fib_air` proofs with the
+  configuration pinned to SP1 v6.0.2's DuplexChallenger + TwoAdicFriPcs +
+  KoalaBear base field. Regeneration requires the Rust toolchain and network
+  access to fetch Plonky3; see each fixture's `regen/`.
+- Corruption fixtures are produced programmatically from `minimal-guest/` by
+  `corruptions/gen.go`. No prover run, no network, no randomness.
 
 ## Upstream version pinning
 
@@ -72,7 +74,7 @@ See each subdirectory's `README.md` for exact commands. High-level:
 | KoalaBear  | Plonky3 koala-bear crate                   |  |
 | Poseidon2  | Plonky3 koala-bear/src/poseidon2.rs        |  |
 
-Any version bump MUST (a) regenerate every fixture in this tree, (b)
-re-run the entire verifier test suite against the new fixtures, (c)
-re-run the regtest measurement pass, (d) update
+Any version bump MUST (a) regenerate every fixture in this tree — including
+re-running `corruptions/gen.go`, (b) re-run the entire verifier test suite
+against the new fixtures, (c) re-run the regtest measurement pass, (d) update
 `docs/sp1-proof-format.md` §1 with the new pinned version strings.

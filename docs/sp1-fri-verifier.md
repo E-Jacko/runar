@@ -281,22 +281,91 @@ From handoff §2.1, executed in order before declaring a deliverable:
 
 ## 6. Negative-test corruption matrix (handoff §2.4)
 
-Each row lives under `tests/vectors/sp1/fri/corruptions/<name>/`
-and must fail `OP_VERIFY` on regtest:
+Each row lives under `tests/vectors/sp1/fri/corruptions/<name>/`,
+generated deterministically from `minimal-guest/` by that directory's
+`gen.go`. The table below is **measured**, not aspirational — the
+"Fails at" column of earlier revisions stated intent before any
+fixture existed, and three rows turned out to reject elsewhere.
 
-| Test                  | Corruption                                              | Fails at |
-|-----------------------|---------------------------------------------------------|----------|
-| bad_merkle            | Flip one byte in a sibling hash of a query Merkle path  | Merkle root recomputation |
-| bad_folding           | Change one FRI query evaluation                         | Colinearity check |
-| bad_final_poly        | Change the final constant poly value                    | Final-poly reduction |
-| wrong_public_values   | Change one byte of `publicValues`                       | Transcript divergence → any downstream check |
-| bad_vk                | Wrong guest's VK hash                                   | Transcript divergence |
-| truncated             | Remove the last 100 bytes of `proofBlob`                | Push-and-hash equality |
-| wrong_program         | Proof for minimal guest with VK for EVM guest           | Transcript divergence |
-| all_zeros             | 200 KB of zeros                                         | bincode length check or push-and-hash |
+| Test                  | Corruption                                                    | Documented           | Off-chain reference rejects at |
+|-----------------------|---------------------------------------------------------------|----------------------|--------------------------------|
+| bad_merkle            | Flip one byte in a sibling hash of a query Merkle path        | Merkle root recompute | ✅ Merkle root recompute (`verify_batch: cap mismatch`) |
+| bad_folding           | Change one FRI query evaluation (commit-phase sibling value)  | Colinearity check     | ⚠️ FRI commit-phase MMCS opening |
+| bad_final_poly        | Change the first final-poly Ext4 limb                         | Final-poly reduction  | ⚠️ input MMCS, via transcript divergence |
+| wrong_public_values   | Change one byte of `publicValues`                             | Transcript divergence | ✅ commit-phase PoW witness |
+| bad_vk                | Wrong guest's VK hash                                         | Transcript divergence | ❌ no fixture — impossible, see below |
+| truncated             | Remove the last 100 bytes of `proofBlob`                      | Push-and-hash equality | ⚠️ postcard EOF off-chain; ✅ push-and-hash on-chain |
+| wrong_program         | Minimal-guest proof bound to a different program              | Transcript divergence | ✅ query-phase PoW witness |
+| all_zeros             | 200 KB of zeros                                               | bincode length check  | ✅ postcard trailing-bytes check |
 
-`tests/vectors/sp1/fri/corruptions/` ships at Phase 1 with minimal-guest
-corruptions; the full EVM-guest matrix lands alongside Phase 2.
+Why the three ⚠️ rows differ:
+
+- **bad_folding** — Plonky3 FRI has no arithmetic colinearity assertion.
+  Every value the fold consumes is Merkle-committed, so the commit-phase
+  MMCS check fires strictly before any folding arithmetic runs.
+  Colinearity is enforced *by* that check plus the final-poly equality.
+- **bad_final_poly** — `final_poly` is absorbed into the transcript
+  before query indices are sampled, so mutating it re-randomises every
+  index and MMCS fails first. The `final_poly mismatch` branch is
+  unreachable by byte-level corruption.
+- **truncated** — off-chain the postcard decoder hits EOF before the
+  verifier runs. On-chain there is no decoder, so the documented
+  push-and-hash binding is the real detection point and is asserted
+  directly against `EmitProofBlobBindingHash`.
+
+**bad_vk cannot be produced.** Neither guest fixture is wrapped in an
+SP1 outer proof, so neither has a verifying key or a VK hash to corrupt.
+The PoC parameter set encodes exactly that — `SP1VKeyHashByteSize: 0`,
+at which `lowerVerifySP1FRI` drops the `sp1VKeyHash` argument and never
+absorbs it, and `sp1fri.Verify` takes no VK-hash parameter at all. No VK
+hash value can change any verifier decision until a real SP1-wrapped
+fixture and a `SP1VKeyHashByteSize == 32` parameter set land together.
+
+### 6.1. On-chain coverage is narrower than off-chain — KNOWN GAP
+
+The requirement above ("must fail `OP_VERIFY` on regtest") is **not yet
+met for three rows**. Replaying every fixture through the compiled PoC
+covenant and the go-sdk script interpreter gives:
+
+| Fixture | Off-chain `sp1fri.Verify` | Compiled locking script |
+|---|---|---|
+| bad_merkle | rejects | **ACCEPTS** |
+| bad_folding | rejects | **ACCEPTS** |
+| bad_final_poly | rejects | **ACCEPTS** |
+| wrong_public_values | rejects | rejects (`OP_VERIFY failed`) |
+| wrong_program | rejects | rejects (`OP_VERIFY failed`) |
+| truncated | rejects (decoder) | rejects (push-and-hash) |
+| canonical fixture | accepts | accepts |
+
+Cause: `EmitFullSP1FriVerifierBody` samples each FRI query index and
+immediately drops it — its Step 10 comment says *"For the deployable
+verifier we sample-and-drop"*. The input-batch MMCS verify, the FRI fold
+chain and the final-poly Horner equality are never emitted. Only the
+transcript-bound grinding-witness checks reach the script, which is why
+the transcript-divergence corruptions are caught and the Merkle ones are
+not.
+
+**Consequence: at the PoC parameter set a spender can supply forged
+Merkle openings — arbitrary opened values with arbitrary authentication
+paths — and the covenant will accept.** On-chain soundness currently
+rests on the Fiat-Shamir transcript, not on the proof. The per-query
+verification chain in §10 must land before this verifier can be treated
+as sound for value-bearing covenants.
+
+The gap is pinned by
+`compilers/go/compiler/sp1_fri_negative_test.go::TestSp1FriVerifier_OnChainRejectsCorruptions`,
+which asserts the present behaviour and fails with an ACTION REQUIRED
+message the moment the missing emission lands.
+
+### 6.2. Where the assertions live
+
+- `compilers/go/codegen/sp1_fri_negative_test.go` — per-fixture rejection
+  and exact detection point against the off-chain reference, plus the
+  push-and-hash binding for `truncated`, plus a non-vacuity control that
+  requires the canonical fixture to still verify.
+- `compilers/go/compiler/sp1_fri_negative_test.go` — the same fixtures
+  replayed through the compiled covenant, with an on-chain non-vacuity
+  control.
 
 ## 7. ABI break: publicValues comes from the proof
 
