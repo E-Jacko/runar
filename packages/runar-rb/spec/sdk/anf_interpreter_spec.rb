@@ -784,6 +784,71 @@ RSpec.describe 'Runar::SDK::ANFInterpreter' do
   end
 
   # ---------------------------------------------------------------------------
+  # +@ref:+ ALIAS bindings must carry the threaded stack bytes.
+  #
+  # The lowering turns every named local into an alias: +const left = this.a <<
+  # 3n+ becomes +t2 = a << 3n+ followed by +left = @ref:t2+, and the consumer
+  # reads +left+. The side-map is keyed by binding name, so an alias that does
+  # not copy the entry drops the real stack bytes — silently disabling BOTH the
+  # non-minimal numeric check AND the chained byte-op threading, on exactly the
+  # shape the compiler actually emits.
+  #
+  # +conformance/tests/shift-ops+ is a live example: +left = this.a << 3n;
+  # assert(left >= 0n || left < 0n)+. With +a = 32+ the shift leaves the 1-byte
+  # [0x00] and OP_GREATERTHANOREQUAL aborts on chain.
+  # ---------------------------------------------------------------------------
+
+  describe '@ref: alias bindings carry the threaded stack bytes' do
+    # Build `t2 = a <shift_op> amount; s = @ref:t2; result = s <op> other`.
+    def aliased_chain_anf(shift_op, amount, op, other)
+      {
+        'contractName' => 'Aliased',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => amount } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => shift_op, 'left' => 't0', 'right' => 't1' } },
+              # The alias the lowering emits for `const s = a <shift_op> amount`.
+              { 'name' => 's', 'value' => { 'kind' => 'load_const', 'value' => '@ref:t2' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'load_const', 'value' => other } },
+              { 'name' => 't4', 'value' => { 'kind' => 'bin_op', 'op' => op, 'left' => 's', 'right' => 't3' } },
+              { 'name' => 't5', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't4' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    it 'aborts a numeric consumer fed an aliased non-minimal result' do
+      # a = 1: (1>>1) leaves [0x00]; OP_NUMEQUAL decodes with fRequireMinimal
+      # and aborts. Dropping the alias entry reports a clean spend instead.
+      expect do
+        mod.compute_new_state(aliased_chain_anf('>>', 1, '===', 0), 'compute', { 'result' => 0 }, { 'a' => 1 })
+      end.to raise_error(/OP_NUMEQUAL: non-minimally encoded script number/)
+    end
+
+    it 'still feeds aliased non-minimal bytes to a byte op (no false abort)' do
+      # CONTROL, and a regression for the byte-op threading itself: an alias
+      # that drops the entry makes OP_OR re-derive 0's EMPTY encoding and abort
+      # on a length mismatch the chain never sees.
+      new_state = mod.compute_new_state(aliased_chain_anf('<<', 8, '|', 5), 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to eq(5)
+    end
+
+    it 'still accepts an aliased MINIMAL shift result' do
+      # a = 2: (2>>1) leaves [0x01], which IS minimal for 1.
+      new_state = mod.compute_new_state(aliased_chain_anf('>>', 1, '===', 1), 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to be true
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # eval_call — built-in functions
   # ---------------------------------------------------------------------------
 
