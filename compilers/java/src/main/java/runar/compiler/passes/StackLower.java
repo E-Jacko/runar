@@ -2577,6 +2577,15 @@ public final class StackLower {
                 for (String name : results) {
                     sm.push(name);
                 }
+                // How far below the result block the deepest stale slot sat.
+                // Adopting a result puts it ON TOP, but its pre-`if` binding
+                // lived at depth `d`, i.e. BENEATH the `d - nDeclared` slots in
+                // between. Removing the stale copy does not reorder those, so
+                // the adopted result has crossed them: the layout is rotated
+                // even though the NAME SET and the DEPTH are both unchanged.
+                // Invisible to the reconcile's name-set check and to Layer C's
+                // depth check — the whole of issue #149.
+                int sinkBelow = 0;
                 for (int i = nDeclared - 1; i >= 0; i--) {
                     String name = results.get(i);
                     for (int d = nDeclared; d < sm.depth(); d++) {
@@ -2590,8 +2599,38 @@ public final class StackLower {
                             emitOp(new DropOp());
                             sm.pop();
                             postEndifDrops++;
+                            if (d - nDeclared > sinkBelow) {
+                                sinkBelow = d - nDeclared;
+                            }
                             break;
                         }
+                    }
+                }
+
+                // Restore the inherited layout: sink the result block back
+                // under the `sinkBelow` slots it just crossed, so BOTH paths of
+                // the enclosing `if` leave the same slot order and every
+                // post-OP_ENDIF read resolves against the layout it was
+                // generated for. Rolling the deepest item of the
+                // (nDeclared + sinkBelow) window to the top, `sinkBelow` times,
+                // lifts those slots back above the results while preserving
+                // their own relative order.
+                //
+                // Applied unconditionally, NOT gated on this `if`'s own else:
+                // the asymmetry belongs to the ENCLOSING `if`, which lowerIf
+                // cannot see from here. Gating on an empty else was measured in
+                // the TS tier and is WRONG — the #149 inner `if` HAS a real
+                // else, so the gate disables the repair exactly where it is
+                // needed.
+                if (sinkBelow > 0) {
+                    int windowSize = nDeclared + sinkBelow;
+                    for (int j = 0; j < sinkBelow; j++) {
+                        emitOp(new PushOp(PushValue.of(windowSize - 1)));
+                        sm.push("");
+                        emitOp(new RollOp(windowSize));
+                        sm.pop();
+                        String lifted = sm.removeAtDepth(windowSize - 1);
+                        sm.push(lifted);
                     }
                 }
             } else if (thenCtx.sm.depth() > sm.depth()
