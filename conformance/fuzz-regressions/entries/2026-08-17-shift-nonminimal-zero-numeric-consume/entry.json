@@ -1,0 +1,25 @@
+{
+  "id": "2026-08-17-shift-nonminimal-zero-numeric-consume",
+  "title": "`1 >> 1` leaves a non-minimal [0x00]; a numeric consumer aborts on chain while the interpreter accepted \u2014 the FUNDS-LOCKING direction",
+  "discovered": "2026-08-17",
+  "oracle": "tri-modal",
+  "sourceFile": "contract.runar.ts",
+  "fileName": "ShiftNonMinimalZero.runar.ts",
+  "method": "spend",
+  "constructorArgs": {
+    "n": "1n"
+  },
+  "args": [],
+  "expect": {
+    "interpreterAccepted": false,
+    "vmAccepted": false
+  },
+  "requiredOpcodes": [
+    "OP_RSHIFT"
+  ],
+  "provenance": {
+    "issue": "three-way v1 audit remediation; surfaced while resolving Grok probe P18 (shift >= width), which was recorded INCONCLUSIVE rather than cleared",
+    "note": "Found because the probe's agreement was VACUOUS - every input rejected, so interpreter/script agreement proved nothing. Forcing an accepting input exposed the divergence. The bare ScriptVM does NOT enforce minimal encoding (its success is 'no error and truthy top', no consensus wrappers), so this is only visible against Spend.validate(); measured over the 126-case chained sweep, interpreter vs consensus Spend = 0 mismatches, vs bare ScriptVM = 22."
+  },
+  "rationale": "OP_RSHIFT preserves byte length, so 1 >> 1 = [0x00], a non-minimal zero. `=== 0n` lowers to OP_NOT, a numeric op, and numeric ops decode with fRequireMinimal=true and abort. The interpreter threaded scriptBytes through the shift but read only the decoded value in the comparison, re-minimising and accepting a spend no node accepts. Both engines must REJECT."
+}
