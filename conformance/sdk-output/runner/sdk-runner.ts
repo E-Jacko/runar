@@ -42,13 +42,35 @@ function isExecutable(path: string): boolean {
   }
 }
 
+/**
+ * Resolve the `tsx` this repo installs rather than trusting `npx` to find one.
+ *
+ * `tsx` is NOT a direct dependency of the repo root, so `npx tsx` there does not
+ * resolve and the spawn dies with `sh: tsx: command not found`. That surfaced as
+ * "typescript: FAIL" beside six passing tiers — indistinguishable from a real
+ * TypeScript-tier conformance failure, and it cost a false alarm during the v1
+ * audit remediation. Prefer the conformance-local binary, then the workspace
+ * root, and only fall back to bare `npx` if neither exists.
+ */
+function resolveTsxCmd(): { cmd: string; prefix: string[] } {
+  const candidates = [
+    join(ROOT, 'conformance', 'node_modules', '.bin', 'tsx'),
+    join(ROOT, 'node_modules', '.bin', 'tsx'),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return { cmd: c, prefix: [] };
+  }
+  return { cmd: 'npx', prefix: ['tsx'] };
+}
+
 function buildSdkTools(): SdkTool[] {
   const toolsDir = join(ROOT, 'conformance', 'sdk-output', 'tools');
+  const tsx = resolveTsxCmd();
   const tools: SdkTool[] = [
     {
       name: 'typescript',
-      cmd: 'npx',
-      args: (input) => ['tsx', join(toolsDir, 'ts-sdk-tool.ts'), input],
+      cmd: tsx.cmd,
+      args: (input) => [...tsx.prefix, join(toolsDir, 'ts-sdk-tool.ts'), input],
     },
     {
       name: 'go',
