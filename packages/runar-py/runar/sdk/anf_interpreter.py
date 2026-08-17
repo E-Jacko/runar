@@ -781,7 +781,16 @@ def _eval_value(
         v = value.get('value')
         # Handle @ref: aliases
         if isinstance(v, str) and v.startswith('@ref:'):
-            return env.get(v[5:])
+            target = v[5:]
+            # An alias is a pure rename -- the lowering emits one for every
+            # named local (``const left = a << 3n`` becomes ``t2 = a << 3n``
+            # plus ``left = @ref:t2``). It occupies the SAME stack bytes as its
+            # target, so the side-map entry must travel with it or both the
+            # non-minimal numeric check and the chained byte-op threading go
+            # blind on real compiler output.
+            if target in script_bytes:
+                script_bytes[binding_name] = script_bytes[target]
+            return env.get(target)
         return v
 
     if kind == 'bin_op':
@@ -807,7 +816,12 @@ def _eval_value(
                 else _snum_encode(_to_int(left_val))
             )
             if op in ('<<', '>>'):
-                # Shift count is read as a number on-chain -- only `ab`'s length matters.
+                # Shift count is read as a NUMBER on-chain -- it decodes with
+                # fRequireMinimal and aborts on a non-minimal operand. Only
+                # `ab`'s length matters otherwise.
+                _assert_minimal_numeric_operand(
+                    'OP_LSHIFT' if op == '<<' else 'OP_RSHIFT', right_ref, script_bytes,
+                )
                 rb = _script_number_shift_bytes(op, ab, _to_int(right_val))
             else:
                 bb = (
@@ -817,6 +831,15 @@ def _eval_value(
                 rb = _script_number_bitwise_bytes(op, ab, bb)
             script_bytes[binding_name] = rb
             return _bin2num_int(rb.hex())
+        # Every NUMERIC consumer decodes its operands with fRequireMinimal on
+        # chain and aborts on a non-minimal encoding. A shift result is
+        # length-preserving and can be non-minimal (`1 >> 1` leaves [0x00]),
+        # so the threaded bytes -- not the re-minimised value -- decide
+        # whether the deployed script spends here.
+        opcode = _NUMERIC_CONSUMER_OPCODES.get(op)
+        if opcode is not None:
+            _assert_minimal_numeric_operand(opcode, left_ref, script_bytes)
+            _assert_minimal_numeric_operand(opcode, right_ref, script_bytes)
         return _eval_bin_op(op, left_val, right_val, value.get('result_type'))
 
     if kind == 'unary_op':
@@ -1482,6 +1505,67 @@ def _snum_encode(n: int) -> bytes:
     elif negative:
         out[-1] |= 0x80
     return bytes(out)
+
+
+# Source operators that consume their operands as SCRIPT NUMBERS, mapped to the
+# opcode they lower to. Those opcodes decode with ``fRequireMinimal=True`` and
+# abort on a non-minimally-encoded operand. Deliberately EXCLUDES the
+# byte-array ops ``& | ^ ~`` (which take non-minimal bytes and only require
+# equal length) and the boolean ops ``&& ||`` (OP_BOOLAND/OP_BOOLOR read
+# truthiness, not a decoded number). ``<< >>`` are handled separately: only
+# their COUNT operand is read as a number.
+_NUMERIC_CONSUMER_OPCODES = {
+    '+': 'OP_ADD',
+    '-': 'OP_SUB',
+    '*': 'OP_MUL',
+    '/': 'OP_DIV',
+    '%': 'OP_MOD',
+    '==': 'OP_NUMEQUAL',
+    '===': 'OP_NUMEQUAL',
+    '!=': 'OP_NUMNOTEQUAL',
+    '!==': 'OP_NUMNOTEQUAL',
+    '<': 'OP_LESSTHAN',
+    '<=': 'OP_LESSTHANOREQUAL',
+    '>': 'OP_GREATERTHAN',
+    '>=': 'OP_GREATERTHANOREQUAL',
+}
+
+
+def _assert_minimal_numeric_operand(
+    opcode: str, ref: str, script_bytes: Dict[str, bytes],
+) -> None:
+    """Abort when the operand bound to ``ref`` carries threaded stack bytes
+    that are NOT the minimal encoding of its decoded value.
+
+    That is exactly the condition on which a numeric opcode's
+    ``fRequireMinimal`` decode fails on chain. A shift preserves its operand's
+    byte length, so ``1 >> 1`` leaves the 1-byte ``[0x00]`` -- re-minimising it
+    to ``0`` off-chain reports a spend the deployed script rejects, locking the
+    UTXO.
+
+    Only bindings produced by a byte-array op appear in ``script_bytes``; every
+    other value is minimal on chain, so an absent entry is always fine. The
+    check is confined to the numeric consumers (see
+    ``_NUMERIC_CONSUMER_OPCODES``): OP_AND/OP_OR/OP_XOR/OP_INVERT and a shift's
+    VALUE operand legitimately take non-minimal bytes, so rejecting them here
+    would break spends the chain accepts (see conformance/fuzz-regressions/
+    entries/2026-07-14-chained-shift-or-nonminimal).
+
+    Raises:
+        ValueError: mirroring the other opcode-abort helpers in this module.
+    """
+    raw = script_bytes.get(ref)
+    if raw is None:
+        return
+    decoded = _bin2num_int(raw.hex())
+    minimal = _snum_encode(decoded)
+    if raw == minimal:
+        return
+    raise ValueError(
+        f'{opcode}: non-minimally encoded script number '
+        f'(operand bytes {raw.hex()} decode to {decoded}, '
+        f'minimal encoding is {minimal.hex()})'
+    )
 
 
 # The *_bytes helpers operate on RAW stack bytes (the exact byte array a value

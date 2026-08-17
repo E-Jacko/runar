@@ -308,3 +308,395 @@ func TestAnfInterpreter_ChainedByteOps_Abort(t *testing.T) {
 		t.Errorf("expected OP_AND same-length abort, got %q: %q", se.Opcode, se.Message)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// NON-MINIMAL numeric operands (funds-locking).
+//
+// A shift PRESERVES its operand's byte length, so `1 >> 1` leaves the 1-byte
+// array [0x00] — a NON-minimal zero (minimal zero is the empty array). Every
+// NUMERIC consumer on-chain (OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD, OP_NUMEQUAL/
+// OP_NOT and the relational ops, and a shift's COUNT operand) decodes with
+// fRequireMinimal=true and ABORTS on a non-minimal encoding.
+//
+// The interpreter threads the real stack bytes through the byte ops but the
+// NUMERIC path used to read only the decoded value, re-minimising [0x00] to 0
+// and reporting the spend VALID. A developer testing off-chain saw green and
+// deployed a UTXO the chain will never let them spend.
+//
+// The byte-array ops OP_AND/OP_OR/OP_XOR and a shift's VALUE operand are NOT
+// covered by fRequireMinimal — they legitimately take non-minimal bytes and
+// only require equal length. Those must stay accepted (see the controls
+// below and conformance/fuzz-regressions/entries/
+// 2026-07-14-chained-shift-or-nonminimal).
+// ---------------------------------------------------------------------------
+
+// sbAlias builds the `@ref:` alias binding the ANF lowering emits for a named
+// local (`const left: bigint = a << 3n` becomes t2 = a << 3n followed by
+// left = @ref:t2). Real compiler output routes almost every byte-op result
+// through one of these before it reaches a consumer.
+func sbAlias(name, target string) ANFBinding {
+	return ANFBinding{Name: name, Value: map[string]interface{}{
+		"kind": "load_const", "value": "@ref:" + target,
+	}}
+}
+
+// sbAssert builds an `assert` binding over the predicate binding `pred`.
+func sbAssert(name, pred string) ANFBinding {
+	return ANFBinding{Name: name, Value: map[string]interface{}{
+		"kind": "assert", "value": pred,
+	}}
+}
+
+// TestAnfInterpreter_NonMinimalNumericOperand_Aborts pins that feeding a
+// non-minimally-encoded shift result to a numeric consumer ABORTS, matching
+// the deployed script's fRequireMinimal decode.
+func TestAnfInterpreter_NonMinimalNumericOperand_Aborts(t *testing.T) {
+	// Prefix shared by every case: t2 = 1 >> 1 -> raw stack bytes [0x00].
+	prefix := []ANFBinding{
+		sbConst("t0", "1"),
+		sbConst("t1", "1"),
+		sbBin("t2", ">>", "t0", "t1"),
+		sbConst("t3", "0"),
+		sbConst("t4", "1"),
+	}
+
+	cases := []struct {
+		name   string
+		tail   []ANFBinding
+		opcode string
+	}{
+		{
+			// OP_NUMEQUAL on [0x00] — the canonical funds-locking guard:
+			// `(n >> 1) === 0` reports VALID off-chain, aborts on-chain.
+			name:   "(1>>1)===0 -> ABORT (OP_NUMEQUAL)",
+			tail:   []ANFBinding{sbBin("t5", "===", "t2", "t3")},
+			opcode: "OP_NUMEQUAL",
+		},
+		{
+			name:   "0===(1>>1) -> ABORT (right operand too)",
+			tail:   []ANFBinding{sbBin("t5", "===", "t3", "t2")},
+			opcode: "OP_NUMEQUAL",
+		},
+		{
+			name:   "(1>>1)+1 -> ABORT (OP_ADD)",
+			tail:   []ANFBinding{sbBin("t5", "+", "t2", "t4")},
+			opcode: "OP_ADD",
+		},
+		{
+			name:   "(1>>1)-1 -> ABORT (OP_SUB)",
+			tail:   []ANFBinding{sbBin("t5", "-", "t2", "t4")},
+			opcode: "OP_SUB",
+		},
+		{
+			name:   "(1>>1)*1 -> ABORT (OP_MUL)",
+			tail:   []ANFBinding{sbBin("t5", "*", "t2", "t4")},
+			opcode: "OP_MUL",
+		},
+		{
+			name:   "(1>>1)/1 -> ABORT (OP_DIV)",
+			tail:   []ANFBinding{sbBin("t5", "/", "t2", "t4")},
+			opcode: "OP_DIV",
+		},
+		{
+			name:   "(1>>1)%1 -> ABORT (OP_MOD)",
+			tail:   []ANFBinding{sbBin("t5", "%", "t2", "t4")},
+			opcode: "OP_MOD",
+		},
+		{
+			name:   "(1>>1)!==1 -> ABORT (OP_NUMNOTEQUAL)",
+			tail:   []ANFBinding{sbBin("t5", "!==", "t2", "t4")},
+			opcode: "OP_NUMNOTEQUAL",
+		},
+		{
+			name:   "(1>>1)<1 -> ABORT (OP_LESSTHAN)",
+			tail:   []ANFBinding{sbBin("t5", "<", "t2", "t4")},
+			opcode: "OP_LESSTHAN",
+		},
+		{
+			name:   "(1>>1)<=1 -> ABORT (OP_LESSTHANOREQUAL)",
+			tail:   []ANFBinding{sbBin("t5", "<=", "t2", "t4")},
+			opcode: "OP_LESSTHANOREQUAL",
+		},
+		{
+			name:   "(1>>1)>1 -> ABORT (OP_GREATERTHAN)",
+			tail:   []ANFBinding{sbBin("t5", ">", "t2", "t4")},
+			opcode: "OP_GREATERTHAN",
+		},
+		{
+			name:   "(1>>1)>=1 -> ABORT (OP_GREATERTHANOREQUAL)",
+			tail:   []ANFBinding{sbBin("t5", ">=", "t2", "t4")},
+			opcode: "OP_GREATERTHANOREQUAL",
+		},
+		{
+			// A shift's COUNT operand IS read as a number -> fRequireMinimal.
+			name:   "1<<(1>>1) -> ABORT (OP_LSHIFT count operand)",
+			tail:   []ANFBinding{sbBin("t5", "<<", "t4", "t2")},
+			opcode: "OP_LSHIFT",
+		},
+		{
+			name:   "1>>(1>>1) -> ABORT (OP_RSHIFT count operand)",
+			tail:   []ANFBinding{sbBin("t5", ">>", "t4", "t2")},
+			opcode: "OP_RSHIFT",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := append(append([]ANFBinding{}, prefix...), c.tail...)
+			body = append(body, sbUpd("t6", "out", "t3"))
+			_, err := ComputeNewState(
+				sbProgram(body), "run",
+				map[string]interface{}{"out": big.NewInt(0)},
+				map[string]interface{}{}, nil,
+			)
+			if err == nil {
+				t.Fatalf("expected a non-minimal-operand ABORT, got nil (spend wrongly reported valid)")
+			}
+			se, ok := err.(*ScriptOpcodeError)
+			if !ok {
+				t.Fatalf("expected *ScriptOpcodeError, got %T (%v)", err, err)
+			}
+			if se.Opcode != c.opcode {
+				t.Errorf("expected opcode %s, got %s", c.opcode, se.Opcode)
+			}
+			if !strings.Contains(se.Message, "non-minimally encoded") {
+				t.Errorf("expected a non-minimal-encoding message, got %q", se.Message)
+			}
+		})
+	}
+}
+
+// TestExecuteStrict_NonMinimalNumericOperand_GuardDoesNotSilentlyPass is the
+// funds-locking scenario end to end: `assert((n >> 1) === 0)` with n = 1. The
+// deployed script aborts at OP_NUMEQUAL, so strict mode must report a failure
+// rather than a clean spend.
+func TestExecuteStrict_NonMinimalNumericOperand_GuardDoesNotSilentlyPass(t *testing.T) {
+	body := []ANFBinding{
+		sbConst("t0", "1"),
+		sbConst("t1", "1"),
+		sbBin("t2", ">>", "t0", "t1"),
+		sbConst("t3", "0"),
+		sbBin("t4", "===", "t2", "t3"),
+		sbAssert("t5", "t4"),
+		sbUpd("t6", "out", "t3"),
+	}
+	_, _, _, err := ExecuteStrict(
+		sbProgram(body), "run",
+		map[string]interface{}{"out": big.NewInt(0)},
+		map[string]interface{}{}, nil,
+	)
+	if err == nil {
+		t.Fatalf("assert((1>>1)===0) was accepted off-chain; the deployed script aborts at OP_NUMEQUAL (funds locked)")
+	}
+	if _, ok := err.(*ScriptOpcodeError); !ok {
+		t.Fatalf("expected *ScriptOpcodeError, got %T (%v)", err, err)
+	}
+}
+
+// TestAnfInterpreter_MinimalOperands_StillAccepted are the CONTROLS. None of
+// these carry a non-minimal encoding into a numeric consumer, so all must
+// keep spending exactly as before.
+func TestAnfInterpreter_MinimalOperands_StillAccepted(t *testing.T) {
+	cases := []struct {
+		name string
+		body []ANFBinding
+		want int64
+	}{
+		{
+			// 2>>1 leaves [0x01] — that IS the minimal encoding of 1, so the
+			// numeric compare is legal on-chain and must still accept.
+			name: "(2>>1)===1 accepts",
+			body: []ANFBinding{
+				sbConst("t0", "2"),
+				sbConst("t1", "1"),
+				sbBin("t2", ">>", "t0", "t1"),
+				sbConst("t3", "1"),
+				sbBin("t4", "===", "t2", "t3"),
+				sbAssert("t5", "t4"),
+				sbUpd("t6", "out", "t3"),
+			},
+			want: 1,
+		},
+		{
+			// `& | ^` are NOT fRequireMinimal — they take non-minimal bytes and
+			// only require equal length. (2<<8) is the 1-byte [0x00]; OR with
+			// [0x05] gives [0x05], which is minimal, so the `=== 5` is legal.
+			// Pinned by conformance/fuzz-regressions/entries/
+			// 2026-07-14-chained-shift-or-nonminimal — rejecting this is WRONG.
+			name: "(2<<8)|5 === 5 accepts",
+			body: []ANFBinding{
+				sbConst("t0", "2"),
+				sbConst("t1", "8"),
+				sbBin("t2", "<<", "t0", "t1"),
+				sbConst("t3", "5"),
+				sbBin("t4", "|", "t2", "t3"),
+				sbBin("t5", "===", "t4", "t3"),
+				sbAssert("t6", "t5"),
+				sbUpd("t7", "out", "t3"),
+			},
+			want: 5,
+		},
+		{
+			// A shift's VALUE operand is not fRequireMinimal either: (2<<8) is
+			// [0x00], shifting it again is legal and stays 1 byte.
+			name: "((2<<8)<<1)|5 === 5 accepts",
+			body: []ANFBinding{
+				sbConst("t0", "2"),
+				sbConst("t1", "8"),
+				sbBin("t2", "<<", "t0", "t1"),
+				sbConst("t3", "1"),
+				sbBin("t4", "<<", "t2", "t3"),
+				sbConst("t5", "5"),
+				sbBin("t6", "|", "t4", "t5"),
+				sbBin("t7", "===", "t6", "t5"),
+				sbAssert("t8", "t7"),
+				sbUpd("t9", "out", "t5"),
+			},
+			want: 5,
+		},
+		{
+			// ~(2<<8) = [0xff] = -127, which IS minimal for -127.
+			name: "~(2<<8) === -127 accepts",
+			body: []ANFBinding{
+				sbConst("t0", "2"),
+				sbConst("t1", "8"),
+				sbBin("t2", "<<", "t0", "t1"),
+				sbUn("t3", "~", "t2"),
+				sbConst("t4", "-127"),
+				sbBin("t5", "===", "t3", "t4"),
+				sbAssert("t6", "t5"),
+				sbUpd("t7", "out", "t4"),
+			},
+			want: -127,
+		},
+		{
+			// Plain arithmetic on values that never touched a byte op.
+			name: "1+1===2 accepts",
+			body: []ANFBinding{
+				sbConst("t0", "1"),
+				sbConst("t1", "1"),
+				sbBin("t2", "+", "t0", "t1"),
+				sbConst("t3", "2"),
+				sbBin("t4", "===", "t2", "t3"),
+				sbAssert("t5", "t4"),
+				sbUpd("t6", "out", "t2"),
+			},
+			want: 2,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			state, _, _, err := ExecuteStrict(
+				sbProgram(c.body), "run",
+				map[string]interface{}{"out": big.NewInt(0)},
+				map[string]interface{}{}, nil,
+			)
+			if err != nil {
+				t.Fatalf("control regressed — expected a clean spend, got %v", err)
+			}
+			// `out` is whatever the written binding held: a *big.Int from an
+			// arithmetic/byte op, or the decimal string a load_const carries.
+			if got := anfToBigInt(state["out"]); got.Cmp(bi(c.want)) != 0 {
+				t.Errorf("out = %s, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// `@ref:` ALIAS bindings must carry the threaded stack bytes.
+//
+// The lowering turns every named local into an alias: `const left: bigint =
+// this.a << 3n` becomes `t2 = a << 3n` followed by `left = @ref:t2`, and the
+// consumer reads `left`. The side map is keyed by binding name, so an alias
+// that does not copy the entry drops the real stack bytes — which silently
+// disables BOTH the non-minimal numeric check above AND the chained byte-op
+// threading, on exactly the shape the compiler actually emits.
+//
+// conformance/tests/shift-ops is a live example: `left = this.a << 3n;
+// assert(left >= 0n || left < 0n)`. With a = 32 the shift leaves the 1-byte
+// [0x00] and OP_GREATERTHANOREQUAL aborts on chain.
+// ---------------------------------------------------------------------------
+
+func TestAnfInterpreter_AliasCarriesScriptBytes(t *testing.T) {
+	t.Run("aliased non-minimal shift result aborts a numeric consumer", func(t *testing.T) {
+		body := []ANFBinding{
+			sbConst("t0", "1"),
+			sbConst("t1", "1"),
+			sbBin("t2", ">>", "t0", "t1"), // raw [0x00]
+			sbAlias("s", "t2"),            // const s = a >> 1
+			sbConst("t3", "0"),
+			sbBin("t4", "===", "s", "t3"),
+			sbAssert("t5", "t4"),
+			sbUpd("t6", "out", "t3"),
+		}
+		_, _, _, err := ExecuteStrict(
+			sbProgram(body), "run",
+			map[string]interface{}{"out": big.NewInt(0)},
+			map[string]interface{}{}, nil,
+		)
+		if err == nil {
+			t.Fatalf("aliased [0x00] was accepted; the deployed script aborts at OP_NUMEQUAL (funds locked)")
+		}
+		se, ok := err.(*ScriptOpcodeError)
+		if !ok {
+			t.Fatalf("expected *ScriptOpcodeError, got %T (%v)", err, err)
+		}
+		if se.Opcode != "OP_NUMEQUAL" || !strings.Contains(se.Message, "non-minimally encoded") {
+			t.Errorf("expected an OP_NUMEQUAL non-minimal abort, got %q: %q", se.Opcode, se.Message)
+		}
+	})
+
+	t.Run("aliased non-minimal bytes still feed a byte op (no false abort)", func(t *testing.T) {
+		// CONTROL, and a regression for the byte-op threading itself: an alias
+		// that drops the entry makes OP_OR re-derive 0's EMPTY encoding and
+		// abort on a length mismatch the chain never sees.
+		body := []ANFBinding{
+			sbConst("t0", "2"),
+			sbConst("t1", "8"),
+			sbBin("t2", "<<", "t0", "t1"), // raw [0x00]
+			sbAlias("s", "t2"),            // const s = a << 8
+			sbConst("t3", "5"),
+			sbBin("t4", "|", "s", "t3"),
+			sbBin("t5", "===", "t4", "t3"),
+			sbAssert("t6", "t5"),
+			sbUpd("t7", "out", "t4"),
+		}
+		state, _, _, err := ExecuteStrict(
+			sbProgram(body), "run",
+			map[string]interface{}{"out": big.NewInt(0)},
+			map[string]interface{}{}, nil,
+		)
+		if err != nil {
+			t.Fatalf("(2<<8)|5 through an alias must spend to 5, got %v", err)
+		}
+		if got := anfToBigInt(state["out"]); got.Cmp(bi(5)) != 0 {
+			t.Errorf("out = %s, want 5", got)
+		}
+	})
+
+	t.Run("aliased MINIMAL shift result still accepted", func(t *testing.T) {
+		body := []ANFBinding{
+			sbConst("t0", "2"),
+			sbConst("t1", "1"),
+			sbBin("t2", ">>", "t0", "t1"), // raw [0x01] — minimal
+			sbAlias("s", "t2"),
+			sbConst("t3", "1"),
+			sbBin("t4", "===", "s", "t3"),
+			sbAssert("t5", "t4"),
+			sbUpd("t6", "out", "t3"),
+		}
+		state, _, _, err := ExecuteStrict(
+			sbProgram(body), "run",
+			map[string]interface{}{"out": big.NewInt(0)},
+			map[string]interface{}{}, nil,
+		)
+		if err != nil {
+			t.Fatalf("control regressed — expected a clean spend, got %v", err)
+		}
+		if got := anfToBigInt(state["out"]); got.Cmp(bi(1)) != 0 {
+			t.Errorf("out = %s, want 1", got)
+		}
+	})
+}

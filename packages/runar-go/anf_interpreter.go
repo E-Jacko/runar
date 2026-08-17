@@ -1,6 +1,7 @@
 package runar
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -622,7 +623,17 @@ func anfEvalValue(
 		v := value["value"]
 		// Handle @ref: aliases
 		if s, ok := v.(string); ok && strings.HasPrefix(s, "@ref:") {
-			return env[s[5:]]
+			target := s[5:]
+			// An alias is a pure rename — the lowering emits one for every
+			// named local (`const left = a << 3n` becomes t2 = a << 3n plus
+			// left = @ref:t2). It occupies the SAME stack bytes as its
+			// target, so the side-map entry must travel with it or both the
+			// non-minimal numeric check and the chained byte-op threading go
+			// blind on real compiler output.
+			if raw, ok := scriptBytes[target]; ok {
+				scriptBytes[bindingName] = raw
+			}
+			return env[target]
 		}
 		return v
 
@@ -645,9 +656,11 @@ func anfEvalValue(
 			}
 			var rb []byte
 			if op == "<<" || op == ">>" {
-				// Shift count is read as a number on-chain — only `ab`'s
-				// length is significant, so the count operand's bytes are
-				// never consulted.
+				// Shift count is read as a NUMBER on-chain — it therefore
+				// decodes with fRequireMinimal and aborts on a non-minimal
+				// operand. Only `ab`'s length is significant otherwise, so
+				// the count operand's bytes are never consulted for width.
+				anfAssertMinimalNumericOperand(scriptOpcodeName(op), rightName, env, scriptBytes)
 				rb = anfScriptNumShiftBytes(op, ab, anfToBigInt(env[rightName]))
 			} else {
 				bb, okr := scriptBytes[rightName]
@@ -658,6 +671,15 @@ func anfEvalValue(
 			}
 			scriptBytes[bindingName] = rb
 			return anfBin2numBigInt(hex.EncodeToString(rb))
+		}
+		// Every NUMERIC consumer decodes its operands with fRequireMinimal on
+		// chain and aborts on a non-minimal encoding. A shift result is
+		// length-preserving and can be non-minimal (`1 >> 1` leaves [0x00]),
+		// so the threaded bytes — not the re-minimised value — decide whether
+		// the deployed script spends here.
+		if opcode := anfNumericConsumerOpcode(op); opcode != "" {
+			anfAssertMinimalNumericOperand(opcode, leftName, env, scriptBytes)
+			anfAssertMinimalNumericOperand(opcode, rightName, env, scriptBytes)
 		}
 		return anfEvalBinOp(op, env[leftName], env[rightName], resultType)
 
@@ -1832,6 +1854,77 @@ func scriptOpcodeName(op string) string {
 		return "OP_RSHIFT"
 	}
 	return op
+}
+
+// anfNumericConsumerOpcode maps a source operator to the Bitcoin Script opcode
+// it lowers to, but ONLY for operators that consume their operands as SCRIPT
+// NUMBERS. Those opcodes decode with fRequireMinimal=true and abort on a
+// non-minimally-encoded operand. Returns "" for every other operator —
+// notably the byte-array ops `& | ^ ~` (which take non-minimal bytes and only
+// require equal length) and the boolean ops `&& ||` (OP_BOOLAND/OP_BOOLOR read
+// truthiness, not a decoded number).
+func anfNumericConsumerOpcode(op string) string {
+	switch op {
+	case "+":
+		return "OP_ADD"
+	case "-":
+		return "OP_SUB"
+	case "*":
+		return "OP_MUL"
+	case "/":
+		return "OP_DIV"
+	case "%":
+		return "OP_MOD"
+	case "==", "===":
+		return "OP_NUMEQUAL"
+	case "!=", "!==":
+		return "OP_NUMNOTEQUAL"
+	case "<":
+		return "OP_LESSTHAN"
+	case "<=":
+		return "OP_LESSTHANOREQUAL"
+	case ">":
+		return "OP_GREATERTHAN"
+	case ">=":
+		return "OP_GREATERTHANOREQUAL"
+	}
+	return ""
+}
+
+// anfAssertMinimalNumericOperand aborts when the operand bound to `name`
+// carries threaded stack bytes that are NOT the minimal encoding of its
+// decoded value — exactly the condition on which a numeric opcode's
+// fRequireMinimal decode fails on chain.
+//
+// Only bindings produced by a byte-array op appear in `scriptBytes`; every
+// other value is minimal on chain, so an absent entry is always fine. The
+// check is deliberately confined to the numeric consumers (see
+// anfNumericConsumerOpcode): OP_AND/OP_OR/OP_XOR/OP_INVERT and a shift's VALUE
+// operand legitimately take non-minimal bytes, so rejecting them here would
+// break spends the chain accepts (see
+// conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal).
+func anfAssertMinimalNumericOperand(
+	opcode, name string,
+	env map[string]interface{},
+	scriptBytes map[string][]byte,
+) {
+	raw, ok := scriptBytes[name]
+	if !ok {
+		return
+	}
+	minimal := anfScriptNumEncode(anfBin2numBigInt(hex.EncodeToString(raw)))
+	if bytes.Equal(raw, minimal) {
+		return
+	}
+	panic(&ScriptOpcodeError{
+		Opcode: opcode,
+		Message: fmt.Sprintf(
+			"non-minimally encoded script number (operand bytes %s decode to %s, minimal encoding is %s)",
+			hex.EncodeToString(raw),
+			anfBin2numBigInt(hex.EncodeToString(raw)),
+			hex.EncodeToString(minimal),
+		),
+	})
 }
 
 // anfIsNumericByteOp reports whether a `bin_op` should evaluate through the
