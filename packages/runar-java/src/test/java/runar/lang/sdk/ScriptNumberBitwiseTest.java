@@ -142,6 +142,112 @@ class ScriptNumberBitwiseTest {
             """));
     }
 
+    // --- NON-MINIMAL numeric operands (funds-loss: the interpreter reports a
+    // VALID spend for a script that aborts on chain). A shift preserves its
+    // operand's byte LENGTH, so `1 >> 1` leaves the 1-byte [0x00] — a
+    // NON-minimal zero (minimal zero is empty). Every numeric consumer decodes
+    // with fRequireMinimal = true and ABORTS on it: OP_ADD/OP_SUB/OP_MUL/OP_DIV/
+    // OP_MOD, OP_NUMEQUAL and the relational ops, and a shift's COUNT operand.
+    // The byte-array ops `& | ^` and a shift's VALUE operand are exempt — they
+    // take raw bytes and only require equal length. ---
+
+    @Test
+    void nonMinimalOperandAbortsNumericEquality() {
+        // On-chain: OP_RSHIFT([0x01], 1) = [0x00]; OP_NUMEQUAL then aborts with
+        // "non-minimally encoded script number". The buggy path decoded [0x00]
+        // to 0 and answered `true` — a funds-loss spend.
+        assertThrows(
+            AnfInterpreter.InterpreterException.class,
+            () -> runChainRaw("""
+                {"name":"n","value":{"kind":"load_const","value":1}},
+                {"name":"one","value":{"kind":"load_const","value":1}},
+                {"name":"sh","value":{"kind":"bin_op","op":">>","left":"n","right":"one"}},
+                {"name":"z","value":{"kind":"load_const","value":0}},
+                {"name":"eq","value":{"kind":"bin_op","op":"===","left":"sh","right":"z"}},
+                {"name":"w","value":{"kind":"update_prop","name":"out","value":"eq"}}
+                """),
+            "(1>>1)===0 must abort");
+    }
+
+    @Test
+    void nonMinimalOperandAbortsAddition() {
+        // OP_ADD is a numeric consumer too.
+        assertThrows(
+            AnfInterpreter.InterpreterException.class,
+            () -> runChainRaw("""
+                {"name":"n","value":{"kind":"load_const","value":1}},
+                {"name":"one","value":{"kind":"load_const","value":1}},
+                {"name":"sh","value":{"kind":"bin_op","op":">>","left":"n","right":"one"}},
+                {"name":"z","value":{"kind":"load_const","value":0}},
+                {"name":"sum","value":{"kind":"bin_op","op":"+","left":"sh","right":"z"}},
+                {"name":"w","value":{"kind":"update_prop","name":"out","value":"sum"}}
+                """),
+            "(1>>1)+0 must abort");
+    }
+
+    @Test
+    void nonMinimalShiftCountAborts() {
+        // A shift's COUNT operand is read as a number, so a non-minimal count
+        // aborts even though the VALUE operand need not be minimal.
+        assertThrows(
+            AnfInterpreter.InterpreterException.class,
+            () -> runChainRaw("""
+                {"name":"n","value":{"kind":"load_const","value":1}},
+                {"name":"one","value":{"kind":"load_const","value":1}},
+                {"name":"cnt","value":{"kind":"bin_op","op":">>","left":"n","right":"one"}},
+                {"name":"four","value":{"kind":"load_const","value":4}},
+                {"name":"t","value":{"kind":"bin_op","op":">>","left":"four","right":"cnt"}},
+                {"name":"w","value":{"kind":"update_prop","name":"out","value":"t"}}
+                """),
+            "4>>(1>>1) must abort");
+    }
+
+    @Test
+    void minimalShiftResultStillAccepted() {
+        // CONTROL — `2 >> 1` leaves [0x01], the minimal encoding of 1, so
+        // OP_NUMEQUAL is happy and the spend stays valid.
+        assertEquals(Boolean.TRUE, runChainRaw("""
+            {"name":"two","value":{"kind":"load_const","value":2}},
+            {"name":"one","value":{"kind":"load_const","value":1}},
+            {"name":"sh","value":{"kind":"bin_op","op":">>","left":"two","right":"one"}},
+            {"name":"c1","value":{"kind":"load_const","value":1}},
+            {"name":"eq","value":{"kind":"bin_op","op":"===","left":"sh","right":"c1"}},
+            {"name":"w","value":{"kind":"update_prop","name":"out","value":"eq"}}
+            """));
+    }
+
+    @Test
+    void bitwiseOnNonMinimalOperandsStillAccepted() {
+        // CONTROL — `& | ^` still take non-minimal equal-length operands:
+        // OP_OR([0x00], [0x05]) = [0x05], which IS minimal for 5, so the
+        // following `=== 5` accepts. Pinned by
+        // conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal
+        // — a fix that rejects this is WRONG.
+        assertEquals(Boolean.TRUE, runChainRaw("""
+            {"name":"a","value":{"kind":"load_const","value":2}},
+            {"name":"sh","value":{"kind":"load_const","value":8}},
+            {"name":"t0","value":{"kind":"bin_op","op":"<<","left":"a","right":"sh"}},
+            {"name":"five","value":{"kind":"load_const","value":5}},
+            {"name":"t1","value":{"kind":"bin_op","op":"|","left":"t0","right":"five"}},
+            {"name":"c5","value":{"kind":"load_const","value":5}},
+            {"name":"eq","value":{"kind":"bin_op","op":"===","left":"t1","right":"c5"}},
+            {"name":"w","value":{"kind":"update_prop","name":"out","value":"eq"}}
+            """));
+    }
+
+    /** Like {@link #runChain}, but returns the raw {@code out} value so a
+     *  boolean-valued comparison result can be asserted directly. */
+    private static Object runChainRaw(String bodyJson) {
+        String json = "{\"anf\":{"
+            + "\"contractName\":\"ShiftChain\","
+            + "\"properties\":[{\"name\":\"out\",\"readonly\":false}],"
+            + "\"methods\":[{\"name\":\"compute\",\"params\":[],\"isPublic\":true,"
+            + "\"body\":[" + bodyJson + "]}]}}";
+        Map<String, Object> anf = AnfInterpreter.loadAnf(json);
+        return AnfInterpreter.computeNewState(
+            anf, "compute", Map.of("out", BigInteger.ZERO), Map.of(), List.of()).get("out");
+    }
+
     /**
      * Run a synthetic chained ANF program: wraps {@code bodyJson} (a list of
      * bindings ending in an {@code update_prop} onto the mutable {@code out}
