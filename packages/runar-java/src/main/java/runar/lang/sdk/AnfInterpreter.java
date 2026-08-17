@@ -782,11 +782,27 @@ public final class AnfInterpreter {
                     scriptBytes.put(bindingName, rb);
                     return MockCrypto.decodeScriptNumber(rb);
                 }
+                // Every other unary op reads its operand as a script NUMBER
+                // (`-` -> OP_NEGATE) or coerces it to a boolean (`!` ->
+                // OP_NOT), both fRequireMinimal decodes. `~` never reaches here
+                // on the numeric path — it is a byte op and must keep accepting
+                // non-minimal bytes.
+                assertMinimalNumericOperand(scriptBytes, operandRef, operand);
                 return evalUnaryOp(op, operand, resultType);
             }
             case "call": {
                 String func = (String) value.get("func");
                 List<String> argNames = stringList(value.get("args"));
+                // The single funnel every numeric builtin (`abs`, `min`, `max`,
+                // `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+                // operands through. Only a NUMERIC byte-op result ever carries
+                // threaded bytes, and a bigint argument is exactly what those
+                // builtins decode with fRequireMinimal on chain — a ByteString
+                // argument can never carry an entry here, so gating every
+                // argument costs nothing and cannot miss a builtin.
+                for (String n : argNames) {
+                    assertMinimalNumericOperand(scriptBytes, n, env.get(n));
+                }
                 List<Object> argVals = new ArrayList<>(argNames.size());
                 for (String n : argNames) argVals.add(env.get(n));
                 // Strict mode: a `call(assert, x)` lowering path enforces the
