@@ -470,7 +470,10 @@ module Runar
             # by ref name) if present, else the value's minimal encoding.
             ab = sbytes[value['left']] || encode_scriptnum_bytes(to_int(left_val))
             rb = if op == '<<' || op == '>>'
-                   # Shift count is read as a number on-chain — only ab's length matters.
+                   # Shift count is read as a NUMBER on-chain — it decodes with
+                   # fRequireMinimal and aborts on a non-minimal operand. Only
+                   # ab's length matters otherwise.
+                   assert_minimal_numeric_operand(op == '<<' ? 'OP_LSHIFT' : 'OP_RSHIFT', value['right'], sbytes)
                    scriptnum_shift_bytes(op, ab, to_int(right_val))
                  else
                    bb = sbytes[value['right']] || encode_scriptnum_bytes(to_int(right_val))
@@ -479,6 +482,19 @@ module Runar
             sbytes[binding_name] = rb if binding_name
             decode_scriptnum_bytes(rb)
           else
+            # Every NUMERIC consumer decodes its operands with fRequireMinimal
+            # on-chain and aborts on a non-minimal encoding. A shift result is
+            # length-preserving and can be non-minimal (+1 >> 1+ leaves
+            # [0x00]), so the threaded bytes — not the re-minimised value —
+            # decide whether the deployed script spends here.
+            opcode = NUMERIC_CONSUMER_OPCODES[op]
+            # Read the side-map without creating it: outside a
+            # #compute_new_state call there are no threaded bytes to check.
+            sbytes = Thread.current[:runar_script_bytes]
+            if opcode && sbytes
+              assert_minimal_numeric_operand(opcode, value['left'], sbytes)
+              assert_minimal_numeric_operand(opcode, value['right'], sbytes)
+            end
             eval_bin_op(op, left_val, right_val, value['result_type'])
           end
 
@@ -1351,6 +1367,71 @@ module Runar
           result_type != 'bytes' &&
           !left.is_a?(String) &&
           !right.is_a?(String)
+      end
+
+      # Source operators that consume their operands as SCRIPT NUMBERS, mapped
+      # to the opcode they lower to. Those opcodes decode with
+      # +fRequireMinimal = true+ and abort on a non-minimally-encoded operand.
+      #
+      # Deliberately EXCLUDES the byte-array ops +& | ^ ~+ (which take
+      # non-minimal bytes and only require equal length) and the boolean ops
+      # +&& ||+ (OP_BOOLAND/OP_BOOLOR read truthiness, not a decoded number).
+      # +<< >>+ are handled separately: only their COUNT operand is a number.
+      NUMERIC_CONSUMER_OPCODES = {
+        '+' => 'OP_ADD',
+        '-' => 'OP_SUB',
+        '*' => 'OP_MUL',
+        '/' => 'OP_DIV',
+        '%' => 'OP_MOD',
+        '==' => 'OP_NUMEQUAL',
+        '===' => 'OP_NUMEQUAL',
+        '!=' => 'OP_NUMNOTEQUAL',
+        '!==' => 'OP_NUMNOTEQUAL',
+        '<' => 'OP_LESSTHAN',
+        '<=' => 'OP_LESSTHANOREQUAL',
+        '>' => 'OP_GREATERTHAN',
+        '>=' => 'OP_GREATERTHANOREQUAL',
+      }.freeze
+
+      # Abort when the operand bound to +ref+ carries threaded stack bytes that
+      # are NOT the minimal encoding of its decoded value — exactly the
+      # condition on which a numeric opcode's +fRequireMinimal+ decode fails
+      # on-chain. A shift preserves its operand's byte length, so +1 >> 1+
+      # leaves the 1-byte [0x00]; re-minimising it to 0 off-chain reports a
+      # spend the deployed script rejects, locking the UTXO.
+      #
+      # Only bindings produced by a byte-array op appear in +sbytes+; every
+      # other value is minimal on-chain, so an absent entry is always fine. The
+      # check is confined to the numeric consumers (see
+      # {NUMERIC_CONSUMER_OPCODES}): OP_AND/OP_OR/OP_XOR/OP_INVERT and a
+      # shift's VALUE operand legitimately take non-minimal bytes, so rejecting
+      # them here would break spends the chain accepts (see
+      # conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal).
+      #
+      # @param opcode [String] opcode name for the abort message
+      # @param ref    [String, nil] binding name of the operand
+      # @param sbytes [Hash{String=>Array<Integer>}] raw-stack-byte side-map
+      # @return [void]
+      # @raise [RuntimeError] when the operand's bytes are non-minimal
+      def assert_minimal_numeric_operand(opcode, ref, sbytes)
+        raw = sbytes[ref]
+        return if raw.nil?
+
+        decoded = decode_scriptnum_bytes(raw)
+        minimal = encode_scriptnum_bytes(decoded)
+        return if raw == minimal
+
+        raise "#{opcode}: non-minimally encoded script number " \
+              "(operand bytes #{hexify_scriptnum_bytes(raw)} decode to #{decoded}, " \
+              "minimal encoding is #{hexify_scriptnum_bytes(minimal)})"
+      end
+
+      # Render raw stack bytes as a hex string for abort messages.
+      #
+      # @param bytes [Array<Integer>]
+      # @return [String]
+      def hexify_scriptnum_bytes(bytes)
+        bytes.map { |b| format('%02x', b) }.join
       end
 
       # ---------------------------------------------------------------------------
