@@ -623,7 +623,17 @@ func anfEvalValue(
 		v := value["value"]
 		// Handle @ref: aliases
 		if s, ok := v.(string); ok && strings.HasPrefix(s, "@ref:") {
-			return env[s[5:]]
+			target := s[5:]
+			// An alias is a pure rename — the lowering emits one for every
+			// named local (`const left = a << 3n` becomes t2 = a << 3n plus
+			// left = @ref:t2). It occupies the SAME stack bytes as its
+			// target, so the side-map entry must travel with it or both the
+			// non-minimal numeric check and the chained byte-op threading go
+			// blind on real compiler output.
+			if raw, ok := scriptBytes[target]; ok {
+				scriptBytes[bindingName] = raw
+			}
+			return env[target]
 		}
 		return v
 
