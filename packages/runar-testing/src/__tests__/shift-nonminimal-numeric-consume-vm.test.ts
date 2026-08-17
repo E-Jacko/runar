@@ -86,3 +86,34 @@ describe('a shift result that is a non-minimal zero', () => {
     });
   }
 });
+
+describe('a non-minimal shift result consumed by a UNARY op or numeric builtin', () => {
+  // The binary-op gate does not see these: the value goes straight into
+  // OP_NOT / OP_ABS / a bool coercion without passing through `+ - * / %` or a
+  // comparison. On chain those opcodes decode with fRequireMinimal=true too.
+  for (const fold of [true, false]) {
+    const mode = fold ? 'fold-OFF' : 'fold-ON';
+
+    it(`bool() of a non-minimal shift agrees with Spend (${mode})`, () => {
+      const r = run('bool(this.n >> 1n) === false', 1n, fold);
+      expect(r.interpreterAccepted).toBe(r.spendAccepted);
+    });
+
+    it(`! of a non-minimal shift agrees with Spend (${mode})`, () => {
+      const r = run('!bool(this.n >> 1n)', 1n, fold);
+      expect(r.interpreterAccepted).toBe(r.spendAccepted);
+    });
+
+    it(`abs() of a non-minimal shift agrees with Spend (${mode})`, () => {
+      const r = run('abs(this.n >> 1n) === 0n', 1n, fold);
+      expect(r.interpreterAccepted).toBe(r.spendAccepted);
+    });
+
+    // Control: the same builtins over a MINIMAL shift result must still work.
+    it(`abs() of a minimal shift result still accepts (${mode})`, () => {
+      const r = run('abs(this.n >> 1n) === 1n', 2n, fold);
+      expect(r.interpreterAccepted).toBe(true);
+      expect(r.spendAccepted).toBe(true);
+    });
+  }
+});

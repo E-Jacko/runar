@@ -1436,6 +1436,11 @@ export class RunarInterpreter {
       case 'boolean':
         return val.value;
       case 'bigint':
+        // Coercing a script number to a boolean is OP_NOT/OP_0NOTEQUAL on
+        // chain — a NUMERIC consumer, so minimal encoding is enforced. Without
+        // this a non-minimal shift result reaches `!`, `bool()` or an `if`
+        // condition and the interpreter answers where a node aborts.
+        assertMinimalNumericOperand(val, 'boolean coercion');
         return val.value !== 0n;
       case 'bytes':
         return val.value.length > 0 && val.value.some((b) => b !== 0);
@@ -1462,6 +1467,12 @@ export class RunarInterpreter {
   private toBigInt(val: RunarValue): bigint {
     switch (val.kind) {
       case 'bigint':
+        // The funnel every numeric builtin (`abs`, `min`, `max`, `within`,
+        // `safediv`, ...) and unary `-` reads its operand through. All of them
+        // lower to numeric opcodes, which require minimal encoding. The
+        // byte-array ops do NOT come through here — they read `scriptBytes`
+        // directly — so this does not over-reject `& | ^ << >> ~`.
+        assertMinimalNumericOperand(val, 'numeric operand');
         return val.value;
       case 'boolean':
         return val.value ? 1n : 0n;
