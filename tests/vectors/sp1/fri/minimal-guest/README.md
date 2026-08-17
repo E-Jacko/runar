@@ -10,6 +10,7 @@ field SP1 v6.0.2 uses), config matching Plonky3's
 | File                   | Size       | Notes                                                     |
 |------------------------|------------|-----------------------------------------------------------|
 | `proof.postcard`       | 1589 bytes | postcard-encoded `p3_uni_stark::Proof<MyConfig>`          |
+| `public_values.hex`    | 12 bytes   | `[a, b, x]` = `[0, 1, 21]` as little-endian `u32`s, lowercase hex, no `0x` |
 | `README.md`            | —          | this file                                                 |
 | `regen/Cargo.toml`     | —          | Rust fixture generator manifest (depends on Plonky3 main) |
 | `regen/src/main.rs`    | —          | Fibonacci AIR + KoalaBear config + postcard dump          |
