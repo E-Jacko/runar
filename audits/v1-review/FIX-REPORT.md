@@ -257,13 +257,19 @@ known-wrong behaviour that ships silently.
 | 9 | Zig diagnostic | **CLOSED — and my finding was wrong.** Zig exits 1 with a descriptive message; "terse" was an artefact of my own `tail -1`. Only the property name was missing; added. |
 | 10 | `conformance:sdk` ambient tsx | **CLOSED.** Resolves the repo-local binary. |
 | 11 | 24 untriaged mutation survivors | **CLOSED.** All **66** triaged (not 25): 60 equivalent with stated reasons, **6 real holes** — including the `sinkBelow` DISTANCE at `05-stack-lower.ts:2538`, i.e. a gap in the #149 fix's own coverage. 16 pins added and verified by running the mutation gate. |
-| **NEW** | **SP1 FRI on-chain verifier is not sound** | **DISCLOSED + DETECTED, not fixed.** `sample-and-drop` means the per-query chain is never emitted: `bad_merkle`/`bad_folding`/`bad_final_poly` are ACCEPTED on-chain. Documented, pinned by tests that fail when the emission lands, and now a **compile-time warning**. Fixing it requires implementing the per-query chain — a real v1 decision, not a cleanup. |
+| **NEW** | **SP1 FRI on-chain verifier is not sound** | **CLOSED as a shippable defect.** `sample-and-drop` means the per-query chain is never emitted, so `bad_merkle`/`bad_folding`/`bad_final_poly` are ACCEPTED on-chain. The compiler now **REFUSES** to emit `verifySP1FRI` unless the source carries `@acknowledgeUnsoundSP1FriVerifier` (scanned over raw source, so all nine surfaces honour it); opting in still warns on every compile. The unsound artefact can no longer be produced by accident. Implementing the per-query chain remains the real feature work. |
 
 ### Residual items, stated plainly
 
-- **The SP1 FRI verifier must not be used for value-bearing covenants** until the
-  per-query chain lands. Everything else here is closed; this one is a feature
-  gap with a loud detector, not a silent defect.
+- **The SP1 FRI per-query verification chain is still unimplemented.** This is
+  now a FEATURE GAP, not a shippable defect: the compiler refuses to emit the
+  verifier at all without an explicit in-source acknowledgement, so an unsound
+  covenant cannot be produced by accident. Implementing the chain (input-batch
+  MMCS verify, reduced-opening accumulator, per-fold-step MMCS verify,
+  colinearity fold, final-poly Horner) is real work and needs the per-query
+  opening layout in the unlocking script — roughly 50 KB per query. I did not
+  attempt it: a hastily written FRI verifier that LOOKS sound is strictly worse
+  than one that refuses to compile.
 - `conformance/mutation/baseline.json` not re-stamped (new ids are simply not
   compared; cannot cause a false pass).
 - The 60 "equivalent" mutation verdicts are evidence (2101 compiles found no
