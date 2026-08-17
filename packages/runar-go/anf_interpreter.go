@@ -699,6 +699,11 @@ func anfEvalValue(
 			scriptBytes[bindingName] = rb
 			return anfBin2numBigInt(hex.EncodeToString(rb))
 		}
+		// Every other unary op reads its operand as a script NUMBER
+		// (`-` -> OP_NEGATE) or coerces it to a boolean (`!` -> OP_NOT), both
+		// fRequireMinimal decodes. `~` never reaches here on the numeric path
+		// — it is a byte op and must keep accepting non-minimal bytes.
+		anfAssertMinimalNumericOperand(anfUnaryOperandContext(op), operandName, env, scriptBytes)
 		return anfEvalUnaryOp(op, env[operandName], resultType)
 
 	case "call":
@@ -707,6 +712,16 @@ func anfEvalValue(
 		argVals := make([]interface{}, len(argNames))
 		for i, name := range argNames {
 			argVals[i] = env[name]
+		}
+		// The single funnel every numeric builtin (`abs`, `min`, `max`,
+		// `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+		// operands through. Only a NUMERIC byte-op result ever carries
+		// threaded bytes, and a bigint-typed argument is exactly what those
+		// builtins decode with fRequireMinimal on chain — a ByteString
+		// argument can never carry an entry here, so gating every argument
+		// costs nothing and cannot miss a builtin.
+		for _, name := range argNames {
+			anfAssertMinimalNumericOperand("numeric operand", name, env, scriptBytes)
 		}
 		// Strict mode: a `call(assert, x)` lowering path enforces the
 		// predicate the same way the dedicated `assert` ANF node does.
@@ -1889,6 +1904,17 @@ func anfNumericConsumerOpcode(op string) string {
 		return "OP_GREATERTHANOREQUAL"
 	}
 	return ""
+}
+
+// anfUnaryOperandContext names the way a unary op consumes its operand, for
+// the abort message. `-` lowers to OP_NEGATE (a script-number decode) and `!`
+// to OP_NOT (a numeric truthiness decode); both are fRequireMinimal. `~` is a
+// byte op handled on its own path and never reaches here numerically.
+func anfUnaryOperandContext(op string) string {
+	if op == "!" {
+		return "boolean coercion"
+	}
+	return "numeric operand"
 }
 
 // anfAssertMinimalNumericOperand aborts when the operand bound to `name`
