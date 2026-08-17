@@ -694,7 +694,17 @@ public final class AnfInterpreter {
             case "load_const": {
                 Object v = value.get("value");
                 if (v instanceof String s && s.startsWith("@ref:")) {
-                    return env.get(s.substring(5));
+                    String target = s.substring(5);
+                    // An alias is a pure rename — the lowering emits one for
+                    // every named local (`const left = a << 3n` becomes
+                    // `t2 = a << 3n` plus `left = @ref:t2`). It occupies the
+                    // SAME stack bytes as its target, so the side-map entry
+                    // must travel with it or both the non-minimal numeric
+                    // check and the chained byte-op threading go blind on real
+                    // compiler output.
+                    byte[] aliased = scriptBytes.get(target);
+                    if (aliased != null) scriptBytes.put(bindingName, aliased);
+                    return env.get(target);
                 }
                 return v;
             }
