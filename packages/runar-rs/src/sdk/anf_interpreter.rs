@@ -891,7 +891,14 @@ fn eval_value(
                     .unwrap_or_else(|| encode_script_num(left.to_i64()));
                 let rb = if op == "<<" || op == ">>" {
                     // Shift count is read as a number on-chain — only `ab`'s
-                    // length matters.
+                    // length matters. But being read AS A NUMBER means the count
+                    // itself must be minimally encoded, or the shift aborts.
+                    if assert_minimal_numeric_operand(script_bytes, &right_name, &right).is_err() {
+                        return Err(AssertionFailureError {
+                            method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                            binding_name: binding_name.to_string(),
+                        });
+                    }
                     script_num_shift_bytes(&op, &ab, right.to_i64())
                 } else {
                     let bb = script_bytes
@@ -917,6 +924,26 @@ fn eval_value(
                     }
                 }
             } else {
+                // Numeric consumers decode BOTH operands with fRequireMinimal,
+                // so a threaded non-minimal intermediate (e.g. the 1-byte
+                // [0x00] that `1 >> 1` leaves) aborts the script rather than
+                // silently re-minimising to 0. Byte-typed ops are exempt: they
+                // never carry threaded bytes and OP_CAT/OP_EQUAL impose no
+                // numeric decode.
+                let is_bytes_path =
+                    result_type == "bytes" || (left.is_bytes() && right.is_bytes());
+                if is_numeric_consumer_op(&op) && !is_bytes_path {
+                    let non_minimal =
+                        assert_minimal_numeric_operand(script_bytes, &left_name, &left).is_err()
+                            || assert_minimal_numeric_operand(script_bytes, &right_name, &right)
+                                .is_err();
+                    if non_minimal {
+                        return Err(AssertionFailureError {
+                            method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                            binding_name: binding_name.to_string(),
+                        });
+                    }
+                }
                 // A byte-array bitwise/shift op that aborts on-chain (length
                 // mismatch or negative shift) fails the spend; surface it through
                 // the interpreter's rejection channel just like a false assert.
@@ -1320,6 +1347,39 @@ fn script_num_invert(a: i64) -> i64 {
 fn script_num_shift(op: &str, a: i64, shift: i64) -> Result<i64, ()> {
     let bytes = script_num_shift_bytes(op, &encode_script_num(a), shift).map_err(|_| ())?;
     Ok(decode_script_num(&bytes))
+}
+
+/// Whether a bin_op consumes its operands NUMERICALLY, i.e. lowers to an opcode
+/// that decodes them with `fRequireMinimal = true`: OP_ADD/OP_SUB/OP_MUL/OP_DIV/
+/// OP_MOD, OP_NUMEQUAL(VERIFY)/OP_NUMNOTEQUAL and the relational ops. The
+/// byte-array ops `& | ^` and a shift's VALUE operand are deliberately absent —
+/// they take raw bytes and only require equal length. `&&`/`||` cast to bool,
+/// which imposes no minimal-encoding requirement either.
+fn is_numeric_consumer_op(op: &str) -> bool {
+    matches!(
+        op,
+        "+" | "-" | "*" | "/" | "%" | "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">="
+    )
+}
+
+/// `Err(())` if `name`'s threaded stack bytes are a NON-minimal encoding of its
+/// decoded value — the exact case a numeric consumer rejects on chain
+/// ("non-minimally encoded script number"). Only byte-array ops thread bytes, so
+/// a ref absent from the side map is minimal by construction and always passes.
+///
+/// Without this, `1 >> 1` (which leaves the 1-byte `[0x00]`, NOT the empty
+/// minimal zero) is re-minimised to `0` by the numeric path: the interpreter
+/// reports a VALID spend for a script that aborts on chain, leaving the UTXO
+/// permanently unspendable.
+fn assert_minimal_numeric_operand(
+    script_bytes: &HashMap<String, Vec<u8>>,
+    name: &str,
+    val: &Val,
+) -> Result<(), ()> {
+    match script_bytes.get(name) {
+        Some(raw) if raw.as_slice() != encode_script_num(val.to_i64()).as_slice() => Err(()),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
