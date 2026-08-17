@@ -74,6 +74,16 @@ const GOLDEN_MATCHERS = [
   (p) => /^conformance\/tests\/[^/]+\/expected-ir\.json$/.test(p),
   // Runtime KAT vectors (official known-answer test hashes).
   (p) => /^conformance\/runtime-vectors\/.*\.json$/.test(p),
+  // Repo-root research vectors (added 2026-08-17, v1 audit finding CC-010).
+  // These are the Plonky3 (p3-baby-bear / p3-koala-bear / p3-poseidon2) and
+  // gnark-crypto derived vectors, and they are the ONLY independent oracle for
+  // the Go-ONLY proof-system families — BabyBear, KoalaBear, Poseidon2, BN254 /
+  // Groth16, Merkle and FRI. Cross-tier parity is definitionally VACUOUS there
+  // (one implementation cannot disagree with itself), so if these move
+  // unjustified nothing else in the repo would notice. They were outside
+  // GOLDEN_MATCHERS entirely: the gate answered "no golden/vector files changed
+  // — nothing to justify" and exited 0 while all 22 were edited.
+  (p) => /^tests\/vectors\/.*\.json$/.test(p),
   // Cross-SDK deployed-locking-script goldens.
   (p) => /^conformance\/sdk-output\/tests\/[^/]+\/expected-.*\.hex$/.test(p),
   // Compiler<->SDK VERTICAL pins (plan Phase C3/C4). Three families, all
