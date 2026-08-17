@@ -266,7 +266,23 @@ table below makes the partition explicit.
 
 ## Axiom Taxonomy — preserved vs discharge-target
 
-The 78 current axioms split into two roles. **Preserved** axioms
+> **HISTORICAL SNAPSHOT — not the current count, and NOT machine-checked.**
+> The counts in this section are a point-in-time record from when the
+> preserved/target partition was drawn (78 axioms). The trust base is **71**
+> today. The authoritative, gate-enforced per-file numbers are in
+> "## Axiom Inventory" below, which `scripts/check-tcb-drift.sh` parses and
+> verifies row by row against the Lean sources; nothing parses the table in
+> THIS section, so treat its Count columns as history, not as a claim about the
+> tree. Where the two disagree — e.g. this section lists `ANF/Eval.lean` at 6
+> and the inventory at the gate-verified 7 — the inventory is right.
+>
+> Kept rather than deleted because the preserved-vs-target *partition* is the
+> reasoning this document exists to record; re-deriving that classification for
+> the current 71 is a separate exercise from correcting a count, and inventing
+> numbers for it here would just recreate the drift the gate was added to stop.
+
+The 78 axioms current AT THE TIME OF THIS SNAPSHOT split into two roles.
+**Preserved** axioms
 are real cryptographic primitive existence / group law / EUF-CMA
 assumptions that Path 2 does not target — they remain axiomatic by
 design (no Lean proof can discharge "ECDSA satisfies EUF-CMA",
