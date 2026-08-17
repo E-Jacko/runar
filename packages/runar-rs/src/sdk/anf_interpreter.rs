@@ -2264,6 +2264,134 @@ mod tests {
         assert_eq!(result.get("count"), Some(&SdkValue::Bool(true)));
     }
 
+    // --- NON-MINIMAL operands reaching a UNARY op or a numeric BUILTIN. ---
+    //
+    // The binary gate above only sees a value consumed by a BINARY numeric op.
+    // A non-minimal shift result can reach a UNARY op or a numeric BUILTIN
+    // without passing through one, and those opcodes decode with
+    // fRequireMinimal = true as well: OP_ABS, OP_0NOTEQUAL (`bool`), OP_NOT
+    // (`!`), OP_NEGATE (unary `-`). Reading only the decoded value re-minimises
+    // the 1-byte [0x00] that `1 >> 1` leaves, reports a clean spend, and the
+    // deployed script aborts — the UTXO is unspendable.
+
+    /// Body prefix binding `sh` = `1 >> 1` — raw stack bytes [0x00].
+    fn nonminimal_prefix() -> Vec<ANFBinding> {
+        vec![
+            b("n", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b("one", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": ">>", "left": "n", "right": "one" })),
+            b("z", serde_json::json!({ "kind": "load_const", "value": 0 })),
+        ]
+    }
+
+    /// Run `prefix ++ [tail, update_prop count = z]`.
+    fn run_with_tail(tail: serde_json::Value) -> Result<HashMap<String, SdkValue>, String> {
+        let mut body = nonminimal_prefix();
+        body.push(b("r", tail));
+        body.push(b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "z" })));
+        run_expr(body)
+    }
+
+    /// Every numeric BUILTIN reads its operand through the same fRequireMinimal
+    /// decode a binary numeric op does, so a non-minimal argument must abort.
+    #[test]
+    fn test_non_minimal_operand_through_builtin_aborts() {
+        for (label, tail) in [
+            ("abs", serde_json::json!({ "kind": "call", "func": "abs", "args": ["sh"] })),
+            ("bool", serde_json::json!({ "kind": "call", "func": "bool", "args": ["sh"] })),
+            ("sign", serde_json::json!({ "kind": "call", "func": "sign", "args": ["sh"] })),
+            ("min-left", serde_json::json!({ "kind": "call", "func": "min", "args": ["sh", "one"] })),
+            ("min-right", serde_json::json!({ "kind": "call", "func": "min", "args": ["one", "sh"] })),
+            ("max", serde_json::json!({ "kind": "call", "func": "max", "args": ["sh", "one"] })),
+            ("within", serde_json::json!({ "kind": "call", "func": "within", "args": ["sh", "z", "one"] })),
+            ("safediv", serde_json::json!({ "kind": "call", "func": "safediv", "args": ["sh", "one"] })),
+            ("clamp", serde_json::json!({ "kind": "call", "func": "clamp", "args": ["sh", "z", "one"] })),
+        ] {
+            let result = run_with_tail(tail);
+            assert!(result.is_err(), "{label}(1>>1) must abort, got {result:?}");
+        }
+    }
+
+    /// A UNARY op reads its operand the same way: `-` -> OP_NEGATE,
+    /// `!` -> OP_NOT, both fRequireMinimal.
+    #[test]
+    fn test_non_minimal_operand_through_unary_op_aborts() {
+        for (label, tail) in [
+            ("-", serde_json::json!({ "kind": "unary_op", "op": "-", "operand": "sh" })),
+            ("!", serde_json::json!({ "kind": "unary_op", "op": "!", "operand": "sh" })),
+        ] {
+            let result = run_with_tail(tail);
+            assert!(result.is_err(), "{label}(1>>1) must abort, got {result:?}");
+        }
+    }
+
+    /// The shape the lowering actually emits: a named local is an `@ref:`
+    /// alias, so the alias must carry the threaded bytes into the builtin.
+    #[test]
+    fn test_non_minimal_operand_through_aliased_builtin_aborts() {
+        let result = run_expr(vec![
+            b("n", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b("one", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": ">>", "left": "n", "right": "one" })),
+            b("s", serde_json::json!({ "kind": "load_const", "value": "@ref:sh" })),
+            b("r", serde_json::json!({ "kind": "call", "func": "abs", "args": ["s"] })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ]);
+        assert!(result.is_err(), "abs(alias of 1>>1) must abort, got {result:?}");
+    }
+
+    /// CONTROL — a MINIMAL operand through a builtin still spends: `2 >> 1`
+    /// leaves [0x01], the minimal encoding of 1, so OP_ABS is legal.
+    #[test]
+    fn test_minimal_operand_through_builtin_still_accepted() {
+        let result = run_expr(vec![
+            b("two", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("one", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": ">>", "left": "two", "right": "one" })),
+            b("r", serde_json::json!({ "kind": "call", "func": "abs", "args": ["sh"] })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("abs(2>>1) must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(1)));
+    }
+
+    /// CONTROL — `~` is a byte op with its own path and must NOT be gated:
+    /// `~(2 << 8)` inverts the non-minimal [0x00] to [0xff] = -127.
+    #[test]
+    fn test_invert_of_non_minimal_still_accepted_after_widening() {
+        let result = run_expr(vec![
+            b("two", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("eight", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "two", "right": "eight" })),
+            b("inv", serde_json::json!({ "kind": "unary_op", "op": "~", "operand": "sh" })),
+            b("m127", serde_json::json!({ "kind": "load_const", "value": -127 })),
+            b("eq", serde_json::json!({ "kind": "bin_op", "op": "===", "left": "inv", "right": "m127" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "eq" })),
+        ])
+        .expect("~(2<<8) === -127 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Bool(true)));
+    }
+
+    /// CONTROL — `(2 << 8) | 5 === 5` through a named-local alias. OP_OR takes
+    /// non-minimal bytes; rejecting this is WRONG (pinned by
+    /// conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal).
+    #[test]
+    fn test_aliased_bitwise_on_nonminimal_still_accepted_after_widening() {
+        let result = run_expr(vec![
+            b("two", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("eight", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "two", "right": "eight" })),
+            b("s", serde_json::json!({ "kind": "load_const", "value": "@ref:sh" })),
+            b("five", serde_json::json!({ "kind": "load_const", "value": 5 })),
+            b("orr", serde_json::json!({ "kind": "bin_op", "op": "|", "left": "s", "right": "five" })),
+            b("c5", serde_json::json!({ "kind": "load_const", "value": 5 })),
+            b("eq", serde_json::json!({ "kind": "bin_op", "op": "===", "left": "orr", "right": "c5" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "eq" })),
+        ])
+        .expect("aliased ((2<<8)|5) === 5 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Bool(true)));
+    }
+
     #[test]
     fn test_method_not_found() {
         let anf = make_anf(vec![]);
