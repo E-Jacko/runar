@@ -810,6 +810,16 @@ fn evalNode(
             switch (lc.value) {
                 .bytes => |b| {
                     if (b.len > 5 and std.mem.startsWith(u8, b, "@ref:")) {
+                        // An alias is a pure rename — the lowering emits one
+                        // for every named local (`const left = a << 3n`
+                        // becomes `t2 = a << 3n` plus `left = @ref:t2`). It
+                        // occupies the SAME stack bytes as its target, so the
+                        // side-map entry must travel with it or both the
+                        // non-minimal numeric check and the chained byte-op
+                        // threading go blind on real compiler output.
+                        if (eval_ctx.script_bytes.get(b[5..])) |bytes| {
+                            try eval_ctx.script_bytes.put(binding_name, bytes);
+                        }
                         return env.get(b[5..]) orelse anf_none;
                     }
                     if (std.mem.eql(u8, b, "@this")) {
