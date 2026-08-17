@@ -21,6 +21,11 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
 bs58 = { version = "0.5", features = ["check"] }
-bsv-sdk = ">=0.1, <0.3"
+# >=0.2.89 is a REQUIREMENT, not a preference: 0.1.x builds the BIP-143
+# `hashPrevouts` in the wrong order for `input_index > 0` (see
+# docs/audit/upstream-bsv-sdk-bip143-hashprevouts.md). 0.2.89 fixes it, and
+# `<0.3` keeps this crate on the same bsv-sdk as its `runar-compiler-rust`
+# path dependency instead of building two copies.
+bsv-sdk = ">=0.2.89, <0.3"
 num-bigint = "0.4"
 ureq = "2"

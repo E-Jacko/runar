@@ -9,11 +9,14 @@
 //! inputs are known validated NOTHING and was accepted. Here that is an error,
 //! so the gate can never pass vacuously.
 //!
-//! Divergence recorded honestly rather than papered over: `bsv-sdk` 0.1.72's
-//! script parser desyncs on the `0x8d` byte a Rúnar OP_PUSH_TX covenant
-//! embeds and aborts with `disabled opcode: OP_2MUL`. Such an input is counted
-//! as UNVALIDATABLE, never as validated — so it can never satisfy the
+//! Divergence recorded honestly rather than papered over: `bsv-sdk` aborts on a
+//! Rúnar OP_PUSH_TX covenant with `disabled opcode: OP_2MUL`. Such an input is
+//! counted as UNVALIDATABLE, never as validated — so it can never satisfy the
 //! non-vacuity requirement on its own. See `last_validation_report()`.
+//!
+//! The other bound this file used to record — `bsv-sdk` mis-ordering
+//! `hashPrevouts` for `input_index > 0` — is **fixed as of 0.2.89**, which
+//! `Cargo.toml` now requires; every known input is validated at every index.
 
 use std::path::Path;
 
@@ -109,20 +112,20 @@ fn broadcast_rejects_vacuous_validation() {
     );
 }
 
-// --- pins on the two upstream bsv-sdk defects that bound this tier ----------
-//
-// These are DELIBERATELY written to go RED if `bsv-sdk` ever fixes them, so the
-// gate in `provider.rs` can be tightened at that moment instead of silently
-// staying weaker than it needs to be.
+// --- pins on the upstream bsv-sdk behaviour this tier's gate depends on -----
 
-/// `bsv-sdk` 0.1.72 builds `hashPrevouts` as "current input's outpoint first,
-/// then other_inputs" — transaction input order only for `input_index == 0`.
-/// A genuine BIP-143 signature on input 1 (produced by this SDK's own
-/// `LocalSigner`, and accepted by the Go tier's go-sdk interpreter) therefore
-/// evaluates to FALSE. That is why `validate_broadcast_tx` refuses to draw any
-/// conclusion from inputs at index > 0.
+/// `bsv-sdk` 0.1.72 built `hashPrevouts` as "current input's outpoint first,
+/// then other_inputs" — transaction input order only for `input_index == 0` —
+/// so a genuine BIP-143 signature on input 1 evaluated to FALSE. That is why
+/// `validate_broadcast_tx` used to refuse to draw any conclusion from inputs at
+/// index > 0.
+///
+/// **Fixed as of 0.2.89**, which `Cargo.toml` now requires. This pin is the
+/// load-bearing evidence for having deleted that carve-out: it goes RED if a
+/// future bsv-sdk regresses multi-input sighashing, which would mean
+/// `validate_broadcast_tx` is once again drawing conclusions it may not draw.
 #[test]
-fn pin_bsv_sdk_cannot_sighash_input_index_above_zero() {
+fn pin_bsv_sdk_sighashes_every_input_index_correctly() {
     use bsv::script::spend::{Spend, SpendParams};
 
     let signer = LocalSigner::new(DEPLOYER_KEY).unwrap();
@@ -178,20 +181,23 @@ fn pin_bsv_sdk_cannot_sighash_input_index_above_zero() {
 
     assert!(verdict(0), "input 0 must validate — if this fails, bsv-sdk's BIP-143 broke entirely");
     assert!(
-        !verdict(1),
-        "bsv-sdk now sighashes input_index > 0 correctly! Remove the `unsupported_index` \
-         carve-out in src/sdk/provider.rs::validate_broadcast_tx and validate ALL known inputs."
+        verdict(1),
+        "bsv-sdk has REGRESSED BIP-143 sighashing for input_index > 0. \
+         src/sdk/provider.rs::validate_broadcast_tx executes every known input on the \
+         strength of this pin; restore an index carve-out there before trusting it again."
     );
 }
 
 /// A validating provider must never report an input it could not execute as
-/// validated. This pins the bucket accounting itself.
+/// validated. This pins the bucket accounting itself: two known, spendable
+/// inputs BOTH execute (index > 0 included, since bsv-sdk >= 0.2.89 sighashes
+/// it correctly), while an input whose outpoint is unknown lands in `unknown`.
 #[test]
 fn report_buckets_never_count_an_unexecuted_input_as_validated() {
     let mut p = MockProvider::testnet();
     seed(&mut p, &"66".repeat(32), 10_000, ANYONE_CAN_SPEND);
     let mut tx = one_input_tx(&"66".repeat(32), "", 1_000);
-    // Second input at index 1 — known, but bsv-sdk cannot sighash index > 0.
+    // Second input at index 1 — known and spendable, so it must EXECUTE now.
     p.add_utxo(
         "addr",
         Utxo {
@@ -208,13 +214,25 @@ fn report_buckets_never_count_an_unexecuted_input_as_validated() {
         sequence: 0xffff_ffff,
         source_transaction: None,
     });
+    // Third input at index 2 — outpoint this provider has never heard of.
+    tx.add_input(BsvTxIn {
+        source_txid: Some("88".repeat(32)),
+        source_output_index: 0,
+        unlocking_script: Some(UnlockingScript::from_hex("").unwrap()),
+        sequence: 0xffff_ffff,
+        source_transaction: None,
+    });
 
-    p.broadcast(&tx).expect("a conserving 2-input tx with a valid input 0 is acceptable");
+    p.broadcast(&tx).expect("a 3-input tx whose two known inputs both pass is acceptable");
     let r = p.last_validation_report();
-    assert_eq!(r.total, 2);
-    assert_eq!(r.validated, 1, "only input 0 could actually be executed");
-    assert_eq!(r.unsupported_index, 1, "input 1 must be reported as NOT executed, not as validated");
-    assert!(r.value_conserved, "both outpoints were known, so value conservation ran");
+    assert_eq!(r.total, 3);
+    assert_eq!(r.validated, 2, "BOTH known inputs must really execute, index 1 included");
+    assert_eq!(r.unknown, 1, "the unknown outpoint must be reported as NOT executed");
+    assert_eq!(r.unvalidatable, 0);
+    assert!(
+        !r.value_conserved,
+        "one outpoint is unknown, so value conservation must NOT claim to have run"
+    );
 }
 
 // --- rejection: unsigned transaction ----------------------------------------
