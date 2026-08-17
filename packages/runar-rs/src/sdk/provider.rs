@@ -61,12 +61,9 @@ pub struct BroadcastValidationReport {
     pub validated: usize,
     /// Inputs whose outpoint this provider does not know (nothing was run).
     pub unknown: usize,
-    /// Inputs the bundled `bsv-sdk` script parser cannot handle — see
+    /// Inputs the bundled `bsv-sdk` interpreter refuses to run — see
     /// [`validate_broadcast_tx`]. NOT counted as validated.
     pub unvalidatable: usize,
-    /// Inputs at index > 0, which `bsv-sdk` 0.1.72 cannot sighash correctly —
-    /// see [`validate_broadcast_tx`]. NOT counted as validated.
-    pub unsupported_index: usize,
     /// True when every input's outpoint was known, so the outputs-vs-inputs
     /// value-conservation check actually ran.
     pub value_conserved: bool,
@@ -221,25 +218,30 @@ impl MockProvider {
 ///
 /// The Rust tier's `Spend` wrapper is **execute-only** (upstream keeps the
 /// stack / program counter `pub(crate)`) — the divergence recorded in the root
-/// CLAUDE.md. Two further `bsv-sdk` 0.1.72 defects bound what a Rust-tier
-/// broadcast gate can honestly assert, and each gets its OWN bucket in
+/// CLAUDE.md.
+///
+/// **EVERY known input is executed, at any index.** `bsv-sdk` 0.1.72 built the
+/// BIP-143 `hashPrevouts` as *current input's outpoint first, then
+/// `other_inputs`*, which equals transaction order only at index 0, so this
+/// function used to refuse to draw any conclusion from inputs at index > 0.
+/// That defect is **fixed as of 0.2.89** (this crate now requires it — see
+/// `Cargo.toml` and `docs/audit/upstream-bsv-sdk-bip143-hashprevouts.md`), and
+/// the carve-out is gone: a multi-input transaction is now validated in full.
+///
+/// One limitation remains, and it gets its OWN bucket in
 /// [`BroadcastValidationReport`] so a not-checked input can never be mistaken
 /// for a passing one:
 ///
-/// 1. **Only `input_index == 0` gets a correct BIP-143 preimage.**
-///    `spend_ops.rs` builds `hashPrevouts` as *current input's outpoint first,
-///    then `other_inputs`* — transaction input order only for index 0. A valid
-///    BIP-143 signature on input 1 (produced by this very SDK's `LocalSigner`,
-///    and accepted by the Go tier's go-sdk interpreter) evaluates to FALSE
-///    here. Inputs at index > 0 are therefore counted as `unsupported_index`.
-/// 2. **Rúnar OP_PUSH_TX covenants do not parse.** The compiled covenant
-///    embeds a `0x8d` byte; the parser desyncs and aborts with
-///    `disabled opcode: OP_2MUL` (`spend_ops.rs:779`, hard-disabled with no
-///    config escape). Those inputs are counted as `unvalidatable`.
-///
-/// If either defect is fixed upstream, `mock_broadcast_validation.rs` pins
-/// both with dedicated tests that go RED — at which point this function should
-/// be tightened.
+/// - **Rúnar OP_PUSH_TX covenants cannot be run.** Rúnar targets *Chronicle*,
+///   the post-Genesis BSV profile that re-enables `OP_2MUL` (0x8d), and the
+///   OP_PUSH_TX low-S normalisation emits exactly that opcode. `bsv-sdk`
+///   implements the pre-Chronicle policy and hard-disables it with no config
+///   escape, so the covenant aborts with `disabled opcode: OP_2MUL`. Those
+///   inputs are counted as `unvalidatable`, never as validated. Pinned by
+///   `mock_broadcast_validation.rs::pin_bsv_sdk_rejects_op2mul_*`, which go RED
+///   the day upstream adopts the Chronicle opcode set — at which point this
+///   tolerated-error class should be deleted too. See
+///   `docs/audit/upstream-bsv-sdk-op2mul-chronicle.md`.
 fn validate_broadcast_tx(
     tx: &BsvTransaction,
     known: &HashMap<String, KnownOutpoint>,
@@ -269,13 +271,6 @@ fn validate_broadcast_tx(
             }
         };
         total_known_in += ko.satoshis;
-
-        if i > 0 {
-            // Defect (1) above: the preimage upstream would build here is not
-            // BIP-143, so a pass/fail from it would be meaningless.
-            report.unsupported_index += 1;
-            continue;
-        }
 
         let locking_script = LockingScript::from_hex(&ko.script)
             .map_err(|e| format!("input {}: known outpoint {} has invalid script hex: {}", i, key, e))?;
@@ -312,8 +307,9 @@ fn validate_broadcast_tx(
             }
             Err(e) => {
                 let msg = e.to_string();
-                // The ONLY tolerated class: the upstream parser desync on a
-                // Rúnar push-tx covenant. Counted, never treated as a pass.
+                // The ONLY tolerated class: bsv-sdk's pre-Chronicle opcode
+                // policy refusing the OP_2MUL a Rúnar push-tx covenant emits.
+                // Counted, never treated as a pass.
                 if msg.contains("disabled opcode") {
                     report.unvalidatable += 1;
                 } else {
@@ -369,8 +365,8 @@ impl Provider for MockProvider {
                     if vacuous {
                         return Err(format!(
                             "MockProvider: refusing to broadcast — NOTHING was checked \
-                             (0 of {} inputs executed; unknown outpoints: {}, unparseable by \
-                             bsv-sdk: {}, index>0 unsupported by bsv-sdk: {}; value conservation \
+                             (0 of {} inputs executed; unknown outpoints: {}, rejected by \
+                             bsv-sdk's pre-Chronicle opcode policy: {}; value conservation \
                              could not run because not every input's outpoint is known). \
                              Seed the spent outpoints via add_utxo/add_contract_utxo/\
                              add_transaction, or use MockProvider::always_ack (allowlisted) if \
@@ -378,7 +374,6 @@ impl Provider for MockProvider {
                             self.last_report.total,
                             self.last_report.unknown,
                             self.last_report.unvalidatable,
-                            self.last_report.unsupported_index,
                         ));
                     }
                 }

@@ -1,15 +1,59 @@
-# Upstream defect: `bsv-sdk` (Rust) builds `hashPrevouts` in the wrong order
+# Upstream defect: `bsv-sdk` (Rust) built `hashPrevouts` in the wrong order
 
-**Status:** confirmed, pinned in-repo, **not yet filed upstream**
-**Affects:** `bsv-sdk` 0.1.72 (our range: `>=0.1, <0.3`, `packages/runar-rs/Cargo.toml:24`)
-**Found:** 2026-08-06, while bringing the Rust tier's mock provider to fail-closed
-**Our pin:** `packages/runar-rs/tests/mock_broadcast_validation.rs`
-`pin_bsv_sdk_cannot_sighash_input_index_above_zero`
+**Status: FIXED UPSTREAM — closed, no issue needs filing.**
 
-This document is written to be **pasted into an upstream issue**. Nothing here
-depends on Rúnar-specific context.
+| | |
+|---|---|
+| **Affected** | `bsv-sdk` <= 0.1.x (last version we observed it on: 0.1.72) |
+| **Fixed in** | `bsv-sdk` 0.2.89 — also verified fixed on 0.4.0 |
+| **Found** | 2026-08-06, while bringing the Rust tier's mock provider to fail-closed |
+| **Closed** | 2026-08-17, by requiring `bsv-sdk = ">=0.2.89, <0.3"` in `packages/runar-rs/Cargo.toml` |
+| **Pin** | `packages/runar-rs/tests/mock_broadcast_validation.rs::pin_bsv_sdk_sighashes_every_input_index_correctly` |
+
+## How it was closed
+
+The defect was never bounded by upstream's willingness to fix it — it was
+bounded by **our own stale version floor**. `packages/runar-rs/Cargo.toml`
+pinned `bsv-sdk = ">=0.1, <0.3"` and the checked-in lockfile held 0.1.72, so a
+release that already contained the fix was never resolved. Widening the range
+and re-resolving made the pin below go RED on its own:
+
+```
+---- pin_bsv_sdk_cannot_sighash_input_index_above_zero stdout ----
+bsv-sdk now sighashes input_index > 0 correctly! Remove the `unsupported_index`
+carve-out in src/sdk/provider.rs::validate_broadcast_tx and validate ALL known inputs.
+```
+
+That is exactly what the pin existed to do. Acting on it:
+
+- the manifest now requires `>=0.2.89` — the fix is a **requirement**, not a
+  lockfile accident that the next `cargo update` could undo;
+- `validate_broadcast_tx` no longer skips inputs at index > 0. Every input whose
+  outpoint the provider knows is executed, at every index;
+- the `unsupported_index` bucket is **deleted** from
+  `BroadcastValidationReport` rather than left at a permanent 0 with a comment
+  describing a defect that no longer exists;
+- the pin was rewritten to assert the CORRECT behaviour, so it now goes red on a
+  regression instead of on a fix.
+
+Net effect: the Rust tier's fail-closed broadcast gate got **stronger**.
+Multi-input transactions were previously validated only at input 0; they are now
+validated in full.
+
+`0.4.0` was evaluated too. It fixes the same defect and passes the same suite,
+but `packages/runar-rs` path-depends on `compilers/rust`, which still requires
+`<0.3`; taking 0.4.0 in this crate alone makes cargo build two copies of
+`bsv-sdk` and leaves the compiler crate's `Spend` on a different interpreter than
+the SDK's. `>=0.2.89, <0.3` keeps the whole in-repo Rust graph on ONE bsv-sdk.
+Moving to 0.4.0 is a separate change that must bump `compilers/rust` in the same
+commit.
 
 ---
+
+## Historical record — the defect as it was
+
+Kept because it is the reproducer any future regression should be checked
+against, and because the pin test's assertions only make sense next to it.
 
 ## Summary
 
@@ -84,25 +128,29 @@ practice this means:
   weaker** than it appears
 
 In our case it meant our Rust SDK's broadcast validator had to refuse to draw any
-conclusion from inputs at index > 0 — see the linked pin, which is written to go
-**red** when this is fixed so we can tighten immediately.
+conclusion from inputs at index > 0 — see the linked pin, which was written to go
+**red** when this is fixed so we could tighten immediately. It did, and we did.
 
 ## Related, same crate, same investigation
 
 `Spend::validate()` never returns `false` — every failure path calls
 `scriptEvaluationError`, which throws. Downstream `if !spend.validate()` branches
 are therefore unreachable. Not a correctness bug, but it invites
-"`validate()` returned true, we're fine" reasoning in consumers. Worth either
-documenting or changing the signature to reflect it.
+"`validate()` returned true, we're fine" reasoning in consumers. Still true on
+0.2.89; `validate_broadcast_tx` handles both arms regardless.
+
+The other Rust-tier `bsv-sdk` limitation — `OP_2MUL` rejected by its
+pre-Chronicle opcode policy, which blocks script-validation of Rúnar covenants —
+is **not** fixed and is **not** an upstream defect. See
+`upstream-bsv-sdk-op2mul-chronicle.md`.
 
 ---
 
-## For the Rúnar maintainer, before filing
+## Lesson worth keeping
 
-- Confirm the defect still reproduces on the newest published `bsv-sdk` — the pin
-  was written against **0.1.72** and our Cargo range admits up to `<0.3`.
-- The reproducer in `mock_broadcast_validation.rs` is Rúnar-flavoured; reduce it
-  to a standalone `bsv-sdk`-only snippet before filing (it needs nothing from
-  this repo).
-- Filing is an outward-facing action on a third-party repository and has not been
-  done — this document exists so it can be, deliberately, by a human.
+A finding recorded as an "unfixable upstream defect" was, for some unknown span
+of time, already fixed upstream. Nothing in the repo would have noticed: the pin
+could only fire against the version the lockfile chose, and the lockfile was
+never re-resolved. **A pin on third-party behaviour is only as live as the
+dependency range it runs under.** Any "accepted upstream risk" should carry a
+recurring re-resolution check, not just a test.
