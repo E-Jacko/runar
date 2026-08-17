@@ -523,10 +523,34 @@ module Runar
             sbytes[binding_name] = rb if binding_name
             decode_scriptnum_bytes(rb)
           else
+            # Every other unary op reads its operand as a script NUMBER
+            # (+-+ -> OP_NEGATE) or coerces it to a boolean (+!+ -> OP_NOT),
+            # both fRequireMinimal decodes. +~+ never reaches here on the
+            # numeric path — it is a byte op and must keep accepting
+            # non-minimal bytes.
+            sbytes = Thread.current[:runar_script_bytes]
+            if sbytes
+              assert_minimal_numeric_operand(
+                op == '!' ? 'boolean coercion' : 'numeric operand', value['operand'], sbytes
+              )
+            end
             eval_unary_op(op, operand_val, value['result_type'])
           end
 
         when 'call'
+          # The single funnel every numeric builtin (+abs+, +min+, +max+,
+          # +within+, +safediv+, +clamp+, +sign+, +bool+, ...) reads its
+          # operands through. Only a NUMERIC byte-op result ever carries
+          # threaded bytes, and a bigint argument is exactly what those
+          # builtins decode with fRequireMinimal on-chain — a ByteString
+          # argument can never carry an entry here, so gating every argument
+          # costs nothing and cannot miss a builtin.
+          sbytes = Thread.current[:runar_script_bytes]
+          if sbytes
+            Array(value['args']).each do |a|
+              assert_minimal_numeric_operand('numeric operand', a, sbytes)
+            end
+          end
           call_args = Array(value['args']).map { |a| env[a] }
           # Strict mode: a +call(func: 'assert', args: [pred])+ lowering path
           # enforces the predicate the same way the dedicated +assert+ ANF
