@@ -46,6 +46,16 @@ def _unary(name, op, operand):
     return {'name': name, 'value': {'kind': 'unary_op', 'op': op, 'operand': operand}}
 
 
+def _alias(name, target):
+    """The ``@ref:`` alias binding the ANF lowering emits for a named local.
+
+    ``const left: bigint = this.a << 3n`` lowers to ``t2 = a << 3n`` followed
+    by ``left = @ref:t2``, and the consumer reads ``left``. Real compiler
+    output routes almost every byte-op result through one of these.
+    """
+    return {'name': name, 'value': {'kind': 'load_const', 'value': f'@ref:{target}'}}
+
+
 class TestShiftTruthTable:
     @pytest.mark.parametrize(
         "op,a,b,expected",
@@ -275,5 +285,58 @@ class TestMinimalOperandsStillAccepted:
             _bin("sum", "+", "a", "b"),
             _const("two", 2),
             _bin("result", "===", "sum", "two"),
+        ])
+        assert env["result"] is True
+
+
+class TestAliasCarriesScriptBytes:
+    """``@ref:`` alias bindings must carry the threaded stack bytes.
+
+    The lowering turns every named local into an alias, so almost every byte-op
+    result passes through one before it reaches a consumer. The side map is
+    keyed by binding name, so an alias that does not copy the entry drops the
+    real stack bytes -- silently disabling BOTH the non-minimal numeric check
+    AND the chained byte-op threading, on exactly the shape the compiler emits.
+
+    ``conformance/tests/shift-ops`` is a live example: ``left = this.a << 3n;
+    assert(left >= 0n || left < 0n)``. With ``a = 32`` the shift leaves the
+    1-byte ``[0x00]`` and OP_GREATERTHANOREQUAL aborts on chain.
+    """
+
+    def test_aliased_non_minimal_result_aborts_numeric_consumer(self):
+        with pytest.raises(ValueError, match="OP_NUMEQUAL: non-minimally encoded"):
+            _run_chain([
+                _const("a", 1),
+                _const("b", 1),
+                _bin("shifted", ">>", "a", "b"),   # raw [0x00]
+                _alias("s", "shifted"),            # const s = a >> 1
+                _const("zero", 0),
+                _bin("result", "===", "s", "zero"),
+            ])
+
+    def test_aliased_non_minimal_bytes_still_feed_a_byte_op(self):
+        # CONTROL, and a regression for the byte-op threading itself: an alias
+        # that drops the entry makes OP_OR re-derive 0's EMPTY encoding and
+        # abort on a length mismatch the chain never sees.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),   # raw [0x00]
+            _alias("s", "shifted"),            # const s = a << 8
+            _const("c", 5),
+            _bin("ored", "|", "s", "c"),
+            _bin("result", "===", "ored", "c"),
+        ])
+        assert env["ored"] == 5
+        assert env["result"] is True
+
+    def test_aliased_minimal_result_still_accepted(self):
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 1),
+            _bin("shifted", ">>", "a", "b"),   # raw [0x01] -- minimal
+            _alias("s", "shifted"),
+            _const("one", 1),
+            _bin("result", "===", "s", "one"),
         ])
         assert env["result"] is True
