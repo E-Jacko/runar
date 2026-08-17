@@ -19,15 +19,18 @@
 //! # Why this test asserts the output layout instead of replaying ScriptVM
 //!
 //! The Rust tier's `ScriptVm` (`packages/runar-rs/src/sdk/script_vm.rs`) wraps
-//! `bsv-sdk` v0.1.72's `Spend`. That interpreter **cannot validate any Rúnar
-//! OP_PUSH_TX continuation covenant**: the compiled covenant embeds a `0x8d`
-//! byte inside its push-tx machinery, and `bsv-sdk`'s script parser desyncs on
-//! it and aborts with `DisabledOpcode("OP_2MUL")` (0x8d) — hard-disabled with
-//! no config escape (`spend_ops.rs:779`). This reproduces for a PLAIN
-//! continuation with NO raw output (e.g. `MessageBoard.post`), so it is a
-//! standing library limitation entirely independent of G1, not something this
-//! fix can influence. The Rust `Spend` therefore cannot distinguish the pre-fix
-//! (broken) tx from the post-fix (valid) one — both abort at parse.
+//! `bsv-sdk`'s `Spend`. That interpreter **cannot validate any Rúnar OP_PUSH_TX
+//! continuation covenant**: Rúnar targets Chronicle, whose re-enabled `OP_2MUL`
+//! (0x8d) the OP_PUSH_TX low-S normalisation emits as a real opcode, and
+//! `bsv-sdk` implements the pre-Chronicle policy that hard-disables it with no
+//! config escape — so the spend aborts with `DisabledOpcode("OP_2MUL")`. (This
+//! is an opcode-profile mismatch, not the "parser desync" an earlier write-up
+//! claimed; see `docs/audit/upstream-bsv-sdk-op2mul-chronicle.md`.) It
+//! reproduces for a PLAIN continuation with NO raw output (e.g.
+//! `MessageBoard.post`), so it is a standing library limitation entirely
+//! independent of G1, not something this fix can influence. The Rust `Spend`
+//! therefore cannot distinguish the pre-fix (broken) tx from the post-fix
+//! (valid) one — both abort on that opcode.
 //!
 //! We instead assert the exact byte-level output layout the covenant's
 //! hashOutputs check requires — the same verification the spec prescribes for

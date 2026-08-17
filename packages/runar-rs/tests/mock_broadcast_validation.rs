@@ -9,10 +9,13 @@
 //! inputs are known validated NOTHING and was accepted. Here that is an error,
 //! so the gate can never pass vacuously.
 //!
-//! Divergence recorded honestly rather than papered over: `bsv-sdk` aborts on a
-//! Rúnar OP_PUSH_TX covenant with `disabled opcode: OP_2MUL`. Such an input is
-//! counted as UNVALIDATABLE, never as validated — so it can never satisfy the
-//! non-vacuity requirement on its own. See `last_validation_report()`.
+//! Divergence recorded honestly rather than papered over: Rúnar targets
+//! **Chronicle**, the post-Genesis BSV profile that re-enables `OP_2MUL`
+//! (0x8d), and every OP_PUSH_TX covenant emits that opcode. `bsv-sdk`
+//! implements the pre-Chronicle policy and hard-disables it, aborting with
+//! `disabled opcode: OP_2MUL`. Such an input is counted as UNVALIDATABLE, never
+//! as validated — so it can never satisfy the non-vacuity requirement on its
+//! own. See `last_validation_report()`.
 //!
 //! The other bound this file used to record — `bsv-sdk` mis-ordering
 //! `hashPrevouts` for `input_index > 0` — is **fixed as of 0.2.89**, which
@@ -32,6 +35,19 @@ use runar_lang::sdk::{
 
 const ANYONE_CAN_SPEND: &str = "51"; // OP_TRUE
 const DEPLOYER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000003";
+
+/// Minimal stateful contract — compiles to an OP_PUSH_TX continuation covenant,
+/// which is the script class `bsv-sdk` cannot run (see the OP_2MUL pins).
+const STATEFUL_COUNTER_SRC: &str = r#"
+    class SatCounter extends StatefulSmartContract {
+      count: bigint;
+      constructor(count: bigint) { super(count); this.count = count; }
+      public inc() {
+        this.count = this.count + 1n;
+        this.addOutput(1000n, this.count);
+      }
+    }
+"#;
 
 /// One-input, one-output transaction spending `prev_txid:0`.
 fn one_input_tx(prev_txid: &str, unlocking_hex: &str, out_sats: u64) -> BsvTx {
@@ -185,6 +201,127 @@ fn pin_bsv_sdk_sighashes_every_input_index_correctly() {
         "bsv-sdk has REGRESSED BIP-143 sighashing for input_index > 0. \
          src/sdk/provider.rs::validate_broadcast_tx executes every known input on the \
          strength of this pin; restore an index carve-out there before trusting it again."
+    );
+}
+
+/// Rúnar targets **Chronicle**, the post-Genesis BSV profile that re-enables
+/// `OP_2MUL` (0x8d) — `06-emit.ts` maps it as such, and the OP_PUSH_TX low-S
+/// normalisation (`oppushtx-codegen.ts`) emits it, so it appears as a real
+/// opcode in EVERY stateful contract's covenant. `bsv-sdk` implements the
+/// pre-Chronicle policy and hard-disables `OP_2MUL` with no config escape.
+///
+/// This is NOT a parser desync (an earlier write-up said so): a correct script
+/// walk lands on 0x8d at a genuine opcode boundary. It is an opcode-profile
+/// mismatch, which is why `validate_broadcast_tx` tolerates exactly one error
+/// class and buckets those inputs as `unvalidatable`.
+///
+/// Minimal pin: a bare `OP_2MUL` script. Goes RED the day bsv-sdk adopts the
+/// Chronicle opcode set — at which point the tolerated-error class in
+/// `validate_broadcast_tx` should be deleted.
+#[test]
+fn pin_bsv_sdk_rejects_op2mul_disabled_by_pre_chronicle_policy() {
+    use bsv::script::spend::{Spend, SpendParams};
+
+    // <1> OP_2MUL  — on Chronicle this leaves 2 on the stack and succeeds.
+    let err = Spend::new(SpendParams {
+        locking_script: LockingScript::from_hex("8d").unwrap(),
+        unlocking_script: UnlockingScript::from_hex("51").unwrap(),
+        source_txid: "ee".repeat(32),
+        source_output_index: 0,
+        source_satoshis: 10_000,
+        transaction_version: 1,
+        transaction_lock_time: 0,
+        transaction_sequence: 0xffff_ffff,
+        other_inputs: vec![],
+        other_outputs: vec![],
+        input_index: 0,
+    })
+    .validate()
+    .err()
+    .map(|e| e.to_string());
+
+    assert_eq!(
+        err.as_deref(),
+        Some("disabled opcode: OP_2MUL"),
+        "bsv-sdk now runs OP_2MUL (Chronicle opcode set adopted). Delete the \
+         `disabled opcode` tolerated-error class in \
+         src/sdk/provider.rs::validate_broadcast_tx so Rúnar covenant inputs are \
+         script-validated instead of bucketed as `unvalidatable`."
+    );
+}
+
+/// End-to-end companion to the pin above: a REAL compiled Rúnar stateful
+/// covenant, spent through the SDK's own call path, still cannot be executed by
+/// `bsv-sdk` — so the primary fund path of a stateful contract is bucketed
+/// `unvalidatable`, never `validated`. This is the finding the bare-opcode pin
+/// abstracts, kept alongside it so the consequence is stated in Rúnar's own
+/// terms and goes RED at the same moment.
+#[test]
+fn pin_runar_stateful_covenant_input_is_unvalidatable_by_bsv_sdk() {
+    let signer = LocalSigner::new(DEPLOYER_KEY).unwrap();
+    let address = signer.get_address().unwrap();
+    let funding = build_p2pkh_script(&signer.get_public_key().unwrap());
+
+    let mut deploy_provider = MockProvider::testnet();
+    deploy_provider.add_utxo(
+        &address,
+        Utxo {
+            txid: "a1".repeat(32),
+            output_index: 0,
+            satoshis: 500_000,
+            script: funding.clone(),
+        },
+    );
+
+    let artifact: RunarArtifact = {
+        let compiler_art = runar_compiler_rust::compile_from_source_str(
+            STATEFUL_COUNTER_SRC,
+            Some("SatCounter.runar.ts"),
+        )
+        .expect("SatCounter source should compile");
+        let json = serde_json::to_string(&compiler_art).expect("serialize compiler artifact");
+        serde_json::from_str(&json).expect("deserialize into SDK RunarArtifact")
+    };
+
+    let mut contract = RunarContract::new(artifact, vec![SdkValue::Int(5)]);
+    contract
+        .deploy(
+            &mut deploy_provider,
+            &signer,
+            &DeployOptions { satoshis: 1, change_address: None, funding_signer: None },
+        )
+        .expect("deploy should succeed");
+
+    let mut call_provider = MockProvider::testnet();
+    call_provider.add_utxo(
+        &address,
+        Utxo {
+            txid: "b1".repeat(32),
+            output_index: 1,
+            satoshis: 500_000,
+            script: funding,
+        },
+    );
+    let contract_utxo = contract.get_utxo().expect("deploy tracks a contract UTXO").clone();
+    call_provider.add_contract_utxo(&contract_utxo.script.clone(), contract_utxo);
+
+    contract
+        .call("inc", &[], &mut call_provider, &signer, None)
+        .expect("call(inc) should build + broadcast");
+
+    let r = call_provider.last_validation_report();
+    assert_eq!(r.total, 2, "the call spends the covenant plus one funding coin");
+    assert_eq!(
+        r.unvalidatable, 1,
+        "the covenant input must be bucketed as unvalidatable — if this is now 0, bsv-sdk \
+         can run Rúnar covenants and the tolerated-error class in validate_broadcast_tx \
+         should be deleted; report was {:?}",
+        r
+    );
+    assert_eq!(
+        r.validated, 1,
+        "the funding input must still really execute (non-vacuity witness); report was {:?}",
+        r
     );
 }
 

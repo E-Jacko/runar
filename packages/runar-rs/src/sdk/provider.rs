@@ -237,9 +237,11 @@ impl MockProvider {
 ///   OP_PUSH_TX low-S normalisation emits exactly that opcode. `bsv-sdk`
 ///   implements the pre-Chronicle policy and hard-disables it with no config
 ///   escape, so the covenant aborts with `disabled opcode: OP_2MUL`. Those
-///   inputs are counted as `unvalidatable`, never as validated. If upstream
-///   ever adopts the Chronicle opcode set, this tolerated-error class should be
-///   deleted too.
+///   inputs are counted as `unvalidatable`, never as validated. Pinned by
+///   `mock_broadcast_validation.rs::pin_bsv_sdk_rejects_op2mul_*`, which go RED
+///   the day upstream adopts the Chronicle opcode set — at which point this
+///   tolerated-error class should be deleted too. See
+///   `docs/audit/upstream-bsv-sdk-op2mul-chronicle.md`.
 fn validate_broadcast_tx(
     tx: &BsvTransaction,
     known: &HashMap<String, KnownOutpoint>,

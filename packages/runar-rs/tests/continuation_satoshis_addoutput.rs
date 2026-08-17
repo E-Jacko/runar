@@ -13,8 +13,9 @@
 //! # Verification strategy (no ScriptVM replay)
 //!
 //! The Rust tier's `ScriptVm` wraps `bsv-sdk`'s `Spend`, which cannot validate a
-//! Rúnar OP_PUSH_TX continuation covenant (it aborts on the `0x8d` byte inside
-//! the push-tx machinery — see `g1_raw_outputs_spend.rs` for the full write-up).
+//! Rúnar OP_PUSH_TX continuation covenant (it hard-disables the `OP_2MUL` the
+//! push-tx machinery emits — see `g1_raw_outputs_spend.rs` for the full
+//! write-up).
 //! We therefore assert the byte-level output layout the covenant's hashOutputs
 //! check requires: continuation output (index 0) must carry exactly the
 //! addOutput amount. RED (pre-fix) emits the input value (1 sat); GREEN
