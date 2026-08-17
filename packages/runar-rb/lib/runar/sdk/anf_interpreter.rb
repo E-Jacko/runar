@@ -452,7 +452,20 @@ module Runar
         when 'load_const'
           v = value['value']
           # Handle @ref: aliases — resolve to the named env variable.
-          v.is_a?(String) && v.start_with?('@ref:') ? env[v[5..]] : v
+          if v.is_a?(String) && v.start_with?('@ref:')
+            target = v[5..]
+            # An alias is a pure rename — the lowering emits one for every
+            # named local (+const left = a << 3n+ becomes +t2 = a << 3n+ plus
+            # +left = @ref:t2+). It occupies the SAME stack bytes as its
+            # target, so the side-map entry must travel with it or both the
+            # non-minimal numeric check and the chained byte-op threading go
+            # blind on real compiler output.
+            sbytes = Thread.current[:runar_script_bytes]
+            sbytes[binding_name] = sbytes[target] if sbytes && binding_name && sbytes.key?(target)
+            env[target]
+          else
+            v
+          end
 
         when 'bin_op'
           op        = value['op']
