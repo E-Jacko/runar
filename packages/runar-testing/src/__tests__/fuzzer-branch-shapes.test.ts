@@ -136,6 +136,26 @@ function classifyBranch(body: Stmt[]): BranchShape | null {
       ? 'straight-line-rebind'
       : null;
   }
+  // The #149 shape, re-derived from the statements rather than from a label:
+  // an outer `if` with NO else whose ONLY statement is an inner `if` that
+  // rebinds the SAME single local in both arms — leaving the second declared
+  // carrier live and untouched in the region inherited from the outer arm.
+  const innerIf = branch.then.length === 1 && branch.then[0]!.kind === 'if' ? (branch.then[0] as If) : null;
+  if (innerIf !== null && branch.else_ === undefined) {
+    const it_ = [...new Set(targets(innerIf.then, false))];
+    const ie = [...new Set(targets(innerIf.else_, false))];
+    if (
+      it_.length === 1 &&
+      ie.length === 1 &&
+      it_[0] === ie[0] &&
+      carriers.length === 2 &&
+      it_[0] === carriers[0] &&
+      !targets(innerIf.then, false).includes(carriers[1]!) &&
+      !targets(innerIf.else_, false).includes(carriers[1]!)
+    ) {
+      return 'nested-sibling-no-else';
+    }
+  }
   const thenLocals = targets(branch.then, false);
   const elseLocals = targets(branch.else_, false);
   const thenProps = targets(branch.then, true);
@@ -195,13 +215,14 @@ describe('IR generator branch shapes: reachability', () => {
     // Fixed seed => fixed first-hit indices. Recorded so a change to the draw
     // order shows up in the diff rather than silently shifting the corpus.
     expect(Object.fromEntries(firstIndex)).toEqual({
-      'straight-line-rebind': 0,
-      'multi-rebind-one-arm': 1,
-      'both-arms-rebind-one': 1,
-      'asymmetric-rebind': 2,
-      'both-arms-rebind-both': 4,
-      'assert-only': 7,
-      'rebind-read-after': 8,
+      'both-arms-rebind-one': 0,
+      'rebind-read-after': 1,
+      'assert-only': 4,
+      'straight-line-rebind': 6,
+      'both-arms-rebind-both': 8,
+      'asymmetric-rebind': 14,
+      'nested-sibling-no-else': 20,
+      'multi-rebind-one-arm': 36,
     });
     // The stateless contract has only readonly properties, so no arm can
     // contain a property write there — that shape is stateful-only.
@@ -216,14 +237,21 @@ describe('IR generator branch shapes: reachability', () => {
       `seed ${SEED} / 120 samples reached: ${JSON.stringify(Object.fromEntries(firstIndex))}`,
     ).toEqual([]);
     expect(Object.fromEntries(firstIndex)).toEqual({
-      'rebind-read-after': 2,
-      'prop-write-in-arm': 3,
-      'straight-line-rebind': 8,
-      'multi-rebind-one-arm': 10,
-      'assert-only': 13,
-      'asymmetric-rebind': 15,
-      'both-arms-rebind-one': 20,
-      'both-arms-rebind-both': 32,
+      'asymmetric-rebind': 2,
+      'prop-write-in-arm': 2,
+      'both-arms-rebind-one': 3,
+      'straight-line-rebind': 4,
+      'rebind-read-after': 8,
+      'both-arms-rebind-both': 13,
+      'assert-only': 18,
+      'multi-rebind-one-arm': 22,
+      // Last to appear, and the reason this map is pinned rather than merely
+      // checked for completeness: the #149 shape is drawn from the same
+      // uniform pool as the rest but needs a stateful method that draws the
+      // branch block at all, so it lands deep in the 120-sample corpus. A draw
+      // change that pushed it past the sample budget would silently drop the
+      // ONLY nested-`if` topology `--execute` can reach.
+      'nested-sibling-no-else': 80,
     });
   });
 
@@ -235,12 +263,12 @@ describe('IR generator branch shapes: reachability', () => {
     expect(Object.fromEntries(stateless)).toEqual({
       'single-carrier': 0,
       'k2-cross-read': 1,
-      'nested-cross-read': 5,
+      'nested-cross-read': 1,
     });
     expect(Object.fromEntries(stateful)).toEqual({
       'k2-cross-read': 1,
       'nested-cross-read': 7,
-      'single-carrier': 11,
+      'single-carrier': 9,
     });
   });
 
@@ -305,6 +333,75 @@ describe('IR generator branch shapes: structure', () => {
         expect(targets(branch.else_, false)).toEqual(['merge1']);
       }
     }
+  });
+
+  it('nested-sibling-no-else has BOTH #149 degrees of freedom', () => {
+    for (const c of sampleOf('nested-sibling-no-else')) {
+      for (const m of c.methods) {
+        const outer = findIf(m.body)!;
+        // (2) the OUTER `if` has no else, so only one outer path rearranges the
+        // inherited region and the two paths exit at equal DEPTH, different
+        // LAYOUT. With an else, both paths get rearranged and every
+        // post-OP_ENDIF read resolves the same way on either.
+        expect(outer.else_, 'the outer if must have NO else').toBeUndefined();
+        expect(outer.then.length).toBe(1);
+        const inner = outer.then[0]!;
+        expect(inner.kind).toBe('if');
+        if (inner.kind !== 'if') continue;
+        // (1) the inner `if` merges merge0 in BOTH arms — so it DECLARES a
+        // result and ROLL+DROPs the stale copy — and never touches merge1,
+        // which therefore stays live in the region inherited from the outer arm.
+        expect(targets(inner.then, false)).toEqual(['merge0']);
+        expect(targets(inner.else_, false)).toEqual(['merge0']);
+        expect(mutableDecls(m.body).filter((n) => n.startsWith('merge'))).toEqual([
+          'merge0',
+          'merge1',
+        ]);
+      }
+    }
+  });
+
+  it('nested-sibling-no-else reads the merged local and the sibling ORDER-SENSITIVELY', () => {
+    // `===` / `!==` are symmetric in their operands: a script that read the two
+    // slots CROSSED reports the same verdict as one that read them correctly,
+    // so every downstream oracle agrees on bytes that resolved the wrong stack
+    // positions. Measured on the tri-modal generator, whose commutative read
+    // clause did exactly that. Only a RELATIONAL read flips under the rotation.
+    const RELATIONAL = new Set(['<', '>', '<=', '>=']);
+    for (const c of sampleOf('nested-sibling-no-else')) {
+      for (const m of c.methods) {
+        const last = m.body[m.body.findIndex((s) => s.kind === 'if') + 1]!;
+        expect(last.kind).toBe('assert');
+        if (last.kind !== 'assert') continue;
+        const cond = last.condition;
+        expect(cond.kind).toBe('binary');
+        if (cond.kind !== 'binary') continue;
+        expect(RELATIONAL.has(cond.op), `read clause op ${cond.op} is symmetric`).toBe(true);
+        expect(cond.left).toEqual({ kind: 'var_ref', name: 'merge0' });
+        expect(cond.right).toEqual({ kind: 'var_ref', name: 'merge1' });
+      }
+    }
+  });
+
+  it('the UNFORCED stateless corpus now nests an `if` (it never did)', () => {
+    // The regression this pins, measured on the pre-2026-08-17 generator: over
+    // 3000 unforced samples of `arbGeneratedContract` the maximum `if`-nesting
+    // depth was 1. `--execute` draws its ENTIRE corpus from this arbitrary, so
+    // no seed and no budget could have reached a nested-`if` layout defect —
+    // while `--tri-modal` and `--spend-oracle` had both been extended to.
+    const depth = (stmts: Stmt[]): number =>
+      stmts.reduce((best, s) => {
+        if (s.kind === 'if') {
+          return Math.max(best, 1 + Math.max(depth(s.then), depth(s.else_ ?? [])));
+        }
+        if (s.kind === 'for') return Math.max(best, depth(s.body));
+        return best;
+      }, 0);
+    const corpus = fc.sample(arbGeneratedContract, { numRuns: 120, seed: SEED });
+    const maxDepth = Math.max(
+      ...corpus.flatMap((c) => c.methods.map((m) => depth(m.body))),
+    );
+    expect(maxDepth).toBeGreaterThanOrEqual(2);
   });
 
   it('prop-write-in-arm writes a PROPERTY inside an arm', () => {

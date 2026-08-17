@@ -909,6 +909,56 @@ export type BranchShape =
   | 'asymmetric-rebind'
   /** Both arms rebind BOTH locals — the balanced control for the above. */
   | 'both-arms-rebind-both'
+  /**
+   * The issue-#149 shape: an inner `if` that merges `merge0` in BOTH arms,
+   * nested inside an outer `if` with NO `else`, with `merge1` left LIVE and
+   * UNTOUCHED beside it.
+   *
+   * Every other member of this family has ONE `if`. Measured on the pre-#149
+   * generator, `arbGeneratedContract` reached a maximum `if`-nesting depth of 1
+   * over 3000 samples — it never nested, so `--execute` (which draws its whole
+   * corpus from here) was structurally blind to the defect while `--tri-modal`
+   * and `--spend-oracle` had both been extended to reach it.
+   *
+   * TWO degrees of freedom are required TOGETHER, which is why no combination
+   * of the single-`if` shapes above can stand in for it:
+   *
+   *  1. the inner `if` rebinds only a PREFIX of the carriers (`merge0`), so
+   *     `merge1` stays live and untouched in the slot region the outer arm
+   *     INHERITED from the parent — the slots an adopted result has to cross.
+   *     When every local is a declared result there is no inherited slot left
+   *     to rotate past and the adopt-then-remove sequence disturbs no layout;
+   *  2. the OUTER `if` has NO `else`, so only ONE outer path rearranges that
+   *     region: the two paths leave equal DEPTH with different LAYOUT, which is
+   *     invisible to both the reconcile's name-set check and Layer C's depth
+   *     check. With an outer `else` both paths get rearranged and every
+   *     post-`OP_ENDIF` read resolves the same way on either.
+   *
+   * The inner `if` keeps a real `else` on purpose: the confirmed #149 inner
+   * `if` had one, and the repair must not be gated on its absence.
+   *
+   * MEASURED, not asserted. Against the compiler with the `sinkBelow` repair in
+   * `lowerIf` (`packages/runar-compiler/src/passes/05-stack-lower.ts`)
+   * temporarily reverted, `--execute --num 1000` reports, per seed:
+   *
+   *      seed        WITHOUT this shape      WITH this shape
+   *      424242       0 / 11874 spends       11 / 11874 spends
+   *      20260817     0 / 11862 spends       14 / 11862 spends
+   *      909090       0 / 11712 spends       17 / 11712 spends
+   *
+   * and 0 on all three once the repair is restored. The left column is the gap
+   * this shape closes: the harness was not merely unlucky, the layout was
+   * OUTSIDE its reachable space. Note the rate — roughly 1 divergence per 1000
+   * contracts, because a divergence is only visible when the interpreter
+   * accepts the whole method (~7% of spends) — so a gate run at `--num 60`
+   * will NOT see a #149 regression even now.
+   *
+   * See `conformance/fuzzer/spend-shapes.ts` (`nested-sibling`) for the same
+   * two degrees of freedom in the Spend-oracle corpus, and
+   * `packages/runar-testing/src/__tests__/branch-inherited-layout-directions-vm.test.ts`
+   * for the hand-reduced witnesses in both directions.
+   */
+  | 'nested-sibling-no-else'
   /** A PROPERTY write inside an arm (stateful contracts only). */
   | 'prop-write-in-arm';
 
@@ -922,6 +972,7 @@ export const BRANCH_SHAPES: readonly BranchShape[] = [
   'multi-rebind-one-arm',
   'asymmetric-rebind',
   'both-arms-rebind-both',
+  'nested-sibling-no-else',
 ];
 
 /** Branch shapes reachable in a `StatefulSmartContract` — the stateless set
@@ -948,6 +999,11 @@ export function branchShapeCarriers(shape: BranchShape): string[] {
     case 'multi-rebind-one-arm':
     case 'asymmetric-rebind':
     case 'both-arms-rebind-both':
+    // `merge0` is the inner `if`'s declared result; `merge1` is the live
+    // untouched sibling it has to rotate past. Both are declared before the
+    // outer branch, in this order — `merge0` deeper, which is what puts an
+    // inherited slot between the adopted result and its stale pre-`if` copy.
+    case 'nested-sibling-no-else':
       return [...MERGE_LOCALS];
   }
 }
@@ -1000,6 +1056,36 @@ function arbCarrierReadClause(
 }
 
 /**
+ * The ORDER-SENSITIVE post-branch read for `nested-sibling-no-else`:
+ * `merged <relop> sibling`, with `relop` drawn from the four RELATIONAL
+ * operators only.
+ *
+ * `===` / `!==` are deliberately excluded: they are symmetric in their
+ * operands, so a script that read the two slots CROSSED reports the same
+ * verdict as one that read them correctly, and every downstream oracle agrees
+ * on bytes that resolved the wrong stack positions. That is not hypothetical —
+ * it was measured directly on the tri-modal generator, whose commutative read
+ * clause reported agreement on a rotated layout. A relational read flips
+ * whenever the two values differ, which is the whole point of the shape.
+ */
+function arbSiblingReadClause(
+  merged: string,
+  sibling: string,
+): fc.Arbitrary<Stmt> {
+  return fc
+    .constantFrom('<' as const, '>' as const, '<=' as const, '>=' as const)
+    .map((op): Stmt => ({
+      kind: 'assert',
+      condition: {
+        kind: 'binary',
+        op,
+        left: { kind: 'var_ref', name: merged },
+        right: { kind: 'var_ref', name: sibling },
+      },
+    }));
+}
+
+/**
  * A branch block of the requested shape: carrier declarations, the branch (or
  * straight-line rebind), and the carrier read. `mutableProps` is the list of
  * writable bigint property names — empty for a stateless contract, which is
@@ -1034,6 +1120,52 @@ function arbBranchBlockIR(
   // The carriers are in scope for the rebind expressions and the read clause,
   // so an arm can read the other merged local as well as write its own.
   const inner = [...carriers, ...bigintVars];
+
+  if (shape === 'nested-sibling-no-else') {
+    // Drawn on its own so the other shapes' draw sequences are untouched: this
+    // is the only member that needs TWO conditions (outer and inner) and a
+    // dedicated read clause, and folding those into the shared tuple below
+    // would reshuffle the whole fixed-seed corpus for no gain.
+    const [merged, sibling] = carriers as [string, string];
+    return fc
+      .tuple(
+        fc.tuple(arbBigintExprIR(bigintVars, 1), arbBigintExprIR(bigintVars, 1)),
+        arbBoolExprIR(bigintVars, boolVars, 1),
+        arbBoolExprIR(bigintVars, boolVars, 1),
+        arbLocalRebind(merged, inner),
+        arbLocalRebind(merged, inner),
+        arbSiblingReadClause(merged, sibling),
+      )
+      .map(([inits, outerCond, innerCond, thenRebind, elseRebind, readClause]): Stmt[] => {
+        const decls: Stmt[] = carriers.map((name, i) => ({
+          kind: 'var_decl',
+          name,
+          type: 'bigint',
+          value: inits[i]!,
+          mutable: true,
+        }));
+        return [
+          ...decls,
+          {
+            kind: 'if',
+            condition: outerCond,
+            // NO else on the outer `if` — degree of freedom (2).
+            then: [
+              {
+                kind: 'if',
+                condition: innerCond,
+                // Only `merged` is rebound, so `sibling` stays live and
+                // untouched in the inherited region — degree of freedom (1).
+                then: [thenRebind],
+                else_: [elseRebind],
+              },
+            ],
+            else_: undefined,
+          },
+          readClause,
+        ];
+      });
+  }
 
   return fc
     .tuple(
