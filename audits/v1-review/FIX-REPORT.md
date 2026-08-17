@@ -179,23 +179,83 @@ audit says lets defects through.
 
 ---
 
+## Round 2 — resolving the open risks
+
+### A NEW S0 fell out of risk 7, and it was hiding behind a vacuous test
+
+Probes P16/P17/P18 were recorded INCONCLUSIVE. Resolving them properly:
+
+- **P16** (negative `OP_DIV`/`OP_MOD`) — **cleared**. 12 runs, both fold modes,
+  0 divergences, and **non-vacuous**: 2 accepts / 10 rejects, so both verdicts
+  are genuinely exercised.
+- **P17** (`safediv`/`safemod` zero divisor) — **probe authoring error**, not a
+  defect. `spec/grammar.md:676` defines these as *asserting* `b != 0`, so a zero
+  divisor correctly aborts; the probe expected `0`.
+- **P18** (shift ≥ width) — agreement was **VACUOUS**: every input rejected, so
+  interpreter/script agreement proved nothing. Forcing an accepting input
+  exposed a real, previously-unknown **S0**.
+
+**The defect.** `OP_LSHIFT`/`OP_RSHIFT` preserve byte length, so `1 >> 1` leaves
+`[0x00]` — a NON-MINIMAL zero. Every numeric consumer on chain decodes with
+`fRequireMinimal=true` and ABORTS. The ANF interpreter threaded `scriptBytes`
+through `& | ^ << >>` (the 2026-07 #141 fix) but the numeric cases read only the
+decoded value and dropped them — re-minimising and ACCEPTING a spend no node
+accepts. `TestContract` green, deployed UTXO unspendable.
+
+```
+n=1  (n >> 1) === 0   interp=true  spend=false   "non-minimally encoded script number"
+n=1  (n << 64) === 0  interp=true  spend=false   same
+n=2  (n >> 1) === 1   both accept                (minimal result — unaffected)
+```
+
+Fixed in TS by gating exactly the numeric consumers (`+ - * / %`, the
+comparisons, and a shift's COUNT); byte ops untouched so
+`2026-07-14-chained-shift-or-nonminimal` still passes. Ported to the other tiers
+(in flight at time of writing — see status below).
+
+**It also exposed a weak oracle.** `script-number-bitwise-chained.test.ts`
+compared against the bare `ScriptVM`, whose `success` is "no evaluation error and
+truthy top of stack" — no consensus wrappers, so no minimal-encoding rule.
+Measured over its own 126-case sweep after the fix: interpreter vs **consensus
+`Spend` = 0 mismatches**; vs bare `ScriptVM` = **22**. Re-keyed onto consensus,
+and the replay harness gained an `oracle: tri-modal` mode so a divergence only a
+real node sees can be pinned at all.
+
+**Regression entry proven, not assumed:** with the fix reverted the new entry
+FAILS; restored, the corpus is 6/6. That is the property CC-012 found missing.
+
+### Risk 5 reclassified — it is dead code, not a coverage hole
+
+CC-016 called `05-stack-lower.ts:2212` a zero-coverage *reachable* path. Measured
+by instrumenting the body and counting firings: **0** across all 71 fixtures,
+9 hand-designed terminal-`if` shapes, 1200 `--tri-modal` runs and 400
+`--spend-oracle` cases. So the surviving mutant there is an **equivalent mutant
+over dead code**, not coverage debt — a different finding, and the mutation score
+should stop counting it. Not deleted: "I could not reach it" is not "provably
+unreachable", and removing a defensive cleanup from `lowerIf` on that evidence is
+not a trade worth making before v1. Recorded in-code with what would change the
+decision either way.
+
 ## Open v1 risks — blunt
 
 | # | risk | recommendation | cost to close |
 |---|---|---|---|
-| 1 | **`--execute` still blind to #149.** `arbGeneratedContract` measured max `if`-nesting depth **1 over 3000 samples** — it never nests. M1 fixed `--tri-modal` only. | **Defer** — `--spend-oracle` and `--tri-modal` now cover the shape | Touches `BRANCH_SHAPES`, which feeds `--ir` cross-tier parity + a 51-test gate. ~1 session |
-| 2 | **GK-031 / GK-032 upstream `bsv-sdk` (Rust)** — `hashPrevouts` wrong order for `input_index>0`; OP_PUSH_TX `0x8d` desync makes covenants UNVALIDATABLE in the Rust tier. Documented + pinned in-repo, **not filed upstream**. | **Accept for v1, file upstream** | Not fixable here |
-| 3 | **Provenance debt: 27 of 210 entries self-declare `unreviewed`**; `tests/vectors/*.json` (the ONLY independent oracle for Go-only crypto) still outside `GOLDEN_MATCHERS` | **Defer with a named owner** | ~1 session for the matcher; the 27 need human review |
-| 4 | **Go-only crypto KATs** (Merkle et al. have only repo-generated vectors) | **Accept** — documented policy | Upstream KAT or 2nd implementation |
-| 5 | **Mutation corpus** — curated 22 @ 100% vs mechanical 578 @ 68.3%; 25/25 escalated survivors caught by NOTHING; a zero-coverage path inside `lowerIf` (`05-stack-lower.ts:2212`, 0 executions across all 71 fixtures) | **Defer** | ~1 session |
-| 6 | **"Axiom Taxonomy" table** (manifest line 275) still claims `ANF/Eval.lean` = 6 vs gate-verified 7 — same drift class, outside the new gate | **Defer** — cosmetic, gate is authoritative | ~1 hour |
-| 7 | **Probes P16/P17/P18 INCONCLUSIVE, not cleared** — negative `OP_DIV`/`OP_MOD`, zero divisor, shift ≥ width. Two runs used mismatched args. | **Close before v1** | ~2 hours |
-| ~~8~~ | ~~`test:ci` not run end-to-end; native suites not re-run after C2/C3~~ | **CLOSED** — full `test:ci` green including on-chain integration on all 7 tiers; all 7 native suites green | done |
-| 9 | Zig's rejection message is `error: ValidationFailed` where peers name the property | **Accept** | ~1 hour |
-| 10 | **`conformance:sdk` depends on ambient-PATH `tsx`.** Without a root-level tsx it fails as `sh: tsx: command not found`, surfaced as a TypeScript-TIER conformance failure while 6 tiers pass — it reads like a code defect, not a missing tool. Cost a false alarm here; would cost CI one too. | **Close before v1** — pin the stage to the conformance-local tsx | ~15 min |
+| 1 | **`--execute` still blind to #149.** `arbGeneratedContract` measured max `if`-nesting depth **1 over 3000 samples**. M1 fixed `--tri-modal` and `--spend-oracle` only. | **DEFER, explicitly.** The shape is now covered by two absolute oracles, one of them the strongest in the repo. Extending `BRANCH_SHAPES` also feeds `--ir` cross-tier parity and a gate that enumerates shapes dynamically and requires each to be reachable at a FIXED seed and to compile in both fold modes — a broad generator change for marginal safety value. Not attempted rather than half-done. | ~1 session |
+| 2 | **GK-031 / GK-032 upstream `bsv-sdk` (Rust)** — `hashPrevouts` wrong order for `input_index>0`; OP_PUSH_TX `0x8d` desync makes covenants UNVALIDATABLE in the Rust tier. Documented + pinned in-repo. | **Accept for v1.** Not fixable here; upstream filing left to you (no issues filed this session, per instruction) | Not fixable here |
+| ~~3~~ | ~~`tests/vectors/*.json` outside `GOLDEN_MATCHERS`~~ | **CLOSED** — gate extended; demonstrated rejecting an unjustified vector change (exit 1) and passing the real diff (exit 0) | done |
+| 3b | **27 of 210 provenance entries still self-declare `unreviewed`** | **Defer with a named owner** — needs human review, not a code change | human review |
+| 4 | **Go-only crypto KATs** (Merkle et al. have only repo-generated vectors) | **Accept** — documented policy; now at least gate-protected via risk 3 | upstream KAT or 2nd impl |
+| ~~5~~ | ~~zero-coverage path inside `lowerIf`~~ | **RECLASSIFIED** — measured unreachable; equivalent mutant over dead code, not coverage debt | done |
+| ~~6~~ | ~~Axiom Taxonomy table drift~~ | **CLOSED** — labelled a dated snapshot pointing at the machine-checked inventory | done |
+| ~~7~~ | ~~P16/P17/P18 inconclusive~~ | **CLOSED** — P16 cleared (non-vacuous), P17 was a probe authoring error, P18 exposed a real S0 now fixed + pinned | done |
+| ~~8~~ | ~~`test:ci` not run end-to-end~~ | **CLOSED** — all five stages green incl. on-chain integration on 7 tiers | done |
+| 9 | Zig's rejection message is `error: ValidationFailed` where peers name the property | **Accept** — DX, not correctness; rejection itself is verified in all 7 tiers | ~1 hour |
+| ~~10~~ | ~~`conformance:sdk` ambient-PATH `tsx`~~ | **CLOSED** — resolves the repo-local binary; verified with tsx absent from PATH | done |
+| 11 | **Mutation corpus: 68.3%, 25/25 escalated survivors caught by nothing.** Risk 5 explains ONE survivor; the other 24 are untriaged for equivalence. | **Defer** | ~1 session |
 
-Risk 7 is the one I would not ship without. Risk 10 is trivial to close and
-actively misleading while open.
+Nothing in this table is now a known-wrong behaviour. What remains is coverage
+debt (1, 11), human review (3b), an upstream defect nobody in this repo can fix
+(2), an accepted policy (4) and a DX nit (9).
 
 ---
 
