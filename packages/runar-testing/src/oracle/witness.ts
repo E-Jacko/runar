@@ -55,6 +55,19 @@ function encodeArg(arg: WitnessArg): Uint8Array {
     const num = encodeScriptNumber(arg); // minimal little-endian sign-magnitude
     return pushData(num);
   }
+  // MINIMAL PUSH for ByteStrings too, not just for bigints.
+  //
+  // Consensus `minimaldata` requires the shortest encoding for a push, so a
+  // single byte 0x01..0x10 MUST be OP_1..OP_16 and 0x81 MUST be OP_1NEGATE —
+  // `PUSH1 <byte>` is REJECTED by a node even though it leaves the identical
+  // stack item. Emitting the long form here fed the execution oracle witnesses
+  // no node would accept, which stayed invisible while the VM ran with
+  // `isRelaxed: true` (see oracle/differential-execution.ts).
+  if (arg.length === 1) {
+    const b = arg[0]!;
+    if (b >= 0x01 && b <= 0x10) return new Uint8Array([OP_1 - 1 + b]);
+    if (b === 0x81) return new Uint8Array([OP_1NEGATE]);
+  }
   return pushData(arg);
 }
 

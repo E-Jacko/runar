@@ -22,10 +22,21 @@ describe('BitwiseOps', () => {
     expect(r.success).toBe(true);
   });
 
-  it('testBitwise runs on positive values', () => {
+  it('testBitwise is UNSPENDABLE for these values (non-minimal AND result)', () => {
+  // a=42, b=17 -> 42 & 17 = 0, and OP_AND PRESERVES the operands' 1-byte
+  // length, so the result is the NON-MINIMAL [0x00]. The next line consumes it
+  // with `>=`, a numeric op, and every numeric op on chain decodes with
+  // fRequireMinimal=true and ABORTS. So this spend is impossible.
+  //
+  // Verified against consensus (`Spend.validate()`), not just the interpreter:
+  //   a=42,b=17 -> interp=false spend=false      a=0,b=0 -> both accept
+  //   a=1,b=1   -> interp=false spend=false      a=3,b=1 -> both accept
+  //
+  // Until 2026-08-17 the interpreter re-minimised the result and this asserted
+  // `.toBe(true)` — a green test for a spend no node would accept.
     const c = TestContract.fromSource(source, { a: 42n, b: 17n });
     const r = c.call('testBitwise');
-    expect(r.success).toBe(true);
+    expect(r.success).toBe(false);
   });
 
   it('testBitwise runs on zero', () => {

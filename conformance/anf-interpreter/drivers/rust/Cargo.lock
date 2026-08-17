@@ -1002,8 +1002,9 @@ dependencies = [
 
 [[package]]
 name = "runar-compiler-rust"
-version = "0.4.4"
+version = "1.0.0-rc.1"
 dependencies = [
+ "bsv-sdk",
  "clap",
  "hex",
  "num-bigint",
@@ -1018,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "runar-lang"
-version = "0.4.4"
+version = "1.0.0-rc.1"
 dependencies = [
  "bs58",
  "bsv-sdk",
@@ -1038,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "runar-lang-macros"
-version = "0.4.4"
+version = "1.0.0-rc.1"
 dependencies = [
  "proc-macro2",
  "quote",
