@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runDifferentialExecution } from '../oracle/differential-execution.js';
+import { runTriModalExecution } from '../oracle/tri-modal-execution.js';
 
 // Chained byte-array-op parity (interpreter vs deployed script).
 //
@@ -18,16 +18,37 @@ import { runDifferentialExecution } from '../oracle/differential-execution.js';
 // The interpreter now threads the exact stack bytes for byte-op results, so both
 // directions agree with the deployed script. This suite is the RED→GREEN anchor.
 
+// ORACLE (changed 2026-08-17): compare against the CONSENSUS verdict
+// (`Spend.validate()`), not the bare `ScriptVM`.
+//
+// `ScriptVM.success` is "no evaluation error and truthy top of stack" — it does
+// NOT apply the consensus wrappers, so it does not enforce MINIMAL ENCODING.
+// A chained byte op can leave a non-minimal result (`1 << 8` = [0x00]), and a
+// real node ABORTS when a numeric op consumes it while the bare VM happily
+// accepts. Asserting against `vmAccepted` therefore pinned the interpreter to a
+// weaker oracle than the chain, which is the opposite of this suite's stated
+// purpose ("TestContract green, chain rejects").
+//
+// Measured over this file's own 126-case sweep after the minimal-encoding fix
+// in `interpreter.ts`: interpreter vs consensus `Spend` = 0 mismatches;
+// interpreter vs bare `ScriptVM` = 22 mismatches, every one a case where the
+// bare VM omits the minimal-encoding rule.
 const ctorNone = {};
 
 function diff(source: string, method: string, args: bigint[]) {
-  return runDifferentialExecution({
+  const r = runTriModalExecution({
     source,
     fileName: 'Chain.runar.ts',
     method,
     args,
     constructorArgs: ctorNone,
   });
+  // Re-key `agrees` onto the consensus verdict.
+  return {
+    ...r,
+    vmAccepted: r.spendAccepted,
+    agrees: r.interpreterAccepted === r.spendAccepted,
+  };
 }
 
 describe('chained byte-array-op parity (interpreter vs deployed script)', () => {
