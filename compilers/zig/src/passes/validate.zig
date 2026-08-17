@@ -451,8 +451,20 @@ fn walkReadonlyWrites(
         switch (stmt) {
             .assign => |a| {
                 if (a.target_is_property and isReadonlyPropertyName(contract, a.target)) {
+                    // Name the offending property, as the other six tiers do
+                    // ("cannot assign to readonly property 'x' ..."). A generic
+                    // message is correct but makes a developer hunt for which
+                    // write tripped it in a contract with several readonly
+                    // properties. Allocator-owned, like the other allocPrint'd
+                    // diagnostics in this file.
+                    const msg = try std.fmt.allocPrint(
+                        allocator,
+                        "cannot assign to readonly property '{s}' outside the constructor; " ++
+                            "readonly properties may only be assigned in the constructor",
+                        .{a.target},
+                    );
                     try errors.append(allocator, .{
-                        .message = READONLY_WRITE_MSG,
+                        .message = msg,
                         .severity = .@"error",
                     });
                 }
