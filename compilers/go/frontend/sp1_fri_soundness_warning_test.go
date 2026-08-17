@@ -24,6 +24,17 @@ func sp1WarningPresent(t *testing.T, contract *ContractNode) bool {
 	return false
 }
 
+func sp1RefusalPresent(t *testing.T, contract *ContractNode) bool {
+	t.Helper()
+	res := Validate(contract)
+	for _, d := range res.Errors {
+		if d.Severity == SeverityError && containsSubstr(d.Message, "REFUSING to emit a known-unsound") {
+			return true
+		}
+	}
+	return false
+}
+
 func containsSubstr(haystack, needle string) bool {
 	if len(needle) > len(haystack) {
 		return false
@@ -36,8 +47,8 @@ func containsSubstr(haystack, needle string) bool {
 	return false
 }
 
-func TestSP1FriSoundnessWarning_FiresWhenBuiltinIsCalled(t *testing.T) {
-	contract := &ContractNode{
+func sp1CallingContract() *ContractNode {
+	return &ContractNode{
 		Name: "UsesSP1",
 		Methods: []MethodNode{{
 			Name:       "spend",
@@ -59,9 +70,30 @@ func TestSP1FriSoundnessWarning_FiresWhenBuiltinIsCalled(t *testing.T) {
 			},
 		}},
 	}
+}
+
+func TestSP1FriSoundnessWarning_FiresWhenBuiltinIsCalled(t *testing.T) {
+	contract := sp1CallingContract()
+	// DEFAULT: refuse. Documenting an unsound verifier is not the same as
+	// preventing its deployment, and this one accepts forged proofs.
+	if !sp1RefusalPresent(t, contract) {
+		t.Fatal("expected verifySP1FRI to be REFUSED without the acknowledgement directive; " +
+			"the emitted script accepts forged Merkle openings and must not compile by default")
+	}
+	if sp1WarningPresent(t, contract) {
+		t.Fatal("without the directive this must be an ERROR, not a downgradeable warning")
+	}
+}
+
+func TestSP1FriSoundness_CompilesWithExplicitAcknowledgement(t *testing.T) {
+	contract := sp1CallingContract()
+	contract.AckUnsoundSP1Fri = true
+	if sp1RefusalPresent(t, contract) {
+		t.Fatal("with @acknowledgeUnsoundSP1FriVerifier the contract must compile (verifier development)")
+	}
+	// Opting in silences the refusal, never the disclosure.
 	if !sp1WarningPresent(t, contract) {
-		t.Fatal("expected the SP1 FRI soundness warning; a caller of the built-in would " +
-			"otherwise get no signal that the emitted script accepts forged Merkle openings")
+		t.Fatal("an acknowledged unsound verifier must still warn on every compile")
 	}
 }
 
@@ -81,8 +113,8 @@ func TestSP1FriSoundnessWarning_SilentForUnrelatedContracts(t *testing.T) {
 			},
 		}},
 	}
-	if sp1WarningPresent(t, contract) {
-		t.Fatal("the SP1 FRI warning fired for a contract that never calls the built-in; " +
-			"a warning that fires everywhere is a warning nobody reads")
+	if sp1WarningPresent(t, contract) || sp1RefusalPresent(t, contract) {
+		t.Fatal("the SP1 FRI diagnostic fired for a contract that never calls the built-in; " +
+			"a diagnostic that fires everywhere is one nobody reads")
 	}
 }

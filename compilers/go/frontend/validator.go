@@ -66,7 +66,15 @@ func Validate(contract *ContractNode) *ValidationResult {
 	// forged Merkle openings at the PoC parameter set. Say so at compile time,
 	// not only in a doc a caller of the built-in would never open.
 	if contractCallsSP1FriVerifier(contract) {
-		ctx.addWarning(sp1FriSoundnessWarning)
+		if contract.AckUnsoundSP1Fri {
+			// Explicitly opted in (verifier development / the PoC contract):
+			// still say it, loudly, on every compile.
+			ctx.addWarning(sp1FriSoundnessWarning)
+		} else {
+			// Default: REFUSE. Documenting an unsound verifier is not the same
+			// as preventing its deployment, and this one accepts forged proofs.
+			ctx.addError(sp1FriSoundnessError)
+		}
 	}
 
 	return &ValidationResult{

@@ -20,6 +20,15 @@ package frontend
 //
 // Remove this warning when the per-query verification chain lands.
 
+const sp1FriSoundnessError = "verifySP1FRI: REFUSING to emit a known-unsound proof verifier. " +
+	"The per-query chain (input-batch MMCS verify, FRI fold, final-poly equality) is not emitted, so " +
+	"the locking script ACCEPTS forged Merkle openings — an attacker spends with a fabricated proof. " +
+	"Replaying the corruption fixtures through the compiled covenant shows bad_merkle, bad_folding and " +
+	"bad_final_poly all ACCEPTED on-chain while the off-chain reference rejects them. This is NOT usable " +
+	"for a value-bearing covenant. If you are working on the verifier itself, add the comment directive " +
+	"@acknowledgeUnsoundSP1FriVerifier to the contract source to compile it anyway. See " +
+	"docs/sp1-fri-verifier.md."
+
 const sp1FriSoundnessWarning = "verifySP1FRI: the emitted locking script is NOT a sound proof " +
 	"verifier at the PoC parameter set. The per-query chain (input-batch MMCS verify, FRI fold, " +
 	"final-poly equality) is not emitted, so FORGED Merkle openings are ACCEPTED on-chain — only " +
