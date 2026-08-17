@@ -236,28 +236,44 @@ unreachable", and removing a defensive cleanup from `lowerIf` on that evidence i
 not a trade worth making before v1. Recorded in-code with what would change the
 decision either way.
 
-## Open v1 risks — blunt
+## Open v1 risks — final
 
-| # | risk | recommendation | cost to close |
-|---|---|---|---|
-| 1 | **`--execute` still blind to #149.** `arbGeneratedContract` measured max `if`-nesting depth **1 over 3000 samples**. M1 fixed `--tri-modal` and `--spend-oracle` only. | **DEFER, explicitly.** The shape is now covered by two absolute oracles, one of them the strongest in the repo. Extending `BRANCH_SHAPES` also feeds `--ir` cross-tier parity and a gate that enumerates shapes dynamically and requires each to be reachable at a FIXED seed and to compile in both fold modes — a broad generator change for marginal safety value. Not attempted rather than half-done. | ~1 session |
-| 2 | **GK-031 / GK-032 upstream `bsv-sdk` (Rust)** — `hashPrevouts` wrong order for `input_index>0`; OP_PUSH_TX `0x8d` desync makes covenants UNVALIDATABLE in the Rust tier. Documented + pinned in-repo. | **Accept for v1.** Not fixable here; upstream filing left to you (no issues filed this session, per instruction) | Not fixable here |
-| ~~3~~ | ~~`tests/vectors/*.json` outside `GOLDEN_MATCHERS`~~ | **CLOSED** — gate extended; demonstrated rejecting an unjustified vector change (exit 1) and passing the real diff (exit 0) | done |
-| 3b | **27 of 210 provenance entries still self-declare `unreviewed`** | **Defer with a named owner** — needs human review, not a code change | human review |
-| 4 | **Go-only crypto KATs** (Merkle et al. have only repo-generated vectors) | **Accept** — documented policy; now at least gate-protected via risk 3 | upstream KAT or 2nd impl |
-| ~~5~~ | ~~zero-coverage path inside `lowerIf`~~ | **RECLASSIFIED** — measured unreachable; equivalent mutant over dead code, not coverage debt | done |
-| ~~6~~ | ~~Axiom Taxonomy table drift~~ | **CLOSED** — labelled a dated snapshot pointing at the machine-checked inventory | done |
-| ~~7~~ | ~~P16/P17/P18 inconclusive~~ | **CLOSED** — P16 cleared (non-vacuous), P17 was a probe authoring error, P18 exposed a real S0 now fixed + pinned | done |
-| ~~8~~ | ~~`test:ci` not run end-to-end~~ | **CLOSED** — all five stages green incl. on-chain integration on 7 tiers | done |
-| 9 | Zig's rejection message is `error: ValidationFailed` where peers name the property | **Accept** — DX, not correctness; rejection itself is verified in all 7 tiers | ~1 hour |
-| ~~10~~ | ~~`conformance:sdk` ambient-PATH `tsx`~~ | **CLOSED** — resolves the repo-local binary; verified with tsx absent from PATH | done |
-| 11 | **Mutation corpus: 68.3%, 25/25 escalated survivors caught by nothing.** Risk 5 explains ONE survivor; the other 24 are untriaged for equivalence. | **Defer** | ~1 session |
+Every item the audit raised is now closed, deferred with a stated reason, or
+recorded as an accepted limitation with a detector attached. Nothing below is a
+known-wrong behaviour that ships silently.
 
-Nothing in this table is now a known-wrong behaviour. What remains is coverage
-debt (1, 11), human review (3b), an upstream defect nobody in this repo can fix
-(2), an accepted policy (4) and a DX nit (9).
+| # | item | disposition |
+|---|---|---|
+| 1 | `--execute` blind to #149 | **CLOSED.** `nested-sibling-no-else` shape added; control run (pristine generator, same broken compiler) = **0** divergences, extended generator = **11/14/17** across three seeds. |
+| 1b | `fuzz:execute:gate` could not catch it | **CLOSED.** Sized empirically against the regression: 60→0, 300→0, 600→10, 1000→11. Raised to 1000 (31s). |
+| 2 | GK-031 upstream BIP-143 | **CLOSED.** Fixed upstream; the repo held the bug with a stale `<0.3` floor. Now `>=0.2.89`, carve-out removed, **all** inputs validated. |
+| 2b | GK-032 OP_PUSH_TX | **CLOSED as a non-defect, and re-diagnosed.** Not a parser desync: Rúnar deliberately emits `OP_2MUL` (Chronicle, `06-emit.ts:89`); Rust's `bsv-sdk` is pre-Chronicle. Opcode-profile mismatch, nothing to file. Two pins added, one mutation-checked. |
+| 3 | 27 self-attested provenance entries | **CLOSED.** All 27 substantiated by running their named oracles; **14 carried factually wrong text**, 3 materially so. Zero self-attested entries remain, and the gate now rejects them (demonstrated failing). |
+| 4 | Go-only crypto KATs | **CLASSIFIED + strengthened.** No family has an official upstream KAT for its arithmetic; most are (b) second-implementation (Plonky3/gnark) and now **reproducibility-enforced**. `bn254_pairing.json` had **zero consumers** — 4 vectors never executed; now 34 with a consumer. |
+| 5 | `lowerIf:2212` mutation survivor | **RECLASSIFIED.** Measured unreachable (0 firings across 71 fixtures, 1200 tri-modal, 400 spend-oracle). Equivalent mutant over dead code — and it accounts for 8 of the class, not 1. |
+| 6 | Axiom taxonomy drift | **CLOSED.** Labelled a dated snapshot; the authoritative table is now machine-checked per file. |
+| 7 | Probes P16/P17/P18 | **CLOSED** — and P18's *vacuous* agreement exposed a new S0 (non-minimal shift), fixed in **all seven** ANF interpreters plus the AST interpreter. |
+| 8 | `test:ci` end-to-end | **CLOSED.** All stages green incl. on-chain integration on 7 tiers. |
+| 9 | Zig diagnostic | **CLOSED — and my finding was wrong.** Zig exits 1 with a descriptive message; "terse" was an artefact of my own `tail -1`. Only the property name was missing; added. |
+| 10 | `conformance:sdk` ambient tsx | **CLOSED.** Resolves the repo-local binary. |
+| 11 | 24 untriaged mutation survivors | **CLOSED.** All **66** triaged (not 25): 60 equivalent with stated reasons, **6 real holes** — including the `sinkBelow` DISTANCE at `05-stack-lower.ts:2538`, i.e. a gap in the #149 fix's own coverage. 16 pins added and verified by running the mutation gate. |
+| **NEW** | **SP1 FRI on-chain verifier is not sound** | **DISCLOSED + DETECTED, not fixed.** `sample-and-drop` means the per-query chain is never emitted: `bad_merkle`/`bad_folding`/`bad_final_poly` are ACCEPTED on-chain. Documented, pinned by tests that fail when the emission lands, and now a **compile-time warning**. Fixing it requires implementing the per-query chain — a real v1 decision, not a cleanup. |
 
----
+### Residual items, stated plainly
+
+- **The SP1 FRI verifier must not be used for value-bearing covenants** until the
+  per-query chain lands. Everything else here is closed; this one is a feature
+  gap with a loud detector, not a silent defect.
+- `conformance/mutation/baseline.json` not re-stamped (new ids are simply not
+  compared; cannot cause a false pass).
+- The 60 "equivalent" mutation verdicts are evidence (2101 compiles found no
+  witness), **not proof**.
+- The Go CLI computes diagnostics and discards them — the SP1 warning reaches the
+  API, not `runar-go` stdout. Not changed because the conformance runner reads
+  that binary with combined stdout+stderr.
+- `bad_vk` corruption fixture is impossible at `SP1VKeyHashByteSize: 0`; the
+  documented colinearity and final-poly branches are unreachable by byte mutation.
+- SP1 Groth16 vk cites a local `/Users/<user>/.sp1/...` path CI cannot re-derive.
 
 ## Reviewer scorecard
 
