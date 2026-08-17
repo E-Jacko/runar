@@ -1,0 +1,22 @@
+{
+  "seed": 6,
+  "reason": "tri-modal disagreement: interpreter=false vm=true spend=true",
+  "contractName": "ExecFuzz8",
+  "method": "run8",
+  "source": "import { SmartContract, assert, toByteString } from 'runar-lang';\nimport type { ByteString } from 'runar-lang';\n\nclass ExecFuzz8 extends SmartContract {\n  readonly prop8: ByteString;\n  readonly prop8X: ByteString;\n\n  constructor(prop8: ByteString, prop8X: ByteString) {\n    super(prop8, prop8X);\n    this.prop8 = prop8;\n    this.prop8X = prop8X;\n  }\n\n  public run8(param0: ByteString, param8: bigint, param7: ByteString): void {\n    let acc: bigint = -3n;\n    let br0: bigint = (param8 - -1n);\n    const sib0: bigint = 3n;\n    if ((param8 >= 4n)) {\n      if ((param8 !== -1n)) {\n        br0 = param8;\n      } else {\n        br0 = (param8 + 4n);\n      }\n    } else {\n      br0 = (param8 - 3n);\n    }\n    assert(((param8 !== ((1n + param8) + acc)) && (((br0 + acc) > -1000000n) && (br0 <= sib0))));\n  }\n}",
+  "constructorArgs": {
+    "prop8": "0x00000000",
+    "prop8X": "0x00000000"
+  },
+  "args": [
+    "0x00000000",
+    "4n",
+    "0x00000000"
+  ],
+  "interpreterAccepted": false,
+  "vmAccepted": true,
+  "spendAccepted": true,
+  "lockingHex": "5301835379514f7b7c9453567954a2635679514f7b7c9c9163577976776757795493767768537a75767b756756795394767768527a75567951587a935579939c9178557a930340420f0340428f7b7ca0537a547aa19a7b7c9a7777777777",
+  "witnessHex": "0400000000540400000000",
+  "interpreterError": "assert failed"
+}

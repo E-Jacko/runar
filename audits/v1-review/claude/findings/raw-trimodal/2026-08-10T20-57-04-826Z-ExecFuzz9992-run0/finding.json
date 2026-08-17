@@ -1,0 +1,21 @@
+{
+  "seed": 4,
+  "reason": "tri-modal disagreement: interpreter=false vm=true spend=true",
+  "contractName": "ExecFuzz9992",
+  "method": "run0",
+  "source": "import { SmartContract, assert } from 'runar-lang';\n\nclass ExecFuzz9992 extends SmartContract {\n  readonly prop1: bigint;\n  readonly prop1X: bigint;\n\n  constructor(prop1: bigint, prop1X: bigint) {\n    super(prop1, prop1X);\n    this.prop1 = prop1;\n    this.prop1X = prop1X;\n  }\n\n  public run0(param0: boolean, param3: bigint): void {\n    let acc: bigint = (2n + this.prop1X);\n    let wacc: bigint = (-4n - 3n);\n    for (let k: bigint = 4n; k > 2n; k--) {\n      for (let k2: bigint = 8n; k2 > 6n; k2--) {\n        acc = (acc + (this.prop1X - k));\n      }\n      wacc = (wacc - acc);\n    }\n    let br0: bigint = 2n;\n    const sib0: bigint = (4n - this.prop1X);\n    if ((param3 !== -6n)) {\n      if ((param3 >= -2n)) {\n        br0 = param3;\n      } else {\n        br0 = 4n;\n      }\n    }\n    assert(((!(param0) && ((acc <= -2n) && (wacc >= -4n))) && (((br0 + acc) > -1000000n) && (br0 > sib0))));\n  }\n}",
+  "constructorArgs": {
+    "prop1": "0n",
+    "prop1X": "-3n"
+  },
+  "args": [
+    "false",
+    "0n"
+  ],
+  "interpreterAccepted": false,
+  "vmAccepted": true,
+  "spendAccepted": true,
+  "lockingHex": "4f54018453018754580183527994577a7c93570183547a947b7c93537a789453580183527994547a7c93570183547a947b7c93537a789452575b795601867b7c9c91635c795201827b7ca2635d7a76776754765f7a757768547a7577675c7a75685c7a9152018257797ca1540184587a7ca27b7c9a537a7c9a5579577a930340420f0340428f7b7ca0577a577aa09a7b7c9a7777777777777777777777",
+  "witnessHex": "0000",
+  "interpreterError": "assert failed"
+}

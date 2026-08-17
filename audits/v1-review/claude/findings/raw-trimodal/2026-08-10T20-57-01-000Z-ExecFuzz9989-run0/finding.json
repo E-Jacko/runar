@@ -1,0 +1,17 @@
+{
+  "seed": 1,
+  "reason": "tri-modal disagreement: interpreter=false vm=true spend=true",
+  "contractName": "ExecFuzz9989",
+  "method": "run0",
+  "source": "import { SmartContract, assert } from 'runar-lang';\n\nclass ExecFuzz9989 extends SmartContract {\n\n  constructor() {\n    super();\n  }\n\n  public run0(param1: bigint): void {\n    let acc: bigint = (param1 + param1);\n    let br0: bigint = (param1 + 0n);\n    const sib0: bigint = (param1 + param1);\n    if ((param1 !== 0n)) {\n      if ((param1 === 0n)) {\n        br0 = (param1 + 0n);\n      } else {\n        br0 = param1;\n      }\n    }\n    assert((((param1 === ((acc + acc) + 0n)) || (((acc + acc) * acc) >= 0n)) && (((br0 + acc) > -1000000n) && (br0 < sib0))));\n  }\n}",
+  "constructorArgs": {},
+  "args": [
+    "-1n"
+  ],
+  "interpreterAccepted": false,
+  "vmAccepted": true,
+  "spendAccepted": true,
+  "lockingHex": "76789378527953799353799191635379916353797677675379767768527a7568537a537976939c5379769354799500a29b5279547a930340420f0340428f7b7ca0547a547a9f9a7b7c9a77",
+  "witnessHex": "4f",
+  "interpreterError": "assert failed"
+}

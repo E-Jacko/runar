@@ -1,0 +1,382 @@
+[
+ {
+  "id": "P01",
+  "cls": "P01",
+  "method": "go",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1",
+   "1",
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: The top stack element must be truthy after script evaluation.\nTXID: bc6d3bb3c93aec1dd",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P02",
+  "cls": "P02",
+  "method": "go",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1",
+   "1",
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: The top stack element must be truthy after script evaluation.\nTXID: e371b6cd8c6234f7a",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P03",
+  "cls": "P03",
+  "method": "step",
+  "ctorArgs": [
+   "3",
+   "1"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P04",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P05",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P06",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P07",
+  "cls": "P07",
+  "method": "go",
+  "ctorArgs": [
+   "3",
+   "1"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P08",
+  "cls": "P08",
+  "method": "go",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P09",
+  "cls": "P09",
+  "method": "go",
+  "ctorArgs": [
+   "3",
+   "1",
+   "0",
+   "2"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P10",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P11",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P12",
+  "cls": "P12",
+  "method": "go",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P13",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P14",
+  "cls": "P14",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P15",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P16",
+  "cls": "P16",
+  "method": "f",
+  "ctorArgs": [
+   "3",
+   "1"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: OP_NUMEQUALVERIFY requires the top stack item to be truthy.\nTXID: 5066e8bad18e5004d40",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P17",
+  "cls": "P17",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: OP_VERIFY requires the top stack value to be truthy.\nTXID: 2ddf33c513b2c6b34a670886d2",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P18",
+  "cls": "P18",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): non-minimally encoded script number. Refusing to broadcast a tx the network would reject. Omit { dryRun: true ",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P19",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P20",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P21",
+  "cls": "P21",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P22",
+  "cls": "P22",
+  "method": "m1",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: The clean stack rule requires exactly one item to be on the stack after script execut",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P23",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P24",
+  "cls": "P24",
+  "method": "go",
+  "ctorArgs": [],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P25",
+  "cls": "P25",
+  "method": "unlock",
+  "ctorArgs": [
+   "02a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  ],
+  "mArgs": [
+   "1",
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: The signature format is invalid.\nTXID: c4d0b72ee61d1894eef7dde9b105b6b12a276ac75718ae",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P26",
+  "cls": "P26",
+  "method": "go",
+  "ctorArgs": [
+   "3",
+   "1",
+   "0"
+  ],
+  "mArgs": [
+   "1",
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P27",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P28",
+  "cls": "P28",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P29",
+  "cls": "P29",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: The clean stack rule requires exactly one item to be on the stack after script execut",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P30",
+  "cls": "P30",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": false,
+  "engineErr": "RunarContract.finalizeCall: local pre-broadcast dry-run rejected the primary contract input (deep-review C8): Script evaluation error: The clean stack rule requires exactly one item to be on the stack after script execut",
+  "verdict": "DIVERGENT"
+ },
+ {
+  "id": "P31",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P32",
+  "cls": "P32",
+  "method": "f",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P33",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P34",
+  "cls": "P34",
+  "method": "go",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ },
+ {
+  "id": "P36",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P37",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P43",
+  "verdict": "COMPILE-REJECT"
+ },
+ {
+  "id": "P45",
+  "cls": "P45",
+  "method": "go",
+  "ctorArgs": [
+   "3"
+  ],
+  "mArgs": [
+   "1",
+   "1"
+  ],
+  "interpAccepted": true,
+  "spendAccepted": true,
+  "verdict": "agree"
+ }
+]

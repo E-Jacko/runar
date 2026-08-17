@@ -1,0 +1,5969 @@
+[
+ {
+  "id": "G0001",
+  "file": "codegen/stack.go",
+  "line": 132,
+  "before": "\t\"===\": {\"OP_NUMEQUAL\"},",
+  "after": "\t\"!==\": {\"OP_NUMEQUAL\"},",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0002",
+  "file": "codegen/stack.go",
+  "line": 133,
+  "before": "\t\"!==\": {\"OP_NUMEQUAL\", \"OP_NOT\"},",
+  "after": "\t\"!!=\": {\"OP_NUMEQUAL\", \"OP_NOT\"},",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0003",
+  "file": "codegen/stack.go",
+  "line": 133,
+  "before": "\t\"!==\": {\"OP_NUMEQUAL\", \"OP_NOT\"},",
+  "after": "\t\"===\": {\"OP_NUMEQUAL\", \"OP_NOT\"},",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0004",
+  "file": "codegen/stack.go",
+  "line": 134,
+  "before": "\t\"<\":   {\"OP_LESSTHAN\"},",
+  "after": "\t\"<=\":   {\"OP_LESSTHAN\"},",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0005",
+  "file": "codegen/stack.go",
+  "line": 135,
+  "before": "\t\">\":   {\"OP_GREATERTHAN\"},",
+  "after": "\t\">=\":   {\"OP_GREATERTHAN\"},",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0006",
+  "file": "codegen/stack.go",
+  "line": 136,
+  "before": "\t\"<=\":  {\"OP_LESSTHANOREQUAL\"},",
+  "after": "\t\"<\":  {\"OP_LESSTHANOREQUAL\"},",
+  "op": "cmp-le-to-lt",
+  "region": "other"
+ },
+ {
+  "id": "G0007",
+  "file": "codegen/stack.go",
+  "line": 137,
+  "before": "\t\">=\":  {\"OP_GREATERTHANOREQUAL\"},",
+  "after": "\t\">\":  {\"OP_GREATERTHANOREQUAL\"},",
+  "op": "cmp-ge-to-gt",
+  "region": "other"
+ },
+ {
+  "id": "G0008",
+  "file": "codegen/stack.go",
+  "line": 138,
+  "before": "\t\"&&\":  {\"OP_BOOLAND\"},",
+  "after": "\t\"||\":  {\"OP_BOOLAND\"},",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0009",
+  "file": "codegen/stack.go",
+  "line": 139,
+  "before": "\t\"||\":  {\"OP_BOOLOR\"},",
+  "after": "\t\"&&\":  {\"OP_BOOLOR\"},",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0010",
+  "file": "codegen/stack.go",
+  "line": 180,
+  "before": "\tif len(s.slots) == 0 {",
+  "after": "\tif len(s.slots) != 0 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0011",
+  "file": "codegen/stack.go",
+  "line": 183,
+  "before": "\tlast := s.slots[len(s.slots)-1]",
+  "after": "\tlast := s.slots[len(s.slots)-2]",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0012",
+  "file": "codegen/stack.go",
+  "line": 183,
+  "before": "\tlast := s.slots[len(s.slots)-1]",
+  "after": "\tlast := s.slots[len(s.slots)]",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0013",
+  "file": "codegen/stack.go",
+  "line": 184,
+  "before": "\ts.slots = s.slots[:len(s.slots)-1]",
+  "after": "\ts.slots = s.slots[:len(s.slots)-2]",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0014",
+  "file": "codegen/stack.go",
+  "line": 184,
+  "before": "\ts.slots = s.slots[:len(s.slots)-1]",
+  "after": "\ts.slots = s.slots[:len(s.slots)]",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0015",
+  "file": "codegen/stack.go",
+  "line": 191,
+  "before": "\tfor i := len(s.slots) - 1; i >= 0; i-- {",
+  "after": "\tfor i := len(s.slots) - 2; i >= 0; i-- {",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0016",
+  "file": "codegen/stack.go",
+  "line": 191,
+  "before": "\tfor i := len(s.slots) - 1; i >= 0; i-- {",
+  "after": "\tfor i := len(s.slots); i >= 0; i-- {",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0017",
+  "file": "codegen/stack.go",
+  "line": 191,
+  "before": "\tfor i := len(s.slots) - 1; i >= 0; i-- {",
+  "after": "\tfor i := len(s.slots) - 1; i > 0; i-- {",
+  "op": "cmp-ge-to-gt",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0018",
+  "file": "codegen/stack.go",
+  "line": 191,
+  "before": "\tfor i := len(s.slots) - 1; i >= 0; i-- {",
+  "after": "\tfor i := len(s.slots) + 1; i >= 0; i-- {",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0019",
+  "file": "codegen/stack.go",
+  "line": 192,
+  "before": "\t\tif s.slots[i] == name {",
+  "after": "\t\tif s.slots[i] != name {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0020",
+  "file": "codegen/stack.go",
+  "line": 193,
+  "before": "\t\t\treturn len(s.slots) - 1 - i",
+  "after": "\t\t\treturn len(s.slots) - 2 - i",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0021",
+  "file": "codegen/stack.go",
+  "line": 193,
+  "before": "\t\t\treturn len(s.slots) - 1 - i",
+  "after": "\t\t\treturn len(s.slots) - i",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0022",
+  "file": "codegen/stack.go",
+  "line": 193,
+  "before": "\t\t\treturn len(s.slots) - 1 - i",
+  "after": "\t\t\treturn len(s.slots) + 1 - i",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0023",
+  "file": "codegen/stack.go",
+  "line": 201,
+  "before": "\t\tif slot == name {",
+  "after": "\t\tif slot != name {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0024",
+  "file": "codegen/stack.go",
+  "line": 209,
+  "before": "\tindex := len(s.slots) - 1 - depthFromTop",
+  "after": "\tindex := len(s.slots) - 2 - depthFromTop",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0025",
+  "file": "codegen/stack.go",
+  "line": 209,
+  "before": "\tindex := len(s.slots) - 1 - depthFromTop",
+  "after": "\tindex := len(s.slots) - depthFromTop",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0026",
+  "file": "codegen/stack.go",
+  "line": 209,
+  "before": "\tindex := len(s.slots) - 1 - depthFromTop",
+  "after": "\tindex := len(s.slots) + 1 - depthFromTop",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0027",
+  "file": "codegen/stack.go",
+  "line": 210,
+  "before": "\tif index < 0 || index >= len(s.slots) {",
+  "after": "\tif index <= 0 || index >= len(s.slots) {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0028",
+  "file": "codegen/stack.go",
+  "line": 210,
+  "before": "\tif index < 0 || index >= len(s.slots) {",
+  "after": "\tif index < 0 || index > len(s.slots) {",
+  "op": "cmp-ge-to-gt",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0029",
+  "file": "codegen/stack.go",
+  "line": 210,
+  "before": "\tif index < 0 || index >= len(s.slots) {",
+  "after": "\tif index < 0 && index >= len(s.slots) {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0030",
+  "file": "codegen/stack.go",
+  "line": 214,
+  "before": "\ts.slots = append(s.slots[:index], s.slots[index+1:]...)",
+  "after": "\ts.slots = append(s.slots[:index], s.slots[index+2:]...)",
+  "op": "idx-plus1-to-plus2",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0031",
+  "file": "codegen/stack.go",
+  "line": 219,
+  "before": "\tindex := len(s.slots) - 1 - depthFromTop",
+  "after": "\tindex := len(s.slots) - 2 - depthFromTop",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0032",
+  "file": "codegen/stack.go",
+  "line": 219,
+  "before": "\tindex := len(s.slots) - 1 - depthFromTop",
+  "after": "\tindex := len(s.slots) - depthFromTop",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0033",
+  "file": "codegen/stack.go",
+  "line": 219,
+  "before": "\tindex := len(s.slots) - 1 - depthFromTop",
+  "after": "\tindex := len(s.slots) + 1 - depthFromTop",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0034",
+  "file": "codegen/stack.go",
+  "line": 220,
+  "before": "\tif index < 0 || index >= len(s.slots) {",
+  "after": "\tif index <= 0 || index >= len(s.slots) {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0035",
+  "file": "codegen/stack.go",
+  "line": 220,
+  "before": "\tif index < 0 || index >= len(s.slots) {",
+  "after": "\tif index < 0 || index > len(s.slots) {",
+  "op": "cmp-ge-to-gt",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0036",
+  "file": "codegen/stack.go",
+  "line": 220,
+  "before": "\tif index < 0 || index >= len(s.slots) {",
+  "after": "\tif index < 0 && index >= len(s.slots) {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0037",
+  "file": "codegen/stack.go",
+  "line": 227,
+  "before": "\tidx := len(s.slots) - 1 - depthFromTop",
+  "after": "\tidx := len(s.slots) - 2 - depthFromTop",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0038",
+  "file": "codegen/stack.go",
+  "line": 227,
+  "before": "\tidx := len(s.slots) - 1 - depthFromTop",
+  "after": "\tidx := len(s.slots) - depthFromTop",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0039",
+  "file": "codegen/stack.go",
+  "line": 227,
+  "before": "\tidx := len(s.slots) - 1 - depthFromTop",
+  "after": "\tidx := len(s.slots) + 1 - depthFromTop",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0040",
+  "file": "codegen/stack.go",
+  "line": 228,
+  "before": "\tif idx < 0 || idx >= len(s.slots) {",
+  "after": "\tif idx <= 0 || idx >= len(s.slots) {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0041",
+  "file": "codegen/stack.go",
+  "line": 228,
+  "before": "\tif idx < 0 || idx >= len(s.slots) {",
+  "after": "\tif idx < 0 || idx > len(s.slots) {",
+  "op": "cmp-ge-to-gt",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0042",
+  "file": "codegen/stack.go",
+  "line": 228,
+  "before": "\tif idx < 0 || idx >= len(s.slots) {",
+  "after": "\tif idx < 0 && idx >= len(s.slots) {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0043",
+  "file": "codegen/stack.go",
+  "line": 242,
+  "before": "\tif n < 2 {",
+  "after": "\tif n <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0044",
+  "file": "codegen/stack.go",
+  "line": 245,
+  "before": "\ts.slots[n-1], s.slots[n-2] = s.slots[n-2], s.slots[n-1]",
+  "after": "\ts.slots[n-2], s.slots[n-2] = s.slots[n-2], s.slots[n-1]",
+  "op": "idx-minus1-to-minus2",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0045",
+  "file": "codegen/stack.go",
+  "line": 245,
+  "before": "\ts.slots[n-1], s.slots[n-2] = s.slots[n-2], s.slots[n-1]",
+  "after": "\ts.slots[n-1], s.slots[n-2] = s.slots[n-2], s.slots[n-2]",
+  "op": "idx-minus1-to-minus2",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0046",
+  "file": "codegen/stack.go",
+  "line": 249,
+  "before": "\tif len(s.slots) < 1 {",
+  "after": "\tif len(s.slots) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0047",
+  "file": "codegen/stack.go",
+  "line": 252,
+  "before": "\ts.slots = append(s.slots, s.slots[len(s.slots)-1])",
+  "after": "\ts.slots = append(s.slots, s.slots[len(s.slots)-2])",
+  "op": "len-off-by-one",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0048",
+  "file": "codegen/stack.go",
+  "line": 252,
+  "before": "\ts.slots = append(s.slots, s.slots[len(s.slots)-1])",
+  "after": "\ts.slots = append(s.slots, s.slots[len(s.slots)])",
+  "op": "len-drop-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0049",
+  "file": "codegen/stack.go",
+  "line": 264,
+  "before": "\t\tif slot != \"\" {",
+  "after": "\t\tif slot == \"\" {",
+  "op": "neq-to-eq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0050",
+  "file": "codegen/stack.go",
+  "line": 283,
+  "before": "\t\tif b.Value.Kind == \"array_literal\" {",
+  "after": "\t\tif b.Value.Kind != \"array_literal\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0051",
+  "file": "codegen/stack.go",
+  "line": 292,
+  "before": "\t\tif binding.Value.Kind == \"array_literal\" {",
+  "after": "\t\tif binding.Value.Kind != \"array_literal\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0052",
+  "file": "codegen/stack.go",
+  "line": 399,
+  "before": "\t\t\tif first, ok := firstBind[ref]; ok && i < first {",
+  "after": "\t\t\tif first, ok := firstBind[ref]; ok && i <= first {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0053",
+  "file": "codegen/stack.go",
+  "line": 399,
+  "before": "\t\t\tif first, ok := firstBind[ref]; ok && i < first {",
+  "after": "\t\t\tif first, ok := firstBind[ref]; ok || i < first {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0054",
+  "file": "codegen/stack.go",
+  "line": 402,
+  "before": "\t\t\tif last, ok := lastBind[ref]; ok && i > last {",
+  "after": "\t\t\tif last, ok := lastBind[ref]; ok && i >= last {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0055",
+  "file": "codegen/stack.go",
+  "line": 402,
+  "before": "\t\t\tif last, ok := lastBind[ref]; ok && i > last {",
+  "after": "\t\t\tif last, ok := lastBind[ref]; ok || i > last {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0056",
+  "file": "codegen/stack.go",
+  "line": 449,
+  "before": "\t\tif body[i].Value.Kind == \"loop\" || body[i].Value.Kind == \"if\" {",
+  "after": "\t\tif body[i].Value.Kind != \"loop\" || body[i].Value.Kind == \"if\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0057",
+  "file": "codegen/stack.go",
+  "line": 449,
+  "before": "\t\tif body[i].Value.Kind == \"loop\" || body[i].Value.Kind == \"if\" {",
+  "after": "\t\tif body[i].Value.Kind == \"loop\" || body[i].Value.Kind != \"if\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0058",
+  "file": "codegen/stack.go",
+  "line": 449,
+  "before": "\t\tif body[i].Value.Kind == \"loop\" || body[i].Value.Kind == \"if\" {",
+  "after": "\t\tif body[i].Value.Kind == \"loop\" && body[i].Value.Kind == \"if\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0059",
+  "file": "codegen/stack.go",
+  "line": 475,
+  "before": "\tif depth == 0 {",
+  "after": "\tif depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0060",
+  "file": "codegen/stack.go",
+  "line": 480,
+  "before": "\tif depth == 1 {",
+  "after": "\tif depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0061",
+  "file": "codegen/stack.go",
+  "line": 507,
+  "before": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\t\tif value.ConstString != nil && len(*value.ConstString) >= 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0062",
+  "file": "codegen/stack.go",
+  "line": 507,
+  "before": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] != \"@ref:\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0063",
+  "file": "codegen/stack.go",
+  "line": 507,
+  "before": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\t\tif value.ConstString == nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0064",
+  "file": "codegen/stack.go",
+  "line": 507,
+  "before": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\t\tif value.ConstString != nil || len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0065",
+  "file": "codegen/stack.go",
+  "line": 507,
+  "before": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\t\tif value.ConstString != nil && len(*value.ConstString) > 5 || (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0066",
+  "file": "codegen/stack.go",
+  "line": 542,
+  "before": "\t\tif value.Preimage != \"\" {",
+  "after": "\t\tif value.Preimage == \"\" {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0067",
+  "file": "codegen/stack.go",
+  "line": 646,
+  "before": "\tif ctx.sm.depth() > ctx.maxDepth {",
+  "after": "\tif ctx.sm.depth() >= ctx.maxDepth {",
+  "op": "cmp-gt-to-ge",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0068",
+  "file": "codegen/stack.go",
+  "line": 652,
+  "before": "\tif ctx.currentSourceLoc != nil && op.SourceLoc == nil {",
+  "after": "\tif ctx.currentSourceLoc != nil && op.SourceLoc != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0069",
+  "file": "codegen/stack.go",
+  "line": 652,
+  "before": "\tif ctx.currentSourceLoc != nil && op.SourceLoc == nil {",
+  "after": "\tif ctx.currentSourceLoc == nil && op.SourceLoc == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0070",
+  "file": "codegen/stack.go",
+  "line": 652,
+  "before": "\tif ctx.currentSourceLoc != nil && op.SourceLoc == nil {",
+  "after": "\tif ctx.currentSourceLoc != nil || op.SourceLoc == nil {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0071",
+  "file": "codegen/stack.go",
+  "line": 688,
+  "before": "\t\tctx.emitOp(StackOp{Op: \"push\", Value: bigIntPush(nBytes + 1)})",
+  "after": "\t\tctx.emitOp(StackOp{Op: \"push\", Value: bigIntPush(nBytes - 1)})",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0072",
+  "file": "codegen/stack.go",
+  "line": 985,
+  "before": "\tif depth < 0 {",
+  "after": "\tif depth <= 0 {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0073",
+  "file": "codegen/stack.go",
+  "line": 989,
+  "before": "\tif depth == 0 {",
+  "after": "\tif depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0074",
+  "file": "codegen/stack.go",
+  "line": 997,
+  "before": "\tif depth == 1 && consume {",
+  "after": "\tif depth != 1 && consume {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0075",
+  "file": "codegen/stack.go",
+  "line": 997,
+  "before": "\tif depth == 1 && consume {",
+  "after": "\tif depth == 1 || consume {",
+  "op": "bool-and-to-or",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0076",
+  "file": "codegen/stack.go",
+  "line": 1004,
+  "before": "\t\tif depth == 2 {",
+  "after": "\t\tif depth != 2 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0077",
+  "file": "codegen/stack.go",
+  "line": 1018,
+  "before": "\t\tif depth == 1 {",
+  "after": "\t\tif depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0078",
+  "file": "codegen/stack.go",
+  "line": 1055,
+  "before": "\tfor d := 1; d < ctx.sm.depth(); d++ {",
+  "after": "\tfor d := 1; d <= ctx.sm.depth(); d++ {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0079",
+  "file": "codegen/stack.go",
+  "line": 1057,
+  "before": "\t\tif name == \"\" {",
+  "after": "\t\tif name != \"\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0080",
+  "file": "codegen/stack.go",
+  "line": 1063,
+  "before": "\tif len(drainDepths) == 0 {",
+  "after": "\tif len(drainDepths) != 0 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0081",
+  "file": "codegen/stack.go",
+  "line": 1068,
+  "before": "\t\tif depth == 1 {",
+  "after": "\t\tif depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0082",
+  "file": "codegen/stack.go",
+  "line": 1086,
+  "before": "\treturn !ok || last <= currentIndex",
+  "after": "\treturn !ok || last < currentIndex",
+  "op": "cmp-le-to-lt",
+  "region": "other"
+ },
+ {
+  "id": "G0083",
+  "file": "codegen/stack.go",
+  "line": 1086,
+  "before": "\treturn !ok || last <= currentIndex",
+  "after": "\treturn !ok && last <= currentIndex",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0084",
+  "file": "codegen/stack.go",
+  "line": 1113,
+  "before": "\t\tif o == ref {",
+  "after": "\t\tif o != ref {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0085",
+  "file": "codegen/stack.go",
+  "line": 1117,
+  "before": "\treturn occurrences <= 1",
+  "after": "\treturn occurrences < 1",
+  "op": "cmp-le-to-lt",
+  "region": "other"
+ },
+ {
+  "id": "G0086",
+  "file": "codegen/stack.go",
+  "line": 1132,
+  "before": "\tif ctx.outerProtectedRefs != nil {",
+  "after": "\tif ctx.outerProtectedRefs == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0087",
+  "file": "codegen/stack.go",
+  "line": 1144,
+  "before": "\t\tlastBinding := bindings[len(bindings)-1]",
+  "after": "\t\tlastBinding := bindings[len(bindings)-2]",
+  "op": "len-off-by-one",
+  "region": "other"
+ },
+ {
+  "id": "G0088",
+  "file": "codegen/stack.go",
+  "line": 1144,
+  "before": "\t\tlastBinding := bindings[len(bindings)-1]",
+  "after": "\t\tlastBinding := bindings[len(bindings)]",
+  "op": "len-drop-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0089",
+  "file": "codegen/stack.go",
+  "line": 1145,
+  "before": "\t\tif lastBinding.Value.Kind == \"if\" {",
+  "after": "\t\tif lastBinding.Value.Kind != \"if\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0090",
+  "file": "codegen/stack.go",
+  "line": 1146,
+  "before": "\t\t\tterminalIfIdx = len(bindings) - 1",
+  "after": "\t\t\tterminalIfIdx = len(bindings) - 2",
+  "op": "len-off-by-one",
+  "region": "other"
+ },
+ {
+  "id": "G0091",
+  "file": "codegen/stack.go",
+  "line": 1146,
+  "before": "\t\t\tterminalIfIdx = len(bindings) - 1",
+  "after": "\t\t\tterminalIfIdx = len(bindings)",
+  "op": "len-drop-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0092",
+  "file": "codegen/stack.go",
+  "line": 1146,
+  "before": "\t\t\tterminalIfIdx = len(bindings) - 1",
+  "after": "\t\t\tterminalIfIdx = len(bindings) + 1",
+  "op": "arith-minus-to-plus",
+  "region": "other"
+ },
+ {
+  "id": "G0093",
+  "file": "codegen/stack.go",
+  "line": 1148,
+  "before": "\t\t\tfor i := len(bindings) - 1; i >= 0; i-- {",
+  "after": "\t\t\tfor i := len(bindings) - 2; i >= 0; i-- {",
+  "op": "len-off-by-one",
+  "region": "other"
+ },
+ {
+  "id": "G0094",
+  "file": "codegen/stack.go",
+  "line": 1148,
+  "before": "\t\t\tfor i := len(bindings) - 1; i >= 0; i-- {",
+  "after": "\t\t\tfor i := len(bindings); i >= 0; i-- {",
+  "op": "len-drop-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0095",
+  "file": "codegen/stack.go",
+  "line": 1148,
+  "before": "\t\t\tfor i := len(bindings) - 1; i >= 0; i-- {",
+  "after": "\t\t\tfor i := len(bindings) - 1; i > 0; i-- {",
+  "op": "cmp-ge-to-gt",
+  "region": "other"
+ },
+ {
+  "id": "G0096",
+  "file": "codegen/stack.go",
+  "line": 1148,
+  "before": "\t\t\tfor i := len(bindings) - 1; i >= 0; i-- {",
+  "after": "\t\t\tfor i := len(bindings) + 1; i >= 0; i-- {",
+  "op": "arith-minus-to-plus",
+  "region": "other"
+ },
+ {
+  "id": "G0097",
+  "file": "codegen/stack.go",
+  "line": 1149,
+  "before": "\t\t\t\tif bindings[i].Value.Kind == \"assert\" {",
+  "after": "\t\t\t\tif bindings[i].Value.Kind != \"assert\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0098",
+  "file": "codegen/stack.go",
+  "line": 1160,
+  "before": "\t\tif binding.Value.Kind == \"assert\" && i == lastAssertIdx {",
+  "after": "\t\tif binding.Value.Kind != \"assert\" && i == lastAssertIdx {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0099",
+  "file": "codegen/stack.go",
+  "line": 1160,
+  "before": "\t\tif binding.Value.Kind == \"assert\" && i == lastAssertIdx {",
+  "after": "\t\tif binding.Value.Kind == \"assert\" && i != lastAssertIdx {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0100",
+  "file": "codegen/stack.go",
+  "line": 1160,
+  "before": "\t\tif binding.Value.Kind == \"assert\" && i == lastAssertIdx {",
+  "after": "\t\tif binding.Value.Kind == \"assert\" || i == lastAssertIdx {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0101",
+  "file": "codegen/stack.go",
+  "line": 1163,
+  "before": "\t\t} else if binding.Value.Kind == \"if\" && i == terminalIfIdx {",
+  "after": "\t\t} else if binding.Value.Kind != \"if\" && i == terminalIfIdx {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0102",
+  "file": "codegen/stack.go",
+  "line": 1163,
+  "before": "\t\t} else if binding.Value.Kind == \"if\" && i == terminalIfIdx {",
+  "after": "\t\t} else if binding.Value.Kind == \"if\" && i != terminalIfIdx {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0103",
+  "file": "codegen/stack.go",
+  "line": 1163,
+  "before": "\t\t} else if binding.Value.Kind == \"if\" && i == terminalIfIdx {",
+  "after": "\t\t} else if binding.Value.Kind == \"if\" || i == terminalIfIdx {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0104",
+  "file": "codegen/stack.go",
+  "line": 1187,
+  "before": "\t\tlastUses[name] = 1<<31 - 1 // MAX_INT",
+  "after": "\t\tlastUses[name] = 1<<31 + 1 // MAX_INT",
+  "op": "arith-minus-to-plus",
+  "region": "other"
+ },
+ {
+  "id": "G0105",
+  "file": "codegen/stack.go",
+  "line": 1284,
+  "before": "\t\tif ctx.properties[i].Name == propName {",
+  "after": "\t\tif ctx.properties[i].Name != propName {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0106",
+  "file": "codegen/stack.go",
+  "line": 1296,
+  "before": "\t} else if prop != nil && prop.InitialValue != nil {",
+  "after": "\t} else if prop == nil && prop.InitialValue != nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0107",
+  "file": "codegen/stack.go",
+  "line": 1296,
+  "before": "\t} else if prop != nil && prop.InitialValue != nil {",
+  "after": "\t} else if prop != nil && prop.InitialValue == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0108",
+  "file": "codegen/stack.go",
+  "line": 1296,
+  "before": "\t} else if prop != nil && prop.InitialValue != nil {",
+  "after": "\t} else if prop != nil || prop.InitialValue != nil {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0109",
+  "file": "codegen/stack.go",
+  "line": 1313,
+  "before": "\t\t\tif p.InitialValue != nil {",
+  "after": "\t\t\tif p.InitialValue == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0110",
+  "file": "codegen/stack.go",
+  "line": 1316,
+  "before": "\t\t\tif p.Name == propName {",
+  "after": "\t\t\tif p.Name != propName {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0111",
+  "file": "codegen/stack.go",
+  "line": 1325,
+  "before": "\t\t\t\tif p.InitialValue == nil {",
+  "after": "\t\t\t\tif p.InitialValue != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0112",
+  "file": "codegen/stack.go",
+  "line": 1330,
+  "before": "\t\t\tif ctx.currentSourceLoc != nil {",
+  "after": "\t\t\tif ctx.currentSourceLoc == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0113",
+  "file": "codegen/stack.go",
+  "line": 1366,
+  "before": "\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\tif value.ConstString != nil && len(*value.ConstString) >= 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0114",
+  "file": "codegen/stack.go",
+  "line": 1366,
+  "before": "\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] != \"@ref:\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0115",
+  "file": "codegen/stack.go",
+  "line": 1366,
+  "before": "\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\tif value.ConstString == nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0116",
+  "file": "codegen/stack.go",
+  "line": 1366,
+  "before": "\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\tif value.ConstString != nil || len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0117",
+  "file": "codegen/stack.go",
+  "line": 1366,
+  "before": "\tif value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == \"@ref:\" {",
+  "after": "\tif value.ConstString != nil && len(*value.ConstString) > 5 || (*value.ConstString)[:5] == \"@ref:\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0118",
+  "file": "codegen/stack.go",
+  "line": 1387,
+  "before": "\t\t\tconsume := ctx.localBindings[refName] && ctx.isLastUse(refName, bindingIndex, lastUses)",
+  "after": "\t\t\tconsume := ctx.localBindings[refName] || ctx.isLastUse(refName, bindingIndex, lastUses)",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0119",
+  "file": "codegen/stack.go",
+  "line": 1404,
+  "before": "\tif value.ConstString != nil && *value.ConstString == \"@this\" {",
+  "after": "\tif value.ConstString != nil && *value.ConstString != \"@this\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0120",
+  "file": "codegen/stack.go",
+  "line": 1404,
+  "before": "\tif value.ConstString != nil && *value.ConstString == \"@this\" {",
+  "after": "\tif value.ConstString == nil && *value.ConstString == \"@this\" {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0121",
+  "file": "codegen/stack.go",
+  "line": 1404,
+  "before": "\tif value.ConstString != nil && *value.ConstString == \"@this\" {",
+  "after": "\tif value.ConstString != nil || *value.ConstString == \"@this\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0122",
+  "file": "codegen/stack.go",
+  "line": 1409,
+  "before": "\tif value.ConstBool != nil {",
+  "after": "\tif value.ConstBool == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0123",
+  "file": "codegen/stack.go",
+  "line": 1411,
+  "before": "\t} else if value.ConstBigInt != nil {",
+  "after": "\t} else if value.ConstBigInt == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0124",
+  "file": "codegen/stack.go",
+  "line": 1415,
+  "before": "\t} else if value.ConstString != nil {",
+  "after": "\t} else if value.ConstString == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0125",
+  "file": "codegen/stack.go",
+  "line": 1435,
+  "before": "\tif resultType == \"bytes\" && (op == \"===\" || op == \"!==\") {",
+  "after": "\tif resultType != \"bytes\" && (op == \"===\" || op == \"!==\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0126",
+  "file": "codegen/stack.go",
+  "line": 1435,
+  "before": "\tif resultType == \"bytes\" && (op == \"===\" || op == \"!==\") {",
+  "after": "\tif resultType == \"bytes\" && (op != \"===\" || op == \"!==\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0127",
+  "file": "codegen/stack.go",
+  "line": 1435,
+  "before": "\tif resultType == \"bytes\" && (op == \"===\" || op == \"!==\") {",
+  "after": "\tif resultType == \"bytes\" && (op == \"===\" || op == \"===\") {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0128",
+  "file": "codegen/stack.go",
+  "line": 1435,
+  "before": "\tif resultType == \"bytes\" && (op == \"===\" || op == \"!==\") {",
+  "after": "\tif resultType == \"bytes\" || (op == \"===\" || op == \"!==\") {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0129",
+  "file": "codegen/stack.go",
+  "line": 1435,
+  "before": "\tif resultType == \"bytes\" && (op == \"===\" || op == \"!==\") {",
+  "after": "\tif resultType == \"bytes\" && (op == \"===\" && op == \"!==\") {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0130",
+  "file": "codegen/stack.go",
+  "line": 1437,
+  "before": "\t\tif op == \"!==\" {",
+  "after": "\t\tif op != \"!==\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0131",
+  "file": "codegen/stack.go",
+  "line": 1437,
+  "before": "\t\tif op == \"!==\" {",
+  "after": "\t\tif op == \"!!=\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0132",
+  "file": "codegen/stack.go",
+  "line": 1437,
+  "before": "\t\tif op == \"!==\" {",
+  "after": "\t\tif op == \"===\" {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0133",
+  "file": "codegen/stack.go",
+  "line": 1440,
+  "before": "\t} else if resultType == \"bytes\" && op == \"+\" {",
+  "after": "\t} else if resultType != \"bytes\" && op == \"+\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0134",
+  "file": "codegen/stack.go",
+  "line": 1440,
+  "before": "\t} else if resultType == \"bytes\" && op == \"+\" {",
+  "after": "\t} else if resultType == \"bytes\" && op != \"+\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0135",
+  "file": "codegen/stack.go",
+  "line": 1440,
+  "before": "\t} else if resultType == \"bytes\" && op == \"+\" {",
+  "after": "\t} else if resultType == \"bytes\" || op == \"+\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0136",
+  "file": "codegen/stack.go",
+  "line": 1486,
+  "before": "\tif (funcName == \"assertGroth16WitnessAssisted\" || funcName == \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "after": "\tif (funcName != \"assertGroth16WitnessAssisted\" || funcName == \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0137",
+  "file": "codegen/stack.go",
+  "line": 1486,
+  "before": "\tif (funcName == \"assertGroth16WitnessAssisted\" || funcName == \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "after": "\tif (funcName == \"assertGroth16WitnessAssisted\" || funcName != \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0138",
+  "file": "codegen/stack.go",
+  "line": 1486,
+  "before": "\tif (funcName == \"assertGroth16WitnessAssisted\" || funcName == \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "after": "\tif (funcName == \"assertGroth16WitnessAssisted\" || funcName == \"assertGroth16WitnessAssistedWithMSM\") || ctx.skipGroth16WAMarker {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0139",
+  "file": "codegen/stack.go",
+  "line": 1486,
+  "before": "\tif (funcName == \"assertGroth16WitnessAssisted\" || funcName == \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "after": "\tif (funcName == \"assertGroth16WitnessAssisted\" && funcName == \"assertGroth16WitnessAssistedWithMSM\") && ctx.skipGroth16WAMarker {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0140",
+  "file": "codegen/stack.go",
+  "line": 1505,
+  "before": "\tif funcName == \"groth16PublicInput\" {",
+  "after": "\tif funcName != \"groth16PublicInput\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0141",
+  "file": "codegen/stack.go",
+  "line": 1506,
+  "before": "\t\tif len(args) != 1 {",
+  "after": "\t\tif len(args) == 1 {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0142",
+  "file": "codegen/stack.go",
+  "line": 1511,
+  "before": "\t\tif !ok || idxVal == nil {",
+  "after": "\t\tif !ok || idxVal != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0143",
+  "file": "codegen/stack.go",
+  "line": 1511,
+  "before": "\t\tif !ok || idxVal == nil {",
+  "after": "\t\tif !ok && idxVal == nil {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0144",
+  "file": "codegen/stack.go",
+  "line": 1518,
+  "before": "\t\tif idx < 0 || idx > 4 {",
+  "after": "\t\tif idx <= 0 || idx > 4 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0145",
+  "file": "codegen/stack.go",
+  "line": 1518,
+  "before": "\t\tif idx < 0 || idx > 4 {",
+  "after": "\t\tif idx < 0 || idx >= 4 {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0146",
+  "file": "codegen/stack.go",
+  "line": 1518,
+  "before": "\t\tif idx < 0 || idx > 4 {",
+  "after": "\t\tif idx < 0 && idx > 4 {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0147",
+  "file": "codegen/stack.go",
+  "line": 1545,
+  "before": "\tif funcName == \"assert\" {",
+  "after": "\tif funcName != \"assert\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0148",
+  "file": "codegen/stack.go",
+  "line": 1546,
+  "before": "\t\tif len(args) >= 1 {",
+  "after": "\t\tif len(args) > 1 {",
+  "op": "cmp-ge-to-gt",
+  "region": "other"
+ },
+ {
+  "id": "G0149",
+  "file": "codegen/stack.go",
+  "line": 1557,
+  "before": "\tif funcName == \"exit\" {",
+  "after": "\tif funcName != \"exit\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0150",
+  "file": "codegen/stack.go",
+  "line": 1558,
+  "before": "\t\tif len(args) >= 1 {",
+  "after": "\t\tif len(args) > 1 {",
+  "op": "cmp-ge-to-gt",
+  "region": "other"
+ },
+ {
+  "id": "G0151",
+  "file": "codegen/stack.go",
+  "line": 1570,
+  "before": "\tif funcName == \"super\" {",
+  "after": "\tif funcName != \"super\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0152",
+  "file": "codegen/stack.go",
+  "line": 1579,
+  "before": "\tif funcName == \"checkMultiSig\" && len(args) == 2 {",
+  "after": "\tif funcName != \"checkMultiSig\" && len(args) == 2 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0153",
+  "file": "codegen/stack.go",
+  "line": 1579,
+  "before": "\tif funcName == \"checkMultiSig\" && len(args) == 2 {",
+  "after": "\tif funcName == \"checkMultiSig\" && len(args) != 2 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0154",
+  "file": "codegen/stack.go",
+  "line": 1579,
+  "before": "\tif funcName == \"checkMultiSig\" && len(args) == 2 {",
+  "after": "\tif funcName == \"checkMultiSig\" || len(args) == 2 {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0155",
+  "file": "codegen/stack.go",
+  "line": 1584,
+  "before": "\tif funcName == \"reverseBytes\" {",
+  "after": "\tif funcName != \"reverseBytes\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0156",
+  "file": "codegen/stack.go",
+  "line": 1589,
+  "before": "\tif funcName == \"__array_access\" {",
+  "after": "\tif funcName != \"__array_access\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0157",
+  "file": "codegen/stack.go",
+  "line": 1594,
+  "before": "\tif funcName == \"substr\" {",
+  "after": "\tif funcName != \"substr\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0158",
+  "file": "codegen/stack.go",
+  "line": 1599,
+  "before": "\tif funcName == \"verifyRabinSig\" {",
+  "after": "\tif funcName != \"verifyRabinSig\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0159",
+  "file": "codegen/stack.go",
+  "line": 1604,
+  "before": "\tif funcName == \"verifyWOTS\" {",
+  "after": "\tif funcName != \"verifyWOTS\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0160",
+  "file": "codegen/stack.go",
+  "line": 1615,
+  "before": "\tif funcName == \"verifySP1FRI\" {",
+  "after": "\tif funcName != \"verifySP1FRI\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0161",
+  "file": "codegen/stack.go",
+  "line": 1620,
+  "before": "\tif funcName == \"sha256Compress\" {",
+  "after": "\tif funcName != \"sha256Compress\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0162",
+  "file": "codegen/stack.go",
+  "line": 1625,
+  "before": "\tif funcName == \"sha256Finalize\" {",
+  "after": "\tif funcName != \"sha256Finalize\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0163",
+  "file": "codegen/stack.go",
+  "line": 1630,
+  "before": "\tif funcName == \"blake3Compress\" {",
+  "after": "\tif funcName != \"blake3Compress\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0164",
+  "file": "codegen/stack.go",
+  "line": 1635,
+  "before": "\tif funcName == \"blake3Hash\" {",
+  "after": "\tif funcName != \"blake3Hash\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0165",
+  "file": "codegen/stack.go",
+  "line": 1650,
+  "before": "\tif funcName == \"verifyECDSA_P256\" || funcName == \"verifyECDSA_P384\" {",
+  "after": "\tif funcName != \"verifyECDSA_P256\" || funcName == \"verifyECDSA_P384\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0166",
+  "file": "codegen/stack.go",
+  "line": 1650,
+  "before": "\tif funcName == \"verifyECDSA_P256\" || funcName == \"verifyECDSA_P384\" {",
+  "after": "\tif funcName == \"verifyECDSA_P256\" || funcName != \"verifyECDSA_P384\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0167",
+  "file": "codegen/stack.go",
+  "line": 1650,
+  "before": "\tif funcName == \"verifyECDSA_P256\" || funcName == \"verifyECDSA_P384\" {",
+  "after": "\tif funcName == \"verifyECDSA_P256\" && funcName == \"verifyECDSA_P384\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0168",
+  "file": "codegen/stack.go",
+  "line": 1670,
+  "before": "\tif funcName == \"merkleRootSha256\" || funcName == \"merkleRootHash256\" {",
+  "after": "\tif funcName != \"merkleRootSha256\" || funcName == \"merkleRootHash256\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0169",
+  "file": "codegen/stack.go",
+  "line": 1670,
+  "before": "\tif funcName == \"merkleRootSha256\" || funcName == \"merkleRootHash256\" {",
+  "after": "\tif funcName == \"merkleRootSha256\" || funcName != \"merkleRootHash256\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0170",
+  "file": "codegen/stack.go",
+  "line": 1670,
+  "before": "\tif funcName == \"merkleRootSha256\" || funcName == \"merkleRootHash256\" {",
+  "after": "\tif funcName == \"merkleRootSha256\" && funcName == \"merkleRootHash256\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0171",
+  "file": "codegen/stack.go",
+  "line": 1675,
+  "before": "\tif funcName == \"merkleRootPoseidon2KB\" {",
+  "after": "\tif funcName != \"merkleRootPoseidon2KB\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0172",
+  "file": "codegen/stack.go",
+  "line": 1680,
+  "before": "\tif funcName == \"safediv\" || funcName == \"safemod\" {",
+  "after": "\tif funcName != \"safediv\" || funcName == \"safemod\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0173",
+  "file": "codegen/stack.go",
+  "line": 1680,
+  "before": "\tif funcName == \"safediv\" || funcName == \"safemod\" {",
+  "after": "\tif funcName == \"safediv\" || funcName != \"safemod\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0174",
+  "file": "codegen/stack.go",
+  "line": 1680,
+  "before": "\tif funcName == \"safediv\" || funcName == \"safemod\" {",
+  "after": "\tif funcName == \"safediv\" && funcName == \"safemod\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0175",
+  "file": "codegen/stack.go",
+  "line": 1685,
+  "before": "\tif funcName == \"clamp\" {",
+  "after": "\tif funcName != \"clamp\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0176",
+  "file": "codegen/stack.go",
+  "line": 1690,
+  "before": "\tif funcName == \"pow\" {",
+  "after": "\tif funcName != \"pow\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0177",
+  "file": "codegen/stack.go",
+  "line": 1695,
+  "before": "\tif funcName == \"mulDiv\" {",
+  "after": "\tif funcName != \"mulDiv\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0178",
+  "file": "codegen/stack.go",
+  "line": 1700,
+  "before": "\tif funcName == \"percentOf\" {",
+  "after": "\tif funcName != \"percentOf\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0179",
+  "file": "codegen/stack.go",
+  "line": 1705,
+  "before": "\tif funcName == \"sqrt\" {",
+  "after": "\tif funcName != \"sqrt\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0180",
+  "file": "codegen/stack.go",
+  "line": 1710,
+  "before": "\tif funcName == \"gcd\" {",
+  "after": "\tif funcName != \"gcd\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0181",
+  "file": "codegen/stack.go",
+  "line": 1715,
+  "before": "\tif funcName == \"divmod\" {",
+  "after": "\tif funcName != \"divmod\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0182",
+  "file": "codegen/stack.go",
+  "line": 1720,
+  "before": "\tif funcName == \"log2\" {",
+  "after": "\tif funcName != \"log2\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0183",
+  "file": "codegen/stack.go",
+  "line": 1725,
+  "before": "\tif funcName == \"sign\" {",
+  "after": "\tif funcName != \"sign\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0184",
+  "file": "codegen/stack.go",
+  "line": 1730,
+  "before": "\tif funcName == \"right\" {",
+  "after": "\tif funcName != \"right\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0185",
+  "file": "codegen/stack.go",
+  "line": 1736,
+  "before": "\tif funcName == \"pack\" || funcName == \"toByteString\" {",
+  "after": "\tif funcName != \"pack\" || funcName == \"toByteString\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0186",
+  "file": "codegen/stack.go",
+  "line": 1736,
+  "before": "\tif funcName == \"pack\" || funcName == \"toByteString\" {",
+  "after": "\tif funcName == \"pack\" || funcName != \"toByteString\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0187",
+  "file": "codegen/stack.go",
+  "line": 1736,
+  "before": "\tif funcName == \"pack\" || funcName == \"toByteString\" {",
+  "after": "\tif funcName == \"pack\" && funcName == \"toByteString\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0188",
+  "file": "codegen/stack.go",
+  "line": 1737,
+  "before": "\t\tif len(args) >= 1 {",
+  "after": "\t\tif len(args) > 1 {",
+  "op": "cmp-ge-to-gt",
+  "region": "other"
+ },
+ {
+  "id": "G0189",
+  "file": "codegen/stack.go",
+  "line": 1750,
+  "before": "\tif funcName == \"computeStateOutputHash\" {",
+  "after": "\tif funcName != \"computeStateOutputHash\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0190",
+  "file": "codegen/stack.go",
+  "line": 1758,
+  "before": "\tif funcName == \"computeStateOutput\" {",
+  "after": "\tif funcName != \"computeStateOutput\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0191",
+  "file": "codegen/stack.go",
+  "line": 1766,
+  "before": "\tif funcName == \"buildChangeOutput\" {",
+  "after": "\tif funcName != \"buildChangeOutput\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0192",
+  "file": "codegen/stack.go",
+  "line": 1774,
+  "before": "\tif len(funcName) > 7 && funcName[:7] == \"extract\" {",
+  "after": "\tif len(funcName) >= 7 && funcName[:7] == \"extract\" {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0193",
+  "file": "codegen/stack.go",
+  "line": 1774,
+  "before": "\tif len(funcName) > 7 && funcName[:7] == \"extract\" {",
+  "after": "\tif len(funcName) > 7 && funcName[:7] != \"extract\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0194",
+  "file": "codegen/stack.go",
+  "line": 1774,
+  "before": "\tif len(funcName) > 7 && funcName[:7] == \"extract\" {",
+  "after": "\tif len(funcName) > 7 || funcName[:7] == \"extract\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0195",
+  "file": "codegen/stack.go",
+  "line": 1803,
+  "before": "\tif funcName == \"split\" {",
+  "after": "\tif funcName != \"split\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0196",
+  "file": "codegen/stack.go",
+  "line": 1806,
+  "before": "\t} else if funcName == \"len\" {",
+  "after": "\t} else if funcName != \"len\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0197",
+  "file": "codegen/stack.go",
+  "line": 1827,
+  "before": "\tif method == \"getStateScript\" {",
+  "after": "\tif method != \"getStateScript\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0198",
+  "file": "codegen/stack.go",
+  "line": 1853,
+  "before": "\t\tif i < len(method.Params) {",
+  "after": "\t\tif i <= len(method.Params) {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0199",
+  "file": "codegen/stack.go",
+  "line": 1886,
+  "before": "\tif len(method.Body) > 0 {",
+  "after": "\tif len(method.Body) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0200",
+  "file": "codegen/stack.go",
+  "line": 1887,
+  "before": "\t\tlastBindingName := method.Body[len(method.Body)-1].Name",
+  "after": "\t\tlastBindingName := method.Body[len(method.Body)-2].Name",
+  "op": "len-off-by-one",
+  "region": "other"
+ },
+ {
+  "id": "G0201",
+  "file": "codegen/stack.go",
+  "line": 1887,
+  "before": "\t\tlastBindingName := method.Body[len(method.Body)-1].Name",
+  "after": "\t\tlastBindingName := method.Body[len(method.Body)].Name",
+  "op": "len-drop-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0202",
+  "file": "codegen/stack.go",
+  "line": 1889,
+  "before": "\t\tif ctx.sm.depth() > 0 {",
+  "after": "\t\tif ctx.sm.depth() >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0203",
+  "file": "codegen/stack.go",
+  "line": 1891,
+  "before": "\t\t\tif topName == lastBindingName {",
+  "after": "\t\t\tif topName != lastBindingName {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0204",
+  "file": "codegen/stack.go",
+  "line": 1904,
+  "before": "\tta := len(terminalAssert) > 0 && terminalAssert[0]",
+  "after": "\tta := len(terminalAssert) >= 0 && terminalAssert[0]",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0205",
+  "file": "codegen/stack.go",
+  "line": 1904,
+  "before": "\tta := len(terminalAssert) > 0 && terminalAssert[0]",
+  "after": "\tta := len(terminalAssert) > 0 || terminalAssert[0]",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0206",
+  "file": "codegen/stack.go",
+  "line": 1917,
+  "before": "\tif len(results) == 0 {",
+  "after": "\tif len(results) != 0 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0207",
+  "file": "codegen/stack.go",
+  "line": 1938,
+  "before": "\tif len(results) > 1 {",
+  "after": "\tif len(results) >= 1 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0208",
+  "file": "codegen/stack.go",
+  "line": 1959,
+  "before": "\t\tif lastIdx > bindingIndex && ctx.sm.has(ref) {",
+  "after": "\t\tif lastIdx >= bindingIndex && ctx.sm.has(ref) {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0209",
+  "file": "codegen/stack.go",
+  "line": 1959,
+  "before": "\t\tif lastIdx > bindingIndex && ctx.sm.has(ref) {",
+  "after": "\t\tif lastIdx > bindingIndex || ctx.sm.has(ref) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0210",
+  "file": "codegen/stack.go",
+  "line": 2013,
+  "before": "\tif ta && thenCtx.sm.depth() > 1 {",
+  "after": "\tif ta && thenCtx.sm.depth() >= 1 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0211",
+  "file": "codegen/stack.go",
+  "line": 2013,
+  "before": "\tif ta && thenCtx.sm.depth() > 1 {",
+  "after": "\tif ta || thenCtx.sm.depth() > 1 {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0212",
+  "file": "codegen/stack.go",
+  "line": 2014,
+  "before": "\t\texcess := thenCtx.sm.depth() - 1",
+  "after": "\t\texcess := thenCtx.sm.depth() + 1",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0213",
+  "file": "codegen/stack.go",
+  "line": 2015,
+  "before": "\t\tfor i := 0; i < excess; i++ {",
+  "after": "\t\tfor i := 0; i <= excess; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0214",
+  "file": "codegen/stack.go",
+  "line": 2030,
+  "before": "\tif ta && elseCtx.sm.depth() > 1 {",
+  "after": "\tif ta && elseCtx.sm.depth() >= 1 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0215",
+  "file": "codegen/stack.go",
+  "line": 2030,
+  "before": "\tif ta && elseCtx.sm.depth() > 1 {",
+  "after": "\tif ta || elseCtx.sm.depth() > 1 {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0216",
+  "file": "codegen/stack.go",
+  "line": 2031,
+  "before": "\t\texcess := elseCtx.sm.depth() - 1",
+  "after": "\t\texcess := elseCtx.sm.depth() + 1",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0217",
+  "file": "codegen/stack.go",
+  "line": 2032,
+  "before": "\t\tfor i := 0; i < excess; i++ {",
+  "after": "\t\tfor i := 0; i <= excess; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0218",
+  "file": "codegen/stack.go",
+  "line": 2053,
+  "before": "\t\tif !postThenNames[name] && elseCtx.sm.has(name) {",
+  "after": "\t\tif !postThenNames[name] || elseCtx.sm.has(name) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0219",
+  "file": "codegen/stack.go",
+  "line": 2060,
+  "before": "\t\tif !postElseNames[name] && thenCtx.sm.has(name) {",
+  "after": "\t\tif !postElseNames[name] || thenCtx.sm.has(name) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0220",
+  "file": "codegen/stack.go",
+  "line": 2067,
+  "before": "\tif len(consumedNames) > 0 {",
+  "after": "\tif len(consumedNames) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0221",
+  "file": "codegen/stack.go",
+  "line": 2074,
+  "before": "\t\t\tif depth == 0 {",
+  "after": "\t\t\tif depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0222",
+  "file": "codegen/stack.go",
+  "line": 2077,
+  "before": "\t\t\t} else if depth == 1 {",
+  "after": "\t\t\t} else if depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0223",
+  "file": "codegen/stack.go",
+  "line": 2092,
+  "before": "\tif len(elseConsumedNames) > 0 {",
+  "after": "\tif len(elseConsumedNames) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0224",
+  "file": "codegen/stack.go",
+  "line": 2099,
+  "before": "\t\t\tif depth == 0 {",
+  "after": "\t\t\tif depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0225",
+  "file": "codegen/stack.go",
+  "line": 2102,
+  "before": "\t\t\t} else if depth == 1 {",
+  "after": "\t\t\t} else if depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0226",
+  "file": "codegen/stack.go",
+  "line": 2132,
+  "before": "\tif nDeclared >= 1 {",
+  "after": "\tif nDeclared > 1 {",
+  "op": "cmp-ge-to-gt",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0227",
+  "file": "codegen/stack.go",
+  "line": 2136,
+  "before": "\t\t\tif !stillHeld[name] && ctx.sm.has(name) {",
+  "after": "\t\t\tif !stillHeld[name] || ctx.sm.has(name) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0228",
+  "file": "codegen/stack.go",
+  "line": 2140,
+  "before": "\t\ttargetDepth := ctx.sm.depth() - consumedFromParent + nDeclared",
+  "after": "\t\ttargetDepth := ctx.sm.depth() - consumedFromParent - nDeclared",
+  "op": "arith-plus-to-minus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0229",
+  "file": "codegen/stack.go",
+  "line": 2140,
+  "before": "\t\ttargetDepth := ctx.sm.depth() - consumedFromParent + nDeclared",
+  "after": "\t\ttargetDepth := ctx.sm.depth() + consumedFromParent + nDeclared",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0230",
+  "file": "codegen/stack.go",
+  "line": 2142,
+  "before": "\t\t\tfor armCtx.sm.depth() > targetDepth {",
+  "after": "\t\t\tfor armCtx.sm.depth() >= targetDepth {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0231",
+  "file": "codegen/stack.go",
+  "line": 2157,
+  "before": "\t\t\tif arm.c.sm.depth() != targetDepth {",
+  "after": "\t\t\tif arm.c.sm.depth() == targetDepth {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0232",
+  "file": "codegen/stack.go",
+  "line": 2160,
+  "before": "\t\t\tfor i := 0; i < nDeclared; i++ {",
+  "after": "\t\t\tfor i := 0; i <= nDeclared; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0233",
+  "file": "codegen/stack.go",
+  "line": 2163,
+  "before": "\t\t\t\tif got != want {",
+  "after": "\t\t\t\tif got == want {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0234",
+  "file": "codegen/stack.go",
+  "line": 2178,
+  "before": "\tfor thenCtx.sm.depth() > elseCtx.sm.depth() {",
+  "after": "\tfor thenCtx.sm.depth() >= elseCtx.sm.depth() {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0235",
+  "file": "codegen/stack.go",
+  "line": 2179,
+  "before": "\t\tresultDepth := thenCtx.sm.depth() - elseCtx.sm.depth() - 1",
+  "after": "\t\tresultDepth := thenCtx.sm.depth() + elseCtx.sm.depth() - 1",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0236",
+  "file": "codegen/stack.go",
+  "line": 2179,
+  "before": "\t\tresultDepth := thenCtx.sm.depth() - elseCtx.sm.depth() - 1",
+  "after": "\t\tresultDepth := thenCtx.sm.depth() - elseCtx.sm.depth() + 1",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0237",
+  "file": "codegen/stack.go",
+  "line": 2181,
+  "before": "\t\tif len(elseBindings) == 0 && thenName != \"\" && elseCtx.sm.has(thenName) {",
+  "after": "\t\tif len(elseBindings) != 0 && thenName != \"\" && elseCtx.sm.has(thenName) {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0238",
+  "file": "codegen/stack.go",
+  "line": 2181,
+  "before": "\t\tif len(elseBindings) == 0 && thenName != \"\" && elseCtx.sm.has(thenName) {",
+  "after": "\t\tif len(elseBindings) == 0 && thenName == \"\" && elseCtx.sm.has(thenName) {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0239",
+  "file": "codegen/stack.go",
+  "line": 2181,
+  "before": "\t\tif len(elseBindings) == 0 && thenName != \"\" && elseCtx.sm.has(thenName) {",
+  "after": "\t\tif len(elseBindings) == 0 || thenName != \"\" && elseCtx.sm.has(thenName) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0240",
+  "file": "codegen/stack.go",
+  "line": 2181,
+  "before": "\t\tif len(elseBindings) == 0 && thenName != \"\" && elseCtx.sm.has(thenName) {",
+  "after": "\t\tif len(elseBindings) == 0 && thenName != \"\" || elseCtx.sm.has(thenName) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0241",
+  "file": "codegen/stack.go",
+  "line": 2183,
+  "before": "\t\t\tif varDepth == 0 {",
+  "after": "\t\t\tif varDepth != 0 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0242",
+  "file": "codegen/stack.go",
+  "line": 2197,
+  "before": "\tfor elseCtx.sm.depth() > thenCtx.sm.depth() {",
+  "after": "\tfor elseCtx.sm.depth() >= thenCtx.sm.depth() {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0243",
+  "file": "codegen/stack.go",
+  "line": 2208,
+  "before": "\tif thenCtx.sm.depth() != elseCtx.sm.depth() {",
+  "after": "\tif thenCtx.sm.depth() == elseCtx.sm.depth() {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0244",
+  "file": "codegen/stack.go",
+  "line": 2209,
+  "before": "\t\tpanic(fmt.Sprintf(\"internal codegen error: conditional emitted stack-imbalanced branches (then depth %d != else depth %d); would produce an unspendable script (see GitHub issue #99); binding=%q\", thenCtx.sm.depth(), elseCtx.sm.depth(), bindingName))",
+  "after": "\t\tpanic(fmt.Sprintf(\"internal codegen error: conditional emitted stack-imbalanced branches (then depth %d == else depth %d); would produce an unspendable script (see GitHub issue #99); binding=%q\", thenCtx.sm.depth(), elseCtx.sm.depth(), bindingName))",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0245",
+  "file": "codegen/stack.go",
+  "line": 2219,
+  "before": "\tif len(elseOps) > 0 {",
+  "after": "\tif len(elseOps) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0246",
+  "file": "codegen/stack.go",
+  "line": 2234,
+  "before": "\t\tif !postBranchNames[name] && ctx.sm.has(name) {",
+  "after": "\t\tif !postBranchNames[name] || ctx.sm.has(name) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0247",
+  "file": "codegen/stack.go",
+  "line": 2252,
+  "before": "\tnResults := thenCtx.sm.depth() - ctx.sm.depth()",
+  "after": "\tnResults := thenCtx.sm.depth() + ctx.sm.depth()",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0248",
+  "file": "codegen/stack.go",
+  "line": 2253,
+  "before": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "after": "\telseMatchesThenNResultLayout := len(elseBindings) >= 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0249",
+  "file": "codegen/stack.go",
+  "line": 2253,
+  "before": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "after": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults > 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "op": "cmp-ge-to-gt",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0250",
+  "file": "codegen/stack.go",
+  "line": 2253,
+  "before": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "after": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() != nResults",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0251",
+  "file": "codegen/stack.go",
+  "line": 2253,
+  "before": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "after": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 || nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0252",
+  "file": "codegen/stack.go",
+  "line": 2253,
+  "before": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 && elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "after": "\telseMatchesThenNResultLayout := len(elseBindings) > 0 && nResults >= 2 || elseCtx.sm.depth()-ctx.sm.depth() == nResults",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0253",
+  "file": "codegen/stack.go",
+  "line": 2255,
+  "before": "\t\tfor i := 0; i < nResults; i++ {",
+  "after": "\t\tfor i := 0; i <= nResults; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0254",
+  "file": "codegen/stack.go",
+  "line": 2257,
+  "before": "\t\t\tif tn == \"\" || tn != elseCtx.sm.peekAtDepth(i) {",
+  "after": "\t\t\tif tn != \"\" || tn != elseCtx.sm.peekAtDepth(i) {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0255",
+  "file": "codegen/stack.go",
+  "line": 2257,
+  "before": "\t\t\tif tn == \"\" || tn != elseCtx.sm.peekAtDepth(i) {",
+  "after": "\t\t\tif tn == \"\" || tn == elseCtx.sm.peekAtDepth(i) {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0256",
+  "file": "codegen/stack.go",
+  "line": 2257,
+  "before": "\t\t\tif tn == \"\" || tn != elseCtx.sm.peekAtDepth(i) {",
+  "after": "\t\t\tif tn == \"\" && tn != elseCtx.sm.peekAtDepth(i) {",
+  "op": "bool-or-to-and",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0257",
+  "file": "codegen/stack.go",
+  "line": 2265,
+  "before": "\tif nDeclared >= 1 {",
+  "after": "\tif nDeclared > 1 {",
+  "op": "cmp-ge-to-gt",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0258",
+  "file": "codegen/stack.go",
+  "line": 2281,
+  "before": "\t\tfor i := nDeclared - 1; i >= 0; i-- {",
+  "after": "\t\tfor i := nDeclared - 1; i > 0; i-- {",
+  "op": "cmp-ge-to-gt",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0259",
+  "file": "codegen/stack.go",
+  "line": 2281,
+  "before": "\t\tfor i := nDeclared - 1; i >= 0; i-- {",
+  "after": "\t\tfor i := nDeclared + 1; i >= 0; i-- {",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0260",
+  "file": "codegen/stack.go",
+  "line": 2283,
+  "before": "\t\t\tfor d := nDeclared; d < ctx.sm.depth(); d++ {",
+  "after": "\t\t\tfor d := nDeclared; d <= ctx.sm.depth(); d++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0261",
+  "file": "codegen/stack.go",
+  "line": 2284,
+  "before": "\t\t\t\tif ctx.sm.peekAtDepth(d) == name {",
+  "after": "\t\t\t\tif ctx.sm.peekAtDepth(d) != name {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0262",
+  "file": "codegen/stack.go",
+  "line": 2287,
+  "before": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 2})",
+  "op": "idx-plus1-to-plus2",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0263",
+  "file": "codegen/stack.go",
+  "line": 2287,
+  "before": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d - 1})",
+  "op": "arith-plus-to-minus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0264",
+  "file": "codegen/stack.go",
+  "line": 2298,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "after": "\t} else if thenCtx.sm.depth() >= ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0265",
+  "file": "codegen/stack.go",
+  "line": 2298,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "after": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults > 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "op": "cmp-ge-to-gt",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0266",
+  "file": "codegen/stack.go",
+  "line": 2298,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "after": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) != 0 || elseMatchesThenNResultLayout) {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0267",
+  "file": "codegen/stack.go",
+  "line": 2298,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "after": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() || nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0268",
+  "file": "codegen/stack.go",
+  "line": 2298,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "after": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 || (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0269",
+  "file": "codegen/stack.go",
+  "line": 2298,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 || elseMatchesThenNResultLayout) {",
+  "after": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() && nResults >= 2 && (len(elseBindings) == 0 && elseMatchesThenNResultLayout) {",
+  "op": "bool-or-to-and",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0270",
+  "file": "codegen/stack.go",
+  "line": 2303,
+  "before": "\t\tresultCount := thenCtx.sm.depth() - ctx.sm.depth()",
+  "after": "\t\tresultCount := thenCtx.sm.depth() + ctx.sm.depth()",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0271",
+  "file": "codegen/stack.go",
+  "line": 2304,
+  "before": "\t\tfor i := resultCount - 1; i >= 0; i-- {",
+  "after": "\t\tfor i := resultCount - 1; i > 0; i-- {",
+  "op": "cmp-ge-to-gt",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0272",
+  "file": "codegen/stack.go",
+  "line": 2304,
+  "before": "\t\tfor i := resultCount - 1; i >= 0; i-- {",
+  "after": "\t\tfor i := resultCount + 1; i >= 0; i-- {",
+  "op": "arith-minus-to-plus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0273",
+  "file": "codegen/stack.go",
+  "line": 2306,
+  "before": "\t\t\tif name == \"\" {",
+  "after": "\t\t\tif name != \"\" {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0274",
+  "file": "codegen/stack.go",
+  "line": 2312,
+  "before": "\t\tfor i := 0; i < resultCount; i++ {",
+  "after": "\t\tfor i := 0; i <= resultCount; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0275",
+  "file": "codegen/stack.go",
+  "line": 2316,
+  "before": "\t\t\tif name == \"\" {",
+  "after": "\t\t\tif name != \"\" {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0276",
+  "file": "codegen/stack.go",
+  "line": 2319,
+  "before": "\t\t\tfor d := resultCount; d < ctx.sm.depth(); d++ {",
+  "after": "\t\t\tfor d := resultCount; d <= ctx.sm.depth(); d++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0277",
+  "file": "codegen/stack.go",
+  "line": 2320,
+  "before": "\t\t\t\tif ctx.sm.peekAtDepth(d) == name {",
+  "after": "\t\t\t\tif ctx.sm.peekAtDepth(d) != name {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0278",
+  "file": "codegen/stack.go",
+  "line": 2323,
+  "before": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 2})",
+  "op": "idx-plus1-to-plus2",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0279",
+  "file": "codegen/stack.go",
+  "line": 2323,
+  "before": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d - 1})",
+  "op": "arith-plus-to-minus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0280",
+  "file": "codegen/stack.go",
+  "line": 2334,
+  "before": "\t} else if thenCtx.sm.depth() > ctx.sm.depth() {",
+  "after": "\t} else if thenCtx.sm.depth() >= ctx.sm.depth() {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0281",
+  "file": "codegen/stack.go",
+  "line": 2338,
+  "before": "\t\tif elseCtx.sm.depth() > 0 {",
+  "after": "\t\tif elseCtx.sm.depth() >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0282",
+  "file": "codegen/stack.go",
+  "line": 2343,
+  "before": "\t\t\tif p.Name == thenTop {",
+  "after": "\t\t\tif p.Name != thenTop {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0283",
+  "file": "codegen/stack.go",
+  "line": 2348,
+  "before": "\t\tif isProperty && thenTop != \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\tif isProperty && thenTop != \"\" && thenTop != elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0284",
+  "file": "codegen/stack.go",
+  "line": 2348,
+  "before": "\t\tif isProperty && thenTop != \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\tif isProperty && thenTop == \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0285",
+  "file": "codegen/stack.go",
+  "line": 2348,
+  "before": "\t\tif isProperty && thenTop != \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\tif isProperty && thenTop != \"\" && thenTop == elseTop && thenTop == bindingName && ctx.sm.has(thenTop) {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0286",
+  "file": "codegen/stack.go",
+  "line": 2348,
+  "before": "\t\tif isProperty && thenTop != \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\tif isProperty || thenTop != \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0287",
+  "file": "codegen/stack.go",
+  "line": 2348,
+  "before": "\t\tif isProperty && thenTop != \"\" && thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\tif isProperty && thenTop != \"\" || thenTop == elseTop && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0288",
+  "file": "codegen/stack.go",
+  "line": 2351,
+  "before": "\t\t\tfor d := 1; d < ctx.sm.depth(); d++ {",
+  "after": "\t\t\tfor d := 1; d <= ctx.sm.depth(); d++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0289",
+  "file": "codegen/stack.go",
+  "line": 2352,
+  "before": "\t\t\t\tif ctx.sm.peekAtDepth(d) == thenTop {",
+  "after": "\t\t\t\tif ctx.sm.peekAtDepth(d) != thenTop {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0290",
+  "file": "codegen/stack.go",
+  "line": 2353,
+  "before": "\t\t\t\t\tif d == 1 {",
+  "after": "\t\t\t\t\tif d != 1 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0291",
+  "file": "codegen/stack.go",
+  "line": 2359,
+  "before": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 2})",
+  "op": "idx-plus1-to-plus2",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0292",
+  "file": "codegen/stack.go",
+  "line": 2359,
+  "before": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d - 1})",
+  "op": "arith-plus-to-minus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0293",
+  "file": "codegen/stack.go",
+  "line": 2370,
+  "before": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) != 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0294",
+  "file": "codegen/stack.go",
+  "line": 2370,
+  "before": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\t} else if thenTop == \"\" && !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0295",
+  "file": "codegen/stack.go",
+  "line": 2370,
+  "before": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) == 0 && thenTop == bindingName && ctx.sm.has(thenTop) {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0296",
+  "file": "codegen/stack.go",
+  "line": 2370,
+  "before": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\t} else if thenTop != \"\" || !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0297",
+  "file": "codegen/stack.go",
+  "line": 2370,
+  "before": "\t\t} else if thenTop != \"\" && !isProperty && len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "after": "\t\t} else if thenTop != \"\" && !isProperty || len(elseBindings) == 0 && thenTop != bindingName && ctx.sm.has(thenTop) {",
+  "op": "bool-and-to-or",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0298",
+  "file": "codegen/stack.go",
+  "line": 2375,
+  "before": "\t\t\tfor d := 1; d < ctx.sm.depth(); d++ {",
+  "after": "\t\t\tfor d := 1; d <= ctx.sm.depth(); d++ {",
+  "op": "cmp-lt-to-le",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0299",
+  "file": "codegen/stack.go",
+  "line": 2376,
+  "before": "\t\t\t\tif ctx.sm.peekAtDepth(d) == thenTop {",
+  "after": "\t\t\t\tif ctx.sm.peekAtDepth(d) != thenTop {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0300",
+  "file": "codegen/stack.go",
+  "line": 2377,
+  "before": "\t\t\t\t\tif d == 1 {",
+  "after": "\t\t\t\t\tif d != 1 {",
+  "op": "eq-to-neq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0301",
+  "file": "codegen/stack.go",
+  "line": 2383,
+  "before": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 2})",
+  "op": "idx-plus1-to-plus2",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0302",
+  "file": "codegen/stack.go",
+  "line": 2383,
+  "before": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d - 1})",
+  "op": "arith-plus-to-minus",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0303",
+  "file": "codegen/stack.go",
+  "line": 2397,
+  "before": "\t} else if elseCtx.sm.depth() > ctx.sm.depth() {",
+  "after": "\t} else if elseCtx.sm.depth() >= ctx.sm.depth() {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0304",
+  "file": "codegen/stack.go",
+  "line": 2428,
+  "before": "\tif ctx.sm.depth()+postEndifDrops != armDepth {",
+  "after": "\tif ctx.sm.depth()+postEndifDrops == armDepth {",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0305",
+  "file": "codegen/stack.go",
+  "line": 2429,
+  "before": "\t\tpanic(fmt.Sprintf(\"internal codegen error: branch result depth mismatch — the parent stack model does not describe the physical stack after OP_ENDIF (stackMap depth %d + %d post-ENDIF drop(s) != arm depth %d); the arms leave %d more physical slot(s) than the compiler recorded, so every later operand would resolve to the wrong slot and the script would be wrong or unspendable; binding=%q\", ctx.sm.depth(), postEndifDrops, armDepth, armDepth-ctx.sm.depth()-postEndifDrops, bindingName))",
+  "after": "\t\tpanic(fmt.Sprintf(\"internal codegen error: branch result depth mismatch — the parent stack model does not describe the physical stack after OP_ENDIF (stackMap depth %d + %d post-ENDIF drop(s) == arm depth %d); the arms leave %d more physical slot(s) than the compiler recorded, so every later operand would resolve to the wrong slot and the script would be wrong or unspendable; binding=%q\", ctx.sm.depth(), postEndifDrops, armDepth, armDepth-ctx.sm.depth()-postEndifDrops, bindingName))",
+  "op": "neq-to-eq",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0306",
+  "file": "codegen/stack.go",
+  "line": 2434,
+  "before": "\tif thenCtx.maxDepth > ctx.maxDepth {",
+  "after": "\tif thenCtx.maxDepth >= ctx.maxDepth {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0307",
+  "file": "codegen/stack.go",
+  "line": 2437,
+  "before": "\tif elseCtx.maxDepth > ctx.maxDepth {",
+  "after": "\tif elseCtx.maxDepth >= ctx.maxDepth {",
+  "op": "cmp-gt-to-ge",
+  "region": "branch-merge"
+ },
+ {
+  "id": "G0308",
+  "file": "codegen/stack.go",
+  "line": 2445,
+  "before": "\tif start == nil {",
+  "after": "\tif start != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0309",
+  "file": "codegen/stack.go",
+  "line": 2448,
+  "before": "\tif step == 0 {",
+  "after": "\tif step != 0 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0310",
+  "file": "codegen/stack.go",
+  "line": 2472,
+  "before": "\t\t\tif ref != iterVar && !deepBodyBindingNames[ref] {",
+  "after": "\t\t\tif ref == iterVar && !deepBodyBindingNames[ref] {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0311",
+  "file": "codegen/stack.go",
+  "line": 2472,
+  "before": "\t\t\tif ref != iterVar && !deepBodyBindingNames[ref] {",
+  "after": "\t\t\tif ref != iterVar || !deepBodyBindingNames[ref] {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0312",
+  "file": "codegen/stack.go",
+  "line": 2484,
+  "before": "\t\tif ref != iterVar {",
+  "after": "\t\tif ref == iterVar {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0313",
+  "file": "codegen/stack.go",
+  "line": 2501,
+  "before": "\tfor i := 0; i < count; i++ {",
+  "after": "\tfor i := 0; i <= count; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0314",
+  "file": "codegen/stack.go",
+  "line": 2521,
+  "before": "\t\tisFinalIteration := i == count-1",
+  "after": "\t\tisFinalIteration := i != count-1",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0315",
+  "file": "codegen/stack.go",
+  "line": 2524,
+  "before": "\t\t\tif enclosingLastUses != nil {",
+  "after": "\t\t\tif enclosingLastUses == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0316",
+  "file": "codegen/stack.go",
+  "line": 2526,
+  "before": "\t\t\t\tif ok && lu > loopBindingIndex {",
+  "after": "\t\t\t\tif ok && lu >= loopBindingIndex {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0317",
+  "file": "codegen/stack.go",
+  "line": 2526,
+  "before": "\t\t\t\tif ok && lu > loopBindingIndex {",
+  "after": "\t\t\t\tif ok || lu > loopBindingIndex {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0318",
+  "file": "codegen/stack.go",
+  "line": 2530,
+  "before": "\t\t\tif !isFinalIteration || usedAfterLoop {",
+  "after": "\t\t\tif !isFinalIteration && usedAfterLoop {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0319",
+  "file": "codegen/stack.go",
+  "line": 2543,
+  "before": "\t\t\tif depth == 0 {",
+  "after": "\t\t\tif depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0320",
+  "file": "codegen/stack.go",
+  "line": 2584,
+  "before": "\t\tfor d := 1; d < ctx.sm.depth(); d++ {",
+  "after": "\t\tfor d := 1; d <= ctx.sm.depth(); d++ {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0321",
+  "file": "codegen/stack.go",
+  "line": 2585,
+  "before": "\t\t\tif ctx.sm.peekAtDepth(d) == propName {",
+  "after": "\t\t\tif ctx.sm.peekAtDepth(d) != propName {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0322",
+  "file": "codegen/stack.go",
+  "line": 2586,
+  "before": "\t\t\t\tif d == 1 {",
+  "after": "\t\t\t\tif d != 1 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0323",
+  "file": "codegen/stack.go",
+  "line": 2592,
+  "before": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 2})",
+  "op": "idx-plus1-to-plus2",
+  "region": "other"
+ },
+ {
+  "id": "G0324",
+  "file": "codegen/stack.go",
+  "line": 2592,
+  "before": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d + 1})",
+  "after": "\t\t\t\t\tctx.emitOp(StackOp{Op: \"roll\", Depth: d - 1})",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0325",
+  "file": "codegen/stack.go",
+  "line": 2615,
+  "before": "\tif len(stateProps) == 0 {",
+  "after": "\tif len(stateProps) != 0 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0326",
+  "file": "codegen/stack.go",
+  "line": 2625,
+  "before": "\t\t} else if prop.InitialValue != nil {",
+  "after": "\t\t} else if prop.InitialValue == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0327",
+  "file": "codegen/stack.go",
+  "line": 2634,
+  "before": "\t\tif prop.Type == \"bigint\" {",
+  "after": "\t\tif prop.Type != \"bigint\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0328",
+  "file": "codegen/stack.go",
+  "line": 2639,
+  "before": "\t\t} else if prop.Type == \"boolean\" {",
+  "after": "\t\t} else if prop.Type != \"boolean\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0329",
+  "file": "codegen/stack.go",
+  "line": 2644,
+  "before": "\t\t} else if prop.Type == \"ByteString\" {",
+  "after": "\t\t} else if prop.Type != \"ByteString\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0330",
+  "file": "codegen/stack.go",
+  "line": 2683,
+  "before": "\tctx.emitOp(StackOp{Op: \"push\", Value: bigIntPush(52)}) // 8 (amount) + 44 (tail)",
+  "after": "\tctx.emitOp(StackOp{Op: \"push\", Value: bigIntPush(52)}) // 8 (amount) - 44 (tail)",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0331",
+  "file": "codegen/stack.go",
+  "line": 2961,
+  "before": "\tif len(stateProps) == 0 {",
+  "after": "\tif len(stateProps) != 0 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0332",
+  "file": "codegen/stack.go",
+  "line": 3197,
+  "before": "\tif len(stateProps) == 1 {",
+  "after": "\tif len(stateProps) != 1 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0333",
+  "file": "codegen/stack.go",
+  "line": 3207,
+  "before": "\t\t\tif i < len(stateProps)-1 {",
+  "after": "\t\t\tif i < len(stateProps)-2 {",
+  "op": "len-off-by-one",
+  "region": "other"
+ },
+ {
+  "id": "G0334",
+  "file": "codegen/stack.go",
+  "line": 3207,
+  "before": "\t\t\tif i < len(stateProps)-1 {",
+  "after": "\t\t\tif i < len(stateProps) {",
+  "op": "len-drop-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0335",
+  "file": "codegen/stack.go",
+  "line": 3207,
+  "before": "\t\t\tif i < len(stateProps)-1 {",
+  "after": "\t\t\tif i <= len(stateProps)-1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0336",
+  "file": "codegen/stack.go",
+  "line": 3241,
+  "before": "\tif len(stateProps) == 1 {",
+  "after": "\tif len(stateProps) != 1 {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0337",
+  "file": "codegen/stack.go",
+  "line": 3256,
+  "before": "\t\t\tif i < len(stateProps)-1 {",
+  "after": "\t\t\tif i < len(stateProps)-2 {",
+  "op": "len-off-by-one",
+  "region": "other"
+ },
+ {
+  "id": "G0338",
+  "file": "codegen/stack.go",
+  "line": 3256,
+  "before": "\t\t\tif i < len(stateProps)-1 {",
+  "after": "\t\t\tif i < len(stateProps) {",
+  "op": "len-drop-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0339",
+  "file": "codegen/stack.go",
+  "line": 3256,
+  "before": "\t\t\tif i < len(stateProps)-1 {",
+  "after": "\t\t\tif i <= len(stateProps)-1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0340",
+  "file": "codegen/stack.go",
+  "line": 3326,
+  "before": "\tfor i := 0; i < len(stateValues) && i < len(stateProps); i++ {",
+  "after": "\tfor i := 0; i <= len(stateValues) && i < len(stateProps); i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0341",
+  "file": "codegen/stack.go",
+  "line": 3326,
+  "before": "\tfor i := 0; i < len(stateValues) && i < len(stateProps); i++ {",
+  "after": "\tfor i := 0; i < len(stateValues) && i <= len(stateProps); i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0342",
+  "file": "codegen/stack.go",
+  "line": 3326,
+  "before": "\tfor i := 0; i < len(stateValues) && i < len(stateProps); i++ {",
+  "after": "\tfor i := 0; i < len(stateValues) || i < len(stateProps); i++ {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0343",
+  "file": "codegen/stack.go",
+  "line": 3334,
+  "before": "\t\tif prop.Type == \"bigint\" {",
+  "after": "\t\tif prop.Type != \"bigint\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0344",
+  "file": "codegen/stack.go",
+  "line": 3339,
+  "before": "\t\t} else if prop.Type == \"boolean\" {",
+  "after": "\t\t} else if prop.Type != \"boolean\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0345",
+  "file": "codegen/stack.go",
+  "line": 3344,
+  "before": "\t\t} else if prop.Type == \"ByteString\" {",
+  "after": "\t\t} else if prop.Type != \"ByteString\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0346",
+  "file": "codegen/stack.go",
+  "line": 3385,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_CAT\"}) // satoshis || varint+script",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_CAT\"}) // satoshis && varint+script",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0347",
+  "file": "codegen/stack.go",
+  "line": 3431,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_CAT\"}) // satoshis || varint+script",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_CAT\"}) // satoshis && varint+script",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0348",
+  "file": "codegen/stack.go",
+  "line": 3462,
+  "before": "\tif ctx.sm.depth() < inArity {",
+  "after": "\tif ctx.sm.depth() <= inArity {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0349",
+  "file": "codegen/stack.go",
+  "line": 3469,
+  "before": "\tif err != nil {",
+  "after": "\tif err == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0350",
+  "file": "codegen/stack.go",
+  "line": 3473,
+  "before": "\tfor i := 0; i < inArity; i++ {",
+  "after": "\tfor i := 0; i <= inArity; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0351",
+  "file": "codegen/stack.go",
+  "line": 3476,
+  "before": "\tfor i := 0; i < outArity; i++ {",
+  "after": "\tfor i := 0; i <= outArity; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0352",
+  "file": "codegen/stack.go",
+  "line": 3478,
+  "before": "\t\tif outArity != 1 {",
+  "after": "\t\tif outArity == 1 {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0353",
+  "file": "codegen/stack.go",
+  "line": 3502,
+  "before": "\tif !ok1 || !ok2 {",
+  "after": "\tif !ok1 && !ok2 {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0354",
+  "file": "codegen/stack.go",
+  "line": 3537,
+  "before": "\tconsumed := 1 + len(sigElems) + 1 + len(pkElems) + 1",
+  "after": "\tconsumed := 1 - len(sigElems) + 1 + len(pkElems) + 1",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0355",
+  "file": "codegen/stack.go",
+  "line": 3537,
+  "before": "\tconsumed := 1 + len(sigElems) + 1 + len(pkElems) + 1",
+  "after": "\tconsumed := 1 + len(sigElems) - 1 + len(pkElems) + 1",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0356",
+  "file": "codegen/stack.go",
+  "line": 3538,
+  "before": "\tfor i := 0; i < consumed; i++ {",
+  "after": "\tfor i := 0; i <= consumed; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0357",
+  "file": "codegen/stack.go",
+  "line": 3597,
+  "before": "\tif len(args) < 1 {",
+  "after": "\tif len(args) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0358",
+  "file": "codegen/stack.go",
+  "line": 3901,
+  "before": "\tif len(args) < 1 {",
+  "after": "\tif len(args) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0359",
+  "file": "codegen/stack.go",
+  "line": 3917,
+  "before": "\tfor i := 0; i < 520; i++ {",
+  "after": "\tfor i := 0; i <= 520; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0360",
+  "file": "codegen/stack.go",
+  "line": 3958,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0361",
+  "file": "codegen/stack.go",
+  "line": 4011,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0362",
+  "file": "codegen/stack.go",
+  "line": 4074,
+  "before": "\tif len(args) < 4 {",
+  "after": "\tif len(args) <= 4 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0363",
+  "file": "codegen/stack.go",
+  "line": 4100,
+  "before": "\tif len(args) < 1 {",
+  "after": "\tif len(args) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0364",
+  "file": "codegen/stack.go",
+  "line": 4129,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0365",
+  "file": "codegen/stack.go",
+  "line": 4143,
+  "before": "\tctx.emitOp(StackOp{Op: \"swap\"})                          // <len> <data>",
+  "after": "\tctx.emitOp(StackOp{Op: \"swap\"})                          // <=len> <data>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0366",
+  "file": "codegen/stack.go",
+  "line": 4143,
+  "before": "\tctx.emitOp(StackOp{Op: \"swap\"})                          // <len> <data>",
+  "after": "\tctx.emitOp(StackOp{Op: \"swap\"})                          // <len> <=data>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0367",
+  "file": "codegen/stack.go",
+  "line": 4143,
+  "before": "\tctx.emitOp(StackOp{Op: \"swap\"})                          // <len> <data>",
+  "after": "\tctx.emitOp(StackOp{Op: \"swap\"})                          // <len>= <data>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0368",
+  "file": "codegen/stack.go",
+  "line": 4144,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len> <data> <size>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <=len> <data> <size>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0369",
+  "file": "codegen/stack.go",
+  "line": 4144,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len> <data> <size>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len> <=data> <size>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0370",
+  "file": "codegen/stack.go",
+  "line": 4144,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len> <data> <size>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len>= <data> <size>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0371",
+  "file": "codegen/stack.go",
+  "line": 4144,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len> <data> <size>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SIZE\"})       // <len> <data>= <size>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0372",
+  "file": "codegen/stack.go",
+  "line": 4145,
+  "before": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data> <size> <len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <=data> <size> <len>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0373",
+  "file": "codegen/stack.go",
+  "line": 4145,
+  "before": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data> <size> <len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data> <=size> <len>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0374",
+  "file": "codegen/stack.go",
+  "line": 4145,
+  "before": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data> <size> <len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data>= <size> <len>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0375",
+  "file": "codegen/stack.go",
+  "line": 4145,
+  "before": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data> <size> <len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"rot\"})                            // <data> <size>= <len>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0376",
+  "file": "codegen/stack.go",
+  "line": 4146,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SUB\"})        // <data> <size-len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SUB\"})        // <=data> <size-len>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0377",
+  "file": "codegen/stack.go",
+  "line": 4146,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SUB\"})        // <data> <size-len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SUB\"})        // <data> <=size-len>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0378",
+  "file": "codegen/stack.go",
+  "line": 4146,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SUB\"})        // <data> <size-len>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SUB\"})        // <data>= <size-len>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0379",
+  "file": "codegen/stack.go",
+  "line": 4147,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SPLIT\"})      // <left> <right>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SPLIT\"})      // <=left> <right>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0380",
+  "file": "codegen/stack.go",
+  "line": 4147,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SPLIT\"})      // <left> <right>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SPLIT\"})      // <left> <=right>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0381",
+  "file": "codegen/stack.go",
+  "line": 4147,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SPLIT\"})      // <left> <right>",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_SPLIT\"})      // <left>= <right>",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0382",
+  "file": "codegen/stack.go",
+  "line": 4148,
+  "before": "\tctx.emitOp(StackOp{Op: \"nip\"})                            // <right>",
+  "after": "\tctx.emitOp(StackOp{Op: \"nip\"})                            // <=right>",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0383",
+  "file": "codegen/stack.go",
+  "line": 4162,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0384",
+  "file": "codegen/stack.go",
+  "line": 4177,
+  "before": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_0NOTEQUAL\"}) // ... a b (b!=0)",
+  "after": "\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_0NOTEQUAL\"}) // ... a b (b==0)",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0385",
+  "file": "codegen/stack.go",
+  "line": 4185,
+  "before": "\tif funcName == \"safemod\" {",
+  "after": "\tif funcName != \"safemod\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0386",
+  "file": "codegen/stack.go",
+  "line": 4197,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0387",
+  "file": "codegen/stack.go",
+  "line": 4234,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0388",
+  "file": "codegen/stack.go",
+  "line": 4254,
+  "before": "\tfor i := 0; i < maxPowIterations; i++ {",
+  "after": "\tfor i := 0; i <= maxPowIterations; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0389",
+  "file": "codegen/stack.go",
+  "line": 4259,
+  "before": "\t\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_GREATERTHAN\"})       // exp base acc (exp > i)",
+  "after": "\t\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_GREATERTHAN\"})       // exp base acc (exp >= i)",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0390",
+  "file": "codegen/stack.go",
+  "line": 4279,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0391",
+  "file": "codegen/stack.go",
+  "line": 4308,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0392",
+  "file": "codegen/stack.go",
+  "line": 4338,
+  "before": "\tif len(args) < 1 {",
+  "after": "\tif len(args) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0393",
+  "file": "codegen/stack.go",
+  "line": 4360,
+  "before": "\tfor i := 0; i < sqrtIterations; i++ {",
+  "after": "\tfor i := 0; i <= sqrtIterations; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0394",
+  "file": "codegen/stack.go",
+  "line": 4365,
+  "before": "\t\tnewtonOps = append(newtonOps, StackOp{Op: \"opcode\", Code: \"OP_ADD\"})     // n (guess + n/guess)",
+  "after": "\t\tnewtonOps = append(newtonOps, StackOp{Op: \"opcode\", Code: \"OP_ADD\"})     // n (guess - n/guess)",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0395",
+  "file": "codegen/stack.go",
+  "line": 4366,
+  "before": "\t\tnewtonOps = append(newtonOps, StackOp{Op: \"push\", Value: bigIntPush(2)}) // n (guess + n/guess) 2",
+  "after": "\t\tnewtonOps = append(newtonOps, StackOp{Op: \"push\", Value: bigIntPush(2)}) // n (guess - n/guess) 2",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0396",
+  "file": "codegen/stack.go",
+  "line": 4385,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0397",
+  "file": "codegen/stack.go",
+  "line": 4407,
+  "before": "\tfor i := 0; i < gcdIterations; i++ {",
+  "after": "\tfor i := 0; i <= gcdIterations; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0398",
+  "file": "codegen/stack.go",
+  "line": 4411,
+  "before": "\t\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_0NOTEQUAL\"})  // a b (b!=0)",
+  "after": "\t\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_0NOTEQUAL\"})  // a b (b==0)",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0399",
+  "file": "codegen/stack.go",
+  "line": 4431,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0400",
+  "file": "codegen/stack.go",
+  "line": 4472,
+  "before": "\tif len(args) < 1 {",
+  "after": "\tif len(args) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0401",
+  "file": "codegen/stack.go",
+  "line": 4487,
+  "before": "\tfor i := 0; i < log2Iterations; i++ {",
+  "after": "\tfor i := 0; i <= log2Iterations; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0402",
+  "file": "codegen/stack.go",
+  "line": 4492,
+  "before": "\t\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_GREATERTHAN\"})        // counter input (input>1)",
+  "after": "\t\tctx.emitOp(StackOp{Op: \"opcode\", Code: \"OP_GREATERTHAN\"})        // counter input (input>=1)",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0403",
+  "file": "codegen/stack.go",
+  "line": 4556,
+  "before": "\t\tif r := recover(); r != nil {",
+  "after": "\t\tif r := recover(); r == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0404",
+  "file": "codegen/stack.go",
+  "line": 4562,
+  "before": "\tif len(opts) > 0 {",
+  "after": "\tif len(opts) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0405",
+  "file": "codegen/stack.go",
+  "line": 4570,
+  "before": "\t\tif !m.IsPublic && m.Name != \"constructor\" {",
+  "after": "\t\tif !m.IsPublic && m.Name == \"constructor\" {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0406",
+  "file": "codegen/stack.go",
+  "line": 4570,
+  "before": "\t\tif !m.IsPublic && m.Name != \"constructor\" {",
+  "after": "\t\tif !m.IsPublic || m.Name != \"constructor\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0407",
+  "file": "codegen/stack.go",
+  "line": 4580,
+  "before": "\t\tif method.Name == \"constructor\" || (!method.IsPublic && method.Name != \"constructor\") {",
+  "after": "\t\tif method.Name != \"constructor\" || (!method.IsPublic && method.Name != \"constructor\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0408",
+  "file": "codegen/stack.go",
+  "line": 4580,
+  "before": "\t\tif method.Name == \"constructor\" || (!method.IsPublic && method.Name != \"constructor\") {",
+  "after": "\t\tif method.Name == \"constructor\" || (!method.IsPublic && method.Name == \"constructor\") {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0409",
+  "file": "codegen/stack.go",
+  "line": 4580,
+  "before": "\t\tif method.Name == \"constructor\" || (!method.IsPublic && method.Name != \"constructor\") {",
+  "after": "\t\tif method.Name == \"constructor\" || (!method.IsPublic || method.Name != \"constructor\") {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0410",
+  "file": "codegen/stack.go",
+  "line": 4580,
+  "before": "\t\tif method.Name == \"constructor\" || (!method.IsPublic && method.Name != \"constructor\") {",
+  "after": "\t\tif method.Name == \"constructor\" && (!method.IsPublic && method.Name != \"constructor\") {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0411",
+  "file": "codegen/stack.go",
+  "line": 4584,
+  "before": "\t\tif err != nil {",
+  "after": "\t\tif err == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0412",
+  "file": "codegen/stack.go",
+  "line": 4615,
+  "before": "\t\tif b.Value.Kind == \"check_preimage\" {",
+  "after": "\t\tif b.Value.Kind != \"check_preimage\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0413",
+  "file": "codegen/stack.go",
+  "line": 4618,
+  "before": "\t\tif b.Value.Kind == \"if\" {",
+  "after": "\t\tif b.Value.Kind != \"if\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0414",
+  "file": "codegen/stack.go",
+  "line": 4626,
+  "before": "\t\tif b.Value.Kind == \"loop\" {",
+  "after": "\t\tif b.Value.Kind != \"loop\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0415",
+  "file": "codegen/stack.go",
+  "line": 4631,
+  "before": "\t\tif b.Value.Kind == \"method_call\" && privateMethods != nil {",
+  "after": "\t\tif b.Value.Kind != \"method_call\" && privateMethods != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0416",
+  "file": "codegen/stack.go",
+  "line": 4631,
+  "before": "\t\tif b.Value.Kind == \"method_call\" && privateMethods != nil {",
+  "after": "\t\tif b.Value.Kind == \"method_call\" && privateMethods == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0417",
+  "file": "codegen/stack.go",
+  "line": 4631,
+  "before": "\t\tif b.Value.Kind == \"method_call\" && privateMethods != nil {",
+  "after": "\t\tif b.Value.Kind == \"method_call\" || privateMethods != nil {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0418",
+  "file": "codegen/stack.go",
+  "line": 4658,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "after": "\t\tif b.Value.Kind != \"call\" && (b.Value.Func == \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0419",
+  "file": "codegen/stack.go",
+  "line": 4658,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "after": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func != \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0420",
+  "file": "codegen/stack.go",
+  "line": 4658,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "after": "\t\tif b.Value.Kind == \"call\" || (b.Value.Func == \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0421",
+  "file": "codegen/stack.go",
+  "line": 4658,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"assertGroth16WitnessAssisted\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "after": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"assertGroth16WitnessAssisted\" && b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\") {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0422",
+  "file": "codegen/stack.go",
+  "line": 4670,
+  "before": "\t\tif b.Value.Kind == \"call\" && b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\" {",
+  "after": "\t\tif b.Value.Kind != \"call\" && b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0423",
+  "file": "codegen/stack.go",
+  "line": 4670,
+  "before": "\t\tif b.Value.Kind == \"call\" && b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\" {",
+  "after": "\t\tif b.Value.Kind == \"call\" && b.Value.Func != \"assertGroth16WitnessAssistedWithMSM\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0424",
+  "file": "codegen/stack.go",
+  "line": 4670,
+  "before": "\t\tif b.Value.Kind == \"call\" && b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\" {",
+  "after": "\t\tif b.Value.Kind == \"call\" || b.Value.Func == \"assertGroth16WitnessAssistedWithMSM\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0425",
+  "file": "codegen/stack.go",
+  "line": 4723,
+  "before": "\tfor i := 0; i < namedDepth; i++ {",
+  "after": "\tfor i := 0; i <= namedDepth; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0426",
+  "file": "codegen/stack.go",
+  "line": 4743,
+  "before": "\t\tfor i := 0; i < namedDepth; i++ {",
+  "after": "\t\tfor i := 0; i <= namedDepth; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0427",
+  "file": "codegen/stack.go",
+  "line": 4761,
+  "before": "\tfor i := 0; i < namedDepth; i++ {",
+  "after": "\tfor i := 0; i <= namedDepth; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0428",
+  "file": "codegen/stack.go",
+  "line": 4769,
+  "before": "\trollDepth := int64(namedDepth + 4)",
+  "after": "\trollDepth := int64(namedDepth - 4)",
+  "op": "arith-plus-to-minus",
+  "region": "other"
+ },
+ {
+  "id": "G0429",
+  "file": "codegen/stack.go",
+  "line": 4770,
+  "before": "\tfor i := 0; i < 5; i++ {",
+  "after": "\tfor i := 0; i <= 5; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0430",
+  "file": "codegen/stack.go",
+  "line": 4775,
+  "before": "\tfor i := 0; i < 5; i++ {",
+  "after": "\tfor i := 0; i <= 5; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0431",
+  "file": "codegen/stack.go",
+  "line": 4801,
+  "before": "\t\tif b.Value.Kind == \"load_prop\" && varLenProps[b.Value.Name] {",
+  "after": "\t\tif b.Value.Kind != \"load_prop\" && varLenProps[b.Value.Name] {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0432",
+  "file": "codegen/stack.go",
+  "line": 4801,
+  "before": "\t\tif b.Value.Kind == \"load_prop\" && varLenProps[b.Value.Name] {",
+  "after": "\t\tif b.Value.Kind == \"load_prop\" || varLenProps[b.Value.Name] {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0433",
+  "file": "codegen/stack.go",
+  "line": 4804,
+  "before": "\t\tif b.Value.Kind == \"if\" {",
+  "after": "\t\tif b.Value.Kind != \"if\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0434",
+  "file": "codegen/stack.go",
+  "line": 4805,
+  "before": "\t\t\tif methodReadsVarLenStateRec(b.Value.Then, varLenProps, privateMethods, seen) ||",
+  "after": "\t\t\tif methodReadsVarLenStateRec(b.Value.Then, varLenProps, privateMethods, seen) &&",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0435",
+  "file": "codegen/stack.go",
+  "line": 4810,
+  "before": "\t\tif b.Value.Kind == \"loop\" && methodReadsVarLenStateRec(b.Value.Body, varLenProps, privateMethods, seen) {",
+  "after": "\t\tif b.Value.Kind != \"loop\" && methodReadsVarLenStateRec(b.Value.Body, varLenProps, privateMethods, seen) {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0436",
+  "file": "codegen/stack.go",
+  "line": 4810,
+  "before": "\t\tif b.Value.Kind == \"loop\" && methodReadsVarLenStateRec(b.Value.Body, varLenProps, privateMethods, seen) {",
+  "after": "\t\tif b.Value.Kind == \"loop\" || methodReadsVarLenStateRec(b.Value.Body, varLenProps, privateMethods, seen) {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0437",
+  "file": "codegen/stack.go",
+  "line": 4813,
+  "before": "\t\tif b.Value.Kind == \"method_call\" && privateMethods != nil {",
+  "after": "\t\tif b.Value.Kind != \"method_call\" && privateMethods != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0438",
+  "file": "codegen/stack.go",
+  "line": 4813,
+  "before": "\t\tif b.Value.Kind == \"method_call\" && privateMethods != nil {",
+  "after": "\t\tif b.Value.Kind == \"method_call\" && privateMethods == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0439",
+  "file": "codegen/stack.go",
+  "line": 4813,
+  "before": "\t\tif b.Value.Kind == \"method_call\" && privateMethods != nil {",
+  "after": "\t\tif b.Value.Kind == \"method_call\" || privateMethods != nil {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0440",
+  "file": "codegen/stack.go",
+  "line": 4837,
+  "before": "\t\tif b.Value.Kind == \"add_output\" || b.Value.Kind == \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "after": "\t\tif b.Value.Kind != \"add_output\" || b.Value.Kind == \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0441",
+  "file": "codegen/stack.go",
+  "line": 4837,
+  "before": "\t\tif b.Value.Kind == \"add_output\" || b.Value.Kind == \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "after": "\t\tif b.Value.Kind == \"add_output\" || b.Value.Kind != \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0442",
+  "file": "codegen/stack.go",
+  "line": 4837,
+  "before": "\t\tif b.Value.Kind == \"add_output\" || b.Value.Kind == \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "after": "\t\tif b.Value.Kind == \"add_output\" && b.Value.Kind == \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0443",
+  "file": "codegen/stack.go",
+  "line": 4837,
+  "before": "\t\tif b.Value.Kind == \"add_output\" || b.Value.Kind == \"add_raw_output\" || b.Value.Kind == \"add_data_output\" {",
+  "after": "\t\tif b.Value.Kind == \"add_output\" || b.Value.Kind == \"add_raw_output\" && b.Value.Kind == \"add_data_output\" {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0444",
+  "file": "codegen/stack.go",
+  "line": 4841,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "after": "\t\tif b.Value.Kind != \"call\" && (b.Value.Func == \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0445",
+  "file": "codegen/stack.go",
+  "line": 4841,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "after": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func != \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0446",
+  "file": "codegen/stack.go",
+  "line": 4841,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "after": "\t\tif b.Value.Kind == \"call\" || (b.Value.Func == \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0447",
+  "file": "codegen/stack.go",
+  "line": 4841,
+  "before": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"computeStateOutput\" || b.Value.Func == \"computeStateOutputHash\") {",
+  "after": "\t\tif b.Value.Kind == \"call\" && (b.Value.Func == \"computeStateOutput\" && b.Value.Func == \"computeStateOutputHash\") {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0448",
+  "file": "codegen/stack.go",
+  "line": 4845,
+  "before": "\t\tif b.Value.Kind == \"if\" {",
+  "after": "\t\tif b.Value.Kind != \"if\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0449",
+  "file": "codegen/stack.go",
+  "line": 4846,
+  "before": "\t\t\tif methodUsesCodePart(b.Value.Then) || methodUsesCodePart(b.Value.Else) {",
+  "after": "\t\t\tif methodUsesCodePart(b.Value.Then) && methodUsesCodePart(b.Value.Else) {",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0450",
+  "file": "codegen/stack.go",
+  "line": 4850,
+  "before": "\t\tif b.Value.Kind == \"loop\" && methodUsesCodePart(b.Value.Body) {",
+  "after": "\t\tif b.Value.Kind != \"loop\" && methodUsesCodePart(b.Value.Body) {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0451",
+  "file": "codegen/stack.go",
+  "line": 4850,
+  "before": "\t\tif b.Value.Kind == \"loop\" && methodUsesCodePart(b.Value.Body) {",
+  "after": "\t\tif b.Value.Kind == \"loop\" || methodUsesCodePart(b.Value.Body) {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0452",
+  "file": "codegen/stack.go",
+  "line": 4878,
+  "before": "\t\tif !p.Readonly && p.Type == \"ByteString\" {",
+  "after": "\t\tif !p.Readonly && p.Type != \"ByteString\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0453",
+  "file": "codegen/stack.go",
+  "line": 4878,
+  "before": "\t\tif !p.Readonly && p.Type == \"ByteString\" {",
+  "after": "\t\tif !p.Readonly || p.Type == \"ByteString\" {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0454",
+  "file": "codegen/stack.go",
+  "line": 4883,
+  "before": "\tusesCodePart := usesCheckPreimage &&",
+  "after": "\tusesCodePart := usesCheckPreimage ||",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0455",
+  "file": "codegen/stack.go",
+  "line": 4884,
+  "before": "\t\t(methodUsesCodePart(method.Body) || methodReadsVarLenStateRec(method.Body, varLenProps, privateMethods, map[string]bool{}))",
+  "after": "\t\t(methodUsesCodePart(method.Body) && methodReadsVarLenStateRec(method.Body, varLenProps, privateMethods, map[string]bool{}))",
+  "op": "bool-or-to-and",
+  "region": "other"
+ },
+ {
+  "id": "G0456",
+  "file": "codegen/stack.go",
+  "line": 4885,
+  "before": "\tif usesCheckPreimage && usesCodePart {",
+  "after": "\tif usesCheckPreimage || usesCodePart {",
+  "op": "bool-and-to-or",
+  "region": "other"
+ },
+ {
+  "id": "G0457",
+  "file": "codegen/stack.go",
+  "line": 4902,
+  "before": "\t\tif opts.Groth16WAConfig == nil {",
+  "after": "\t\tif opts.Groth16WAConfig != nil {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0458",
+  "file": "codegen/stack.go",
+  "line": 4920,
+  "before": "\tif method.IsPublic && ctx.sm.depth() > 1 {",
+  "after": "\tif method.IsPublic && ctx.sm.depth() >= 1 {",
+  "op": "cmp-gt-to-ge",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0459",
+  "file": "codegen/stack.go",
+  "line": 4920,
+  "before": "\tif method.IsPublic && ctx.sm.depth() > 1 {",
+  "after": "\tif method.IsPublic || ctx.sm.depth() > 1 {",
+  "op": "bool-and-to-or",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0460",
+  "file": "codegen/stack.go",
+  "line": 4921,
+  "before": "\t\texcess := ctx.sm.depth() - 1",
+  "after": "\t\texcess := ctx.sm.depth() + 1",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0461",
+  "file": "codegen/stack.go",
+  "line": 4922,
+  "before": "\t\tfor i := 0; i < excess; i++ {",
+  "after": "\t\tfor i := 0; i <= excess; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0462",
+  "file": "codegen/stack.go",
+  "line": 4928,
+  "before": "\tif ctx.maxDepth > maxStackDepth {",
+  "after": "\tif ctx.maxDepth >= maxStackDepth {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0463",
+  "file": "codegen/stack.go",
+  "line": 4961,
+  "before": "\tif method.IsPublic && ctx.sm.depth() > 1 {",
+  "after": "\tif method.IsPublic && ctx.sm.depth() >= 1 {",
+  "op": "cmp-gt-to-ge",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0464",
+  "file": "codegen/stack.go",
+  "line": 4961,
+  "before": "\tif method.IsPublic && ctx.sm.depth() > 1 {",
+  "after": "\tif method.IsPublic || ctx.sm.depth() > 1 {",
+  "op": "bool-and-to-or",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0465",
+  "file": "codegen/stack.go",
+  "line": 4962,
+  "before": "\t\texcess := ctx.sm.depth() - 1",
+  "after": "\t\texcess := ctx.sm.depth() + 1",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0466",
+  "file": "codegen/stack.go",
+  "line": 4963,
+  "before": "\t\tfor i := 0; i < excess; i++ {",
+  "after": "\t\tfor i := 0; i <= excess; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0467",
+  "file": "codegen/stack.go",
+  "line": 4969,
+  "before": "\tif ctx.maxDepth > maxStackDepth {",
+  "after": "\tif ctx.maxDepth >= maxStackDepth {",
+  "op": "cmp-gt-to-ge",
+  "region": "other"
+ },
+ {
+  "id": "G0468",
+  "file": "codegen/stack.go",
+  "line": 4993,
+  "before": "\tif err != nil {",
+  "after": "\tif err == nil {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0469",
+  "file": "codegen/stack.go",
+  "line": 5003,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0470",
+  "file": "codegen/stack.go",
+  "line": 5011,
+  "before": "\tfor i := 0; i < 3; i++ {",
+  "after": "\tfor i := 0; i <= 3; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0471",
+  "file": "codegen/stack.go",
+  "line": 5023,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0472",
+  "file": "codegen/stack.go",
+  "line": 5031,
+  "before": "\tfor i := 0; i < 3; i++ {",
+  "after": "\tfor i := 0; i <= 3; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0473",
+  "file": "codegen/stack.go",
+  "line": 5046,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0474",
+  "file": "codegen/stack.go",
+  "line": 5052,
+  "before": "\tfor i := 0; i < 2; i++ {",
+  "after": "\tfor i := 0; i <= 2; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0475",
+  "file": "codegen/stack.go",
+  "line": 5063,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0476",
+  "file": "codegen/stack.go",
+  "line": 5069,
+  "before": "\tfor i := 0; i < 3; i++ {",
+  "after": "\tfor i := 0; i <= 3; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0477",
+  "file": "codegen/stack.go",
+  "line": 5084,
+  "before": "\tif len(args) < 2 {",
+  "after": "\tif len(args) <= 2 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0478",
+  "file": "codegen/stack.go",
+  "line": 5090,
+  "before": "\tfor i := 0; i < 2; i++ {",
+  "after": "\tfor i := 0; i <= 2; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0479",
+  "file": "codegen/stack.go",
+  "line": 5101,
+  "before": "\tif len(args) < 1 {",
+  "after": "\tif len(args) <= 1 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0480",
+  "file": "codegen/stack.go",
+  "line": 5232,
+  "before": "\tif len(args) < 3 {",
+  "after": "\tif len(args) <= 3 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0481",
+  "file": "codegen/stack.go",
+  "line": 5246,
+  "before": "\tif funcName == \"verifyECDSA_P256\" {",
+  "after": "\tif funcName != \"verifyECDSA_P256\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0482",
+  "file": "codegen/stack.go",
+  "line": 5450,
+  "before": "\tif len(args) != 4 {",
+  "after": "\tif len(args) == 4 {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0483",
+  "file": "codegen/stack.go",
+  "line": 5457,
+  "before": "\tif !ok || depthVal == nil {",
+  "after": "\tif !ok || depthVal != nil {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0484",
+  "file": "codegen/stack.go",
+  "line": 5457,
+  "before": "\tif !ok || depthVal == nil {",
+  "after": "\tif !ok && depthVal == nil {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0485",
+  "file": "codegen/stack.go",
+  "line": 5464,
+  "before": "\tif depth < 1 || depth > 64 {",
+  "after": "\tif depth <= 1 || depth > 64 {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0486",
+  "file": "codegen/stack.go",
+  "line": 5464,
+  "before": "\tif depth < 1 || depth > 64 {",
+  "after": "\tif depth < 1 || depth >= 64 {",
+  "op": "cmp-gt-to-ge",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0487",
+  "file": "codegen/stack.go",
+  "line": 5464,
+  "before": "\tif depth < 1 || depth > 64 {",
+  "after": "\tif depth < 1 && depth > 64 {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0488",
+  "file": "codegen/stack.go",
+  "line": 5476,
+  "before": "\tfor i := 0; i < 3; i++ {",
+  "after": "\tfor i := 0; i <= 3; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0489",
+  "file": "codegen/stack.go",
+  "line": 5482,
+  "before": "\tfor i := 0; i < 3; i++ {",
+  "after": "\tfor i := 0; i <= 3; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0490",
+  "file": "codegen/stack.go",
+  "line": 5488,
+  "before": "\tif funcName == \"merkleRootSha256\" {",
+  "after": "\tif funcName != \"merkleRootSha256\" {",
+  "op": "eq-to-neq",
+  "region": "other"
+ },
+ {
+  "id": "G0491",
+  "file": "codegen/stack.go",
+  "line": 5502,
+  "before": "\tif nArgs < 10 {",
+  "after": "\tif nArgs <= 10 {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0492",
+  "file": "codegen/stack.go",
+  "line": 5509,
+  "before": "\tif !ok || depthVal == nil {",
+  "after": "\tif !ok || depthVal != nil {",
+  "op": "eq-to-neq",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0493",
+  "file": "codegen/stack.go",
+  "line": 5509,
+  "before": "\tif !ok || depthVal == nil {",
+  "after": "\tif !ok && depthVal == nil {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0494",
+  "file": "codegen/stack.go",
+  "line": 5516,
+  "before": "\tif depth < 1 || depth > 64 {",
+  "after": "\tif depth <= 1 || depth > 64 {",
+  "op": "cmp-lt-to-le",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0495",
+  "file": "codegen/stack.go",
+  "line": 5516,
+  "before": "\tif depth < 1 || depth > 64 {",
+  "after": "\tif depth < 1 || depth >= 64 {",
+  "op": "cmp-gt-to-ge",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0496",
+  "file": "codegen/stack.go",
+  "line": 5516,
+  "before": "\tif depth < 1 || depth > 64 {",
+  "after": "\tif depth < 1 && depth > 64 {",
+  "op": "bool-or-to-and",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0497",
+  "file": "codegen/stack.go",
+  "line": 5521,
+  "before": "\texpectedArgs := 8 + depth*8 + 1 + 1",
+  "after": "\texpectedArgs := 8 - depth*8 + 1 + 1",
+  "op": "arith-plus-to-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0498",
+  "file": "codegen/stack.go",
+  "line": 5521,
+  "before": "\texpectedArgs := 8 + depth*8 + 1 + 1",
+  "after": "\texpectedArgs := 8 + depth*8 - 1 + 1",
+  "op": "arith-plus-to-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0499",
+  "file": "codegen/stack.go",
+  "line": 5522,
+  "before": "\tif nArgs != expectedArgs {",
+  "after": "\tif nArgs == expectedArgs {",
+  "op": "neq-to-eq",
+  "region": "other"
+ },
+ {
+  "id": "G0500",
+  "file": "codegen/stack.go",
+  "line": 5523,
+  "before": "\t\tpanic(fmt.Sprintf(\"merkleRootPoseidon2KB: expected %d arguments (8 leaf + %d*8 proof + index + depth), got %d\",",
+  "after": "\t\tpanic(fmt.Sprintf(\"merkleRootPoseidon2KB: expected %d arguments (8 leaf + %d*8 proof - index + depth), got %d\",",
+  "op": "arith-plus-to-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0501",
+  "file": "codegen/stack.go",
+  "line": 5523,
+  "before": "\t\tpanic(fmt.Sprintf(\"merkleRootPoseidon2KB: expected %d arguments (8 leaf + %d*8 proof + index + depth), got %d\",",
+  "after": "\t\tpanic(fmt.Sprintf(\"merkleRootPoseidon2KB: expected %d arguments (8 leaf + %d*8 proof + index - depth), got %d\",",
+  "op": "arith-plus-to-minus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0502",
+  "file": "codegen/stack.go",
+  "line": 5535,
+  "before": "\truntimeArgCount := nArgs - 1 // all except depth",
+  "after": "\truntimeArgCount := nArgs + 1 // all except depth",
+  "op": "arith-minus-to-plus",
+  "region": "frame-offset"
+ },
+ {
+  "id": "G0503",
+  "file": "codegen/stack.go",
+  "line": 5536,
+  "before": "\tfor i := 0; i < runtimeArgCount; i++ {",
+  "after": "\tfor i := 0; i <= runtimeArgCount; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0504",
+  "file": "codegen/stack.go",
+  "line": 5542,
+  "before": "\tfor i := 0; i < runtimeArgCount; i++ {",
+  "after": "\tfor i := 0; i <= runtimeArgCount; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0505",
+  "file": "codegen/stack.go",
+  "line": 5552,
+  "before": "\tfor i := 0; i < 7; i++ {",
+  "after": "\tfor i := 0; i <= 7; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "other"
+ },
+ {
+  "id": "G0506",
+  "file": "codegen/emit.go",
+  "line": 214,
+  "before": "\tif ctx.pendingSourceLoc != nil {",
+  "after": "\tif ctx.pendingSourceLoc == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0507",
+  "file": "codegen/emit.go",
+  "line": 243,
+  "before": "\tif name == \"OP_CODESEPARATOR\" {",
+  "after": "\tif name != \"OP_CODESEPARATOR\" {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0508",
+  "file": "codegen/emit.go",
+  "line": 282,
+  "before": "\tif len(bytes) == 0 {",
+  "after": "\tif len(bytes) != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0509",
+  "file": "codegen/emit.go",
+  "line": 288,
+  "before": "\tctx.appendAsm(fmt.Sprintf(\"<raw %d bytes>\", len(bytes)))",
+  "after": "\tctx.appendAsm(fmt.Sprintf(\"<=raw %d bytes>\", len(bytes)))",
+  "op": "cmp-lt-to-le",
+  "region": "emit"
+ },
+ {
+  "id": "G0510",
+  "file": "codegen/emit.go",
+  "line": 288,
+  "before": "\tctx.appendAsm(fmt.Sprintf(\"<raw %d bytes>\", len(bytes)))",
+  "after": "\tctx.appendAsm(fmt.Sprintf(\"<raw %d bytes>=\", len(bytes)))",
+  "op": "cmp-gt-to-ge",
+  "region": "emit"
+ },
+ {
+  "id": "G0511",
+  "file": "codegen/emit.go",
+  "line": 313,
+  "before": "\tif n.Sign() == 0 {",
+  "after": "\tif n.Sign() != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0512",
+  "file": "codegen/emit.go",
+  "line": 317,
+  "before": "\tnegative := n.Sign() < 0",
+  "after": "\tnegative := n.Sign() <= 0",
+  "op": "cmp-lt-to-le",
+  "region": "emit"
+ },
+ {
+  "id": "G0513",
+  "file": "codegen/emit.go",
+  "line": 321,
+  "before": "\tfor abs.Sign() > 0 {",
+  "after": "\tfor abs.Sign() >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "emit"
+ },
+ {
+  "id": "G0514",
+  "file": "codegen/emit.go",
+  "line": 327,
+  "before": "\tlastByte := bytes[len(bytes)-1]",
+  "after": "\tlastByte := bytes[len(bytes)-2]",
+  "op": "len-off-by-one",
+  "region": "emit"
+ },
+ {
+  "id": "G0515",
+  "file": "codegen/emit.go",
+  "line": 327,
+  "before": "\tlastByte := bytes[len(bytes)-1]",
+  "after": "\tlastByte := bytes[len(bytes)]",
+  "op": "len-drop-minus",
+  "region": "emit"
+ },
+ {
+  "id": "G0516",
+  "file": "codegen/emit.go",
+  "line": 328,
+  "before": "\tif lastByte&0x80 != 0 {",
+  "after": "\tif lastByte&0x80 == 0 {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0517",
+  "file": "codegen/emit.go",
+  "line": 335,
+  "before": "\t\tbytes[len(bytes)-1] = lastByte | 0x80",
+  "after": "\t\tbytes[len(bytes)-2] = lastByte | 0x80",
+  "op": "len-off-by-one",
+  "region": "emit"
+ },
+ {
+  "id": "G0518",
+  "file": "codegen/emit.go",
+  "line": 335,
+  "before": "\t\tbytes[len(bytes)-1] = lastByte | 0x80",
+  "after": "\t\tbytes[len(bytes)] = lastByte | 0x80",
+  "op": "len-drop-minus",
+  "region": "emit"
+ },
+ {
+  "id": "G0519",
+  "file": "codegen/emit.go",
+  "line": 349,
+  "before": "\tif length == 0 {",
+  "after": "\tif length != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0520",
+  "file": "codegen/emit.go",
+  "line": 355,
+  "before": "\tif length == 1 {",
+  "after": "\tif length != 1 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0521",
+  "file": "codegen/emit.go",
+  "line": 357,
+  "before": "\t\tif b >= 1 && b <= 16 {",
+  "after": "\t\tif b > 1 && b <= 16 {",
+  "op": "cmp-ge-to-gt",
+  "region": "emit"
+ },
+ {
+  "id": "G0522",
+  "file": "codegen/emit.go",
+  "line": 357,
+  "before": "\t\tif b >= 1 && b <= 16 {",
+  "after": "\t\tif b >= 1 && b < 16 {",
+  "op": "cmp-le-to-lt",
+  "region": "emit"
+ },
+ {
+  "id": "G0523",
+  "file": "codegen/emit.go",
+  "line": 357,
+  "before": "\t\tif b >= 1 && b <= 16 {",
+  "after": "\t\tif b >= 1 || b <= 16 {",
+  "op": "bool-and-to-or",
+  "region": "emit"
+ },
+ {
+  "id": "G0524",
+  "file": "codegen/emit.go",
+  "line": 358,
+  "before": "\t\t\treturn []byte{0x50 + b} // OP_1 through OP_16",
+  "after": "\t\t\treturn []byte{0x50 - b} // OP_1 through OP_16",
+  "op": "arith-plus-to-minus",
+  "region": "emit"
+ },
+ {
+  "id": "G0525",
+  "file": "codegen/emit.go",
+  "line": 360,
+  "before": "\t\tif b == 0x81 {",
+  "after": "\t\tif b != 0x81 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0526",
+  "file": "codegen/emit.go",
+  "line": 365,
+  "before": "\tif length >= 1 && length <= 75 {",
+  "after": "\tif length > 1 && length <= 75 {",
+  "op": "cmp-ge-to-gt",
+  "region": "emit"
+ },
+ {
+  "id": "G0527",
+  "file": "codegen/emit.go",
+  "line": 365,
+  "before": "\tif length >= 1 && length <= 75 {",
+  "after": "\tif length >= 1 && length < 75 {",
+  "op": "cmp-le-to-lt",
+  "region": "emit"
+ },
+ {
+  "id": "G0528",
+  "file": "codegen/emit.go",
+  "line": 365,
+  "before": "\tif length >= 1 && length <= 75 {",
+  "after": "\tif length >= 1 || length <= 75 {",
+  "op": "bool-and-to-or",
+  "region": "emit"
+ },
+ {
+  "id": "G0529",
+  "file": "codegen/emit.go",
+  "line": 372,
+  "before": "\tif length >= 76 && length <= 255 {",
+  "after": "\tif length > 76 && length <= 255 {",
+  "op": "cmp-ge-to-gt",
+  "region": "emit"
+ },
+ {
+  "id": "G0530",
+  "file": "codegen/emit.go",
+  "line": 372,
+  "before": "\tif length >= 76 && length <= 255 {",
+  "after": "\tif length >= 76 && length < 255 {",
+  "op": "cmp-le-to-lt",
+  "region": "emit"
+ },
+ {
+  "id": "G0531",
+  "file": "codegen/emit.go",
+  "line": 372,
+  "before": "\tif length >= 76 && length <= 255 {",
+  "after": "\tif length >= 76 || length <= 255 {",
+  "op": "bool-and-to-or",
+  "region": "emit"
+ },
+ {
+  "id": "G0532",
+  "file": "codegen/emit.go",
+  "line": 380,
+  "before": "\tif length >= 256 && length <= 65535 {",
+  "after": "\tif length > 256 && length <= 65535 {",
+  "op": "cmp-ge-to-gt",
+  "region": "emit"
+ },
+ {
+  "id": "G0533",
+  "file": "codegen/emit.go",
+  "line": 380,
+  "before": "\tif length >= 256 && length <= 65535 {",
+  "after": "\tif length >= 256 && length < 65535 {",
+  "op": "cmp-le-to-lt",
+  "region": "emit"
+ },
+ {
+  "id": "G0534",
+  "file": "codegen/emit.go",
+  "line": 380,
+  "before": "\tif length >= 256 && length <= 65535 {",
+  "after": "\tif length >= 256 || length <= 65535 {",
+  "op": "bool-and-to-or",
+  "region": "emit"
+ },
+ {
+  "id": "G0535",
+  "file": "codegen/emit.go",
+  "line": 415,
+  "before": "\t\tif len(value.Bytes) == 0 {",
+  "after": "\t\tif len(value.Bytes) != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0536",
+  "file": "codegen/emit.go",
+  "line": 418,
+  "before": "\t\treturn h, fmt.Sprintf(\"<%s>\", hex.EncodeToString(value.Bytes))",
+  "after": "\t\treturn h, fmt.Sprintf(\"<=%s>\", hex.EncodeToString(value.Bytes))",
+  "op": "cmp-lt-to-le",
+  "region": "emit"
+ },
+ {
+  "id": "G0537",
+  "file": "codegen/emit.go",
+  "line": 418,
+  "before": "\t\treturn h, fmt.Sprintf(\"<%s>\", hex.EncodeToString(value.Bytes))",
+  "after": "\t\treturn h, fmt.Sprintf(\"<%s>=\", hex.EncodeToString(value.Bytes))",
+  "op": "cmp-gt-to-ge",
+  "region": "emit"
+ },
+ {
+  "id": "G0538",
+  "file": "codegen/emit.go",
+  "line": 448,
+  "before": "\tif n.Sign() == 0 {",
+  "after": "\tif n.Sign() != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0539",
+  "file": "codegen/emit.go",
+  "line": 452,
+  "before": "\tif n.Cmp(big.NewInt(-1)) == 0 {",
+  "after": "\tif n.Cmp(big.NewInt(-1)) != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0540",
+  "file": "codegen/emit.go",
+  "line": 456,
+  "before": "\tif n.Sign() > 0 && n.Cmp(big.NewInt(16)) <= 0 {",
+  "after": "\tif n.Sign() >= 0 && n.Cmp(big.NewInt(16)) <= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "emit"
+ },
+ {
+  "id": "G0541",
+  "file": "codegen/emit.go",
+  "line": 456,
+  "before": "\tif n.Sign() > 0 && n.Cmp(big.NewInt(16)) <= 0 {",
+  "after": "\tif n.Sign() > 0 && n.Cmp(big.NewInt(16)) < 0 {",
+  "op": "cmp-le-to-lt",
+  "region": "emit"
+ },
+ {
+  "id": "G0542",
+  "file": "codegen/emit.go",
+  "line": 456,
+  "before": "\tif n.Sign() > 0 && n.Cmp(big.NewInt(16)) <= 0 {",
+  "after": "\tif n.Sign() > 0 || n.Cmp(big.NewInt(16)) <= 0 {",
+  "op": "bool-and-to-or",
+  "region": "emit"
+ },
+ {
+  "id": "G0543",
+  "file": "codegen/emit.go",
+  "line": 457,
+  "before": "\t\topcode := 0x50 + int(n.Int64())",
+  "after": "\t\topcode := 0x50 - int(n.Int64())",
+  "op": "arith-plus-to-minus",
+  "region": "emit"
+ },
+ {
+  "id": "G0544",
+  "file": "codegen/emit.go",
+  "line": 463,
+  "before": "\treturn hex.EncodeToString(encoded), fmt.Sprintf(\"<%s>\", hex.EncodeToString(numBytes))",
+  "after": "\treturn hex.EncodeToString(encoded), fmt.Sprintf(\"<=%s>\", hex.EncodeToString(numBytes))",
+  "op": "cmp-lt-to-le",
+  "region": "emit"
+ },
+ {
+  "id": "G0545",
+  "file": "codegen/emit.go",
+  "line": 463,
+  "before": "\treturn hex.EncodeToString(encoded), fmt.Sprintf(\"<%s>\", hex.EncodeToString(numBytes))",
+  "after": "\treturn hex.EncodeToString(encoded), fmt.Sprintf(\"<%s>=\", hex.EncodeToString(numBytes))",
+  "op": "cmp-gt-to-ge",
+  "region": "emit"
+ },
+ {
+  "id": "G0546",
+  "file": "codegen/emit.go",
+  "line": 472,
+  "before": "\tif op.SourceLoc != nil {",
+  "after": "\tif op.SourceLoc == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0547",
+  "file": "codegen/emit.go",
+  "line": 514,
+  "before": "\t\tif codeSepIdx < 0 {",
+  "after": "\t\tif codeSepIdx <= 0 {",
+  "op": "cmp-lt-to-le",
+  "region": "emit"
+ },
+ {
+  "id": "G0548",
+  "file": "codegen/emit.go",
+  "line": 534,
+  "before": "\tif err := ctx.emitOpcode(\"OP_IF\"); err != nil {",
+  "after": "\tif err := ctx.emitOpcode(\"OP_IF\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0549",
+  "file": "codegen/emit.go",
+  "line": 539,
+  "before": "\t\tif err := emitStackOp(&thenOps[i], ctx); err != nil {",
+  "after": "\t\tif err := emitStackOp(&thenOps[i], ctx); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0550",
+  "file": "codegen/emit.go",
+  "line": 544,
+  "before": "\tif len(elseOps) > 0 {",
+  "after": "\tif len(elseOps) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "emit"
+ },
+ {
+  "id": "G0551",
+  "file": "codegen/emit.go",
+  "line": 545,
+  "before": "\t\tif err := ctx.emitOpcode(\"OP_ELSE\"); err != nil {",
+  "after": "\t\tif err := ctx.emitOpcode(\"OP_ELSE\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0552",
+  "file": "codegen/emit.go",
+  "line": 549,
+  "before": "\t\t\tif err := emitStackOp(&elseOps[i], ctx); err != nil {",
+  "after": "\t\t\tif err := emitStackOp(&elseOps[i], ctx); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0553",
+  "file": "codegen/emit.go",
+  "line": 577,
+  "before": "\t\tif m.Name != \"constructor\" {",
+  "after": "\t\tif m.Name == \"constructor\" {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0554",
+  "file": "codegen/emit.go",
+  "line": 582,
+  "before": "\tif len(publicMethods) == 0 {",
+  "after": "\tif len(publicMethods) != 0 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0555",
+  "file": "codegen/emit.go",
+  "line": 586,
+  "before": "\tif len(publicMethods) == 1 {",
+  "after": "\tif len(publicMethods) != 1 {",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0556",
+  "file": "codegen/emit.go",
+  "line": 589,
+  "before": "\t\t\tif err := emitStackOp(&publicMethods[0].Ops[i], ctx); err != nil {",
+  "after": "\t\t\tif err := emitStackOp(&publicMethods[0].Ops[i], ctx); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0557",
+  "file": "codegen/emit.go",
+  "line": 595,
+  "before": "\t\tif err := emitMethodDispatch(publicMethods, ctx); err != nil {",
+  "after": "\t\tif err := emitMethodDispatch(publicMethods, ctx); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0558",
+  "file": "codegen/emit.go",
+  "line": 615,
+  "before": "\t\tisLast := i == len(methods)-1",
+  "after": "\t\tisLast := i == len(methods)-2",
+  "op": "len-off-by-one",
+  "region": "emit"
+ },
+ {
+  "id": "G0559",
+  "file": "codegen/emit.go",
+  "line": 615,
+  "before": "\t\tisLast := i == len(methods)-1",
+  "after": "\t\tisLast := i == len(methods)",
+  "op": "len-drop-minus",
+  "region": "emit"
+ },
+ {
+  "id": "G0560",
+  "file": "codegen/emit.go",
+  "line": 615,
+  "before": "\t\tisLast := i == len(methods)-1",
+  "after": "\t\tisLast := i != len(methods)-1",
+  "op": "eq-to-neq",
+  "region": "emit"
+ },
+ {
+  "id": "G0561",
+  "file": "codegen/emit.go",
+  "line": 618,
+  "before": "\t\t\tif err := ctx.emitOpcode(\"OP_DUP\"); err != nil {",
+  "after": "\t\t\tif err := ctx.emitOpcode(\"OP_DUP\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0562",
+  "file": "codegen/emit.go",
+  "line": 622,
+  "before": "\t\t\tif err := ctx.emitOpcode(\"OP_NUMEQUAL\"); err != nil {",
+  "after": "\t\t\tif err := ctx.emitOpcode(\"OP_NUMEQUAL\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0563",
+  "file": "codegen/emit.go",
+  "line": 625,
+  "before": "\t\t\tif err := ctx.emitOpcode(\"OP_IF\"); err != nil {",
+  "after": "\t\t\tif err := ctx.emitOpcode(\"OP_IF\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0564",
+  "file": "codegen/emit.go",
+  "line": 628,
+  "before": "\t\t\tif err := ctx.emitOpcode(\"OP_DROP\"); err != nil {",
+  "after": "\t\t\tif err := ctx.emitOpcode(\"OP_DROP\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0565",
+  "file": "codegen/emit.go",
+  "line": 634,
+  "before": "\t\t\tif err := ctx.emitOpcode(\"OP_NUMEQUALVERIFY\"); err != nil {",
+  "after": "\t\t\tif err := ctx.emitOpcode(\"OP_NUMEQUALVERIFY\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0566",
+  "file": "codegen/emit.go",
+  "line": 640,
+  "before": "\t\t\tif err := emitStackOp(&method.Ops[j], ctx); err != nil {",
+  "after": "\t\t\tif err := emitStackOp(&method.Ops[j], ctx); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0567",
+  "file": "codegen/emit.go",
+  "line": 646,
+  "before": "\t\t\tif err := ctx.emitOpcode(\"OP_ELSE\"); err != nil {",
+  "after": "\t\t\tif err := ctx.emitOpcode(\"OP_ELSE\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0568",
+  "file": "codegen/emit.go",
+  "line": 653,
+  "before": "\tfor i := 0; i < len(methods)-1; i++ {",
+  "after": "\tfor i := 0; i < len(methods)-2; i++ {",
+  "op": "len-off-by-one",
+  "region": "emit"
+ },
+ {
+  "id": "G0569",
+  "file": "codegen/emit.go",
+  "line": 653,
+  "before": "\tfor i := 0; i < len(methods)-1; i++ {",
+  "after": "\tfor i := 0; i < len(methods); i++ {",
+  "op": "len-drop-minus",
+  "region": "emit"
+ },
+ {
+  "id": "G0570",
+  "file": "codegen/emit.go",
+  "line": 653,
+  "before": "\tfor i := 0; i < len(methods)-1; i++ {",
+  "after": "\tfor i := 0; i <= len(methods)-1; i++ {",
+  "op": "cmp-lt-to-le",
+  "region": "emit"
+ },
+ {
+  "id": "G0571",
+  "file": "codegen/emit.go",
+  "line": 654,
+  "before": "\t\tif err := ctx.emitOpcode(\"OP_ENDIF\"); err != nil {",
+  "after": "\t\tif err := ctx.emitOpcode(\"OP_ENDIF\"); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0572",
+  "file": "codegen/emit.go",
+  "line": 666,
+  "before": "\t\tif err := emitStackOp(&method.Ops[i], ctx); err != nil {",
+  "after": "\t\tif err := emitStackOp(&method.Ops[i], ctx); err == nil {",
+  "op": "neq-to-eq",
+  "region": "emit"
+ },
+ {
+  "id": "G0573",
+  "file": "codegen/optimizer.go",
+  "line": 23,
+  "before": "\tfor iteration := 0; iteration < maxOptimizationIterations; iteration++ {",
+  "after": "\tfor iteration := 0; iteration <= maxOptimizationIterations; iteration++ {",
+  "op": "cmp-lt-to-le",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0574",
+  "file": "codegen/optimizer.go",
+  "line": 35,
+  "before": "\tif op.Op == \"if\" {",
+  "after": "\tif op.Op != \"if\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0575",
+  "file": "codegen/optimizer.go",
+  "line": 38,
+  "before": "\t\tif len(op.Else) > 0 {",
+  "after": "\t\tif len(op.Else) >= 0 {",
+  "op": "cmp-gt-to-ge",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0576",
+  "file": "codegen/optimizer.go",
+  "line": 55,
+  "before": "\tfor i < len(ops) {",
+  "after": "\tfor i <= len(ops) {",
+  "op": "cmp-lt-to-le",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0577",
+  "file": "codegen/optimizer.go",
+  "line": 57,
+  "before": "\t\tif i+3 < len(ops) {",
+  "after": "\t\tif i+3 <= len(ops) {",
+  "op": "cmp-lt-to-le",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0578",
+  "file": "codegen/optimizer.go",
+  "line": 58,
+  "before": "\t\t\tif replacement, ok := matchWindow4(ops[i], ops[i+1], ops[i+2], ops[i+3]); ok {",
+  "after": "\t\t\tif replacement, ok := matchWindow4(ops[i], ops[i+2], ops[i+2], ops[i+3]); ok {",
+  "op": "idx-plus1-to-plus2",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0579",
+  "file": "codegen/optimizer.go",
+  "line": 66,
+  "before": "\t\tif i+2 < len(ops) {",
+  "after": "\t\tif i+2 <= len(ops) {",
+  "op": "cmp-lt-to-le",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0580",
+  "file": "codegen/optimizer.go",
+  "line": 67,
+  "before": "\t\t\tif replacement, ok := matchWindow3(ops[i], ops[i+1], ops[i+2]); ok {",
+  "after": "\t\t\tif replacement, ok := matchWindow3(ops[i], ops[i+2], ops[i+2]); ok {",
+  "op": "idx-plus1-to-plus2",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0581",
+  "file": "codegen/optimizer.go",
+  "line": 75,
+  "before": "\t\tif i+1 < len(ops) {",
+  "after": "\t\tif i+2 < len(ops) {",
+  "op": "idx-plus1-to-plus2",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0582",
+  "file": "codegen/optimizer.go",
+  "line": 75,
+  "before": "\t\tif i+1 < len(ops) {",
+  "after": "\t\tif i+1 <= len(ops) {",
+  "op": "cmp-lt-to-le",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0583",
+  "file": "codegen/optimizer.go",
+  "line": 76,
+  "before": "\t\t\tif replacement, ok := matchWindow2(ops[i], ops[i+1]); ok {",
+  "after": "\t\t\tif replacement, ok := matchWindow2(ops[i], ops[i+2]); ok {",
+  "op": "idx-plus1-to-plus2",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0584",
+  "file": "codegen/optimizer.go",
+  "line": 96,
+  "before": "\treturn op.Op == \"raw_bytes\"",
+  "after": "\treturn op.Op != \"raw_bytes\"",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0585",
+  "file": "codegen/optimizer.go",
+  "line": 100,
+  "before": "\tif isRawBytes(a) || isRawBytes(b) {",
+  "after": "\tif isRawBytes(a) && isRawBytes(b) {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0586",
+  "file": "codegen/optimizer.go",
+  "line": 105,
+  "before": "\tif a.Op == \"push\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op != \"push\" && b.Op == \"drop\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0587",
+  "file": "codegen/optimizer.go",
+  "line": 105,
+  "before": "\tif a.Op == \"push\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op == \"push\" && b.Op != \"drop\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0588",
+  "file": "codegen/optimizer.go",
+  "line": 105,
+  "before": "\tif a.Op == \"push\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op == \"push\" || b.Op == \"drop\" {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0589",
+  "file": "codegen/optimizer.go",
+  "line": 110,
+  "before": "\tif a.Op == \"dup\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op != \"dup\" && b.Op == \"drop\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0590",
+  "file": "codegen/optimizer.go",
+  "line": 110,
+  "before": "\tif a.Op == \"dup\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op == \"dup\" && b.Op != \"drop\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0591",
+  "file": "codegen/optimizer.go",
+  "line": 110,
+  "before": "\tif a.Op == \"dup\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op == \"dup\" || b.Op == \"drop\" {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0592",
+  "file": "codegen/optimizer.go",
+  "line": 115,
+  "before": "\tif a.Op == \"swap\" && b.Op == \"swap\" {",
+  "after": "\tif a.Op != \"swap\" && b.Op == \"swap\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0593",
+  "file": "codegen/optimizer.go",
+  "line": 115,
+  "before": "\tif a.Op == \"swap\" && b.Op == \"swap\" {",
+  "after": "\tif a.Op == \"swap\" && b.Op != \"swap\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0594",
+  "file": "codegen/optimizer.go",
+  "line": 115,
+  "before": "\tif a.Op == \"swap\" && b.Op == \"swap\" {",
+  "after": "\tif a.Op == \"swap\" || b.Op == \"swap\" {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0595",
+  "file": "codegen/optimizer.go",
+  "line": 120,
+  "before": "\tif isPushBigInt(a, 1) && isOpcodeOp(b, \"OP_ADD\") {",
+  "after": "\tif isPushBigInt(a, 1) || isOpcodeOp(b, \"OP_ADD\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0596",
+  "file": "codegen/optimizer.go",
+  "line": 125,
+  "before": "\tif isPushBigInt(a, 1) && isOpcodeOp(b, \"OP_SUB\") {",
+  "after": "\tif isPushBigInt(a, 1) || isOpcodeOp(b, \"OP_SUB\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0597",
+  "file": "codegen/optimizer.go",
+  "line": 130,
+  "before": "\tif isPushBigInt(a, 0) && isOpcodeOp(b, \"OP_ADD\") {",
+  "after": "\tif isPushBigInt(a, 0) || isOpcodeOp(b, \"OP_ADD\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0598",
+  "file": "codegen/optimizer.go",
+  "line": 135,
+  "before": "\tif isPushBigInt(a, 0) && isOpcodeOp(b, \"OP_SUB\") {",
+  "after": "\tif isPushBigInt(a, 0) || isOpcodeOp(b, \"OP_SUB\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0599",
+  "file": "codegen/optimizer.go",
+  "line": 145,
+  "before": "\tif isOpcodeOp(a, \"OP_NEGATE\") && isOpcodeOp(b, \"OP_NEGATE\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_NEGATE\") || isOpcodeOp(b, \"OP_NEGATE\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0600",
+  "file": "codegen/optimizer.go",
+  "line": 150,
+  "before": "\tif isOpcodeOp(a, \"OP_EQUAL\") && isOpcodeOp(b, \"OP_VERIFY\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_EQUAL\") || isOpcodeOp(b, \"OP_VERIFY\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0601",
+  "file": "codegen/optimizer.go",
+  "line": 155,
+  "before": "\tif isOpcodeOp(a, \"OP_CHECKSIG\") && isOpcodeOp(b, \"OP_VERIFY\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_CHECKSIG\") || isOpcodeOp(b, \"OP_VERIFY\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0602",
+  "file": "codegen/optimizer.go",
+  "line": 160,
+  "before": "\tif isOpcodeOp(a, \"OP_NUMEQUAL\") && isOpcodeOp(b, \"OP_VERIFY\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_NUMEQUAL\") || isOpcodeOp(b, \"OP_VERIFY\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0603",
+  "file": "codegen/optimizer.go",
+  "line": 165,
+  "before": "\tif isOpcodeOp(a, \"OP_CHECKMULTISIG\") && isOpcodeOp(b, \"OP_VERIFY\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_CHECKMULTISIG\") || isOpcodeOp(b, \"OP_VERIFY\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0604",
+  "file": "codegen/optimizer.go",
+  "line": 170,
+  "before": "\tif isOpcodeOp(a, \"OP_DUP\") && isOpcodeOp(b, \"OP_DROP\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_DUP\") || isOpcodeOp(b, \"OP_DROP\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0605",
+  "file": "codegen/optimizer.go",
+  "line": 175,
+  "before": "\tif a.Op == \"over\" && b.Op == \"over\" {",
+  "after": "\tif a.Op != \"over\" && b.Op == \"over\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0606",
+  "file": "codegen/optimizer.go",
+  "line": 175,
+  "before": "\tif a.Op == \"over\" && b.Op == \"over\" {",
+  "after": "\tif a.Op == \"over\" && b.Op != \"over\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0607",
+  "file": "codegen/optimizer.go",
+  "line": 175,
+  "before": "\tif a.Op == \"over\" && b.Op == \"over\" {",
+  "after": "\tif a.Op == \"over\" || b.Op == \"over\" {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0608",
+  "file": "codegen/optimizer.go",
+  "line": 180,
+  "before": "\tif a.Op == \"drop\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op != \"drop\" && b.Op == \"drop\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0609",
+  "file": "codegen/optimizer.go",
+  "line": 180,
+  "before": "\tif a.Op == \"drop\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op == \"drop\" && b.Op != \"drop\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0610",
+  "file": "codegen/optimizer.go",
+  "line": 180,
+  "before": "\tif a.Op == \"drop\" && b.Op == \"drop\" {",
+  "after": "\tif a.Op == \"drop\" || b.Op == \"drop\" {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0611",
+  "file": "codegen/optimizer.go",
+  "line": 185,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"roll\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) && b.Op != \"roll\" && b.Depth == 0 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0612",
+  "file": "codegen/optimizer.go",
+  "line": 185,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"roll\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) && b.Op == \"roll\" && b.Depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0613",
+  "file": "codegen/optimizer.go",
+  "line": 185,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"roll\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) || b.Op == \"roll\" && b.Depth == 0 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0614",
+  "file": "codegen/optimizer.go",
+  "line": 185,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"roll\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) && b.Op == \"roll\" || b.Depth == 0 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0615",
+  "file": "codegen/optimizer.go",
+  "line": 190,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"roll\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) && b.Op != \"roll\" && b.Depth == 1 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0616",
+  "file": "codegen/optimizer.go",
+  "line": 190,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"roll\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) && b.Op == \"roll\" && b.Depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0617",
+  "file": "codegen/optimizer.go",
+  "line": 190,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"roll\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) || b.Op == \"roll\" && b.Depth == 1 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0618",
+  "file": "codegen/optimizer.go",
+  "line": 190,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"roll\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) && b.Op == \"roll\" || b.Depth == 1 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0619",
+  "file": "codegen/optimizer.go",
+  "line": 195,
+  "before": "\tif isPushBigInt(a, 2) && b.Op == \"roll\" && b.Depth == 2 {",
+  "after": "\tif isPushBigInt(a, 2) && b.Op != \"roll\" && b.Depth == 2 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0620",
+  "file": "codegen/optimizer.go",
+  "line": 195,
+  "before": "\tif isPushBigInt(a, 2) && b.Op == \"roll\" && b.Depth == 2 {",
+  "after": "\tif isPushBigInt(a, 2) && b.Op == \"roll\" && b.Depth != 2 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0621",
+  "file": "codegen/optimizer.go",
+  "line": 195,
+  "before": "\tif isPushBigInt(a, 2) && b.Op == \"roll\" && b.Depth == 2 {",
+  "after": "\tif isPushBigInt(a, 2) || b.Op == \"roll\" && b.Depth == 2 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0622",
+  "file": "codegen/optimizer.go",
+  "line": 195,
+  "before": "\tif isPushBigInt(a, 2) && b.Op == \"roll\" && b.Depth == 2 {",
+  "after": "\tif isPushBigInt(a, 2) && b.Op == \"roll\" || b.Depth == 2 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0623",
+  "file": "codegen/optimizer.go",
+  "line": 200,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"pick\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) && b.Op != \"pick\" && b.Depth == 0 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0624",
+  "file": "codegen/optimizer.go",
+  "line": 200,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"pick\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) && b.Op == \"pick\" && b.Depth != 0 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0625",
+  "file": "codegen/optimizer.go",
+  "line": 200,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"pick\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) || b.Op == \"pick\" && b.Depth == 0 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0626",
+  "file": "codegen/optimizer.go",
+  "line": 200,
+  "before": "\tif isPushBigInt(a, 0) && b.Op == \"pick\" && b.Depth == 0 {",
+  "after": "\tif isPushBigInt(a, 0) && b.Op == \"pick\" || b.Depth == 0 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0627",
+  "file": "codegen/optimizer.go",
+  "line": 205,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"pick\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) && b.Op != \"pick\" && b.Depth == 1 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0628",
+  "file": "codegen/optimizer.go",
+  "line": 205,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"pick\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) && b.Op == \"pick\" && b.Depth != 1 {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0629",
+  "file": "codegen/optimizer.go",
+  "line": 205,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"pick\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) || b.Op == \"pick\" && b.Depth == 1 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0630",
+  "file": "codegen/optimizer.go",
+  "line": 205,
+  "before": "\tif isPushBigInt(a, 1) && b.Op == \"pick\" && b.Depth == 1 {",
+  "after": "\tif isPushBigInt(a, 1) && b.Op == \"pick\" || b.Depth == 1 {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0631",
+  "file": "codegen/optimizer.go",
+  "line": 210,
+  "before": "\tif isOpcodeOp(a, \"OP_SHA256\") && isOpcodeOp(b, \"OP_SHA256\") {",
+  "after": "\tif isOpcodeOp(a, \"OP_SHA256\") || isOpcodeOp(b, \"OP_SHA256\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0632",
+  "file": "codegen/optimizer.go",
+  "line": 215,
+  "before": "\tif isPushBigInt(a, 0) && isOpcodeOp(b, \"OP_NUMEQUAL\") {",
+  "after": "\tif isPushBigInt(a, 0) || isOpcodeOp(b, \"OP_NUMEQUAL\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0633",
+  "file": "codegen/optimizer.go",
+  "line": 224,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt != nil {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0634",
+  "file": "codegen/optimizer.go",
+  "line": 224,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op == \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0635",
+  "file": "codegen/optimizer.go",
+  "line": 224,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" || op.Value.Kind == \"bigint\" || op.Value.BigInt == nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0636",
+  "file": "codegen/optimizer.go",
+  "line": 224,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" && op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0637",
+  "file": "codegen/optimizer.go",
+  "line": 224,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" && op.Value.BigInt == nil {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0638",
+  "file": "codegen/optimizer.go",
+  "line": 269,
+  "before": "\tif op.Op == \"opcode\" {",
+  "after": "\tif op.Op != \"opcode\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0639",
+  "file": "codegen/optimizer.go",
+  "line": 272,
+  "before": "\tif op.Op == \"push\" {",
+  "after": "\tif op.Op != \"push\" {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0640",
+  "file": "codegen/optimizer.go",
+  "line": 277,
+  "before": "\t\t\treturn isPushBigInt(op, 0) || isPushBigInt(op, 1)",
+  "after": "\t\t\treturn isPushBigInt(op, 0) && isPushBigInt(op, 1)",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0641",
+  "file": "codegen/optimizer.go",
+  "line": 284,
+  "before": "\tif isRawBytes(a) || isRawBytes(b) || isRawBytes(c) {",
+  "after": "\tif isRawBytes(a) && isRawBytes(b) || isRawBytes(c) {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0642",
+  "file": "codegen/optimizer.go",
+  "line": 284,
+  "before": "\tif isRawBytes(a) || isRawBytes(b) || isRawBytes(c) {",
+  "after": "\tif isRawBytes(a) || isRawBytes(b) && isRawBytes(c) {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0643",
+  "file": "codegen/optimizer.go",
+  "line": 304,
+  "before": "\tif producesCanonicalBool(a) && isOpcodeOp(b, \"OP_NOT\") && isOpcodeOp(c, \"OP_NOT\") {",
+  "after": "\tif producesCanonicalBool(a) || isOpcodeOp(b, \"OP_NOT\") && isOpcodeOp(c, \"OP_NOT\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0644",
+  "file": "codegen/optimizer.go",
+  "line": 304,
+  "before": "\tif producesCanonicalBool(a) && isOpcodeOp(b, \"OP_NOT\") && isOpcodeOp(c, \"OP_NOT\") {",
+  "after": "\tif producesCanonicalBool(a) && isOpcodeOp(b, \"OP_NOT\") || isOpcodeOp(c, \"OP_NOT\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0645",
+  "file": "codegen/optimizer.go",
+  "line": 311,
+  "before": "\tif aVal != nil && bVal != nil {",
+  "after": "\tif aVal == nil && bVal != nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0646",
+  "file": "codegen/optimizer.go",
+  "line": 311,
+  "before": "\tif aVal != nil && bVal != nil {",
+  "after": "\tif aVal != nil && bVal == nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0647",
+  "file": "codegen/optimizer.go",
+  "line": 311,
+  "before": "\tif aVal != nil && bVal != nil {",
+  "after": "\tif aVal != nil || bVal != nil {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0648",
+  "file": "codegen/optimizer.go",
+  "line": 341,
+  "before": "\tif isRawBytes(a) || isRawBytes(b) || isRawBytes(c) || isRawBytes(d) {",
+  "after": "\tif isRawBytes(a) && isRawBytes(b) || isRawBytes(c) || isRawBytes(d) {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0649",
+  "file": "codegen/optimizer.go",
+  "line": 341,
+  "before": "\tif isRawBytes(a) || isRawBytes(b) || isRawBytes(c) || isRawBytes(d) {",
+  "after": "\tif isRawBytes(a) || isRawBytes(b) && isRawBytes(c) || isRawBytes(d) {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0650",
+  "file": "codegen/optimizer.go",
+  "line": 348,
+  "before": "\tif aVal != nil && cVal != nil {",
+  "after": "\tif aVal == nil && cVal != nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0651",
+  "file": "codegen/optimizer.go",
+  "line": 348,
+  "before": "\tif aVal != nil && cVal != nil {",
+  "after": "\tif aVal != nil && cVal == nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0652",
+  "file": "codegen/optimizer.go",
+  "line": 348,
+  "before": "\tif aVal != nil && cVal != nil {",
+  "after": "\tif aVal != nil || cVal != nil {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0653",
+  "file": "codegen/optimizer.go",
+  "line": 350,
+  "before": "\t\tif isOpcodeOp(b, \"OP_ADD\") && isOpcodeOp(d, \"OP_ADD\") {",
+  "after": "\t\tif isOpcodeOp(b, \"OP_ADD\") || isOpcodeOp(d, \"OP_ADD\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0654",
+  "file": "codegen/optimizer.go",
+  "line": 355,
+  "before": "\t\tif isOpcodeOp(b, \"OP_SUB\") && isOpcodeOp(d, \"OP_SUB\") {",
+  "after": "\t\tif isOpcodeOp(b, \"OP_SUB\") || isOpcodeOp(d, \"OP_SUB\") {",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0655",
+  "file": "codegen/optimizer.go",
+  "line": 365,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt != nil {",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0656",
+  "file": "codegen/optimizer.go",
+  "line": 365,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op == \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0657",
+  "file": "codegen/optimizer.go",
+  "line": 365,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" || op.Value.Kind == \"bigint\" || op.Value.BigInt == nil {",
+  "op": "neq-to-eq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0658",
+  "file": "codegen/optimizer.go",
+  "line": 365,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" && op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0659",
+  "file": "codegen/optimizer.go",
+  "line": 365,
+  "before": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" || op.Value.BigInt == nil {",
+  "after": "\tif op.Op != \"push\" || op.Value.Kind != \"bigint\" && op.Value.BigInt == nil {",
+  "op": "bool-or-to-and",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0660",
+  "file": "codegen/optimizer.go",
+  "line": 368,
+  "before": "\treturn op.Value.BigInt.Cmp(big.NewInt(n)) == 0",
+  "after": "\treturn op.Value.BigInt.Cmp(big.NewInt(n)) != 0",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0661",
+  "file": "codegen/optimizer.go",
+  "line": 372,
+  "before": "\treturn op.Op == \"opcode\" && op.Code == code",
+  "after": "\treturn op.Op != \"opcode\" && op.Code == code",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0662",
+  "file": "codegen/optimizer.go",
+  "line": 372,
+  "before": "\treturn op.Op == \"opcode\" && op.Code == code",
+  "after": "\treturn op.Op == \"opcode\" && op.Code != code",
+  "op": "eq-to-neq",
+  "region": "optimizer"
+ },
+ {
+  "id": "G0663",
+  "file": "codegen/optimizer.go",
+  "line": 372,
+  "before": "\treturn op.Op == \"opcode\" && op.Code == code",
+  "after": "\treturn op.Op == \"opcode\" || op.Code == code",
+  "op": "bool-and-to-or",
+  "region": "optimizer"
+ }
+]

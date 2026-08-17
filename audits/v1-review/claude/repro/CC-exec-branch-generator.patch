@@ -1,0 +1,114 @@
+diff --git a/packages/runar-testing/src/fuzzer/generator.ts b/packages/runar-testing/src/fuzzer/generator.ts
+index c52e8594..890ff63d 100644
+--- a/packages/runar-testing/src/fuzzer/generator.ts
++++ b/packages/runar-testing/src/fuzzer/generator.ts
+@@ -2122,6 +2122,20 @@ function arbExecMethodBody(
+       useExtra: fc.boolean(),
+       logicalOp: fc.constantFrom('&&' as const, '||' as const),
+       extra: arbExtraClause(['acc', ...bigintPropParamVars], bytesBase),
++      // AUDIT-PATCH (CC): branch family for the execution oracle.
++      includeBranch: fc.boolean(),
++      branchNested: fc.boolean(),
++      brInit: arbAdditiveExpr(bigintPropParamVars, 1),
++      brOuterCmp: fc.constantFrom(...EXEC_CMP_OPS),
++      brInnerCmp: fc.constantFrom(...EXEC_CMP_OPS),
++      brOuterRhs: fc.integer({ min: -8, max: 8 }),
++      brInnerRhs: fc.integer({ min: -8, max: 8 }),
++      brThen: arbAdditiveExpr(bigintPropParamVars, 1),
++      brElse: arbAdditiveExpr(bigintPropParamVars, 1),
++      brOuterElse: fc.boolean(),
++      brOuterElseVal: arbAdditiveExpr(bigintPropParamVars, 1),
++      brSibInit: arbAdditiveExpr(bigintPropParamVars, 1),
++      brDiscCmp: fc.constantFrom('<' as const, '>' as const, '<=' as const, '>=' as const, '===' as const, '!==' as const),
+     })
+     .chain((cfg) => {
+       const body: Stmt[] = [];
+@@ -2162,6 +2176,49 @@ function arbExecMethodBody(
+         }
+       }
+ 
++      // AUDIT-PATCH (CC): a merged local rebound inside a branch, optionally
++      // a DECLARED-RESULTS inner `if` nested in the outer arm while `acc`
++      // stays live and untouched in the inherited region (issue #149 topology).
++      const branchVars: string[] = [];
++      if (cfg.includeBranch && params.length > 0) {
++        const guard = params.find((pp) => pp.type === 'bigint');
++        if (guard) {
++          body.push({
++            kind: 'var_decl', name: 'br0', type: 'bigint',
++            value: cfg.brInit, mutable: true,
++          });
++          // The LIVE SIBLING: declared AFTER br0, so br0 is the deeper slot the
++          // inner `if`'s adopt loop has to rotate past (issue #149 topology).
++          body.push({
++            kind: 'var_decl', name: 'sib0', type: 'bigint',
++            value: cfg.brSibInit, mutable: false,
++          });
++          const cmp = (name: string, op: (typeof EXEC_CMP_OPS)[number], n: number): Expr => ({
++            kind: 'binary', op,
++            left: { kind: 'var_ref', name },
++            right: { kind: 'bigint_literal', value: BigInt(n) },
++          });
++          const rebind = (value: Expr): Stmt => ({
++            kind: 'assign', target: 'br0', value, isProperty: false,
++          });
++          const inner: Stmt = cfg.branchNested
++            ? {
++                kind: 'if',
++                condition: cmp(guard.name, cfg.brInnerCmp, cfg.brInnerRhs),
++                then: [rebind(cfg.brThen)],
++                else_: [rebind(cfg.brElse)],
++              }
++            : rebind(cfg.brThen);
++          body.push({
++            kind: 'if',
++            condition: cmp(guard.name, cfg.brOuterCmp, cfg.brOuterRhs),
++            then: [inner],
++            else_: cfg.brOuterElse ? [rebind(cfg.brOuterElseVal)] : undefined,
++          });
++          branchVars.push('br0');
++        }
++      }
++
+       // Terminal assert: a guaranteed param read, optionally &&/|| an extra
+       // clause, AND — whenever a loop ran — a guaranteed read of every carrier
+       // so the loop's result decides the spend verdict.
+@@ -2175,9 +2232,37 @@ function arbExecMethodBody(
+           const base: Expr = cfg.useExtra
+             ? { kind: 'binary', op: cfg.logicalOp, left: clause, right: cfg.extra }
+             : clause;
+-          const condition: Expr = cfg.includeLoop
++          let condition: Expr = cfg.includeLoop
+             ? { kind: 'binary', op: '&&', left: base, right: carrierClause }
+             : base;
++          // AUDIT-PATCH (CC): make the merged local AND the live sibling `acc`
++          // decide the verdict, so a wrong slot flips accept/reject.
++          if (branchVars.length > 0) {
++            condition = {
++              kind: 'binary', op: '&&',
++              left: condition,
++              right: {
++                kind: 'binary', op: '&&',
++                left: {
++                  kind: 'binary', op: '>',
++                  left: {
++                    kind: 'binary', op: '+',
++                    left: { kind: 'var_ref', name: 'br0' },
++                    right: { kind: 'var_ref', name: EXEC_ACC },
++                  },
++                  right: { kind: 'bigint_literal', value: -1000000n },
++                },
++                // NON-COMMUTATIVE in (br0, sib0): a layout swap between the
++                // two slots flips this clause, which a `br0 + sib0` style
++                // comparison (the existing carrier clauses' shape) cannot see.
++                right: {
++                  kind: 'binary', op: cfg.brDiscCmp,
++                  left: { kind: 'var_ref', name: 'br0' },
++                  right: { kind: 'var_ref', name: 'sib0' },
++                },
++              },
++            };
++          }
+           return { body: [...body, { kind: 'assert', condition }], loopShape };
+         });
+     });

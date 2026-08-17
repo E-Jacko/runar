@@ -1,0 +1,17 @@
+{
+  "seed": 8,
+  "reason": "tri-modal disagreement: interpreter=true vm=false spend=false",
+  "contractName": "ExecFuzz0",
+  "method": "run0",
+  "source": "import { SmartContract, assert } from 'runar-lang';\n\nclass ExecFuzz0 extends SmartContract {\n\n  constructor() {\n    super();\n  }\n\n  public run0(param0: bigint): void {\n    let acc: bigint = param0;\n    let br0: bigint = 0n;\n    const sib0: bigint = (param0 - param0);\n    if ((param0 < 0n)) {\n      if ((param0 === 0n)) {\n        br0 = param0;\n      } else {\n        br0 = (param0 + param0);\n      }\n    }\n    assert((((param0 === ((acc + acc) + 0n)) || (acc > ((acc + acc) + 0n))) && (((br0 + acc) > -1000000n) && (br0 < sib0))));\n  }\n}",
+  "constructorArgs": {},
+  "args": [
+    "-1n"
+  ],
+  "interpreterAccepted": true,
+  "vmAccepted": false,
+  "spendAccepted": false,
+  "lockingHex": "760052795379945379009f635379916353797677675379547993767768527a7568537a537976939c5379769354797ca09b5279547a930340420f0340428f7b7ca0547a547a9f9a7b7c9a77",
+  "witnessHex": "4f",
+  "spendError": "Script evaluation error: The top stack element must be truthy after script evaluation.\nTXID: 0000000000000000000000000000000000000000000000000000000000000000, OutputIdx: 0\nContext: LockingScript, PC: 69\nStack: [] (len: 1, mem: 0)\nAltStack: [] (len: 0, mem: 0)\nIfStack: []"
+}
