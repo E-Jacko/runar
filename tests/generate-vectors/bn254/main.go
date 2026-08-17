@@ -61,9 +61,16 @@ type PairingVectorFile struct {
 }
 
 type PairingVector struct {
-	Op          string   `json:"op"`
-	G1Points    []string `json:"g1_points"`
-	G2Points    []string `json:"g2_points"`
+	Op       string   `json:"op"`
+	G1Points []string `json:"g1_points"`
+	G2Points []string `json:"g2_points"`
+	// Group tags an equivalence class that MUST share one expected_gt. For a
+	// single pairing the class key is the scalar product a*b mod r, because
+	// e(a*G1, b*G2) = e(G1, G2)^(a*b) depends on nothing else. Two vectors in
+	// one group with different expected_gt means the pairing that produced them
+	// is not bilinear — an invariant a verifier can check WITHOUT owning a
+	// second pairing implementation. Empty for vectors that stand alone.
+	Group       string   `json:"group,omitempty"`
 	ExpectedGT  []string `json:"expected_gt"`
 	IsOne       bool     `json:"is_one"`
 	Description string   `json:"description"`
@@ -348,75 +355,234 @@ func generateG1ScalarMulVectors() []G1Vector {
 // Pairing vector generators
 // ---------------------------------------------------------------------------
 
+// pair is bn254.Pair with the error promoted to a panic — every call site here
+// passes points that are on-curve and in the correct subgroup by construction,
+// so an error is a generator bug, not a vector.
+func pair(g1s []bn254.G1Affine, g2s []bn254.G2Affine) bn254.GT {
+	gt, err := bn254.Pair(g1s, g2s)
+	if err != nil {
+		panic(fmt.Sprintf("pairing failed: %v", err))
+	}
+	return gt
+}
+
+func mulG1(p bn254.G1Affine, k *big.Int) bn254.G1Affine {
+	var out bn254.G1Affine
+	out.ScalarMultiplication(&p, k)
+	return out
+}
+
+func mulG2(p bn254.G2Affine, k *big.Int) bn254.G2Affine {
+	var out bn254.G2Affine
+	out.ScalarMultiplication(&p, k)
+	return out
+}
+
+// generatePairingVectors produces the BN254 pairing corpus.
+//
+// The pairing is the single most security-critical operation in the Groth16
+// path and it has no official upstream KAT in this repo, so the corpus is built
+// so that a verifier can falsify a wrong implementation using ALGEBRA over the
+// recorded values alone, without owning a second pairing:
+//
+//   - bilinearity — e(a*G1, b*G2) depends only on a*b mod r, so every vector
+//     carrying the same `group` key must carry byte-identical expected_gt.
+//     Three spellings of each product (a on G1, a on G2, and the split a/b) are
+//     emitted, so a pairing that is not bilinear cannot produce a consistent file.
+//   - degeneracy — pairings that must equal the Fp12 identity carry is_one=true.
+//   - non-degeneracy — negative controls that must NOT be the identity carry
+//     is_one=false, so "return 1 always" is falsified too.
+//
+// conformance/scripts/check-bn254-pairing-invariants.mjs enforces all of this
+// over the checked-in file.
 func generatePairingVectors() []PairingVector {
 	var vecs []PairingVector
 
 	_, _, g1Gen, g2Gen := bn254.Generators()
+	r := fr.Modulus()
 
-	// e(G1, G2)
-	gt, err := bn254.Pair([]bn254.G1Affine{g1Gen}, []bn254.G2Affine{g2Gen})
-	if err != nil {
-		panic(fmt.Sprintf("pairing failed: %v", err))
+	single := func(a, b *big.Int, group, desc string) {
+		p1 := mulG1(g1Gen, a)
+		p2 := mulG2(g2Gen, b)
+		gt := pair([]bn254.G1Affine{p1}, []bn254.G2Affine{p2})
+		var one bn254.GT
+		one.SetOne()
+		vecs = append(vecs, PairingVector{
+			Op:          "single_pairing",
+			G1Points:    g1AffineToHexSlice(p1),
+			G2Points:    g2AffineToHexSlice(p2),
+			Group:       group,
+			ExpectedGT:  gtToHexSlice(&gt),
+			IsOne:       gt.Equal(&one),
+			Description: desc,
+		})
 	}
-	vecs = append(vecs, PairingVector{
-		Op:          "single_pairing",
-		G1Points:    g1AffineToHexSlice(g1Gen),
-		G2Points:    g2AffineToHexSlice(g2Gen),
-		ExpectedGT:  gtToHexSlice(&gt),
-		IsOne:       false,
-		Description: "e(G1, G2) — generator pairing",
-	})
 
-	// Bilinearity: e(2G1, G2) == e(G1, 2G2)
-	var g1x2 bn254.G1Affine
-	g1x2.Add(&g1Gen, &g1Gen)
-	gt2a, _ := bn254.Pair([]bn254.G1Affine{g1x2}, []bn254.G2Affine{g2Gen})
+	// --- bilinearity classes -------------------------------------------------
+	// For each product k, emit e(k*G1, G2), e(G1, k*G2) and every non-trivial
+	// factorisation a*b = k. All of them MUST share one expected_gt.
+	type factorisation struct{ a, b int64 }
+	classes := []struct {
+		k       int64
+		factors []factorisation
+	}{
+		{1, nil},
+		{2, nil},
+		{6, []factorisation{{2, 3}, {3, 2}}},
+		{35, []factorisation{{5, 7}, {7, 5}}},
+		{42, []factorisation{{6, 7}, {7, 6}, {2, 21}, {21, 2}}},
+		{1728, []factorisation{{12, 144}, {144, 12}}},
+	}
+	for _, c := range classes {
+		k := big.NewInt(c.k)
+		group := fmt.Sprintf("bilinear:k=%d", c.k)
+		single(k, big.NewInt(1), group, fmt.Sprintf("e(%d*G1, G2) — bilinearity class k=%d", c.k, c.k))
+		single(big.NewInt(1), k, group, fmt.Sprintf("e(G1, %d*G2) — same class, scalar moved to G2", c.k))
+		for _, f := range c.factors {
+			single(big.NewInt(f.a), big.NewInt(f.b),
+				group,
+				fmt.Sprintf("e(%d*G1, %d*G2) — same class, %d*%d = %d", f.a, f.b, f.a, f.b, c.k))
+		}
+	}
 
-	var g2x2 bn254.G2Affine
-	g2x2.Add(&g2Gen, &g2Gen)
-	gt2b, _ := bn254.Pair([]bn254.G1Affine{g1Gen}, []bn254.G2Affine{g2x2})
+	// A large scalar and its reduction mod r land in the same class: the pairing
+	// output depends on a*b mod r, not on the integer.
+	{
+		big1 := new(big.Int).Add(r, big.NewInt(2)) // r + 2 == 2 (mod r)
+		single(big1, big.NewInt(1), "bilinear:k=2",
+			"e((r+2)*G1, G2) — scalar reduces mod r into class k=2")
+	}
 
-	vecs = append(vecs, PairingVector{
-		Op:          "single_pairing",
-		G1Points:    g1AffineToHexSlice(g1x2),
-		G2Points:    g2AffineToHexSlice(g2Gen),
-		ExpectedGT:  gtToHexSlice(&gt2a),
-		IsOne:       false,
-		Description: "e(2*G1, G2) — bilinearity check LHS",
-	})
+	// --- degeneracy: results that MUST be the Fp12 identity -------------------
+	// e(O, G2) and e(G1, O). gnark represents the point at infinity as the zero
+	// value of the affine type.
+	{
+		var infG1 bn254.G1Affine
+		var infG2 bn254.G2Affine
+		gt := pair([]bn254.G1Affine{infG1}, []bn254.G2Affine{g2Gen})
+		vecs = append(vecs, PairingVector{
+			Op:          "single_pairing",
+			G1Points:    g1AffineToHexSlice(infG1),
+			G2Points:    g2AffineToHexSlice(g2Gen),
+			ExpectedGT:  gtToHexSlice(&gt),
+			IsOne:       true,
+			Description: "e(O, G2) = 1 — G1 argument is the point at infinity",
+		})
+		gt2 := pair([]bn254.G1Affine{g1Gen}, []bn254.G2Affine{infG2})
+		vecs = append(vecs, PairingVector{
+			Op:          "single_pairing",
+			G1Points:    g1AffineToHexSlice(g1Gen),
+			G2Points:    g2AffineToHexSlice(infG2),
+			ExpectedGT:  gtToHexSlice(&gt2),
+			IsOne:       true,
+			Description: "e(G1, O) = 1 — G2 argument is the point at infinity",
+		})
+	}
 
-	vecs = append(vecs, PairingVector{
-		Op:          "single_pairing",
-		G1Points:    g1AffineToHexSlice(g1Gen),
-		G2Points:    g2AffineToHexSlice(g2x2),
-		ExpectedGT:  gtToHexSlice(&gt2b),
-		IsOne:       false,
-		Description: "e(G1, 2*G2) — bilinearity check RHS (should equal LHS)",
-	})
+	// --- product pairings: the Groth16 check shape ----------------------------
+	// e(a*G1, G2) * e(-G1, a*G2) = 1 for several a. This is the two-term form of
+	// the Groth16 verification equation.
+	for _, av := range []int64{1, 2, 42, 65537} {
+		a := big.NewInt(av)
+		aG1 := mulG1(g1Gen, a)
+		aG2 := mulG2(g2Gen, a)
+		var negG1 bn254.G1Affine
+		negG1.Neg(&g1Gen)
+		gt := pair(
+			[]bn254.G1Affine{aG1, negG1},
+			[]bn254.G2Affine{g2Gen, aG2},
+		)
+		vecs = append(vecs, PairingVector{
+			Op:          "product_pairing",
+			G1Points:    append(g1AffineToHexSlice(aG1), g1AffineToHexSlice(negG1)...),
+			G2Points:    append(g2AffineToHexSlice(g2Gen), g2AffineToHexSlice(aG2)...),
+			ExpectedGT:  gtToHexSlice(&gt),
+			IsOne:       true,
+			Description: fmt.Sprintf("e(%d*G1, G2) * e(-G1, %d*G2) = 1 (Groth16-style product)", av, av),
+		})
+	}
 
-	// Product pairing: e(aG1, G2) * e(-G1, aG2) == 1
-	// This is the Groth16-style check pattern
-	a := big.NewInt(42)
-	var aG1 bn254.G1Affine
-	aG1.ScalarMultiplication(&g1Gen, a)
-	var negG1 bn254.G1Affine
-	negG1.Neg(&g1Gen)
-	var aG2 bn254.G2Affine
-	aG2.ScalarMultiplication(&g2Gen, a)
+	// The full FOUR-term Groth16 shape:
+	//   e(A, B) * e(-alpha, beta) * e(-C, delta) * e(-vk_x, gamma) = 1
+	// built so the exponents sum to zero mod r:
+	//   A = a*G1, B = b*G2 with a*b = alpha*beta + c*delta + x*gamma.
+	{
+		alpha, beta := big.NewInt(11), big.NewInt(13)
+		c, delta := big.NewInt(17), big.NewInt(19)
+		x, gamma := big.NewInt(23), big.NewInt(29)
+		sum := new(big.Int).Mul(alpha, beta)
+		sum.Add(sum, new(big.Int).Mul(c, delta))
+		sum.Add(sum, new(big.Int).Mul(x, gamma))
+		sum.Mod(sum, r) // == a*b with b = 1
 
-	prodCheck, _ := bn254.Pair(
-		[]bn254.G1Affine{aG1, negG1},
-		[]bn254.G2Affine{g2Gen, aG2},
-	)
+		aG1 := mulG1(g1Gen, sum)
+		bG2 := g2Gen
+		negAlpha := mulG1(g1Gen, new(big.Int).Sub(r, new(big.Int).Mod(alpha, r)))
+		betaG2 := mulG2(g2Gen, beta)
+		negC := mulG1(g1Gen, new(big.Int).Sub(r, new(big.Int).Mod(c, r)))
+		deltaG2 := mulG2(g2Gen, delta)
+		negVkx := mulG1(g1Gen, new(big.Int).Sub(r, new(big.Int).Mod(x, r)))
+		gammaG2 := mulG2(g2Gen, gamma)
 
-	vecs = append(vecs, PairingVector{
-		Op:          "product_pairing",
-		G1Points:    append(g1AffineToHexSlice(aG1), g1AffineToHexSlice(negG1)...),
-		G2Points:    append(g2AffineToHexSlice(g2Gen), g2AffineToHexSlice(aG2)...),
-		ExpectedGT:  gtToHexSlice(&prodCheck),
-		IsOne:       true,
-		Description: "e(42*G1, G2) * e(-G1, 42*G2) = 1 (Groth16-style product)",
-	})
+		g1s := []bn254.G1Affine{aG1, negAlpha, negC, negVkx}
+		g2s := []bn254.G2Affine{bG2, betaG2, deltaG2, gammaG2}
+		gt := pair(g1s, g2s)
+		var g1hex, g2hex []string
+		for i := range g1s {
+			g1hex = append(g1hex, g1AffineToHexSlice(g1s[i])...)
+			g2hex = append(g2hex, g2AffineToHexSlice(g2s[i])...)
+		}
+		vecs = append(vecs, PairingVector{
+			Op:          "product_pairing",
+			G1Points:    g1hex,
+			G2Points:    g2hex,
+			ExpectedGT:  gtToHexSlice(&gt),
+			IsOne:       true,
+			Description: "e(A,B) * e(-alpha,beta) * e(-C,delta) * e(-vk_x,gamma) = 1 — the four-term Groth16 verification shape",
+		})
+
+		// NEGATIVE CONTROL: perturb one exponent by 1 and the product must stop
+		// being the identity. Without this a verifier that returns 1 for every
+		// input satisfies every is_one=true vector above.
+		badA := mulG1(g1Gen, new(big.Int).Add(sum, big.NewInt(1)))
+		badG1s := []bn254.G1Affine{badA, negAlpha, negC, negVkx}
+		badGT := pair(badG1s, g2s)
+		var badG1hex, badG2hex []string
+		for i := range badG1s {
+			badG1hex = append(badG1hex, g1AffineToHexSlice(badG1s[i])...)
+			badG2hex = append(badG2hex, g2AffineToHexSlice(g2s[i])...)
+		}
+		vecs = append(vecs, PairingVector{
+			Op:          "product_pairing",
+			G1Points:    badG1hex,
+			G2Points:    badG2hex,
+			ExpectedGT:  gtToHexSlice(&badGT),
+			IsOne:       false,
+			Description: "NEGATIVE CONTROL: the same four-term product with A off by one generator — must NOT be 1",
+		})
+	}
+
+	// More negative controls: single pairings that must not be the identity.
+	for _, av := range []int64{1, 2, 3} {
+		a := big.NewInt(av)
+		aG1 := mulG1(g1Gen, a)
+		var negG1 bn254.G1Affine
+		negG1.Neg(&g1Gen)
+		bad := big.NewInt(av + 1)
+		badG2 := mulG2(g2Gen, bad)
+		gt := pair(
+			[]bn254.G1Affine{aG1, negG1},
+			[]bn254.G2Affine{g2Gen, badG2},
+		)
+		vecs = append(vecs, PairingVector{
+			Op:          "product_pairing",
+			G1Points:    append(g1AffineToHexSlice(aG1), g1AffineToHexSlice(negG1)...),
+			G2Points:    append(g2AffineToHexSlice(g2Gen), g2AffineToHexSlice(badG2)...),
+			ExpectedGT:  gtToHexSlice(&gt),
+			IsOne:       false,
+			Description: fmt.Sprintf("NEGATIVE CONTROL: e(%d*G1, G2) * e(-G1, %d*G2) != 1 (exponents %d and %d disagree)", av, av+1, av, av+1),
+		})
+	}
 
 	return vecs
 }

@@ -74,6 +74,14 @@ const GOLDEN_MATCHERS = [
   (p) => /^conformance\/tests\/[^/]+\/expected-ir\.json$/.test(p),
   // Runtime KAT vectors (official known-answer test hashes).
   (p) => /^conformance\/runtime-vectors\/.*\.json$/.test(p),
+  // Research vectors for the Go-only crypto families (BabyBear, KoalaBear,
+  // Poseidon2, BN254/Groth16, Merkle, SP1 FRI). These primitives ship Stack-IR
+  // codegen in ONE tier, so cross-tier parity proves nothing about them and
+  // these files are their entire oracle — which makes a silent regeneration
+  // here strictly more dangerous than one under conformance/tests/, not less.
+  // Reproducibility is separately enforced by
+  // tests/generate-vectors/verify-reproducible.sh.
+  (p) => /^tests\/vectors\/[^/]+\.json$/.test(p),
   // Cross-SDK deployed-locking-script goldens.
   (p) => /^conformance\/sdk-output\/tests\/[^/]+\/expected-.*\.hex$/.test(p),
   // Compiler<->SDK VERTICAL pins (plan Phase C3/C4). Three families, all
