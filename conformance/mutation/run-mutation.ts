@@ -149,6 +149,18 @@ export const GATES: Record<string, GateSpec> = {
     cwd: 'conformance',
     argv: ['npx', 'tsx', 'sdk-vertical/runner/vertical-runner.ts', '--tiers', 'typescript', '--filter', 'codesep-tag-zero'],
   },
+  // --- v1 audit mutation-survivor triage (2026-08-17) ----------------------
+  // Byte pins for four `05-stack-lower.ts` paths the 71-fixture golden corpus
+  // never reaches: `StackMap.dup`'s name bookkeeping, the branch-private
+  // residue drain's depth-1 special case, the empty-else reconcile predicate,
+  // and the #149 `sinkBelow` DISTANCE (as opposed to its already-covered
+  // `> 0` guard). Each witness in that file was delta-reduced from the
+  // generated program that first distinguished the mutant, and kills exactly
+  // the mutants named on it — measured 1:1, not assumed.
+  'stack-frame-mutation-pins': {
+    cwd: '.',
+    argv: ['npx', 'vitest', 'run', 'packages/runar-testing/src/__tests__/stack-frame-mutation-pins.test.ts'],
+  },
 };
 
 // ---------------------------------------------------------------------------
