@@ -728,7 +728,10 @@ public final class AnfInterpreter {
                     if ("<<".equals(op) || ">>".equals(op)) {
                         // Shift count is read as a number on-chain — only `ab`'s
                         // length is significant, so the count operand's bytes
-                        // are never consulted.
+                        // are never consulted for length. But being read AS A
+                        // NUMBER means the count must be minimally encoded, or
+                        // the shift aborts.
+                        assertMinimalNumericOperand(scriptBytes, rightRef, right);
                         rb = scriptNumberShiftBytes(op, ab, toBigInt(right));
                     } else {
                         byte[] bb = scriptBytes.containsKey(rightRef)
@@ -738,6 +741,18 @@ public final class AnfInterpreter {
                     }
                     scriptBytes.put(bindingName, rb);
                     return MockCrypto.decodeScriptNumber(rb);
+                }
+                // Numeric consumers decode BOTH operands with fRequireMinimal,
+                // so a threaded non-minimal intermediate (e.g. the 1-byte
+                // [0x00] that `1 >> 1` leaves) aborts the script rather than
+                // silently re-minimising to 0. Byte-typed ops are exempt: they
+                // never carry threaded bytes and OP_CAT/OP_EQUAL impose no
+                // numeric decode.
+                boolean isBytesPath = "bytes".equals(resultType)
+                    || (left instanceof String && right instanceof String);
+                if (isNumericConsumerOp(op) && !isBytesPath) {
+                    assertMinimalNumericOperand(scriptBytes, leftRef, left);
+                    assertMinimalNumericOperand(scriptBytes, rightRef, right);
                 }
                 return evalBinOp(op, left, right, resultType);
             }
@@ -1122,6 +1137,49 @@ public final class AnfInterpreter {
             num = num.shiftRight(8);
         }
         return result;
+    }
+
+    /**
+     * Whether a bin_op consumes its operands NUMERICALLY, i.e. lowers to an
+     * opcode that decodes them with {@code fRequireMinimal = true}:
+     * OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD, OP_NUMEQUAL(VERIFY)/OP_NUMNOTEQUAL and
+     * the relational ops. The byte-array ops {@code & | ^} and a shift's VALUE
+     * operand are deliberately absent — they take raw bytes and only require
+     * equal length. {@code &&}/{@code ||} cast to bool, which imposes no
+     * minimal-encoding requirement either.
+     */
+    private static boolean isNumericConsumerOp(String op) {
+        switch (op) {
+            case "+": case "-": case "*": case "/": case "%":
+            case "==": case "===": case "!=": case "!==":
+            case "<": case "<=": case ">": case ">=":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Abort if {@code ref}'s threaded stack bytes are a NON-minimal encoding of
+     * its decoded value — the exact case a numeric consumer rejects on chain
+     * ("non-minimally encoded script number"). Only byte-array ops thread bytes,
+     * so a ref absent from the side map is minimal by construction and passes.
+     *
+     * <p>Without this, {@code 1 >> 1} (which leaves the 1-byte {@code [0x00]},
+     * NOT the empty minimal zero) is re-minimised to {@code 0} by the numeric
+     * path: the interpreter reports a VALID spend for a script that aborts on
+     * chain, leaving the UTXO permanently unspendable.
+     */
+    private static void assertMinimalNumericOperand(
+        Map<String, byte[]> scriptBytes, String ref, Object val
+    ) {
+        byte[] raw = scriptBytes.get(ref);
+        if (raw == null) return;
+        if (!java.util.Arrays.equals(raw, MockCrypto.encodeScriptNumber(toBigInt(val)))) {
+            throw new InterpreterException(
+                "non-minimally encoded script number: operand '" + ref + "' occupies "
+                + raw.length + " stack byte(s) but decodes to " + toBigInt(val));
+        }
     }
 
     /** OP_AND/OP_OR/OP_XOR on two script-number-valued BigIntegers (minimal
