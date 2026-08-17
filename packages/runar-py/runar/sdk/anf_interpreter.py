@@ -858,9 +858,26 @@ def _eval_value(
             rb = _script_number_invert_bytes(ab)
             script_bytes[binding_name] = rb
             return _bin2num_int(rb.hex())
+        # Every other unary op reads its operand as a script NUMBER
+        # (`-` -> OP_NEGATE) or coerces it to a boolean (`!` -> OP_NOT), both
+        # fRequireMinimal decodes. `~` never reaches here on the numeric path
+        # -- it is a byte op and must keep accepting non-minimal bytes.
+        _assert_minimal_numeric_operand(
+            'boolean coercion' if op == '!' else 'numeric operand',
+            operand_ref, script_bytes,
+        )
         return _eval_unary_op(op, operand_val, value.get('result_type'))
 
     if kind == 'call':
+        # The single funnel every numeric builtin (`abs`, `min`, `max`,
+        # `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its operands
+        # through. Only a NUMERIC byte-op result ever carries threaded bytes,
+        # and a bigint argument is exactly what those builtins decode with
+        # fRequireMinimal on chain -- a ByteString argument can never carry an
+        # entry here, so gating every argument costs nothing and cannot miss a
+        # builtin.
+        for arg_ref in value.get('args', []):
+            _assert_minimal_numeric_operand('numeric operand', arg_ref, script_bytes)
         call_args = [env.get(a) for a in value.get('args', [])]
         # Strict mode: a `call(assert, x)` lowering path must enforce the
         # predicate the same way the dedicated `assert` ANF node does.
