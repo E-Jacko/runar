@@ -3419,3 +3419,120 @@ test "executeOnChainAuthoritative — checkMultiSig real-crypto rejects non-arra
     );
     try std.testing.expectError(StrictError.AssertionFailure, result);
 }
+
+test "numeric consumers reject non-minimal threaded operands (fRequireMinimal)" {
+    // A shift/bitwise result keeps its operand's byte LENGTH, so `1 >> 1` leaves
+    // the 1-byte `[0x00]` — a NON-minimal zero (minimal zero is empty). Every
+    // NUMERIC consumer on-chain (OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD,
+    // OP_NUMEQUAL and the relational ops, and a shift's COUNT operand) decodes
+    // with fRequireMinimal = true and ABORTS on that encoding. Threading the
+    // real bytes but then reading only the decoded value re-minimises `[0x00]`
+    // to `0`, so the interpreter reports a VALID spend for a script that aborts
+    // on chain — the deployed UTXO is permanently unspendable.
+    //
+    // The byte-array ops `& | ^` and a shift's VALUE operand legitimately take
+    // non-minimal bytes (they only require equal length) and must stay working;
+    // the controls below pin that.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        // Run a one-method contract whose body stores its result into the
+        // mutable `result` property; return that value, or propagate the
+        // on-chain abort.
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "bool", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "Minimal", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .boolean = false });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+    };
+
+    // `(1 >> 1) === 0` ABORTS — OP_NUMEQUAL on the non-minimal [0x00].
+    // The buggy path decoded [0x00] to 0 and answered `true` (a funds-loss
+    // spend: off-chain valid, on-chain "non-minimally encoded script number").
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "z", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            .{ .name = "eq", .value = .{ .bin_op = .{ .op = "===", .left = "sh", .right = "z", .result_type = "bool" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "eq" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+
+    // `(1 >> 1) + 0` ABORTS — OP_ADD is a numeric consumer too.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "z", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            .{ .name = "sum", .value = .{ .bin_op = .{ .op = "+", .left = "sh", .right = "z", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "sum" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+
+    // `4 >> (1 >> 1)` ABORTS — a shift's COUNT operand is read as a number, so
+    // the non-minimal [0x00] count aborts even though the VALUE operand may be
+    // non-minimal.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "cnt", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "four", .value = .{ .load_const = .{ .value = .{ .int = 4 } } } },
+            .{ .name = "sh2", .value = .{ .bin_op = .{ .op = ">>", .left = "four", .right = "cnt", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "sh2" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+
+    // CONTROL — a shift whose result IS minimal stays accepted: `2 >> 1` leaves
+    // [0x01], the minimal encoding of 1, so OP_NUMEQUAL is happy.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "two", .right = "one", .result_type = "int" } } },
+            .{ .name = "c1", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "eq", .value = .{ .bin_op = .{ .op = "===", .left = "sh", .right = "c1", .result_type = "bool" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "eq" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(true, v.boolean);
+    }
+
+    // CONTROL — `& | ^` still take non-minimal equal-length operands:
+    // `(2 << 8) | 5` ORs the non-minimal [0x00] with [0x05] to give [0x05],
+    // which IS minimal for 5, so the following `=== 5` accepts. Pinned by
+    // conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal
+    // — a fix that rejects this is WRONG.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "eight", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "two", .right = "eight", .result_type = "int" } } },
+            .{ .name = "five", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "orr", .value = .{ .bin_op = .{ .op = "|", .left = "sh", .right = "five", .result_type = "int" } } },
+            .{ .name = "c5", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "eq", .value = .{ .bin_op = .{ .op = "===", .left = "orr", .right = "c5", .result_type = "bool" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "eq" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(true, v.boolean);
+    }
+}
