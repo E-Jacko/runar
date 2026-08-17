@@ -3582,3 +3582,209 @@ test "numeric consumers reject non-minimal threaded operands (fRequireMinimal)" 
         try std.testing.expectEqual(true, v.boolean);
     }
 }
+
+test "unary ops and numeric builtins reject non-minimal threaded operands" {
+    // The binary-op gate above only sees a value consumed by a BINARY numeric
+    // op. A non-minimal shift result can also reach a UNARY op or a numeric
+    // BUILTIN without passing through one, and those opcodes decode with
+    // fRequireMinimal = true as well:
+    //
+    //   abs(n >> 1)    OP_ABS
+    //   bool(n >> 1)   OP_0NOTEQUAL
+    //   !(n >> 1)      OP_NOT
+    //   -(n >> 1)      OP_NEGATE
+    //
+    // With n = 1 the shift leaves the 1-byte [0x00]. Reading only the decoded
+    // value re-minimises it to 0, reports a VALID spend, and the deployed
+    // script aborts — the UTXO is permanently unspendable.
+    //
+    // Mirrors the TS reference widening at the `toBigInt` / `toBool` funnels in
+    // packages/runar-testing/src/interpreter/interpreter.ts.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "UnaryMinimal", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+
+        // `sh` = 1 >> 1 -> raw stack bytes [0x00]; `z` = 0; `one` = 1.
+        fn prefix() [5]ANFBinding {
+            return .{
+                .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+                .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+                .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+                .{ .name = "z", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+                .{ .name = "u0", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            };
+        }
+    };
+
+    // Every numeric BUILTIN reads its operand through the same fRequireMinimal
+    // decode a binary numeric op does, so a non-minimal argument must ABORT.
+    {
+        const one_arg = [_][]const u8{"sh"};
+        const two_arg_left = [_][]const u8{ "sh", "one" };
+        const two_arg_right = [_][]const u8{ "one", "sh" };
+        const three_arg = [_][]const u8{ "sh", "z", "one" };
+
+        const tails = [_]ANFNode{
+            .{ .call = .{ .func = "abs", .args = &one_arg } },
+            .{ .call = .{ .func = "bool", .args = &one_arg } },
+            .{ .call = .{ .func = "sign", .args = &one_arg } },
+            .{ .call = .{ .func = "min", .args = &two_arg_left } },
+            .{ .call = .{ .func = "min", .args = &two_arg_right } },
+            .{ .call = .{ .func = "max", .args = &two_arg_left } },
+            .{ .call = .{ .func = "within", .args = &three_arg } },
+            .{ .call = .{ .func = "safediv", .args = &two_arg_left } },
+            .{ .call = .{ .func = "clamp", .args = &three_arg } },
+            .{ .unary_op = .{ .op = "-", .operand = "sh", .result_type = "int" } },
+            .{ .unary_op = .{ .op = "!", .operand = "sh", .result_type = "bool" } },
+        };
+
+        for (tails) |tail| {
+            var body: [7]ANFBinding = undefined;
+            const pre = H.prefix();
+            @memcpy(body[0..5], &pre);
+            body[5] = .{ .name = "r", .value = tail };
+            body[6] = .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "z" } } };
+            try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+        }
+    }
+
+    // The shape the lowering actually emits: a named local is an `@ref:` alias,
+    // so the alias must carry the threaded bytes into the builtin.
+    {
+        const one_arg = [_][]const u8{"s"};
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "s", .value = .{ .load_const = .{ .value = .{ .bytes = "@ref:sh" } } } },
+            .{ .name = "r", .value = .{ .call = .{ .func = "abs", .args = &one_arg } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "r" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+}
+
+test "unary/builtin minimal-encoding controls stay accepted" {
+    // CONTROLS for the widened gate. These must be green BEFORE and AFTER the
+    // widening — they pin the spends the chain accepts, so a fix that rejects
+    // any of them is WRONG. Kept in their own test block so the abort cases
+    // above (which bail the block on first failure) cannot mask them.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "UnaryControls", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+    };
+
+    // CONTROL — a MINIMAL operand through a builtin still spends: `2 >> 1`
+    // leaves [0x01], the minimal encoding of 1, so OP_ABS is legal.
+    {
+        const one_arg = [_][]const u8{"sh"};
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "two", .right = "one", .result_type = "int" } } },
+            .{ .name = "r", .value = .{ .call = .{ .func = "abs", .args = &one_arg } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "r" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(@as(i64, 1), v.int);
+    }
+
+    // CONTROL — `~` is a byte op with its own path and must NOT be gated:
+    // `~(2 << 8)` inverts the non-minimal [0x00] to [0xff] = -127.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "eight", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "two", .right = "eight", .result_type = "int" } } },
+            .{ .name = "inv", .value = .{ .unary_op = .{ .op = "~", .operand = "sh", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "inv" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(@as(i64, -127), v.int);
+    }
+
+}
+
+test "@ref: alias carries the threaded stack bytes" {
+    // An @ref: alias is a pure rename — the lowering emits one for every named
+    // local, so almost every byte-op result passes through one before reaching
+    // a consumer. It occupies the SAME stack bytes as its target, but the side
+    // map is keyed by binding name, so an alias that creates no entry drops the
+    // real bytes. That blinds the minimal-encoding gate AND makes
+    // `(2 << 8) | 5` through an alias FALSE-abort on an OP_OR length mismatch
+    // the chain never sees — the interpreter rejecting a spend the chain
+    // accepts. Go, Python and Ruby already carry the entry across an alias.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "AliasBytes", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+    };
+
+    // CONTROL — `(2 << 8) | 5 == 5` through a named-local alias. OP_OR takes
+    // non-minimal bytes and only requires equal length; rejecting this is WRONG
+    // (pinned by conformance/fuzz-regressions/entries/
+    // 2026-07-14-chained-shift-or-nonminimal).
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "eight", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "two", .right = "eight", .result_type = "int" } } },
+            .{ .name = "s", .value = .{ .load_const = .{ .value = .{ .bytes = "@ref:sh" } } } },
+            .{ .name = "five", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "orr", .value = .{ .bin_op = .{ .op = "|", .left = "s", .right = "five", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "orr" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(@as(i64, 5), v.int);
+    }
+}
