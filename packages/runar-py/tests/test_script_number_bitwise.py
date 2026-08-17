@@ -340,3 +340,120 @@ class TestAliasCarriesScriptBytes:
             _bin("result", "===", "s", "one"),
         ])
         assert env["result"] is True
+
+
+def _call(name, func, *args):
+    return {'name': name, 'value': {'kind': 'call', 'func': func, 'args': list(args)}}
+
+
+class TestNonMinimalOperandThroughUnaryOrBuiltin:
+    """The binary-op gate only sees a value consumed by a BINARY numeric op.
+
+    A non-minimal shift result can reach a UNARY op or a numeric BUILTIN
+    without passing through one, and those opcodes decode with
+    ``fRequireMinimal=True`` as well::
+
+        abs(n >> 1)    OP_ABS
+        bool(n >> 1)   OP_0NOTEQUAL
+        !(n >> 1)      OP_NOT
+        -(n >> 1)      OP_NEGATE
+
+    With ``n = 1`` the shift leaves the 1-byte ``[0x00]``. Reading only the
+    decoded value re-minimises it to ``0``, reports a clean spend, and the
+    deployed script aborts -- the UTXO is unspendable.
+
+    Mirrors the TS reference widening at the ``toBigInt`` / ``toBool`` funnels
+    in packages/runar-testing/src/interpreter/interpreter.ts.
+    """
+
+    # Prefix shared by every case: ``shifted`` = 1 >> 1 -> raw bytes [0x00].
+    PREFIX = [
+        _const("a", 1),
+        _const("b", 1),
+        _bin("shifted", ">>", "a", "b"),
+        _const("zero", 0),
+        _const("one", 1),
+    ]
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            _call("result", "abs", "shifted"),
+            _call("result", "bool", "shifted"),
+            _call("result", "sign", "shifted"),
+            _call("result", "min", "shifted", "one"),
+            _call("result", "min", "one", "shifted"),
+            _call("result", "max", "shifted", "one"),
+            _call("result", "within", "shifted", "zero", "one"),
+            _call("result", "safediv", "shifted", "one"),
+            _call("result", "clamp", "shifted", "zero", "one"),
+            _unary("result", "-", "shifted"),
+            _unary("result", "!", "shifted"),
+        ],
+        ids=[
+            "abs", "bool", "sign", "min-left", "min-right", "max",
+            "within", "safediv", "clamp", "unary-minus", "unary-not",
+        ],
+    )
+    def test_non_minimal_unary_or_builtin_operand_aborts(self, tail):
+        with pytest.raises(ValueError, match="non-minimally encoded"):
+            _run_chain(self.PREFIX + [tail])
+
+    def test_aliased_non_minimal_operand_aborts_through_a_builtin(self):
+        with pytest.raises(ValueError, match="non-minimally encoded"):
+            _run_chain([
+                _const("a", 1),
+                _const("b", 1),
+                _bin("shifted", ">>", "a", "b"),   # raw [0x00]
+                _alias("s", "shifted"),            # const s = a >> 1
+                _call("result", "abs", "s"),
+            ])
+
+
+class TestUnaryAndBuiltinControls:
+    """CONTROLS for the widened gate. Each must keep evaluating."""
+
+    def test_minimal_operand_through_a_builtin_still_accepted(self):
+        # 2>>1 leaves [0x01] -- the minimal encoding of 1, legal at OP_ABS.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 1),
+            _bin("shifted", ">>", "a", "b"),
+            _call("result", "abs", "shifted"),
+        ])
+        assert env["result"] == 1
+
+    def test_bytestring_builtin_arg_never_gated(self):
+        # A ByteString argument can never carry a threaded-bytes entry (only
+        # the NUMERIC byte-op path records one), so the hashing/length
+        # builtins are untouched by the widened gate.
+        env = _run_chain([
+            _const("h", "0102030405"),
+            _call("result", "len", "h"),
+        ])
+        assert env["result"] == 5
+
+    def test_invert_of_non_minimal_still_works_after_widening(self):
+        # `~` is a byte op with its own path -- it must NOT be gated.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),   # raw [0x00] -- NON-minimal
+            _unary("inv", "~", "shifted"),     # OP_INVERT -> [0xff] = -127
+            _const("m127", -127),
+            _bin("result", "===", "inv", "m127"),
+        ])
+        assert env["result"] is True
+
+    def test_or_of_non_minimal_still_works_after_widening(self):
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),
+            _alias("s", "shifted"),
+            _const("c", 5),
+            _bin("ored", "|", "s", "c"),
+            _bin("result", "===", "ored", "c"),
+        ])
+        assert env["ored"] == 5
+        assert env["result"] is True
