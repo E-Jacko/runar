@@ -102,7 +102,7 @@ class TestBranchMergeDeadArmK1 < Minitest::Test
 
   SEVEN_TIER_SCRIPT = {
     "dead-arm-k2/fold-on" =>
-      "00014e01ce006351547a6e7b757b7567527978557a7568527a75537a757ca177",
+      "00014e01ce006351547a6e7b757b7567527978557a7568527a75537a75527a7c7ba177",
     "dead-arm-k2/fold-off" =>
       "00014e8f006351537a6e7b757b75676e547a7568527a75527a757ca1",
     "self-read-both-arms/fold-on" =>

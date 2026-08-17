@@ -2350,6 +2350,15 @@ module RunarCompiler::Codegen
         # reconcile did -- which is why the four +__merge$+ goldens keep their
         # bytes.
         results.each { |name| @sm.push(name) }
+        # How far below the result block the deepest stale slot sat. Adopting a
+        # result puts it ON TOP, but its pre-+if+ binding lived at depth +d+,
+        # i.e. BENEATH the +d - n_declared+ slots in between. Removing the stale
+        # copy does not reorder those in-between slots, so after the loop the
+        # adopted result has crossed them: the layout is rotated even though the
+        # NAME SET and the DEPTH are both unchanged. That is invisible to the
+        # reconcile's name-set check and to Layer C's depth check, and it is the
+        # whole of issue #149 -- see +sink_below+ below.
+        sink_below = 0
         (n_declared - 1).downto(0) do |i|
           name = results[i]
           d = n_declared
@@ -2364,9 +2373,37 @@ module RunarCompiler::Codegen
               emit_op({ op: "drop" })
               @sm.pop
               post_endif_drops += 1
+              sink_below = d - n_declared if d - n_declared > sink_below
               break
             end
             d += 1
+          end
+        end
+
+        # Restore the inherited layout: sink the whole result block back under
+        # the +sink_below+ slots it just crossed, so BOTH paths of the enclosing
+        # +if+ leave the same slot order and every post-OP_ENDIF read resolves
+        # against the layout it was generated for. Rolling the deepest item of
+        # the +n_declared + sink_below+ window to the top, +sink_below+ times,
+        # lifts those slots back above the results while preserving their own
+        # relative order.
+        # Applied unconditionally, NOT gated on this +if+'s own else. The
+        # asymmetry that makes #149 unspendable belongs to the ENCLOSING +if+
+        # (whose fall-through path keeps the pre-+if+ layout), and +lower_if+
+        # has no view of its parent here. Gating on +else_bindings.empty?+ was
+        # measured and is WRONG: the #149 inner +if+ has a real else, so the
+        # gate disables the repair exactly where it is needed. Restoring the
+        # pre-+if+ order unconditionally keeps the parent's own model -- names
+        # at the depths it recorded before the branch -- true on every path.
+        if sink_below.positive?
+          window_size = n_declared + sink_below
+          sink_below.times do
+            emit_push_int(window_size - 1)
+            @sm.push("")
+            emit_op({ op: "roll", depth: window_size })
+            @sm.pop
+            lifted = @sm.remove_at_depth(window_size - 1)
+            @sm.push(lifted)
           end
         end
       elsif then_ctx.sm.depth > @sm.depth &&
