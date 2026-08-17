@@ -2209,6 +2209,24 @@ class LoweringContext {
 
     thenCtx.drainBranchPrivateResidue(preIfNames);
 
+    // COVERAGE (measured 2026-08-17, v1 audit remediation — finding CC-016):
+    // this guard did not fire ONCE across all 71 conformance fixtures, nine
+    // hand-designed terminal-`if` shapes (stateless and stateful, multi-local
+    // arms, property writes, multiple asserts per arm), 1200 `--tri-modal`
+    // property runs, and 400 `--spend-oracle` cases. Instrumented with a
+    // `console.error` in the body and counted; every count was 0.
+    //
+    // So a mechanical mutant here (`- 1` -> `+ 1`, which would emit two extra
+    // OP_NIPs) survives the entire net — but as an EQUIVALENT mutant over dead
+    // code, NOT as a coverage hole in a reachable path. Those are different
+    // findings and the distinction matters for the mutation score.
+    //
+    // Deliberately NOT deleted. "I could not reach it" is not "it is provably
+    // unreachable", and removing a defensive cleanup from `lowerIf` — the
+    // function that carried issue #149 — on that evidence is not a trade worth
+    // making before v1. If someone can show the arm can exit at depth > 1 under
+    // a terminal assert, this needs a fixture; if it is provably unreachable,
+    // it should go, and the mutation corpus should stop counting it.
     if (terminalAssert && thenCtx.stackMap.depth > 1) {
       const excess = thenCtx.stackMap.depth - 1;
       for (let i = 0; i < excess; i++) {
