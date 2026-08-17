@@ -184,6 +184,15 @@ pub const ParamNode = struct { name: []const u8, type_info: RunarType = .unknown
 pub const ANFParam = ParamNode;
 pub const AssignmentNode = struct { target: []const u8, value: Expression };
 
+/// Whether an assignment target expression is rooted at `this.<prop>` —
+/// directly, or through an index-access chain (`this.grid[i][j]`). Used by
+/// every surface parser to populate `Assign.target_is_property`.
+pub fn targetIsProperty(target: Expression) bool {
+    var node = target;
+    while (node == .index_access) node = node.index_access.object;
+    return node == .property_access;
+}
+
 pub const Statement = union(enum) { const_decl: ConstDecl, let_decl: LetDecl, assign: Assign, if_stmt: IfStmt, for_stmt: ForStmt, expr_stmt: ExprStmt, assert_stmt: AssertStmt, return_stmt: ?Expression };
 // Mirrors the canonical AST's `ExpressionStatement.sourceLocation`
 // (`packages/runar-ir-schema/src/runar-ast.ts`). `source_loc` is populated by
@@ -201,6 +210,15 @@ pub const Assign = struct {
     target: []const u8,
     value: Expression,
     source_loc: ?SourceLocation = null,
+    /// True when the assignment target was rooted at `this.<prop>` (directly,
+    /// or through an index-access chain such as `this.grid[i][j]`). `target`
+    /// alone cannot express this: the parsers strip the `this.` and store a
+    /// bare name, so `this.x = v` and a local `x = v` are otherwise
+    /// indistinguishable. The validator needs the distinction to reject writes
+    /// to `readonly` properties without also rejecting a local that happens to
+    /// shadow a property name (see `passes/validate.zig`). Defaults to false —
+    /// every parser sets it explicitly via `targetIsProperty`.
+    target_is_property: bool = false,
     /// When non-null, the assignment target is `this.<prop>[index]`, and
     /// `target` is the base property name. Populated by the parser when it
     /// sees an index-access LHS; consumed by `expand_fixed_arrays.zig` which
