@@ -1282,4 +1282,199 @@ RSpec.describe 'Runar::SDK::ANFInterpreter' do
       end.not_to raise_error
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # NON-MINIMAL operands reaching a UNARY op or a numeric BUILTIN
+  #
+  # The binary-op gate above only sees a value consumed by a BINARY numeric op.
+  # A non-minimal shift result can reach a UNARY op or a numeric BUILTIN
+  # without passing through one, and those opcodes decode with
+  # +fRequireMinimal = true+ as well:
+  #
+  #   abs(n >> 1)    OP_ABS
+  #   bool(n >> 1)   OP_0NOTEQUAL
+  #   !(n >> 1)      OP_NOT
+  #   -(n >> 1)      OP_NEGATE
+  #
+  # With +n = 1+ the shift leaves the 1-byte +[0x00]+. Reading only the decoded
+  # value re-minimises it to 0, reports a clean spend, and the deployed script
+  # aborts — the UTXO is unspendable.
+  #
+  # Mirrors the TS reference widening at the +toBigInt+ / +toBool+ funnels in
+  # packages/runar-testing/src/interpreter/interpreter.ts.
+  # ---------------------------------------------------------------------------
+
+  describe 'non-minimal operands through a unary op or a builtin' do
+    # +t2+ = +a >> 1+ (raw stack bytes [0x00] when +a+ is 1), then +tail+ as
+    # the final binding, then the property write.
+    def unary_builtin_anf(tail)
+      {
+        'contractName' => 'NonMinimalUnary',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => 1 } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => '>>', 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'load_const', 'value' => 0 } },
+              { 'name' => 't4', 'value' => { 'kind' => 'load_const', 'value' => 1 } },
+              { 'name' => 't5', 'value' => tail },
+              { 'name' => 't6', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't3' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    def call_value(func, *args)
+      { 'kind' => 'call', 'func' => func, 'args' => args }
+    end
+
+    {
+      'abs(1>>1)'          => -> { call_value('abs', 't2') },
+      'bool(1>>1)'         => -> { call_value('bool', 't2') },
+      'sign(1>>1)'         => -> { call_value('sign', 't2') },
+      'min(1>>1, 1)'       => -> { call_value('min', 't2', 't4') },
+      'min(1, 1>>1)'       => -> { call_value('min', 't4', 't2') },
+      'max(1>>1, 1)'       => -> { call_value('max', 't2', 't4') },
+      'within(1>>1, 0, 1)' => -> { call_value('within', 't2', 't3', 't4') },
+      'safediv(1>>1, 1)'   => -> { call_value('safediv', 't2', 't4') },
+      'clamp(1>>1, 0, 1)'  => -> { call_value('clamp', 't2', 't3', 't4') },
+      '-(1>>1)'            => -> { { 'kind' => 'unary_op', 'op' => '-', 'operand' => 't2' } },
+      '!(1>>1)'            => -> { { 'kind' => 'unary_op', 'op' => '!', 'operand' => 't2' } },
+    }.each do |label, tail|
+      it "aborts #{label} — the operand decodes with fRequireMinimal" do
+        expect do
+          mod.compute_new_state(unary_builtin_anf(instance_exec(&tail)), 'compute', { 'result' => 0 }, { 'a' => 1 })
+        end.to raise_error(/non-minimally encoded script number/)
+      end
+    end
+
+    it 'aborts through a named-local alias — the shape the lowering emits' do
+      anf = {
+        'contractName' => 'AliasedBuiltin',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => 1 } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => '>>', 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 's', 'value' => { 'kind' => 'load_const', 'value' => '@ref:t2' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'call', 'func' => 'abs', 'args' => ['s'] } },
+              { 'name' => 't4', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't3' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+      expect do
+        mod.compute_new_state(anf, 'compute', { 'result' => 0 }, { 'a' => 1 })
+      end.to raise_error(/non-minimally encoded script number/)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONTROLS for the widened gate. Each must keep spending.
+  # ---------------------------------------------------------------------------
+
+  describe 'unary/builtin controls stay accepted' do
+    # +result = abs(a >> 1)+ — with a = 2 the shift leaves [0x01], the minimal
+    # encoding of 1, so OP_ABS is legal on-chain.
+    def abs_shift_anf
+      {
+        'contractName' => 'MinimalAbs',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => 1 } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => '>>', 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'call', 'func' => 'abs', 'args' => ['t2'] } },
+              { 'name' => 't4', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't3' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    it 'abs(2>>1) == 1 — a MINIMAL operand through a builtin still spends' do
+      new_state = mod.compute_new_state(abs_shift_anf, 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to eq(1)
+    end
+
+    # +result = ~(a << 8) + 0+ — OP_INVERT is a byte op and must NOT be gated:
+    # with a = 2 the shift leaves the NON-minimal [0x00] and the invert gives
+    # [0xff] = -127.
+    def invert_shift_anf
+      {
+        'contractName' => 'InvertShift',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => 8 } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => '<<', 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'unary_op', 'op' => '~', 'operand' => 't2' } },
+              { 'name' => 't4', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't3' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    it '~(2<<8) == -127 — OP_INVERT is a byte op, never gated' do
+      new_state = mod.compute_new_state(invert_shift_anf, 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to eq(-127)
+    end
+
+    # +result = ((a << 8) | 5) === 5+ through a named-local alias — OP_OR takes
+    # non-minimal bytes and only requires equal length.
+    def aliased_or_anf
+      {
+        'contractName' => 'AliasedOr',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => 8 } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => '<<', 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 's', 'value' => { 'kind' => 'load_const', 'value' => '@ref:t2' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'load_const', 'value' => 5 } },
+              { 'name' => 't4', 'value' => { 'kind' => 'bin_op', 'op' => '|', 'left' => 's', 'right' => 't3' } },
+              { 'name' => 't5', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't4' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    it '(2<<8)|5 == 5 through a named-local alias — OP_OR takes non-minimal bytes' do
+      new_state = mod.compute_new_state(aliased_or_anf, 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to eq(5)
+    end
+  end
 end
