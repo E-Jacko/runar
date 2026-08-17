@@ -886,9 +886,25 @@ fn evalNode(
                 try eval_ctx.script_bytes.put(binding_name, rb);
                 return .{ .int = scriptNumDecode(rb) };
             }
+            // Every other unary op reads its operand as a script NUMBER
+            // (`-` -> OP_NEGATE) or coerces it to a boolean (`!` -> OP_NOT),
+            // both fRequireMinimal decodes. `~` never reaches here on the
+            // numeric path — it is a byte op and must keep accepting
+            // non-minimal bytes.
+            try assertMinimalNumericOperand(eval_ctx, uo.operand, operand);
             return evalUnaryOp(allocator, uo.op, operand, uo.result_type);
         },
         .call => |c| {
+            // The single funnel every numeric builtin (`abs`, `min`, `max`,
+            // `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+            // operands through. Only a NUMERIC byte-op result ever carries
+            // threaded bytes, and a bigint argument is exactly what those
+            // builtins decode with fRequireMinimal on chain — a ByteString
+            // argument can never carry an entry here, so gating every argument
+            // costs nothing and cannot miss a builtin.
+            for (c.args) |arg_ref| {
+                try assertMinimalNumericOperand(eval_ctx, arg_ref, env.get(arg_ref) orelse anf_none);
+            }
             // Strict mode: a `call(assert, x)` lowering path must enforce the
             // predicate the same way the dedicated `assert` ANF node does.
             // Crypto built-ins (`checkSig`, `checkMultiSig`, `checkPreimage`)
