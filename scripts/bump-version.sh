@@ -113,7 +113,10 @@ check_versions() {
   # Rust inter-crate deps
   for dep in runar-lang-macros runar-compiler-rust; do
     local v
-    v=$(grep "$dep" "$ROOT/packages/runar-rs/Cargo.toml" | sed 's/.*version = "\([^"]*\)".*/\1/')
+    # Anchor on the dependency line. An unanchored match also picks up prose
+    # comments that mention the crate, which makes $v multi-line and the
+    # comparison below permanently false.
+    v=$(grep "^$dep = " "$ROOT/packages/runar-rs/Cargo.toml" | sed 's/.*version = "\([^"]*\)".*/\1/')
     if [ -n "$v" ] && [ "$v" != "$expected" ]; then
       echo "  ✗ packages/runar-rs/Cargo.toml dep $dep: $v"
       ok=false
