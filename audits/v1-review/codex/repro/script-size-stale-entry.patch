@@ -1,7 +1,0 @@
-diff --git a/conformance/script-size-baseline.json b/conformance/script-size-baseline.json
---- a/conformance/script-size-baseline.json
-+++ b/conformance/script-size-baseline.json
-@@
--  "fixtures": {
-+  "fixtures": {
-+    "audit-nonexistent-fixture": 0,

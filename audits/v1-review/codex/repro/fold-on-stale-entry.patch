@@ -1,7 +1,0 @@
-diff --git a/conformance/fold-on-allowlist.json b/conformance/fold-on-allowlist.json
---- a/conformance/fold-on-allowlist.json
-+++ b/conformance/fold-on-allowlist.json
-@@
--  "skip": []
-+  "skip": [{"fixture":"audit-nonexistent-fixture","reason":"temporary audit perturbation"}]
- }

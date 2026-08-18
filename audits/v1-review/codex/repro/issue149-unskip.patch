@@ -1,6 +1,0 @@
-diff --git a/packages/runar-testing/src/__tests__/nested-declared-results-arm-layout-vm.test.ts b/packages/runar-testing/src/__tests__/nested-declared-results-arm-layout-vm.test.ts
---- a/packages/runar-testing/src/__tests__/nested-declared-results-arm-layout-vm.test.ts
-+++ b/packages/runar-testing/src/__tests__/nested-declared-results-arm-layout-vm.test.ts
-@@
--describe.skip('OPEN: nested declared-results if rotates its enclosing arm', () => {
-+describe('OPEN: nested declared-results if rotates its enclosing arm', () => {
