@@ -5,8 +5,9 @@ import { resolve } from 'node:path';
 const ROOT = resolve(__dirname, '..');
 
 /**
- * `scripts/bump-version.sh --check` is a CI gate (workflow "CI" / job "Lint —
- * no silent test skips, no active TODO markers"). It failed on PR #153 with
+ * `scripts/bump-version.sh --check` is a CI gate — it runs in the same
+ * composite lint job as scripts/lint-no-silent-skips.sh. It failed on PR #153
+ * with
  *
  *   ✗ packages/runar-rs/Cargo.toml dep runar-compiler-rust: 1.0.0-rc.1
  *   # `<0.3` keeps this crate on the same bsv-sdk as its `runar-compiler-rust`
