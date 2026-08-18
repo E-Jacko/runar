@@ -117,11 +117,18 @@ test "the shadowing rebind emits no update_prop" {
     const expanded = try expand_fixed_arrays.expand(alloc, contract);
     const program = try anf_lower.lowerToANF(alloc, expanded.contract);
 
-    // `limit` is only ever written through the local. A contract property
-    // write here would mean the rebind escaped into contract state.
+    // Scoped to `spend`. The CONSTRUCTOR legitimately emits `update_prop
+    // limit` for its own `this.limit = limit`; that is the one property write
+    // this contract is supposed to have. Inside `spend`, `limit` names the
+    // local only, so any update_prop there is the rebind escaping into
+    // contract state.
+    var saw_spend = false;
     for (program.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "spend")) continue;
+        saw_spend = true;
         for (m.bindings) |b| {
             try std.testing.expect(b.value != .update_prop);
         }
     }
+    try std.testing.expect(saw_spend);
 }

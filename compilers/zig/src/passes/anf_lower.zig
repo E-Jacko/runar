@@ -1187,8 +1187,22 @@ fn lowerStatementWithReads(ctx: *LowerCtx, stmt: Statement, reads_after: *const 
             // Skip Zig discard assignments: _ = self; _ = expr;
             if (std.mem.eql(u8, assign.target, "_")) return;
             const value_ref = try lowerExprToRef(ctx, assign.value);
-            // Check if target is a property
-            if (ctx.isProperty(assign.target)) {
+            // Does this assignment write a contract property?
+            //
+            // The parsers strip `this.` before building Assign, so the target
+            // name alone cannot answer that: a LOCAL that shadows a property
+            // name carries the same string. `target_is_property` is the
+            // parser's answer and is authoritative when set.
+            //
+            // The `isProperty` fallback is kept for Assign nodes built without
+            // the flag (hand-constructed AST in tests), but is now guarded by
+            // `!isLocal`, so a shadowing local is never mistaken for a
+            // property write. The read path (`lowerIdentifier`) already
+            // resolves isLocal first; matching that order here is what makes
+            // the two consistent.
+            const writes_property = assign.target_is_property or
+                (!ctx.isLocal(assign.target) and ctx.isProperty(assign.target));
+            if (writes_property) {
                 _ = try ctx.emit(.{ .update_prop = .{
                     .name = assign.target,
                     .value = value_ref,
