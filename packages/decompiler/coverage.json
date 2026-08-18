@@ -1,17 +1,17 @@
 {
-  "generatedAt": "2026-07-31T23:21:12.066Z",
+  "generatedAt": "2026-08-18T15:18:10.643Z",
   "summary": {
-    "byte-match": 76,
+    "byte-match": 77,
     "byte-diff": 0,
     "compile-error": 0,
     "parse-error": 0,
     "skipped": 5
   },
   "pathBreakdown": {
-    "template": 67,
+    "template": 72,
     "assert-recognizer": 1,
-    "symexec": 1,
-    "raw_script": 7
+    "symexec": 0,
+    "raw_script": 4
   },
   "rows": [
     {
@@ -75,9 +75,14 @@
       "recoveryPath": "template"
     },
     {
+      "id": "branch-merged-locals/BranchMergedLocals",
+      "outcome": "byte-match",
+      "recoveryPath": "template"
+    },
+    {
       "id": "branched-readonly-len/BranchedReadonlyLen",
       "outcome": "byte-match",
-      "recoveryPath": "symexec"
+      "recoveryPath": "template"
     },
     {
       "id": "bsv20-token/BSV20Token",
@@ -322,7 +327,7 @@
     {
       "id": "selector/Selector",
       "outcome": "byte-match",
-      "recoveryPath": "raw_script"
+      "recoveryPath": "template"
     },
     {
       "id": "sha256-compress/Sha256CompressTest",
@@ -377,12 +382,12 @@
     {
       "id": "tic-tac-toe/TicTacToe",
       "outcome": "byte-match",
-      "recoveryPath": "raw_script"
+      "recoveryPath": "template"
     },
     {
       "id": "tic-tac-toe/TicTacToe.v2",
       "outcome": "byte-match",
-      "recoveryPath": "raw_script"
+      "recoveryPath": "template"
     },
     {
       "id": "token-ft/FungibleTokenExample",

@@ -147,7 +147,18 @@ export function runDifferentialExecution(opts: DiffExecOptions): DiffExecResult 
   let vmAccepted: boolean;
   let vmError: string | undefined;
   try {
-    const vm = new ScriptVM();
+    // `strictEncoding` is REQUIRED, not optional polish. `ScriptVM` passes
+    // `isRelaxed: this.flags.strictEncoding !== true` to `@bsv/sdk`, so a bare
+    // `new ScriptVM()` runs the script with `fromScriptNum`'s minimal-encoding
+    // check DISABLED. This oracle's whole job is to compare source semantics
+    // against what a node does — and a node enforces minimal encoding.
+    //
+    // Left relaxed, the VM side silently accepts a non-minimal operand (e.g.
+    // `1 >> 1` = [0x00] feeding a numeric op) that a real node ABORTS on, so
+    // the oracle reported "agreement" precisely where the funds-locking
+    // divergence lives, and would have reported a FALSE divergence once the
+    // interpreter was corrected to match consensus.
+    const vm = new ScriptVM({ flags: { strictEncoding: true } });
     const res = vm.execute(witness, hexToBytes(lockingHex));
     vmAccepted = res.success;
     if (!res.success) vmError = res.error;

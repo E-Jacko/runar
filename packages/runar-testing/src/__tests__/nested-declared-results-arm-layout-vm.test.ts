@@ -109,7 +109,7 @@ export class NestedAdopt extends StatefulSmartContract {
 }
 `;
 
-describe.skip('OPEN: nested declared-results if rotates its enclosing arm', () => {
+describe('nested declared-results if must not rotate its enclosing arm', () => {
   for (const fold of [true, false]) {
     const mode = fold ? 'fold-OFF' : 'fold-ON';
 

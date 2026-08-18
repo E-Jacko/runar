@@ -20,11 +20,11 @@
 //! # Verification strategy (no ScriptVM replay)
 //!
 //! The Rust tier's `ScriptVm` wraps `bsv-sdk`'s `Spend`, which cannot validate
-//! ANY Rúnar OP_PUSH_TX covenant — its script parser desyncs on the `0x8d`
-//! byte inside the push-tx machinery and aborts with
-//! `DisabledOpcode("OP_2MUL")` (see `g1_raw_outputs_spend.rs` for the full
-//! write-up). A stateful call is exactly such a covenant, so a full-tx replay
-//! cannot distinguish pre-fix from post-fix here.
+//! ANY Rúnar OP_PUSH_TX covenant — it hard-disables the `OP_2MUL` (0x8d) the
+//! push-tx machinery emits and aborts with `DisabledOpcode("OP_2MUL")` (see
+//! `g1_raw_outputs_spend.rs` for the full write-up). A stateful call is exactly
+//! such a covenant, so a full-tx replay cannot distinguish pre-fix from
+//! post-fix here.
 //!
 //! Instead this test performs the cryptographic check OP_CHECKSIG itself
 //! performs: the signature an external `signHash` wallet produces over

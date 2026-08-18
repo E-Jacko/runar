@@ -810,6 +810,16 @@ fn evalNode(
             switch (lc.value) {
                 .bytes => |b| {
                     if (b.len > 5 and std.mem.startsWith(u8, b, "@ref:")) {
+                        // An alias is a pure rename — the lowering emits one
+                        // for every named local (`const left = a << 3n`
+                        // becomes `t2 = a << 3n` plus `left = @ref:t2`). It
+                        // occupies the SAME stack bytes as its target, so the
+                        // side-map entry must travel with it or both the
+                        // non-minimal numeric check and the chained byte-op
+                        // threading go blind on real compiler output.
+                        if (eval_ctx.script_bytes.get(b[5..])) |bytes| {
+                            try eval_ctx.script_bytes.put(binding_name, bytes);
+                        }
                         return env.get(b[5..]) orelse anf_none;
                     }
                     if (std.mem.eql(u8, b, "@this")) {
@@ -839,6 +849,9 @@ fn evalNode(
                     if (op_byte == '<' or op_byte == '>') {
                         // Shift count is read as a number on-chain — only `ab`'s
                         // length matters, so the count never enters the side map.
+                        // But being read AS A NUMBER means the count itself must
+                        // be minimally encoded, or the shift aborts.
+                        try assertMinimalNumericOperand(eval_ctx, bo.right, right);
                         break :blk try shiftBytes(allocator, op_byte, ab, toInt(right));
                     }
                     const bb: []const u8 = eval_ctx.script_bytes.get(bo.right) orelse
@@ -847,6 +860,17 @@ fn evalNode(
                 };
                 try eval_ctx.script_bytes.put(binding_name, rb);
                 return .{ .int = scriptNumDecode(rb) };
+            }
+            // Numeric consumers decode BOTH operands with fRequireMinimal, so a
+            // threaded non-minimal intermediate (e.g. the 1-byte [0x00] that
+            // `1 >> 1` leaves) aborts the script rather than silently
+            // re-minimising to 0. Byte-typed ops are exempt: they never carry
+            // threaded bytes and OP_CAT/OP_EQUAL impose no numeric decode.
+            const is_bytes_path = std.mem.eql(u8, bo.result_type, "bytes") or
+                (left == .bytes and right == .bytes);
+            if (isNumericConsumerOp(bo.op) and !is_bytes_path) {
+                try assertMinimalNumericOperand(eval_ctx, bo.left, left);
+                try assertMinimalNumericOperand(eval_ctx, bo.right, right);
             }
             return try evalBinOp(allocator, bo.op, left, right, bo.result_type);
         },
@@ -862,9 +886,25 @@ fn evalNode(
                 try eval_ctx.script_bytes.put(binding_name, rb);
                 return .{ .int = scriptNumDecode(rb) };
             }
+            // Every other unary op reads its operand as a script NUMBER
+            // (`-` -> OP_NEGATE) or coerces it to a boolean (`!` -> OP_NOT),
+            // both fRequireMinimal decodes. `~` never reaches here on the
+            // numeric path — it is a byte op and must keep accepting
+            // non-minimal bytes.
+            try assertMinimalNumericOperand(eval_ctx, uo.operand, operand);
             return evalUnaryOp(allocator, uo.op, operand, uo.result_type);
         },
         .call => |c| {
+            // The single funnel every numeric builtin (`abs`, `min`, `max`,
+            // `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+            // operands through. Only a NUMERIC byte-op result ever carries
+            // threaded bytes, and a bigint argument is exactly what those
+            // builtins decode with fRequireMinimal on chain — a ByteString
+            // argument can never carry an entry here, so gating every argument
+            // costs nothing and cannot miss a builtin.
+            for (c.args) |arg_ref| {
+                try assertMinimalNumericOperand(eval_ctx, arg_ref, env.get(arg_ref) orelse anf_none);
+            }
             // Strict mode: a `call(assert, x)` lowering path must enforce the
             // predicate the same way the dedicated `assert` ANF node does.
             // Crypto built-ins (`checkSig`, `checkMultiSig`, `checkPreimage`)
@@ -1156,6 +1196,38 @@ fn isNumericByteOp(op: []const u8, result_type: []const u8, left: ANFValue, righ
 fn minimalBytesArena(allocator: std.mem.Allocator, n: i64) error{OutOfMemory}![]u8 {
     var buf: [9]u8 = undefined;
     return allocator.dupe(u8, scriptNumEncode(n, &buf));
+}
+
+/// Whether a bin_op consumes its operands NUMERICALLY, i.e. lowers to an opcode
+/// that decodes them with `fRequireMinimal = true`: OP_ADD/OP_SUB/OP_MUL/OP_DIV/
+/// OP_MOD, OP_NUMEQUAL(VERIFY)/OP_NUMNOTEQUAL and the relational ops. The
+/// byte-array ops `& | ^` and a shift's VALUE operand are deliberately NOT here
+/// — they take raw bytes and only require equal length. `&&`/`||` cast to bool,
+/// which has no minimal-encoding requirement either.
+fn isNumericConsumerOp(op: []const u8) bool {
+    return std.mem.eql(u8, op, "+") or std.mem.eql(u8, op, "-") or
+        std.mem.eql(u8, op, "*") or std.mem.eql(u8, op, "/") or
+        std.mem.eql(u8, op, "%") or std.mem.eql(u8, op, "==") or
+        std.mem.eql(u8, op, "===") or std.mem.eql(u8, op, "!=") or
+        std.mem.eql(u8, op, "!==") or std.mem.eql(u8, op, "<") or
+        std.mem.eql(u8, op, "<=") or std.mem.eql(u8, op, ">") or
+        std.mem.eql(u8, op, ">=");
+}
+
+/// Abort if `ref`'s threaded stack bytes are a NON-minimal encoding of its
+/// decoded value — the exact case a numeric consumer rejects on chain
+/// ("non-minimally encoded script number"). Only byte-array ops thread bytes, so
+/// a ref absent from the side map is minimal by construction and always passes.
+///
+/// Without this, `1 >> 1` (which leaves the 1-byte `[0x00]`, NOT the empty
+/// minimal zero) would be re-minimised to `0` by the numeric path: the
+/// interpreter reports a VALID spend for a script that aborts on chain, leaving
+/// the UTXO permanently unspendable.
+fn assertMinimalNumericOperand(eval_ctx: EvalCtx, ref: []const u8, val: ANFValue) error{ScriptNumberError}!void {
+    const raw = eval_ctx.script_bytes.get(ref) orelse return;
+    var buf: [9]u8 = undefined;
+    const minimal = scriptNumEncode(toInt(val), &buf);
+    if (!std.mem.eql(u8, raw, minimal)) return error.ScriptNumberError;
 }
 
 /// Raw-byte OP_AND/OP_OR/OP_XOR. `op` is '&' | '|' | '^'. Aborts on length
@@ -3418,4 +3490,327 @@ test "executeOnChainAuthoritative — checkMultiSig real-crypto rejects non-arra
         .{ .sighash = sighash },
     );
     try std.testing.expectError(StrictError.AssertionFailure, result);
+}
+
+test "numeric consumers reject non-minimal threaded operands (fRequireMinimal)" {
+    // A shift/bitwise result keeps its operand's byte LENGTH, so `1 >> 1` leaves
+    // the 1-byte `[0x00]` — a NON-minimal zero (minimal zero is empty). Every
+    // NUMERIC consumer on-chain (OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD,
+    // OP_NUMEQUAL and the relational ops, and a shift's COUNT operand) decodes
+    // with fRequireMinimal = true and ABORTS on that encoding. Threading the
+    // real bytes but then reading only the decoded value re-minimises `[0x00]`
+    // to `0`, so the interpreter reports a VALID spend for a script that aborts
+    // on chain — the deployed UTXO is permanently unspendable.
+    //
+    // The byte-array ops `& | ^` and a shift's VALUE operand legitimately take
+    // non-minimal bytes (they only require equal length) and must stay working;
+    // the controls below pin that.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        // Run a one-method contract whose body stores its result into the
+        // mutable `result` property; return that value, or propagate the
+        // on-chain abort.
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "bool", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "Minimal", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .boolean = false });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+    };
+
+    // `(1 >> 1) === 0` ABORTS — OP_NUMEQUAL on the non-minimal [0x00].
+    // The buggy path decoded [0x00] to 0 and answered `true` (a funds-loss
+    // spend: off-chain valid, on-chain "non-minimally encoded script number").
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "z", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            .{ .name = "eq", .value = .{ .bin_op = .{ .op = "===", .left = "sh", .right = "z", .result_type = "bool" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "eq" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+
+    // `(1 >> 1) + 0` ABORTS — OP_ADD is a numeric consumer too.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "z", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            .{ .name = "sum", .value = .{ .bin_op = .{ .op = "+", .left = "sh", .right = "z", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "sum" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+
+    // `4 >> (1 >> 1)` ABORTS — a shift's COUNT operand is read as a number, so
+    // the non-minimal [0x00] count aborts even though the VALUE operand may be
+    // non-minimal.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "cnt", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "four", .value = .{ .load_const = .{ .value = .{ .int = 4 } } } },
+            .{ .name = "sh2", .value = .{ .bin_op = .{ .op = ">>", .left = "four", .right = "cnt", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "sh2" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+
+    // CONTROL — a shift whose result IS minimal stays accepted: `2 >> 1` leaves
+    // [0x01], the minimal encoding of 1, so OP_NUMEQUAL is happy.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "two", .right = "one", .result_type = "int" } } },
+            .{ .name = "c1", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "eq", .value = .{ .bin_op = .{ .op = "===", .left = "sh", .right = "c1", .result_type = "bool" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "eq" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(true, v.boolean);
+    }
+
+    // CONTROL — `& | ^` still take non-minimal equal-length operands:
+    // `(2 << 8) | 5` ORs the non-minimal [0x00] with [0x05] to give [0x05],
+    // which IS minimal for 5, so the following `=== 5` accepts. Pinned by
+    // conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal
+    // — a fix that rejects this is WRONG.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "eight", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "two", .right = "eight", .result_type = "int" } } },
+            .{ .name = "five", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "orr", .value = .{ .bin_op = .{ .op = "|", .left = "sh", .right = "five", .result_type = "int" } } },
+            .{ .name = "c5", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "eq", .value = .{ .bin_op = .{ .op = "===", .left = "orr", .right = "c5", .result_type = "bool" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "eq" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(true, v.boolean);
+    }
+}
+
+test "unary ops and numeric builtins reject non-minimal threaded operands" {
+    // The binary-op gate above only sees a value consumed by a BINARY numeric
+    // op. A non-minimal shift result can also reach a UNARY op or a numeric
+    // BUILTIN without passing through one, and those opcodes decode with
+    // fRequireMinimal = true as well:
+    //
+    //   abs(n >> 1)    OP_ABS
+    //   bool(n >> 1)   OP_0NOTEQUAL
+    //   !(n >> 1)      OP_NOT
+    //   -(n >> 1)      OP_NEGATE
+    //
+    // With n = 1 the shift leaves the 1-byte [0x00]. Reading only the decoded
+    // value re-minimises it to 0, reports a VALID spend, and the deployed
+    // script aborts — the UTXO is permanently unspendable.
+    //
+    // Mirrors the TS reference widening at the `toBigInt` / `toBool` funnels in
+    // packages/runar-testing/src/interpreter/interpreter.ts.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "UnaryMinimal", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+
+        // `sh` = 1 >> 1 -> raw stack bytes [0x00]; `z` = 0; `one` = 1.
+        fn prefix() [5]ANFBinding {
+            return .{
+                .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+                .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+                .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+                .{ .name = "z", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+                .{ .name = "u0", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            };
+        }
+    };
+
+    // Every numeric BUILTIN reads its operand through the same fRequireMinimal
+    // decode a binary numeric op does, so a non-minimal argument must ABORT.
+    {
+        const one_arg = [_][]const u8{"sh"};
+        const two_arg_left = [_][]const u8{ "sh", "one" };
+        const two_arg_right = [_][]const u8{ "one", "sh" };
+        const three_arg = [_][]const u8{ "sh", "z", "one" };
+
+        const tails = [_]ANFNode{
+            .{ .call = .{ .func = "abs", .args = &one_arg } },
+            .{ .call = .{ .func = "bool", .args = &one_arg } },
+            .{ .call = .{ .func = "sign", .args = &one_arg } },
+            .{ .call = .{ .func = "min", .args = &two_arg_left } },
+            .{ .call = .{ .func = "min", .args = &two_arg_right } },
+            .{ .call = .{ .func = "max", .args = &two_arg_left } },
+            .{ .call = .{ .func = "within", .args = &three_arg } },
+            .{ .call = .{ .func = "safediv", .args = &two_arg_left } },
+            .{ .call = .{ .func = "clamp", .args = &three_arg } },
+            .{ .unary_op = .{ .op = "-", .operand = "sh", .result_type = "int" } },
+            .{ .unary_op = .{ .op = "!", .operand = "sh", .result_type = "bool" } },
+        };
+
+        for (tails) |tail| {
+            var body: [7]ANFBinding = undefined;
+            const pre = H.prefix();
+            @memcpy(body[0..5], &pre);
+            body[5] = .{ .name = "r", .value = tail };
+            body[6] = .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "z" } } };
+            try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+        }
+    }
+
+    // The shape the lowering actually emits: a named local is an `@ref:` alias,
+    // so the alias must carry the threaded bytes into the builtin.
+    {
+        const one_arg = [_][]const u8{"s"};
+        var body = [_]ANFBinding{
+            .{ .name = "n", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "n", .right = "one", .result_type = "int" } } },
+            .{ .name = "s", .value = .{ .load_const = .{ .value = .{ .bytes = "@ref:sh" } } } },
+            .{ .name = "r", .value = .{ .call = .{ .func = "abs", .args = &one_arg } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "r" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
+    }
+}
+
+test "unary/builtin minimal-encoding controls stay accepted" {
+    // CONTROLS for the widened gate. These must be green BEFORE and AFTER the
+    // widening — they pin the spends the chain accepts, so a fix that rejects
+    // any of them is WRONG. Kept in their own test block so the abort cases
+    // above (which bail the block on first failure) cannot mask them.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "UnaryControls", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+    };
+
+    // CONTROL — a MINIMAL operand through a builtin still spends: `2 >> 1`
+    // leaves [0x01], the minimal encoding of 1, so OP_ABS is legal.
+    {
+        const one_arg = [_][]const u8{"sh"};
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "one", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = ">>", .left = "two", .right = "one", .result_type = "int" } } },
+            .{ .name = "r", .value = .{ .call = .{ .func = "abs", .args = &one_arg } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "r" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(@as(i64, 1), v.int);
+    }
+
+    // CONTROL — `~` is a byte op with its own path and must NOT be gated:
+    // `~(2 << 8)` inverts the non-minimal [0x00] to [0xff] = -127.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "eight", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "two", .right = "eight", .result_type = "int" } } },
+            .{ .name = "inv", .value = .{ .unary_op = .{ .op = "~", .operand = "sh", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "inv" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(@as(i64, -127), v.int);
+    }
+
+}
+
+test "@ref: alias carries the threaded stack bytes" {
+    // An @ref: alias is a pure rename — the lowering emits one for every named
+    // local, so almost every byte-op result passes through one before reaching
+    // a consumer. It occupies the SAME stack bytes as its target, but the side
+    // map is keyed by binding name, so an alias that creates no entry drops the
+    // real bytes. That blinds the minimal-encoding gate AND makes
+    // `(2 << 8) | 5` through an alias FALSE-abort on an OP_OR length mismatch
+    // the chain never sees — the interpreter rejecting a spend the chain
+    // accepts. Go, Python and Ruby already carry the entry across an alias.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !ANFValue {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{ .contract_name = "AliasBytes", .properties = &props, .methods = &methods };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?;
+        }
+    };
+
+    // CONTROL — `(2 << 8) | 5 == 5` through a named-local alias. OP_OR takes
+    // non-minimal bytes and only requires equal length; rejecting this is WRONG
+    // (pinned by conformance/fuzz-regressions/entries/
+    // 2026-07-14-chained-shift-or-nonminimal).
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "two", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "eight", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "two", .right = "eight", .result_type = "int" } } },
+            .{ .name = "s", .value = .{ .load_const = .{ .value = .{ .bytes = "@ref:sh" } } } },
+            .{ .name = "five", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "orr", .value = .{ .bin_op = .{ .op = "|", .left = "s", .right = "five", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "orr" } } },
+        };
+        const v = try H.run(allocator, &body);
+        try std.testing.expectEqual(@as(i64, 5), v.int);
+    }
 }

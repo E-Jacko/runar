@@ -25,7 +25,7 @@ import { Transaction, P2PKH as BsvP2PKH, PrivateKey, Script, UnlockingScript } f
 import { LocalSigner, computeOpPushTx } from 'runar-sdk';
 import { createProvider } from './helpers/node.js';
 import { createWallet } from './helpers/wallet.js';
-import { rpcCall, mine } from './helpers/node.js';
+import { rpcCall, mine, mineUntilConfirmed } from './helpers/node.js';
 
 describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
   it('broadcasts a P2PKH spend whose sighash is the agreed cross-tier preimage', async () => {
@@ -98,10 +98,11 @@ describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
     expect(txid).toBeTruthy();
     expect(txid.length).toBe(64);
 
-    // Confirm it actually entered a block.
-    await mine(1);
-    const confirmed = await rpcCall('getrawtransaction', txid, true);
-    expect((confirmed as { confirmations?: number }).confirmations ?? 0).toBeGreaterThan(0);
+    // Confirm it actually entered a block. Mining ONE block is a race under a
+    // full-suite run (see mineUntilConfirmed); the assertion is unchanged, only
+    // the assumption that a single block must contain it.
+    const confirmations = await mineUntilConfirmed(txid);
+    expect(confirmations).toBeGreaterThan(0);
   });
 });
 

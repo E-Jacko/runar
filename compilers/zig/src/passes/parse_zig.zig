@@ -955,7 +955,7 @@ const Parser = struct {
             const bin = self.allocator.create(BinaryOp) catch return null;
             bin.* = .{ .op = bo, .left = expr, .right = rhs };
             const index_tgt: ?*IndexAccess = if (expr == .index_access) expr.index_access else null;
-            return Statement{ .assign = .{ .target = target_name, .value = .{ .binary_op = bin }, .source_loc = loc, .index_target = index_tgt } };
+            return Statement{ .assign = .{ .target = target_name, .value = .{ .binary_op = bin }, .source_loc = loc, .index_target = index_tgt, .target_is_property = types.targetIsProperty(expr) } };
         }
         if (self.current.kind == .assign) {
             _ = self.bump();
@@ -966,7 +966,7 @@ const Parser = struct {
             // the Assign so `expand_fixed_arrays.zig` can rewrite it into
             // dispatch form.
             const index_tgt: ?*IndexAccess = if (expr == .index_access) expr.index_access else null;
-            return Statement{ .assign = .{ .target = target_name, .value = rhs, .source_loc = loc, .index_target = index_tgt } };
+            return Statement{ .assign = .{ .target = target_name, .value = rhs, .source_loc = loc, .index_target = index_tgt, .target_is_property = types.targetIsProperty(expr) } };
         }
         _ = self.expect(.semicolon);
         // Expression statements (including assert calls) carry their own source

@@ -48,7 +48,15 @@ export type RunarValue =
   // length to agree with the deployed script, so those ops thread `scriptBytes`.
   // Absent means "derive the minimal encoding of `value`" — correct for values
   // from every other source (literals, arithmetic, loads), which are minimal
-  // on-chain. Never read `scriptBytes` for non-byte ops; only `value` matters there.
+  // on-chain.
+  //
+  // "only `value` matters" for non-byte ops is WRONG and used to be written
+  // here. Every NUMERIC consumer on chain (OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD,
+  // OP_NUMEQUAL and the relational ops, and a shift's COUNT operand) decodes
+  // its operand with fRequireMinimal=true and ABORTS on a non-minimal encoding.
+  // A shift result such as `1 >> 1` = [0x00] is exactly that. Reading only
+  // `value` there re-minimises it and accepts a spend the deployed script
+  // rejects — the funds-locking direction. See `assertMinimalNumericOperand`.
   | { kind: 'bigint'; value: bigint; scriptBytes?: Uint8Array }
   | { kind: 'boolean'; value: boolean }
   | { kind: 'bytes'; value: Uint8Array }
@@ -487,6 +495,22 @@ export class RunarInterpreter {
 
     // Arithmetic operations (bigint, bigint) -> bigint
     if (left.kind === 'bigint' && right.kind === 'bigint') {
+      // Numeric consumers enforce minimal encoding on chain; byte-array ops
+      // (`& | ^` and a shift's VALUE operand) do not. Gate exactly the numeric
+      // ones, so a non-minimal shift result aborts here as it would on a node.
+      switch (op) {
+        case '+': case '-': case '*': case '/': case '%':
+        case '===': case '!==': case '<': case '<=': case '>': case '>=':
+          assertMinimalNumericOperand(left, op);
+          assertMinimalNumericOperand(right, op);
+          break;
+        case '<<': case '>>':
+          // Only the COUNT is read as a number; the value stays a byte array.
+          assertMinimalNumericOperand(right, `${op} count`);
+          break;
+        default:
+          break;
+      }
       switch (op) {
         case '+': return { kind: 'bigint', value: left.value + right.value };
         case '-': return { kind: 'bigint', value: left.value - right.value };
@@ -1412,6 +1436,11 @@ export class RunarInterpreter {
       case 'boolean':
         return val.value;
       case 'bigint':
+        // Coercing a script number to a boolean is OP_NOT/OP_0NOTEQUAL on
+        // chain — a NUMERIC consumer, so minimal encoding is enforced. Without
+        // this a non-minimal shift result reaches `!`, `bool()` or an `if`
+        // condition and the interpreter answers where a node aborts.
+        assertMinimalNumericOperand(val, 'boolean coercion');
         return val.value !== 0n;
       case 'bytes':
         return val.value.length > 0 && val.value.some((b) => b !== 0);
@@ -1438,6 +1467,12 @@ export class RunarInterpreter {
   private toBigInt(val: RunarValue): bigint {
     switch (val.kind) {
       case 'bigint':
+        // The funnel every numeric builtin (`abs`, `min`, `max`, `within`,
+        // `safediv`, ...) and unary `-` reads its operand through. All of them
+        // lower to numeric opcodes, which require minimal encoding. The
+        // byte-array ops do NOT come through here — they read `scriptBytes`
+        // directly — so this does not over-reject `& | ^ << >> ~`.
+        assertMinimalNumericOperand(val, 'numeric operand');
         return val.value;
       case 'boolean':
         return val.value ? 1n : 0n;
@@ -1704,6 +1739,35 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+/**
+ * Mirror the on-chain minimal-encoding rule for a NUMERIC operand.
+ *
+ * Every numeric consumer in the BSV interpreter (`OP_ADD`/`OP_SUB`/`OP_MUL`/
+ * `OP_DIV`/`OP_MOD`, `OP_NUMEQUAL` and the relational ops, and a shift's count)
+ * decodes with `fRequireMinimal = true` and ABORTS on a non-minimal encoding.
+ *
+ * Only values produced by the byte-array ops carry `scriptBytes`, and only
+ * those can be non-minimal — `1 >> 1` is `[0x00]`, whose minimal encoding is
+ * the EMPTY array. Everything else is minimal by construction, so this is a
+ * no-op for them.
+ *
+ * Without this the interpreter re-minimises such a value, accepts, and the
+ * deployed script rejects: the spend is impossible and the funds are locked.
+ */
+function assertMinimalNumericOperand(v: RunarValue, op: string): void {
+  if (v.kind !== 'bigint' || v.scriptBytes === undefined) return;
+  const minimal = encodeScriptNumber(v.value);
+  if (!bytesEqual(v.scriptBytes, minimal)) {
+    throw new Error(
+      `non-minimally encoded script number consumed by '${op}': ` +
+        `stack bytes [${Array.from(v.scriptBytes).map((b) => b.toString(16).padStart(2, '0')).join(' ')}] ` +
+        `decode to ${v.value}, whose minimal encoding is ` +
+        `[${Array.from(minimal).map((b) => b.toString(16).padStart(2, '0')).join(' ')}]. ` +
+        `A node aborts here; see docs/language-reference.md on OP_LSHIFT/OP_RSHIFT byte semantics.`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

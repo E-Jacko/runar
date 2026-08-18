@@ -48,6 +48,13 @@ func (r *ParseResult) ErrorStrings() []string {
 //   - .runar.zig -> ParseZig
 //   - .runar.java -> ParseJava
 //   - default -> Parse (existing TypeScript parser)
+// ackUnsoundSP1FriRE opts a contract in to the KNOWN-UNSOUND SP1 FRI verifier.
+// Scanned over the RAW SOURCE in ParseSource so every surface format honours it
+// identically — unlike @sighash / @embedAlways, which only the TypeScript
+// parser reads. See sp1_fri_soundness_warning.go for what is unsound and why
+// the default is a hard error.
+var ackUnsoundSP1FriRE = regexp.MustCompile(`@acknowledgeUnsoundSP1FriVerifier\b`)
+
 func ParseSource(source []byte, fileName string) *ParseResult {
 	// DoS-bound size guard. Reject oversized source BEFORE any
 	// format-specific parser touches the input. BUG-008 follow-up.
@@ -84,17 +91,17 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 		if msg := unsupportedDirectiveError(source, "Move"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseMove(source, fileName)
+		return stampSP1FriAck(ParseMove(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.go"):
 		if msg := unsupportedDirectiveError(source, "Go DSL"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseGoContract(source, fileName)
+		return stampSP1FriAck(ParseGoContract(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.py"):
 		if msg := unsupportedDirectiveError(source, "Python"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParsePython(source, fileName)
+		return stampSP1FriAck(ParsePython(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.rs"):
 		if msg := unsupportedDirectiveError(source, "Rust"); msg != "" {
 			return directiveGuardResult(msg)
@@ -104,21 +111,31 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 		if msg := unsupportedDirectiveError(source, "Ruby"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseRuby(source, fileName)
+		return stampSP1FriAck(ParseRuby(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.zig"):
 		if msg := unsupportedDirectiveError(source, "Zig"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseZig(source, fileName)
+		return stampSP1FriAck(ParseZig(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.java"):
 		if msg := unsupportedDirectiveError(source, "Java"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseJava(source, fileName)
+		return stampSP1FriAck(ParseJava(source, fileName), source)
 	default:
 		// TypeScript surface: honours @sighash / @embedAlways directly.
-		return Parse(source, fileName)
+		return stampSP1FriAck(Parse(source, fileName), source)
 	}
+}
+
+// stampSP1FriAck records whether the raw source carried the
+// @acknowledgeUnsoundSP1FriVerifier directive. Applied to the parse RESULT so
+// it is independent of which surface parser ran.
+func stampSP1FriAck(res *ParseResult, source []byte) *ParseResult {
+	if res != nil && res.Contract != nil && ackUnsoundSP1FriRE.Match(source) {
+		res.Contract.AckUnsoundSP1Fri = true
+	}
+	return res
 }
 
 // Directive markers for the fail-closed guard. Word-boundary anchored to

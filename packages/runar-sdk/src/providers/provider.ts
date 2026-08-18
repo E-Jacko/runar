@@ -37,3 +37,43 @@ export interface Provider {
   /** Fetch the raw transaction hex by its txid. */
   getRawTransaction(txid: string): Promise<string>;
 }
+
+/**
+ * Audit finding C4: project a locally-held @bsv/sdk `Transaction` into the
+ * plain `TransactionData` shape `getTransaction()` returns.
+ *
+ * Two call sites need exactly this, and they must not drift apart:
+ *   - `MockProvider.broadcast()` registers the tx it just accepted, so
+ *     `getTransaction()` can resolve it instead of throwing "not found".
+ *   - `RunarContract.deploy()` / `finalizeCall()` fall back to it when
+ *     `provider.getTransaction()` fails (a real node can 404 a transaction it
+ *     has accepted but not yet indexed).
+ *
+ * Both previously improvised their own shape, and the contract.ts one
+ * improvised an EMPTY one — `inputs: []`, `outputs: []` — indistinguishable
+ * from a confirmed transaction with no outputs, which is what made every
+ * post-broadcast `result.tx.outputs` assertion vacuous. Lives here because
+ * `providers/provider.ts` is a leaf both sides already import.
+ *
+ * `txid` is passed in rather than read off `tx`: the mock provider assigns
+ * synthetic txids, and the real deploy/call path uses the txid the provider
+ * returned from `broadcast()`.
+ */
+export function txToTransactionData(txid: string, tx: Transaction): TransactionData {
+  return {
+    txid,
+    version: tx.version,
+    inputs: tx.inputs.map((input) => ({
+      txid: input.sourceTXID ?? input.sourceTransaction?.id('hex') ?? '',
+      outputIndex: input.sourceOutputIndex,
+      script: input.unlockingScript?.toHex() ?? '',
+      sequence: input.sequence ?? 0xffffffff,
+    })),
+    outputs: tx.outputs.map((out) => ({
+      satoshis: out.satoshis ?? 0,
+      script: out.lockingScript.toHex(),
+    })),
+    locktime: tx.lockTime,
+    raw: tx.toHex(),
+  };
+}

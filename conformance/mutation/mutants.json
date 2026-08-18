@@ -1,5 +1,5 @@
 {
-  "_doc": "Curated compiler-bug corpus for measuring the safety-net's detection power (TS-GAP-006). Each mutant is a targeted, exact, UNIQUE find/replace patch to a real line in a TypeScript compiler source file under packages/runar-compiler/src/. run-mutation.ts applies each patch to the working tree, runs the mapped fast in-process gate(s), records caught-vs-survived, and ALWAYS reverts. Because the gates resolve `runar-compiler`/`runar-testing` through the root vitest SRC alias (see vitest.config.ts), a mutated src file is observed WITHOUT a rebuild. Scope: TS tier only; Go/other-tier mutants are a documented future extension. Six Palmer-class entries (TS-GAP-007 / remediation-plan Phase E1, 2026-08) target packages/runar-compiler/src/passes/{04-anf-lower,05-stack-lower}.ts (branch-merged-locals, inverting 23ef2d2b) and packages/runar-sdk/src/{state,contract}.ts (state-section MINIMALDATA framing, also inverting 23ef2d2b; constructor-slot splice length and codeSeparator off-by-one, new families gated on conformance/sdk-vertical). These four inversion mutants and the two sdk-vertical mutants are gated by packages/runar-testing and packages/runar-sdk VM/unit tests and by conformance/sdk-vertical rather than the compiler-only gates above.",
+  "_doc": "Curated compiler-bug corpus for measuring the safety-net's detection power (TS-GAP-006). Each mutant is a targeted, exact, UNIQUE find/replace patch to a real line in a TypeScript compiler source file under packages/runar-compiler/src/. run-mutation.ts applies each patch to the working tree, runs the mapped fast in-process gate(s), records caught-vs-survived, and ALWAYS reverts. Because the gates resolve `runar-compiler`/`runar-testing` through the root vitest SRC alias (see vitest.config.ts), a mutated src file is observed WITHOUT a rebuild. Scope: TS tier only; Go/other-tier mutants are a documented future extension. Six Palmer-class entries (TS-GAP-007 / remediation-plan Phase E1, 2026-08) target packages/runar-compiler/src/passes/{04-anf-lower,05-stack-lower}.ts (branch-merged-locals, inverting 23ef2d2b) and packages/runar-sdk/src/{state,contract}.ts (state-section MINIMALDATA framing, also inverting 23ef2d2b; constructor-slot splice length and codeSeparator off-by-one, new families gated on conformance/sdk-vertical). These four inversion mutants and the two sdk-vertical mutants are gated by packages/runar-testing and packages/runar-sdk VM/unit tests and by conformance/sdk-vertical rather than the compiler-only gates above. Six frame-offset / branch-merge entries (v1 audit mutation-survivor triage, 2026-08-17) were derived MECHANICALLY rather than by hand: 1169 generated mutants over 05-stack-lower.ts, 06-emit.ts and src/optimizer/* were scored against the 71-fixture byte-exact golden corpus (fold-OFF), the 66 survivors in the branch-merge / frame-offset class were re-run against a wider 2101-compile corpus (generated stateless+stateful contracts, every forced branch and loop shape, both folding modes), and the six that changed bytes there are real coverage holes rather than equivalent mutants. Each is killed by a delta-reduced witness pinned in packages/runar-testing/src/__tests__/stack-frame-mutation-pins.test.ts, and each kills exactly the mutants named on it (1:1, measured). The other 60 changed nothing across 2101 compiles; they are recorded as evidence-of-equivalence in the audit report, NOT added here, because a corpus entry that no program can distinguish measures nothing.",
   "_gates": {
     "differential-witness": "cd conformance && npx vitest run witnesses/differential.test.ts",
     "fold-equivalence": "cd conformance && npx vitest run witnesses/fold-equivalence.test.ts",
@@ -9,7 +9,8 @@
     "state-push-framing-vm": "npx vitest run packages/runar-testing/src/__tests__/state-push-framing-vm.test.ts",
     "c28-state-strict": "npx vitest run packages/runar-sdk/src/__tests__/c28-state-strict.test.ts",
     "sdk-vertical-constructor-slots": "cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter bigint-0",
-    "sdk-vertical-codeseparator": "cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter codesep-tag-zero"
+    "sdk-vertical-codeseparator": "cd conformance && npx tsx sdk-vertical/runner/vertical-runner.ts --tiers typescript --filter codesep-tag-zero",
+    "stack-frame-mutation-pins": "npx vitest run packages/runar-testing/src/__tests__/stack-frame-mutation-pins.test.ts"
   },
   "_schema": {
     "id": "stable unique id",
@@ -282,6 +283,72 @@
         "sdk-vertical-codeseparator"
       ],
       "finding": "Phase C4 (TG-016) mutant: off-by-one on the deploy-time-adjusted codeSepIndex value baked into a codeSepIndexSlots placeholder. Caught by the compiler<->SDK vertical pin against the independently-derived expected-code-part.hex / expected-vertical.json for the CodeSepMatrix fixture."
+    },
+    {
+      "id": "stacklower-dup-records-neighbour",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "this.slots.push(this.slots[this.slots.length - 1]!);",
+      "replace": "this.slots.push(this.slots[this.slots.length - 2]!);",
+      "class": "off-by-one stack index",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "stack-frame-mutation-pins"
+      ]
+    },
+    {
+      "id": "stacklower-dup-records-undefined",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "if (this.slots.length < 1) throw new Error('Stack underflow on dup');\n    this.slots.push(this.slots[this.slots.length - 1]!);",
+      "replace": "if (this.slots.length < 1) throw new Error('Stack underflow on dup');\n    this.slots.push(this.slots[this.slots.length - 0]!);",
+      "class": "off-by-one stack index",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "stack-frame-mutation-pins"
+      ]
+    },
+    {
+      "id": "stacklower-drain-nip-vs-roll-inverted",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "for (const depth of drainDepths) {\n      if (depth === 1) {",
+      "replace": "for (const depth of drainDepths) {\n      if (depth !== 1) {",
+      "class": "off-by-one stack index",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "stack-frame-mutation-pins"
+      ]
+    },
+    {
+      "id": "stacklower-empty-else-reconcile-or-a",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "elseBindings.length === 0 && thenName",
+      "replace": "elseBindings.length === 0 || thenName",
+      "class": "if-without-else regression",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "stack-frame-mutation-pins"
+      ]
+    },
+    {
+      "id": "stacklower-empty-else-reconcile-or-b",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "thenName && elseCtx.stackMap.has(thenName)",
+      "replace": "thenName || elseCtx.stackMap.has(thenName)",
+      "class": "if-without-else regression",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "stack-frame-mutation-pins"
+      ]
+    },
+    {
+      "id": "stacklower-sinkbelow-wrong-distance",
+      "file": "packages/runar-compiler/src/passes/05-stack-lower.ts",
+      "find": "if (d - nDeclared > sinkBelow) sinkBelow = d - nDeclared;",
+      "replace": "if (d - nDeclared > sinkBelow) sinkBelow = d + nDeclared;",
+      "class": "branch-merge regression",
+      "stage": "stack-lower",
+      "expectCaughtBy": [
+        "stack-frame-mutation-pins"
+      ]
     }
   ]
 }

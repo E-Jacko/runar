@@ -757,9 +757,14 @@ jobs:
   # Tier-independent (in-process TS compiler + @bsv/sdk), so it needs none of
   # the native toolchains the `fuzz` job builds.
   #
-  #   - pull_request : FIXED seed 424242, 32 cases, metamorphic variants on.
+  #   - pull_request : FIXED seed 424242, 35 cases, metamorphic variants on.
   #                    Deterministic, flake-free, ~1 min including setup.
-  #                    32 == REQUIRED_CASE_COUNT in conformance/fuzzer/spend-shapes.ts.
+  #                    35 == REQUIRED_CASE_COUNT in conformance/fuzzer/spend-shapes.ts.
+  #                    Raised 32 -> 35 on 2026-08-17 with the three
+  #                    `merge-k{2,3,4}-nested-sibling` families (the issue-#149
+  #                    inherited-layout shape). At 32 the round-robin stopped
+  #                    before the last three families, so the PR gate would have
+  #                    skipped exactly the shape those families exist to cover.
   #                    Families are drawn ROUND-ROBIN, so `--num` below that count
   #                    silently skips the tail — at --num 25 the seven loop-carried
   #                    families (indices 25-31) never ran on PRs at all. Keep this
@@ -806,7 +811,7 @@ jobs:
           node_modules/.bin/tsx fuzzer/index.ts \
             --spend-oracle \
             --metamorphic \
-            --num 32 \
+            --num 35 \
             --seed 424242 \
             --output /tmp/spend-oracle-pr.json
 

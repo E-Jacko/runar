@@ -2054,7 +2054,7 @@ because this tier's interpreter is genuinely weaker than Go's — made every
 3. **Value conservation** — when every input's outpoint is known, outputs may
    not exceed inputs.
 
-`last_validation_report()` returns a `BroadcastValidationReport` with four
+`last_validation_report()` returns a `BroadcastValidationReport` with three
 mutually exclusive buckets, so a not-checked input can never masquerade as a
 passing one:
 
@@ -2062,33 +2062,36 @@ passing one:
 |---|---|
 | `validated` | a script really ran and really passed |
 | `unknown` | the provider does not know that outpoint |
-| `unvalidatable` | `bsv-sdk` cannot parse the script (see below) |
-| `unsupported_index` | input index > 0, which `bsv-sdk` cannot sighash (see below) |
+| `unvalidatable` | `bsv-sdk` refuses to run the script (see below) |
 
-### Two upstream limitations, stated rather than papered over
+**Every known input is executed, at any index.** This crate requires
+`bsv-sdk >= 0.2.89`; earlier releases mis-ordered the BIP-143 `hashPrevouts` for
+`input_index > 0`, so the gate used to refuse to judge anything but input 0. See
+`docs/audit/upstream-bsv-sdk-bip143-hashprevouts.md` — that defect is closed, and
+multi-input transactions are now validated in full rather than partially.
 
-`bsv-sdk` 0.1.72 has two defects that bound what a Rust-tier gate can honestly
-assert. Both are pinned by tests in `tests/mock_broadcast_validation.rs` that go
-**RED if either is fixed upstream**, at which point the carve-out in
-`src/sdk/provider.rs::validate_broadcast_tx` should be deleted and the gate
-tightened.
+### The one remaining limitation, stated rather than papered over
 
-1. **Only `input_index == 0` gets a correct BIP-143 preimage.** `spend_ops.rs`
-   builds `hashPrevouts` as *current input's outpoint first, then
-   `other_inputs`* — transaction input order only for index 0. A valid BIP-143
-   signature on input 1 (produced by this SDK's own `LocalSigner`, and accepted
-   by the Go tier's go-sdk interpreter) evaluates to FALSE. Inputs at index > 0
-   are therefore counted as `unsupported_index`, never as validated.
-2. **Rúnar OP_PUSH_TX covenants do not parse.** The compiled covenant embeds a
-   `0x8d` byte; the parser desyncs and aborts with `disabled opcode: OP_2MUL`
-   (`spend_ops.rs:779`, hard-disabled with no config escape). Those inputs are
-   counted as `unvalidatable`.
+**Rúnar OP_PUSH_TX covenants cannot be run by `bsv-sdk`.** Rúnar targets
+*Chronicle*, the post-Genesis BSV profile that re-enables `OP_2MUL` (0x8d), and
+the OP_PUSH_TX low-S normalisation emits exactly that opcode — so it appears at
+a genuine opcode position in every stateful contract's covenant. `bsv-sdk`
+implements the pre-Chronicle policy and hard-disables `OP_2MUL` with no config
+escape, aborting with `disabled opcode: OP_2MUL`. Those inputs are counted as
+`unvalidatable`, never as validated.
 
-**Honest claim:** in practice this means a *deploy* transaction's P2PKH funding
-input is fully script-validated, while a *call* transaction is covered by the
-structural + value-conservation layer plus whatever input 0 can be judged on.
-Script-level correctness of covenant spends in this tier is proven elsewhere:
-byte-level cross-tier conformance goldens and the on-chain integration spends.
+This is an opcode-profile mismatch, not an upstream bug — the Go tier runs the
+same covenants by enabling `interpreter.WithAfterChronicle()`. It is pinned by
+`tests/mock_broadcast_validation.rs::pin_bsv_sdk_rejects_op2mul_*`, which go
+**RED** the day `bsv-sdk` adopts the Chronicle opcode set, at which point the
+tolerated-error class in `src/sdk/provider.rs::validate_broadcast_tx` should be
+deleted. See `docs/audit/upstream-bsv-sdk-op2mul-chronicle.md`.
+
+**Honest claim:** in practice this means every P2PKH input of a deploy *or* call
+transaction is fully script-validated, while the covenant input itself is covered
+by the structural + value-conservation layer. Script-level correctness of
+covenant spends in this tier is proven elsewhere: byte-level cross-tier
+conformance goldens and the on-chain integration spends.
 
 ### The opt-out, and how it is governed
 

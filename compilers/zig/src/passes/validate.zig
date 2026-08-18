@@ -161,7 +161,23 @@ fn validateProperties(
                         .message = "FixedArray property must use an array-literal initializer",
                         .severity = .@"error",
                     });
+                } else if (!isArrayLiteralOfLiterals(init_expr)) {
+                    try errors.append(allocator, .{
+                        .message = "property initializer must be an array literal of literal values",
+                        .severity = .@"error",
+                    });
                 }
+            }
+        } else if (prop.initializer) |init_expr| {
+            // Property initializers are restricted to literal values. Mirrors
+            // the TS validator in `02-validate.ts` and the Go peer in
+            // `validator.go` — without this a non-literal default (e.g.
+            // `1n + 2n`) compiled straight through to a deployable script.
+            if (!isLiteralExpression(init_expr)) {
+                try errors.append(allocator, .{
+                    .message = "property initializer must be a literal value",
+                    .severity = .@"error",
+                });
             }
         }
 
@@ -210,6 +226,37 @@ fn validateProperties(
 // ============================================================================
 // Constructor validation
 // ============================================================================
+
+/// Whether an expression is a literal allowed as a property initializer
+/// (bigint, bool, bytestring, or a negated bigint literal). Mirrors the TS/Go
+/// validator helpers.
+fn isLiteralExpression(expr: Expression) bool {
+    return switch (expr) {
+        .literal_int, .literal_bigint, .literal_bool, .literal_bytes => true,
+        .unary_op => |u| u.op == .negate and switch (u.operand) {
+            .literal_int, .literal_bigint => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Whether an expression is an array literal whose elements are all literal
+/// values (recursively, for nested FixedArray initializers).
+fn isArrayLiteralOfLiterals(expr: Expression) bool {
+    const elements = switch (expr) {
+        .array_literal => |els| els,
+        else => return false,
+    };
+    for (elements) |el| {
+        if (el == .array_literal) {
+            if (!isArrayLiteralOfLiterals(el)) return false;
+        } else if (!isLiteralExpression(el)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 fn validateConstructor(
     allocator: Allocator,
@@ -327,10 +374,175 @@ fn validateMethods(
         // Gate asm({...}) calls on UnsafeSmartContract + check structural args.
         try validateAsmUsage(allocator, contract, method, errors);
 
+        // readonly properties may only be assigned in the constructor.
+        try checkReadonlyWrites(allocator, contract, method, errors);
+
         // Validate for-loop bounds are compile-time constants
         for (method.body) |stmt| {
             try validateStatement(allocator, stmt, errors);
         }
+    }
+}
+
+/// Report every write to a `readonly` contract property in a method body.
+///
+/// spec/semantics.md:
+///   <this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property
+///
+/// The constructor is exempt — that is where every contract initialises its
+/// readonly properties. In this tier `ConstructorNode` carries `assignments`
+/// rather than statements, so constructor writes never reach the statement
+/// walk and no explicit exemption is needed.
+///
+/// `Assign.target` is a bare name with the `this.` already stripped, so the
+/// check keys off `Assign.target_is_property` (set by every surface parser)
+/// rather than the name alone — otherwise a local shadowing a readonly
+/// property name would be rejected, diverging from the other six tiers.
+/// `this.p++` / `this.p--` carry a full `property_access` operand and are
+/// matched structurally.
+fn checkReadonlyWrites(
+    allocator: Allocator,
+    contract: ContractNode,
+    method: MethodNode,
+    errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    var has_readonly = false;
+    for (contract.properties) |p| {
+        if (p.readonly) {
+            has_readonly = true;
+            break;
+        }
+    }
+    if (!has_readonly) return;
+
+    try walkReadonlyWrites(allocator, contract, method.body, errors);
+}
+
+fn isReadonlyPropertyName(contract: ContractNode, name: []const u8) bool {
+    for (contract.properties) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.readonly;
+    }
+    return false;
+}
+
+/// Resolve the property a mutation expression operand writes to, unwrapping
+/// index-access chains (`this.grid[i][j]`). Returns null for non-`this`
+/// targets.
+fn mutatedPropertyName(operand: Expression) ?[]const u8 {
+    var node = operand;
+    while (node == .index_access) node = node.index_access.object;
+    return switch (node) {
+        .property_access => |pa| pa.property,
+        else => null,
+    };
+}
+
+const READONLY_WRITE_MSG =
+    "cannot assign to readonly property outside the constructor; " ++
+    "readonly properties may only be assigned in the constructor";
+
+fn walkReadonlyWrites(
+    allocator: Allocator,
+    contract: ContractNode,
+    stmts: []const Statement,
+    errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    for (stmts) |stmt| {
+        switch (stmt) {
+            .assign => |a| {
+                if (a.target_is_property and isReadonlyPropertyName(contract, a.target)) {
+                    // Name the offending property, as the other six tiers do
+                    // ("cannot assign to readonly property 'x' ..."). A generic
+                    // message is correct but makes a developer hunt for which
+                    // write tripped it in a contract with several readonly
+                    // properties. Allocator-owned, like the other allocPrint'd
+                    // diagnostics in this file.
+                    const msg = try std.fmt.allocPrint(
+                        allocator,
+                        "cannot assign to readonly property '{s}' outside the constructor; " ++
+                            "readonly properties may only be assigned in the constructor",
+                        .{a.target},
+                    );
+                    try errors.append(allocator, .{
+                        .message = msg,
+                        .severity = .@"error",
+                    });
+                }
+                try walkExprForReadonlyMutation(allocator, contract, a.value, errors);
+            },
+            .const_decl => |d| try walkExprForReadonlyMutation(allocator, contract, d.value, errors),
+            .let_decl => |d| {
+                if (d.value) |v| try walkExprForReadonlyMutation(allocator, contract, v, errors);
+            },
+            .expr_stmt => |e| try walkExprForReadonlyMutation(allocator, contract, e.expr, errors),
+            .assert_stmt => |a| try walkExprForReadonlyMutation(allocator, contract, a.condition, errors),
+            .return_stmt => |v| {
+                if (v) |e| try walkExprForReadonlyMutation(allocator, contract, e, errors);
+            },
+            .if_stmt => |if_s| {
+                try walkExprForReadonlyMutation(allocator, contract, if_s.condition, errors);
+                try walkReadonlyWrites(allocator, contract, if_s.then_body, errors);
+                if (if_s.else_body) |eb| try walkReadonlyWrites(allocator, contract, eb, errors);
+            },
+            .for_stmt => |f| try walkReadonlyWrites(allocator, contract, f.body, errors),
+        }
+    }
+}
+
+/// Flag `this.p++` / `this.p--` anywhere inside an expression.
+fn walkExprForReadonlyMutation(
+    allocator: Allocator,
+    contract: ContractNode,
+    expr: Expression,
+    errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    switch (expr) {
+        .increment => |inc| {
+            if (mutatedPropertyName(inc.operand)) |name| {
+                if (isReadonlyPropertyName(contract, name)) {
+                    try errors.append(allocator, .{
+                        .message = READONLY_WRITE_MSG,
+                        .severity = .@"error",
+                    });
+                }
+            }
+            try walkExprForReadonlyMutation(allocator, contract, inc.operand, errors);
+        },
+        .decrement => |dec| {
+            if (mutatedPropertyName(dec.operand)) |name| {
+                if (isReadonlyPropertyName(contract, name)) {
+                    try errors.append(allocator, .{
+                        .message = READONLY_WRITE_MSG,
+                        .severity = .@"error",
+                    });
+                }
+            }
+            try walkExprForReadonlyMutation(allocator, contract, dec.operand, errors);
+        },
+        .binary_op => |b| {
+            try walkExprForReadonlyMutation(allocator, contract, b.left, errors);
+            try walkExprForReadonlyMutation(allocator, contract, b.right, errors);
+        },
+        .unary_op => |u| try walkExprForReadonlyMutation(allocator, contract, u.operand, errors),
+        .call => |c| {
+            for (c.args) |a| try walkExprForReadonlyMutation(allocator, contract, a, errors);
+        },
+        .method_call => |mc| {
+            for (mc.args) |a| try walkExprForReadonlyMutation(allocator, contract, a, errors);
+        },
+        .ternary => |t| {
+            try walkExprForReadonlyMutation(allocator, contract, t.condition, errors);
+            try walkExprForReadonlyMutation(allocator, contract, t.then_expr, errors);
+            try walkExprForReadonlyMutation(allocator, contract, t.else_expr, errors);
+        },
+        .index_access => |ia| {
+            try walkExprForReadonlyMutation(allocator, contract, ia.object, errors);
+            try walkExprForReadonlyMutation(allocator, contract, ia.index, errors);
+        },
+        .array_literal => |els| {
+            for (els) |e| try walkExprForReadonlyMutation(allocator, contract, e, errors);
+        },
+        else => {},
     }
 }
 

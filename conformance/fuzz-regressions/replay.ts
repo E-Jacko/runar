@@ -60,7 +60,10 @@ import {
 import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { runDifferentialExecution } from '../../packages/runar-testing/src/oracle/index.js';
+import {
+  runDifferentialExecution,
+  runTriModalExecution,
+} from '../../packages/runar-testing/src/oracle/index.js';
 import type { WitnessArg } from '../../packages/runar-testing/src/oracle/index.js';
 import { disassemble, hexToBytes } from '../../packages/runar-testing/src/vm/index.js';
 
@@ -82,12 +85,22 @@ export interface RegressionEntry {
   /** ISO date the underlying divergence was found. */
   discovered: string;
   /**
-   * Which fuzzer oracle produced the finding. Only `execute` (the
-   * source-vs-script accept/reject oracle) is replayable today; the field is
-   * explicit so a future ANF/IR-parity replayer can be added without
-   * reinterpreting existing entries.
+   * Which fuzzer oracle produced the finding.
+   *
+   * - `execute`   — the bare `ScriptVM` accept/reject oracle. `ScriptVM.success`
+   *                 is "no evaluation error and truthy top of stack"; it does
+   *                 NOT apply the consensus wrappers, so it does not enforce
+   *                 minimal encoding, clean stack, or push-only unlocking.
+   * - `tri-modal` — the CONSENSUS verdict (`Spend.validate()`). Required for any
+   *                 divergence that only a real node sees. A shift result such
+   *                 as `1 >> 1` = [0x00] is non-minimal: a node aborts when a
+   *                 numeric op consumes it, while the bare VM accepts. Pinning
+   *                 such an entry against `execute` would record the weaker
+   *                 engine's verdict as if it were the chain's.
+   *
+   * `expect.vmAccepted` is read as the chosen oracle's script-side verdict.
    */
-  oracle: 'execute';
+  oracle: 'execute' | 'tri-modal';
   /** Contract source file, relative to the entry directory. */
   sourceFile: string;
   /** File name handed to the compiler — selects the frontend parser. */
@@ -283,14 +296,37 @@ export function replayEntry(loaded: LoadedEntry): ReplayOutcome {
   let result;
   try {
     // SAME path as `conformance/fuzzer/execute-differential.ts`: fold-ON
-    // deployed bytes on the @bsv/sdk ScriptVM vs the ANF interpreter.
-    result = runDifferentialExecution({
-      source,
-      fileName: entry.fileName,
-      method: entry.method,
-      args,
-      constructorArgs: ctor,
-    });
+    // deployed bytes on the @bsv/sdk ScriptVM vs the ANF interpreter. For a
+    // `tri-modal` entry the script side is the CONSENSUS verdict instead, so
+    // `vmAccepted` below carries `Spend.validate()`.
+    if (entry.oracle === 'tri-modal') {
+      const tri = runTriModalExecution({
+        source,
+        fileName: entry.fileName,
+        method: entry.method,
+        args,
+        constructorArgs: ctor,
+      });
+      // Re-key BOTH the verdict and `agrees` onto consensus. `agrees` on a
+      // tri-modal result means "all three engines agree", which is false here
+      // by construction: the bare VM accepts the non-minimal encoding that the
+      // chain rejects. Leaving it would report DIVERGENCE REOPENED on an entry
+      // whose pinned verdicts both match.
+      result = {
+        ...tri,
+        vmAccepted: tri.spendAccepted,
+        vmError: tri.spendError,
+        agrees: tri.interpreterAccepted === tri.spendAccepted,
+      };
+    } else {
+      result = runDifferentialExecution({
+        source,
+        fileName: entry.fileName,
+        method: entry.method,
+        args,
+        constructorArgs: ctor,
+      });
+    }
   } catch (e) {
     return {
       id: entry.id,

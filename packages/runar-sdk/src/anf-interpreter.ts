@@ -375,7 +375,16 @@ function evalValue(
       const v = value.value;
       // Handle @ref: aliases (load_const with "@ref:targetName")
       if (typeof v === 'string' && v.startsWith('@ref:')) {
-        return env[v.slice(5)];
+        const target = v.slice(5);
+        // Carry the threaded stack bytes across the alias. ANF lowering emits
+        // an alias binding for EVERY named local, and `scriptBytes` is keyed by
+        // binding NAME, so returning the value alone silently drops them. That
+        // both blinds the minimal-encoding check below and breaks the chained
+        // byte-op threading itself: `(2 << 8) | 5` then FALSE-aborts on an
+        // OP_OR length mismatch the chain never raises.
+        const carried = scriptBytes[target];
+        if (carried !== undefined) scriptBytes[bindingName] = carried;
+        return env[target];
       }
       return v;
     }
@@ -405,6 +414,12 @@ function evalValue(
         scriptBytes[bindingName] = rb;
         return decodeScriptNumber(Utils.toHex(rb));
       }
+      // NUMERIC consumption: a node decodes with fRequireMinimal=true and
+      // ABORTS on a non-minimal operand. Only the byte-array ops above may
+      // take one. `&& !isNumericByteOp` is implicit — we only reach here when
+      // the op is not one of them.
+      assertMinimalNumericOperand(scriptBytes[value.left], env[value.left], value.op);
+      assertMinimalNumericOperand(scriptBytes[value.right], env[value.right], value.op);
       return evalBinOp(
         value.op,
         env[value.left],
@@ -420,6 +435,7 @@ function evalValue(
         scriptBytes[bindingName] = rb;
         return decodeScriptNumber(Utils.toHex(rb));
       }
+      assertMinimalNumericOperand(scriptBytes[value.operand], env[value.operand], value.op);
       return evalUnaryOp(value.op, env[value.operand], value.result_type);
     }
 
@@ -603,6 +619,36 @@ function evalValue(
 
 /** Minimal sign-magnitude bytes of a script-number-valued bigint
  *  (little-endian, no push-opcode wrapping). */
+/**
+ * Mirror the on-chain minimal-encoding rule for a NUMERIC operand.
+ *
+ * Only values produced by the byte-array ops carry threaded `scriptBytes`, and
+ * only those can be non-minimal (`1 >> 1` is `[0x00]`, whose minimal encoding
+ * is EMPTY). Everything else is minimal by construction, so this is a no-op.
+ *
+ * Without it this interpreter re-minimises such a value and reports a spend
+ * valid that the deployed covenant aborts on — and since
+ * `RunarContract.prepareCall` uses this interpreter to compute the
+ * continuation state, it would build a broadcast against a state no node
+ * accepts.
+ */
+function assertMinimalNumericOperand(
+  bytes: number[] | undefined,
+  value: unknown,
+  op: string,
+): void {
+  if (bytes === undefined || typeof value !== 'bigint') return;
+  const minimal = minimalScriptNumberBytes(value);
+  if (bytes.length === minimal.length && bytes.every((b, i) => b === minimal[i])) return;
+  throw new Error(
+    `non-minimally encoded script number consumed by '${op}': stack bytes [` +
+      bytes.map((b) => b.toString(16).padStart(2, '0')).join(' ') +
+      `] decode to ${value}, whose minimal encoding is [` +
+      minimal.map((b) => b.toString(16).padStart(2, '0')).join(' ') +
+      `]. A node aborts here.`,
+  );
+}
+
 function minimalScriptNumberBytes(n: bigint): number[] {
   if (n === 0n) return [];
   const negative = n < 0n;

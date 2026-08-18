@@ -92,6 +92,32 @@ fn validate_properties(contract: &ContractNode, errors: &mut Vec<Diagnostic>, wa
                 "'txPreimage' is a reserved implicit parameter name and must not be used as a property name", Some(prop.source_location.clone())
             ));
         }
+
+        // Validate initializer if present. FixedArray properties accept an
+        // array literal of literal elements (recursively, for nested arrays);
+        // other properties accept a plain literal value. Mirrors the TS
+        // validator in `02-validate.ts` and the Go peer in `validator.go`.
+        if let Some(init) = &prop.initializer {
+            if matches!(prop.prop_type, TypeNode::FixedArray { .. }) {
+                if !is_array_literal_of_literals(init) {
+                    errors.push(Diagnostic::error(
+                        format!(
+                            "property '{}' initializer must be an array literal of literal values",
+                            prop.name
+                        ),
+                        Some(prop.source_location.clone()),
+                    ));
+                }
+            } else if !is_literal_expression(init) {
+                errors.push(Diagnostic::error(
+                    format!(
+                        "property '{}' initializer must be a literal value",
+                        prop.name
+                    ),
+                    Some(prop.source_location.clone()),
+                ));
+            }
+        }
     }
 
     // SmartContract (and the asm-escape-hatch UnsafeSmartContract) require all
@@ -116,6 +142,33 @@ fn validate_properties(contract: &ContractNode, errors: &mut Vec<Diagnostic>, wa
             ));
         }
     }
+}
+
+/// Reports whether the expression is a literal allowed as a property
+/// initializer (bigint, bool, bytestring, or a negated bigint literal).
+/// Mirrors the TS/Go validator helpers.
+fn is_literal_expression(expr: &Expression) -> bool {
+    match expr {
+        Expression::BigIntLiteral { .. }
+        | Expression::BoolLiteral { .. }
+        | Expression::ByteStringLiteral { .. } => true,
+        Expression::UnaryExpr { op, operand } => {
+            *op == UnaryOp::Neg && matches!(operand.as_ref(), Expression::BigIntLiteral { .. })
+        }
+        _ => false,
+    }
+}
+
+/// Reports whether the expression is an array literal whose elements are all
+/// literal values (recursively, for nested FixedArray initializers).
+fn is_array_literal_of_literals(expr: &Expression) -> bool {
+    let Expression::ArrayLiteral { elements } = expr else {
+        return false;
+    };
+    elements.iter().all(|el| match el {
+        Expression::ArrayLiteral { .. } => is_array_literal_of_literals(el),
+        _ => is_literal_expression(el),
+    })
 }
 
 fn validate_property_type(type_node: &TypeNode, loc: &SourceLocation, errors: &mut Vec<Diagnostic>) {
@@ -306,9 +359,153 @@ fn validate_method(method: &MethodNode, contract: &ContractNode, errors: &mut Ve
     // Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
     validate_asm_usage(method, contract, errors);
 
+    // readonly properties may only be assigned in the constructor.
+    check_readonly_writes(method, contract, errors);
+
     // Validate all statements in method body
     for stmt in &method.body {
         validate_statement(stmt, errors);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Readonly property writes
+// ---------------------------------------------------------------------------
+
+/// Resolve the contract property an assignment target writes to, if any.
+/// Unwraps `IndexAccess` chains so `this.grid[i][j] = v` resolves to `grid`.
+fn written_property(target: &Expression) -> Option<&str> {
+    let mut node = target;
+    while let Expression::IndexAccess { object, .. } = node {
+        node = object.as_ref();
+    }
+    match node {
+        Expression::PropertyAccess { property } => Some(property.as_str()),
+        _ => None,
+    }
+}
+
+/// `spec/semantics.md`:
+///   `<this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property`
+///
+/// The constructor is exempt — that is where every contract initialises its
+/// readonly properties — so this runs per METHOD only (`validate_constructor`
+/// never calls in here).
+///
+/// Three AST shapes reach `update_prop` in ANF lowering and are all covered:
+/// `this.p = e`, `this.p++` / `this.p--`, and `this.arr[i] = e`.
+fn check_readonly_writes(
+    method: &MethodNode,
+    contract: &ContractNode,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let readonly: HashSet<&str> = contract
+        .properties
+        .iter()
+        .filter(|p| p.readonly)
+        .map(|p| p.name.as_str())
+        .collect();
+    if readonly.is_empty() {
+        return;
+    }
+
+    let mut hits: Vec<(String, SourceLocation)> = Vec::new();
+
+    fn visit_expr(
+        expr: &Expression,
+        loc: &SourceLocation,
+        readonly: &HashSet<&str>,
+        hits: &mut Vec<(String, SourceLocation)>,
+    ) {
+        walk_expression(expr, &mut |e| {
+            let operand = match e {
+                Expression::IncrementExpr { operand, .. } => operand.as_ref(),
+                Expression::DecrementExpr { operand, .. } => operand.as_ref(),
+                _ => return,
+            };
+            if let Some(name) = written_property(operand) {
+                if readonly.contains(name) {
+                    hits.push((name.to_string(), loc.clone()));
+                }
+            }
+        });
+    }
+
+    fn visit_statements(
+        stmts: &[Statement],
+        readonly: &HashSet<&str>,
+        hits: &mut Vec<(String, SourceLocation)>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Assignment {
+                    target,
+                    value,
+                    source_location,
+                } => {
+                    if let Some(name) = written_property(target) {
+                        if readonly.contains(name) {
+                            hits.push((name.to_string(), source_location.clone()));
+                        }
+                    }
+                    visit_expr(target, source_location, readonly, hits);
+                    visit_expr(value, source_location, readonly, hits);
+                }
+                Statement::VariableDecl {
+                    init,
+                    source_location,
+                    ..
+                } => visit_expr(init, source_location, readonly, hits),
+                Statement::ExpressionStatement {
+                    expression,
+                    source_location,
+                } => visit_expr(expression, source_location, readonly, hits),
+                Statement::ReturnStatement {
+                    value,
+                    source_location,
+                } => {
+                    if let Some(v) = value {
+                        visit_expr(v, source_location, readonly, hits);
+                    }
+                }
+                Statement::IfStatement {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    source_location,
+                } => {
+                    visit_expr(condition, source_location, readonly, hits);
+                    visit_statements(then_branch, readonly, hits);
+                    if let Some(else_body) = else_branch {
+                        visit_statements(else_body, readonly, hits);
+                    }
+                }
+                Statement::ForStatement {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    source_location,
+                } => {
+                    visit_statements(std::slice::from_ref(init.as_ref()), readonly, hits);
+                    visit_statements(std::slice::from_ref(update.as_ref()), readonly, hits);
+                    visit_expr(condition, source_location, readonly, hits);
+                    visit_statements(body, readonly, hits);
+                }
+            }
+        }
+    }
+
+    visit_statements(&method.body, &readonly, &mut hits);
+
+    for (name, loc) in hits {
+        errors.push(Diagnostic::error(
+            format!(
+                "cannot assign to readonly property '{}' in method '{}'. readonly properties may only be assigned in the constructor.",
+                name, method.name
+            ),
+            Some(loc),
+        ));
     }
 }
 

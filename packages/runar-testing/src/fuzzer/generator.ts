@@ -15,6 +15,7 @@ import type {
   Expr,
   Stmt,
   ForStmt,
+  IfStmt,
   RuinarType,
 } from './contract-ir.js';
 
@@ -908,6 +909,56 @@ export type BranchShape =
   | 'asymmetric-rebind'
   /** Both arms rebind BOTH locals — the balanced control for the above. */
   | 'both-arms-rebind-both'
+  /**
+   * The issue-#149 shape: an inner `if` that merges `merge0` in BOTH arms,
+   * nested inside an outer `if` with NO `else`, with `merge1` left LIVE and
+   * UNTOUCHED beside it.
+   *
+   * Every other member of this family has ONE `if`. Measured on the pre-#149
+   * generator, `arbGeneratedContract` reached a maximum `if`-nesting depth of 1
+   * over 3000 samples — it never nested, so `--execute` (which draws its whole
+   * corpus from here) was structurally blind to the defect while `--tri-modal`
+   * and `--spend-oracle` had both been extended to reach it.
+   *
+   * TWO degrees of freedom are required TOGETHER, which is why no combination
+   * of the single-`if` shapes above can stand in for it:
+   *
+   *  1. the inner `if` rebinds only a PREFIX of the carriers (`merge0`), so
+   *     `merge1` stays live and untouched in the slot region the outer arm
+   *     INHERITED from the parent — the slots an adopted result has to cross.
+   *     When every local is a declared result there is no inherited slot left
+   *     to rotate past and the adopt-then-remove sequence disturbs no layout;
+   *  2. the OUTER `if` has NO `else`, so only ONE outer path rearranges that
+   *     region: the two paths leave equal DEPTH with different LAYOUT, which is
+   *     invisible to both the reconcile's name-set check and Layer C's depth
+   *     check. With an outer `else` both paths get rearranged and every
+   *     post-`OP_ENDIF` read resolves the same way on either.
+   *
+   * The inner `if` keeps a real `else` on purpose: the confirmed #149 inner
+   * `if` had one, and the repair must not be gated on its absence.
+   *
+   * MEASURED, not asserted. Against the compiler with the `sinkBelow` repair in
+   * `lowerIf` (`packages/runar-compiler/src/passes/05-stack-lower.ts`)
+   * temporarily reverted, `--execute --num 1000` reports, per seed:
+   *
+   *      seed        WITHOUT this shape      WITH this shape
+   *      424242       0 / 11874 spends       11 / 11874 spends
+   *      20260817     0 / 11862 spends       14 / 11862 spends
+   *      909090       0 / 11712 spends       17 / 11712 spends
+   *
+   * and 0 on all three once the repair is restored. The left column is the gap
+   * this shape closes: the harness was not merely unlucky, the layout was
+   * OUTSIDE its reachable space. Note the rate — roughly 1 divergence per 1000
+   * contracts, because a divergence is only visible when the interpreter
+   * accepts the whole method (~7% of spends) — so a gate run at `--num 60`
+   * will NOT see a #149 regression even now.
+   *
+   * See `conformance/fuzzer/spend-shapes.ts` (`nested-sibling`) for the same
+   * two degrees of freedom in the Spend-oracle corpus, and
+   * `packages/runar-testing/src/__tests__/branch-inherited-layout-directions-vm.test.ts`
+   * for the hand-reduced witnesses in both directions.
+   */
+  | 'nested-sibling-no-else'
   /** A PROPERTY write inside an arm (stateful contracts only). */
   | 'prop-write-in-arm';
 
@@ -921,6 +972,7 @@ export const BRANCH_SHAPES: readonly BranchShape[] = [
   'multi-rebind-one-arm',
   'asymmetric-rebind',
   'both-arms-rebind-both',
+  'nested-sibling-no-else',
 ];
 
 /** Branch shapes reachable in a `StatefulSmartContract` — the stateless set
@@ -947,6 +999,11 @@ export function branchShapeCarriers(shape: BranchShape): string[] {
     case 'multi-rebind-one-arm':
     case 'asymmetric-rebind':
     case 'both-arms-rebind-both':
+    // `merge0` is the inner `if`'s declared result; `merge1` is the live
+    // untouched sibling it has to rotate past. Both are declared before the
+    // outer branch, in this order — `merge0` deeper, which is what puts an
+    // inherited slot between the adopted result and its stale pre-`if` copy.
+    case 'nested-sibling-no-else':
       return [...MERGE_LOCALS];
   }
 }
@@ -999,6 +1056,36 @@ function arbCarrierReadClause(
 }
 
 /**
+ * The ORDER-SENSITIVE post-branch read for `nested-sibling-no-else`:
+ * `merged <relop> sibling`, with `relop` drawn from the four RELATIONAL
+ * operators only.
+ *
+ * `===` / `!==` are deliberately excluded: they are symmetric in their
+ * operands, so a script that read the two slots CROSSED reports the same
+ * verdict as one that read them correctly, and every downstream oracle agrees
+ * on bytes that resolved the wrong stack positions. That is not hypothetical —
+ * it was measured directly on the tri-modal generator, whose commutative read
+ * clause reported agreement on a rotated layout. A relational read flips
+ * whenever the two values differ, which is the whole point of the shape.
+ */
+function arbSiblingReadClause(
+  merged: string,
+  sibling: string,
+): fc.Arbitrary<Stmt> {
+  return fc
+    .constantFrom('<' as const, '>' as const, '<=' as const, '>=' as const)
+    .map((op): Stmt => ({
+      kind: 'assert',
+      condition: {
+        kind: 'binary',
+        op,
+        left: { kind: 'var_ref', name: merged },
+        right: { kind: 'var_ref', name: sibling },
+      },
+    }));
+}
+
+/**
  * A branch block of the requested shape: carrier declarations, the branch (or
  * straight-line rebind), and the carrier read. `mutableProps` is the list of
  * writable bigint property names — empty for a stateless contract, which is
@@ -1033,6 +1120,52 @@ function arbBranchBlockIR(
   // The carriers are in scope for the rebind expressions and the read clause,
   // so an arm can read the other merged local as well as write its own.
   const inner = [...carriers, ...bigintVars];
+
+  if (shape === 'nested-sibling-no-else') {
+    // Drawn on its own so the other shapes' draw sequences are untouched: this
+    // is the only member that needs TWO conditions (outer and inner) and a
+    // dedicated read clause, and folding those into the shared tuple below
+    // would reshuffle the whole fixed-seed corpus for no gain.
+    const [merged, sibling] = carriers as [string, string];
+    return fc
+      .tuple(
+        fc.tuple(arbBigintExprIR(bigintVars, 1), arbBigintExprIR(bigintVars, 1)),
+        arbBoolExprIR(bigintVars, boolVars, 1),
+        arbBoolExprIR(bigintVars, boolVars, 1),
+        arbLocalRebind(merged, inner),
+        arbLocalRebind(merged, inner),
+        arbSiblingReadClause(merged, sibling),
+      )
+      .map(([inits, outerCond, innerCond, thenRebind, elseRebind, readClause]): Stmt[] => {
+        const decls: Stmt[] = carriers.map((name, i) => ({
+          kind: 'var_decl',
+          name,
+          type: 'bigint',
+          value: inits[i]!,
+          mutable: true,
+        }));
+        return [
+          ...decls,
+          {
+            kind: 'if',
+            condition: outerCond,
+            // NO else on the outer `if` — degree of freedom (2).
+            then: [
+              {
+                kind: 'if',
+                condition: innerCond,
+                // Only `merged` is rebound, so `sibling` stays live and
+                // untouched in the inherited region — degree of freedom (1).
+                then: [thenRebind],
+                else_: [elseRebind],
+              },
+            ],
+            else_: undefined,
+          },
+          readClause,
+        ];
+      });
+  }
 
   return fc
     .tuple(
@@ -1615,6 +1748,11 @@ export interface ExecCase {
    * generated IR and fails if the two disagree.
    */
   loopShape: ExecLoopShape | null;
+  /**
+   * The branch topology this case was drawn for, or `null` when it has no
+   * branch. Same LABEL contract as `loopShape`.
+   */
+  branchShape: ExecBranchShape | null;
 }
 
 /** Fixed ByteString length for all generated params/props — lets the byte-op
@@ -1792,6 +1930,79 @@ const EXEC_WACC = 'wacc';
 export function loopShapeCarriers(shape: ExecLoopShape): string[] {
   return shape === 'single-carrier' ? [EXEC_ACC] : [EXEC_ACC, EXEC_WACC];
 }
+
+// ---------------------------------------------------------------------------
+// Branch topologies (2026-08 — the second REACHABILITY hole)
+// ---------------------------------------------------------------------------
+
+/**
+ * Branch shapes for the exec-oracle method bodies.
+ *
+ * WHY THIS EXISTS — the same class of hole `ExecLoopShape` closed for loops.
+ * `arbExecMethodBody` emitted ZERO `if` statements, so `--execute` and
+ * `--tri-modal` — the only OTHER absolute oracles in the repo — had no
+ * randomized branch coverage at all. Every branch-merge miscompilation the
+ * project has shipped (PALMER-1, issue #149) was therefore outside their
+ * reachable space by construction: no seed, no run count and no time budget
+ * could have produced one.
+ *
+ * `nested-arm-sibling` is the issue-#149 shape and needs BOTH of its degrees of
+ * freedom drawn together — see the `ArmStyle` comment in
+ * `conformance/fuzzer/spend-shapes.ts` for the measurement that established
+ * that either half alone finds nothing.
+ */
+export type ExecBranchShape =
+  /** `if (c) { m0 = …; m1 = …; }` — single-armed, both merged locals are
+   *  declared results and the fall-through path rebinds neither. */
+  | 'flat-if'
+  /** `if (c) { … } else { … }` — both arms rebind both merged locals. */
+  | 'if-else'
+  /**
+   * The issue-#149 shape: an inner `if`/`else` NESTED inside the outer arm
+   * declares results for only a PREFIX of the locals (`m0`), leaving `m1` live
+   * and UNTOUCHED in the slot region the arm inherited — and the OUTER `if` has
+   * NO else, so its two paths leave equal depth with different layout.
+   */
+  | 'nested-arm-sibling';
+
+/** Every branch shape the exec-oracle corpus must be able to reach. */
+export const EXEC_BRANCH_SHAPES: readonly ExecBranchShape[] = [
+  'flat-if',
+  'if-else',
+  'nested-arm-sibling',
+];
+
+/** First merged local — a declared result of every branch shape. */
+const EXEC_M0 = 'm0';
+/** Second merged local. A declared result of `flat-if` / `if-else`; the LIVE
+ *  UNTOUCHED sibling of the inner `if` under `nested-arm-sibling`. */
+const EXEC_M1 = 'm1';
+/** A local declared alongside the merged ones that NO shape ever rebinds, and
+ *  that the terminal assert always reads. It keeps a live value in the branch
+ *  region on every path, so a rotation that crosses it is observable. */
+const EXEC_MSIB = 'msib';
+
+/** Branch-region locals a shape declares, in declaration order. */
+export function branchShapeLocals(_shape: ExecBranchShape): string[] {
+  return [EXEC_M0, EXEC_M1, EXEC_MSIB];
+}
+
+/** The locals a shape's arms actually REBIND (its declared results). */
+export function branchShapeMerged(shape: ExecBranchShape): string[] {
+  return shape === 'nested-arm-sibling' ? [EXEC_M0] : [EXEC_M0, EXEC_M1];
+}
+
+/**
+ * ORDER-SENSITIVE comparison ops only.
+ *
+ * `===` / `!==` are COMMUTATIVE, and that is exactly how the pre-existing
+ * terminal assert was blind: its clauses are all of the form `a + b <cmp> rhs`,
+ * which a pure slot SWAP of `a` and `b` leaves numerically unchanged. The
+ * oracle then reports AGREEMENT on a script that read the wrong slots. Every
+ * comparison in `arbBranchClause` is drawn from this list instead, so a
+ * transposition of two branch locals changes the asserted value.
+ */
+const EXEC_ORDER_CMP_OPS = ['<', '>', '<=', '>='] as const;
 
 interface LoopBounds {
   start: number;
@@ -2078,17 +2289,142 @@ function arbCarrierClause(carriers: string[], bigintVars: string[]): fc.Arbitrar
     );
 }
 
+/** A local (never property) assignment statement. */
+function localAssign(name: string, value: Expr): Stmt {
+  return { kind: 'assign', target: name, value, isProperty: false };
+}
+
+/**
+ * A branch condition that can go EITHER way at runtime. The left operand is
+ * always a real variable reference, never a literal: a condition of two
+ * literals is erased by the constant folder before stack lowering, which would
+ * put the branch shape in the corpus and never in front of the code under test
+ * (the same trap `arbExecStructure`'s "guarantee ONE runtime bigint" fix-up
+ * documents for loop bodies).
+ */
+function arbBranchCond(bigintVars: string[]): fc.Arbitrary<Expr> {
+  return fc
+    .tuple(
+      fc.constantFrom(...bigintVars),
+      fc.constantFrom(...EXEC_CMP_OPS),
+      arbAdditiveExpr(bigintVars, 1),
+    )
+    .map(([v, op, right]): Expr => ({ kind: 'binary', op, left: bigintVarRef(v), right }));
+}
+
+/**
+ * The branch block itself. `m0`/`m1` are the merged locals, `msib` is declared
+ * alongside them and rebound by nothing — see `ExecBranchShape`.
+ */
+function arbBranchBlock(shape: ExecBranchShape, bigintVars: string[]): fc.Arbitrary<IfStmt> {
+  const arm = (): fc.Arbitrary<Expr> => arbAdditiveExpr(bigintVars, 1);
+  const cond = (): fc.Arbitrary<Expr> => arbBranchCond(bigintVars);
+
+  if (shape === 'flat-if') {
+    return fc
+      .tuple(cond(), arm(), arm())
+      .map(([condition, a0, a1]): IfStmt => ({
+        kind: 'if',
+        condition,
+        then: [localAssign(EXEC_M0, a0), localAssign(EXEC_M1, a1)],
+      }));
+  }
+  if (shape === 'if-else') {
+    return fc
+      .tuple(cond(), arm(), arm(), arm(), arm())
+      .map(([condition, a0, a1, b0, b1]): IfStmt => ({
+        kind: 'if',
+        condition,
+        then: [localAssign(EXEC_M0, a0), localAssign(EXEC_M1, a1)],
+        else_: [localAssign(EXEC_M0, b0), localAssign(EXEC_M1, b1)],
+      }));
+  }
+  // 'nested-arm-sibling' — the issue-#149 shape. The inner `if` keeps a REAL
+  // else (the confirmed #149 inner `if` had one); the OUTER `if` deliberately
+  // has none, so its fall-through path preserves the pre-branch layout while
+  // the taken path rotates it.
+  return fc
+    .tuple(cond(), cond(), arm(), arm())
+    .map(([outer, inner, a0, b0]): IfStmt => ({
+      kind: 'if',
+      condition: outer,
+      then: [
+        {
+          kind: 'if',
+          condition: inner,
+          then: [localAssign(EXEC_M0, a0)],
+          else_: [localAssign(EXEC_M0, b0)],
+        },
+      ],
+    }));
+}
+
+/**
+ * The terminal clause that makes a branch-region slot rotation VISIBLE.
+ *
+ * Both conjuncts are ORDER-SENSITIVE between distinct branch locals, which the
+ * rest of the terminal assert is not: `arbParamClause` / `arbExtraClause` /
+ * `arbCarrierClause` all compare a COMMUTATIVE sum (`a + b <cmp> rhs`) against
+ * a threshold, so a pure swap of `a` and `b` leaves the value — and therefore
+ * the verdict — identical, and the oracle reports agreement on a script that
+ * read the wrong slots.
+ *
+ *   `m0 <op> m1`                      inverts under ANY m0/m1 transposition
+ *                                     with distinct values.
+ *   `m0 * K + m1  <op>  msib + atom`  a mixed-radix combination (K >= 2) that
+ *                                     no permutation of the three branch
+ *                                     locals leaves fixed, and which reads
+ *                                     `msib` so the sibling stays LIVE.
+ */
+function arbBranchClause(bigintVars: string[]): fc.Arbitrary<Expr> {
+  const v = (name: string): Expr => ({ kind: 'var_ref', name });
+  return fc
+    .tuple(
+      fc.constantFrom(...EXEC_ORDER_CMP_OPS),
+      fc.constantFrom(...EXEC_ORDER_CMP_OPS),
+      fc.integer({ min: 2, max: 8 }),
+      arbBigintAtom(bigintVars),
+    )
+    .map(([opPair, opRadix, k, atom]): Expr => ({
+      kind: 'binary',
+      op: '&&',
+      left: { kind: 'binary', op: opPair, left: v(EXEC_M0), right: v(EXEC_M1) },
+      right: {
+        kind: 'binary',
+        op: opRadix,
+        left: {
+          kind: 'binary',
+          op: '+',
+          left: {
+            kind: 'binary',
+            op: '*',
+            left: v(EXEC_M0),
+            right: { kind: 'bigint_literal', value: BigInt(k) },
+          },
+          right: v(EXEC_M1),
+        },
+        right: { kind: 'binary', op: '+', left: v(EXEC_MSIB), right: atom },
+      },
+    }));
+}
+
 /**
  * Generate the body of the single exec-oracle method for the given
  * props/params. `forceLoopShape` pins the loop topology (and forces a loop to
  * be present) — used by `arbExecCaseWithLoopShape` so a seeded test can prove
  * each shape is produced instead of arguing from probability.
+ * `forceBranchShape` does the same for the branch topology.
  */
 function arbExecMethodBody(
   props: GeneratedProperty[],
   params: GeneratedParam[],
   forceLoopShape?: ExecLoopShape,
-): fc.Arbitrary<{ body: Stmt[]; loopShape: ExecLoopShape | null }> {
+  forceBranchShape?: ExecBranchShape | 'none',
+): fc.Arbitrary<{
+  body: Stmt[];
+  loopShape: ExecLoopShape | null;
+  branchShape: ExecBranchShape | null;
+}> {
   const bigintPropParamVars = [
     ...props.filter((p) => p.type === 'bigint').map((p) => `this.${p.name}`),
     ...params.filter((p) => p.type === 'bigint').map((p) => p.name),
@@ -2112,6 +2448,21 @@ function arbExecMethodBody(
         : fc.constantFrom(...EXEC_LOOP_SHAPES)
       ).chain((shape) =>
         arbForLoop(shape, bigintPropParamVars).map((stmt) => ({ shape, stmt })),
+      ),
+      includeBranch:
+        forceBranchShape === 'none'
+          ? fc.constant(false)
+          : forceBranchShape !== undefined
+            ? fc.constant(true)
+            : fc.boolean(),
+      branchShape:
+        forceBranchShape !== undefined && forceBranchShape !== 'none'
+          ? fc.constant(forceBranchShape)
+          : fc.constantFrom(...EXEC_BRANCH_SHAPES),
+      branchInits: fc.tuple(
+        arbAdditiveExpr(bigintPropParamVars, 1),
+        arbAdditiveExpr(bigintPropParamVars, 1),
+        arbAdditiveExpr(bigintPropParamVars, 1),
       ),
       numByteDecls: bytesBase.length > 0 ? fc.integer({ min: 0, max: 2 }) : fc.constant(0),
       byteExprs: fc.array(arbBytesExpr(bytesBase.length > 0 ? bytesBase : [{ ref: { kind: 'bigint_literal', value: 0n }, minLen: 0 }], 2), {
@@ -2146,7 +2497,23 @@ function arbExecMethodBody(
           mutable: true,
         });
       }
-      const bigintVars = [...carriers, ...bigintPropParamVars];
+      // Branch-region locals, declared alongside the carriers so the branch
+      // block below has an inherited slot region to rearrange. Only declared
+      // when a branch is actually drawn — an untouched local would otherwise be
+      // eliminated and put a shape in the corpus that never reaches codegen.
+      const branchShape = cfg.includeBranch ? cfg.branchShape : null;
+      const branchLocals = branchShape === null ? [] : branchShapeLocals(branchShape);
+      branchLocals.forEach((name, i) => {
+        body.push({
+          kind: 'var_decl',
+          name,
+          type: 'bigint',
+          value: cfg.branchInits[i]!,
+          mutable: true,
+        });
+      });
+
+      const bigintVars = [...carriers, ...branchLocals, ...bigintPropParamVars];
 
       if (cfg.includeLoop) body.push(cfg.loop.stmt);
 
@@ -2170,15 +2537,31 @@ function arbExecMethodBody(
         .tuple(
           arbParamClause(param, bigintVars, bytesVars),
           arbCarrierClause(carriers, bigintVars),
+          branchShape === null ? fc.constant(null) : arbBranchBlock(branchShape, bigintVars),
+          branchShape === null ? fc.constant(null) : arbBranchClause(bigintVars),
         )
-        .map(([clause, carrierClause]): { body: Stmt[]; loopShape: ExecLoopShape | null } => {
+        .map(([clause, carrierClause, branchStmt, branchClause]): {
+          body: Stmt[];
+          loopShape: ExecLoopShape | null;
+          branchShape: ExecBranchShape | null;
+        } => {
           const base: Expr = cfg.useExtra
             ? { kind: 'binary', op: cfg.logicalOp, left: clause, right: cfg.extra }
             : clause;
-          const condition: Expr = cfg.includeLoop
+          let condition: Expr = cfg.includeLoop
             ? { kind: 'binary', op: '&&', left: base, right: carrierClause }
             : base;
-          return { body: [...body, { kind: 'assert', condition }], loopShape };
+          // The branch block sits AFTER the loop, so the loop's carriers are
+          // already settled and the branch rearranges a region that has live
+          // neighbours above AND below it.
+          const stmts = [...body];
+          if (branchStmt !== null) {
+            stmts.push(branchStmt);
+            // Conjoined LAST: an order-sensitive read of the branch region is
+            // what turns a slot rotation into a verdict change.
+            condition = { kind: 'binary', op: '&&', left: condition, right: branchClause! };
+          }
+          return { body: [...stmts, { kind: 'assert', condition }], loopShape, branchShape };
         });
     });
 }
@@ -2200,10 +2583,14 @@ interface ExecStructure {
   contract: GeneratedContract;
   method: GeneratedMethod;
   loopShape: ExecLoopShape | null;
+  branchShape: ExecBranchShape | null;
 }
 
 /** Generate the structural shell (contract + its single method). */
-function arbExecStructure(forceLoopShape?: ExecLoopShape): fc.Arbitrary<ExecStructure> {
+function arbExecStructure(
+  forceLoopShape?: ExecLoopShape,
+  forceBranchShape?: ExecBranchShape | 'none',
+): fc.Arbitrary<ExecStructure> {
   return fc
   .record({
     name: fc.integer({ min: 0, max: 9999 }).map((n) => `ExecFuzz${n}`),
@@ -2243,27 +2630,33 @@ function arbExecStructure(forceLoopShape?: ExecLoopShape): fc.Arbitrary<ExecStru
     const hasBigint =
       properties.some((p) => p.type === 'bigint') || params.some((p) => p.type === 'bigint');
     if (!hasBigint) params[0]!.type = 'bigint';
-    return arbExecMethodBody(properties, params, forceLoopShape).map(({ body, loopShape }) => {
-      const method: GeneratedMethod = {
-        name: s.methodName,
-        visibility: 'public',
-        params,
-        body,
-        mutatesState: false,
-      };
-      const contract: GeneratedContract = {
-        name: s.name,
-        parentClass: 'SmartContract',
-        properties,
-        methods: [method],
-      };
-      return { contract, method, loopShape };
-    });
+    return arbExecMethodBody(properties, params, forceLoopShape, forceBranchShape).map(
+      ({ body, loopShape, branchShape }) => {
+        const method: GeneratedMethod = {
+          name: s.methodName,
+          visibility: 'public',
+          params,
+          body,
+          mutatesState: false,
+        };
+        const contract: GeneratedContract = {
+          name: s.name,
+          parentClass: 'SmartContract',
+          properties,
+          methods: [method],
+        };
+        return { contract, method, loopShape, branchShape };
+      },
+    );
   });
 }
 
-function arbExecCaseOf(forceLoopShape?: ExecLoopShape): fc.Arbitrary<ExecCase> {
-  return arbExecStructure(forceLoopShape).chain(({ contract, method, loopShape }) => {
+function arbExecCaseOf(
+  forceLoopShape?: ExecLoopShape,
+  forceBranchShape?: ExecBranchShape | 'none',
+): fc.Arbitrary<ExecCase> {
+  return arbExecStructure(forceLoopShape, forceBranchShape).chain(
+    ({ contract, method, loopShape, branchShape }) => {
     const ctorEntries = contract.properties.map(
       (p) => [p.name, arbExecValue(p.type)] as const,
     );
@@ -2281,9 +2674,11 @@ function arbExecCaseOf(forceLoopShape?: ExecLoopShape): fc.Arbitrary<ExecCase> {
         constructorArgs,
         args,
         loopShape,
+        branchShape,
       }),
     );
-  });
+    },
+  );
 }
 
 /**
@@ -2299,7 +2694,24 @@ export const arbExecCase: fc.Arbitrary<ExecCase> = arbExecCaseOf();
  * turns "every shape is reachable" from a probability argument into a
  * deterministic, per-shape assertion (the fast-check analogue of the
  * round-robin family draw in `conformance/fuzzer/spend-shapes.ts`).
+ *
+ * The branch block is SUPPRESSED here: this probe exists to assert facts about
+ * a loop shape's carriers (that the declared mutable locals are EXACTLY that
+ * shape's carriers, among others), and a branch block legitimately declares
+ * more. Branch topologies get their own pinned probe in
+ * `arbExecCaseWithBranchShape`, and the composite `arbExecCase` still draws
+ * loops and branches together.
  */
 export function arbExecCaseWithLoopShape(shape: ExecLoopShape): fc.Arbitrary<ExecCase> {
-  return arbExecCaseOf(shape);
+  return arbExecCaseOf(shape, 'none');
+}
+
+/**
+ * The same generator with the BRANCH topology PINNED — the branch-shape
+ * analogue of `arbExecCaseWithLoopShape`, and the reason the reachability of
+ * `nested-arm-sibling` is a deterministic assertion rather than a probability
+ * argument.
+ */
+export function arbExecCaseWithBranchShape(shape: ExecBranchShape): fc.Arbitrary<ExecCase> {
+  return arbExecCaseOf(undefined, shape);
 }

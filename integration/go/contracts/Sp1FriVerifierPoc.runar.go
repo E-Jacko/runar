@@ -2,6 +2,18 @@ package contracts
 
 import runar "github.com/icellan/runar/packages/runar-go"
 
+// @acknowledgeUnsoundSP1FriVerifier
+//
+// THIS CONTRACT COMPILES TO AN UNSOUND VERIFIER AND MUST NOT HOLD VALUE.
+//
+// The directive above is required as of 2026-08-17: without it the compiler
+// REFUSES to emit `verifySP1FRI`, because the per-query chain (input-batch MMCS
+// verify, FRI fold, final-poly equality) is never emitted and the locking
+// script therefore ACCEPTS forged Merkle openings. This file carries the
+// directive because it exists to develop and pin that very gap — the
+// corruption fixtures in tests/vectors/sp1/fri/corruptions are replayed through
+// the script it produces. It is not an example to copy.
+//
 // Sp1FriVerifierPoc exercises the `runar.VerifySP1FRI` intrinsic at the
 // frontend level so covenant authors can write ABIs against it before the
 // STARK verifier codegen body lands.

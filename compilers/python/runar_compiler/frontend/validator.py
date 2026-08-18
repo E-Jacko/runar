@@ -11,9 +11,11 @@ from dataclasses import dataclass, field
 import re
 
 from runar_compiler.frontend.ast_nodes import (
+    ArrayLiteralExpr,
     AssignmentStmt,
     BigIntLiteral,
     BinaryExpr,
+    BoolLiteral,
     ByteStringLiteral,
     CallExpr,
     ContractNode,
@@ -135,6 +137,25 @@ class _ValidationContext:
                     "and must not be declared",
                     loc=prop.source_location,
                 )
+
+            # Validate initializer if present. FixedArray properties accept an
+            # array literal of literal elements (recursively, for nested
+            # arrays); other properties accept a plain literal value. Mirrors
+            # the TS validator in `02-validate.ts` and the Go peer in
+            # `validator.go`.
+            if prop.initializer is not None:
+                if isinstance(prop.type, FixedArrayType):
+                    if not _is_array_literal_of_literals(prop.initializer):
+                        self._add_error(
+                            f"property '{prop.name}' initializer must be an "
+                            f"array literal of literal values",
+                            loc=prop.source_location,
+                        )
+                elif not _is_literal_expression(prop.initializer):
+                    self._add_error(
+                        f"property '{prop.name}' initializer must be a literal value",
+                        loc=prop.source_location,
+                    )
 
         # SmartContract (and the asm-escape-hatch UnsafeSmartContract) require
         # all properties to be readonly.
@@ -297,9 +318,81 @@ class _ValidationContext:
         # Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
         self._validate_asm_usage(method)
 
+        # readonly properties may only be assigned in the constructor.
+        self._check_readonly_writes(method)
+
         # Validate statements
         for stmt in method.body:
             self._validate_statement(stmt)
+
+    # -------------------------------------------------------------------
+    # Readonly property writes
+    # -------------------------------------------------------------------
+
+    def _check_readonly_writes(self, method) -> None:
+        """Report every write to a readonly contract property in a method body.
+
+        ``spec/semantics.md``::
+
+            <this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property
+
+        The constructor is exempt -- that is where every contract initialises
+        its readonly properties -- so this runs per METHOD only
+        (``validate_constructor`` never calls in here).
+
+        Three AST shapes reach ``update_prop`` in ANF lowering and are all
+        covered: ``this.p = e``, ``this.p++`` / ``this.p--``, and
+        ``this.arr[i] = e``.
+        """
+        readonly = {p.name for p in self.contract.properties if p.readonly}
+        if not readonly:
+            return
+
+        def report(name: str, loc: SourceLocation | None) -> None:
+            self._add_error(
+                f"cannot assign to readonly property '{name}' in method "
+                f"'{method.name}'. readonly properties may only be assigned "
+                f"in the constructor.",
+                loc=loc,
+            )
+
+        def visit_expr(expr: Expression | None, loc: SourceLocation | None) -> None:
+            if expr is None:
+                return
+
+            def visitor(e: Expression) -> None:
+                if not isinstance(e, (IncrementExpr, DecrementExpr)):
+                    return
+                name = _written_property(e.operand)
+                if name is not None and name in readonly:
+                    report(name, loc)
+
+            _walk_expr(expr, visitor)
+
+        def visit_statements(stmts) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, AssignmentStmt):
+                    name = _written_property(stmt.target)
+                    if name is not None and name in readonly:
+                        report(name, stmt.source_location)
+                    visit_expr(stmt.target, stmt.source_location)
+                    visit_expr(stmt.value, stmt.source_location)
+                elif isinstance(stmt, VariableDeclStmt):
+                    visit_expr(stmt.init, stmt.source_location)
+                elif isinstance(stmt, ExpressionStmt):
+                    visit_expr(stmt.expr, stmt.source_location)
+                elif isinstance(stmt, ReturnStmt):
+                    visit_expr(stmt.value, stmt.source_location)
+                elif isinstance(stmt, IfStmt):
+                    visit_expr(stmt.condition, stmt.source_location)
+                    visit_statements(stmt.then)
+                    visit_statements(stmt.else_)
+                elif isinstance(stmt, ForStmt):
+                    visit_statements([stmt.init, stmt.update])
+                    visit_expr(stmt.condition, stmt.source_location)
+                    visit_statements(stmt.body)
+
+        visit_statements(method.body)
 
     # -------------------------------------------------------------------
     # asm() intrinsic validation
@@ -760,6 +853,49 @@ def _callee_property(callee: Expression | None) -> str | None:
     if isinstance(callee, MemberExpr):
         return callee.property
     return None
+
+
+def _written_property(target: Expression | None) -> str | None:
+    """Resolve the contract property an assignment target writes to, if any.
+
+    Unwraps ``IndexAccessExpr`` chains so ``this.grid[i][j] = v`` resolves to
+    ``grid``.
+    """
+    node = target
+    while isinstance(node, IndexAccessExpr):
+        node = node.object
+    if isinstance(node, PropertyAccessExpr):
+        return node.property
+    return None
+
+
+def _is_literal_expression(expr: Expression | None) -> bool:
+    """Whether the expression is a literal allowed as a property initializer.
+
+    bigint, bool, bytestring, or a negated bigint literal. Mirrors the TS/Go
+    validator helpers.
+    """
+    if isinstance(expr, (BigIntLiteral, BoolLiteral, ByteStringLiteral)):
+        return True
+    if isinstance(expr, UnaryExpr) and expr.op == "-":
+        return isinstance(expr.operand, BigIntLiteral)
+    return False
+
+
+def _is_array_literal_of_literals(expr: Expression | None) -> bool:
+    """Whether the expression is an array literal of literal values.
+
+    Recursive, for nested FixedArray initializers.
+    """
+    if not isinstance(expr, ArrayLiteralExpr):
+        return False
+    for el in expr.elements:
+        if isinstance(el, ArrayLiteralExpr):
+            if not _is_array_literal_of_literals(el):
+                return False
+        elif not _is_literal_expression(el):
+            return False
+    return True
 
 
 def _walk_expressions_in_body(stmts: list[Statement], visitor) -> None:

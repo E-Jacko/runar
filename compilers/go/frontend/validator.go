@@ -62,6 +62,21 @@ func Validate(contract *ContractNode) *ValidationResult {
 		}
 	}
 
+	// See sp1_fri_soundness_warning.go: the deployable SP1 FRI verifier accepts
+	// forged Merkle openings at the PoC parameter set. Say so at compile time,
+	// not only in a doc a caller of the built-in would never open.
+	if contractCallsSP1FriVerifier(contract) {
+		if contract.AckUnsoundSP1Fri {
+			// Explicitly opted in (verifier development / the PoC contract):
+			// still say it, loudly, on every compile.
+			ctx.addWarning(sp1FriSoundnessWarning)
+		} else {
+			// Default: REFUSE. Documenting an unsound verifier is not the same
+			// as preventing its deployment, and this one accepts forged proofs.
+			ctx.addError(sp1FriSoundnessError)
+		}
+	}
+
 	return &ValidationResult{
 		Errors:   ctx.errors,
 		Warnings: ctx.warnings,
@@ -370,10 +385,114 @@ func (ctx *validationContext) validateMethod(method MethodNode) {
 	// Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
 	ctx.validateAsmUsage(method)
 
+	// readonly properties may only be assigned in the constructor.
+	ctx.checkReadonlyWrites(method)
+
 	// Validate statements
 	for _, stmt := range method.Body {
 		ctx.validateStatement(stmt)
 	}
+}
+
+// checkReadonlyWrites reports every write to a readonly contract property in
+// a method body.
+//
+// spec/semantics.md:
+//
+//	<this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property
+//
+// The constructor is exempt — that is where every contract initialises its
+// readonly properties — so this runs per METHOD only (validateConstructor
+// never calls in here).
+//
+// Three AST shapes reach update_prop in ANF lowering and are all covered:
+// `this.p = e`, `this.p++` / `this.p--`, and `this.arr[i] = e`.
+func (ctx *validationContext) checkReadonlyWrites(method MethodNode) {
+	readonly := make(map[string]bool)
+	for _, prop := range ctx.contract.Properties {
+		if prop.Readonly {
+			readonly[prop.Name] = true
+		}
+	}
+	if len(readonly) == 0 {
+		return
+	}
+
+	report := func(name string, loc SourceLocation) {
+		ctx.addErrorWithLoc(fmt.Sprintf(
+			"cannot assign to readonly property '%s' in method '%s'. readonly properties may only be assigned in the constructor.",
+			name, method.Name,
+		), &loc)
+	}
+
+	var visitStatements func(stmts []Statement)
+	visitExpr := func(expr Expression, loc SourceLocation) {
+		if expr == nil {
+			return
+		}
+		walkExpr(expr, func(e Expression) {
+			var operand Expression
+			switch v := e.(type) {
+			case IncrementExpr:
+				operand = v.Operand
+			case DecrementExpr:
+				operand = v.Operand
+			default:
+				return
+			}
+			if name, ok := writtenProperty(operand); ok && readonly[name] {
+				report(name, loc)
+			}
+		})
+	}
+
+	visitStatements = func(stmts []Statement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case AssignmentStmt:
+				if name, ok := writtenProperty(s.Target); ok && readonly[name] {
+					report(name, s.SourceLocation)
+				}
+				visitExpr(s.Target, s.SourceLocation)
+				visitExpr(s.Value, s.SourceLocation)
+			case VariableDeclStmt:
+				visitExpr(s.Init, s.SourceLocation)
+			case ExpressionStmt:
+				visitExpr(s.Expr, s.SourceLocation)
+			case ReturnStmt:
+				visitExpr(s.Value, s.SourceLocation)
+			case IfStmt:
+				visitExpr(s.Condition, s.SourceLocation)
+				visitStatements(s.Then)
+				visitStatements(s.Else)
+			case ForStmt:
+				visitStatements([]Statement{s.Init, s.Update})
+				visitExpr(s.Condition, s.SourceLocation)
+				visitStatements(s.Body)
+			}
+		}
+	}
+
+	visitStatements(method.Body)
+}
+
+// writtenProperty resolves the contract property an assignment target writes
+// to. Unwraps IndexAccessExpr chains so `this.grid[i][j] = v` resolves to
+// `grid`.
+func writtenProperty(target Expression) (string, bool) {
+	node := target
+	for {
+		idx, ok := node.(IndexAccessExpr)
+		if !ok {
+			break
+		}
+		node = idx.Object
+	}
+	pa, ok := node.(PropertyAccessExpr)
+	if !ok {
+		return "", false
+	}
+	return pa.Property, true
 }
 
 // isAsmCall reports whether expr is a call to the asm compiler intrinsic.

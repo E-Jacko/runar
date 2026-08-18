@@ -75,6 +75,36 @@ export async function mine(blocks: number): Promise<void> {
   }
 }
 
+/**
+ * Mine until `txid` has at least one confirmation, or fail loudly.
+ *
+ * A bare `mine(1)` is a RACE: the node must have accepted the tx into its
+ * mempool AND selected it for the block template before that block is built.
+ * Under a full suite (many tests broadcasting and mining against one node)
+ * that ordering is not guaranteed, so the block can land without the tx and a
+ * `confirmations > 0` assertion fails on timing rather than on consensus.
+ *
+ * Observed exactly that: `bip143-crosstier` failed with "expected 0 to be
+ * greater than 0" inside `run-all.sh` while passing 4/4 in isolation.
+ *
+ * This keeps the assertion's strength — the tx must really enter a block — and
+ * only removes the assumption that one block suffices.
+ */
+export async function mineUntilConfirmed(txid: string, maxBlocks = 5): Promise<number> {
+  for (let i = 0; i < maxBlocks; i++) {
+    await mine(1);
+    const tx = (await rpcCall('getrawtransaction', txid, true)) as {
+      confirmations?: number;
+    };
+    const confirmations = tx.confirmations ?? 0;
+    if (confirmations > 0) return confirmations;
+  }
+  throw new Error(
+    `tx ${txid} still unconfirmed after mining ${maxBlocks} blocks — ` +
+      `it was accepted to the mempool but never selected into a block`,
+  );
+}
+
 export async function getBlockCount(): Promise<number> {
   return (await rpcCall('getblockcount')) as number;
 }

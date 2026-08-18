@@ -46,6 +46,16 @@ def _unary(name, op, operand):
     return {'name': name, 'value': {'kind': 'unary_op', 'op': op, 'operand': operand}}
 
 
+def _alias(name, target):
+    """The ``@ref:`` alias binding the ANF lowering emits for a named local.
+
+    ``const left: bigint = this.a << 3n`` lowers to ``t2 = a << 3n`` followed
+    by ``left = @ref:t2``, and the consumer reads ``left``. Real compiler
+    output routes almost every byte-op result through one of these.
+    """
+    return {'name': name, 'value': {'kind': 'load_const', 'value': f'@ref:{target}'}}
+
+
 class TestShiftTruthTable:
     @pytest.mark.parametrize(
         "op,a,b,expected",
@@ -155,3 +165,295 @@ class TestChainedByteThreading:
             _bin("result", "&", "shifted", "c"),
         ])
         assert env["result"] == 0
+
+
+class TestNonMinimalNumericOperandAborts:
+    """A shift PRESERVES its operand's byte length, so ``1 >> 1`` leaves the
+    1-byte array ``[0x00]`` -- a NON-minimal zero (minimal zero is the empty
+    array).
+
+    Every NUMERIC consumer on-chain decodes with ``fRequireMinimal=True`` and
+    ABORTS on a non-minimal encoding: OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD,
+    OP_NUMEQUAL/OP_NUMNOTEQUAL and the relational ops, and a shift's COUNT
+    operand. The interpreter threaded the real stack bytes through the byte
+    ops but the numeric path read only the decoded value, re-minimising
+    ``[0x00]`` to ``0``. ``assert((n >> 1) == 0)`` with ``n = 1`` therefore
+    reported a clean spend off-chain while the deployed script aborts --
+    the UTXO becomes permanently unspendable.
+    """
+
+    # Prefix shared by every case: ``shifted`` = 1 >> 1 -> raw bytes [0x00].
+    PREFIX = [
+        _const("a", 1),
+        _const("b", 1),
+        _bin("shifted", ">>", "a", "b"),
+        _const("zero", 0),
+        _const("one", 1),
+    ]
+
+    @pytest.mark.parametrize(
+        "op,left,right",
+        [
+            # The canonical funds-locking guard.
+            ("===", "shifted", "zero"),
+            # ...and with the non-minimal operand on the right.
+            ("===", "zero", "shifted"),
+            ("+", "shifted", "one"),
+            ("-", "shifted", "one"),
+            ("*", "shifted", "one"),
+            ("/", "shifted", "one"),
+            ("%", "shifted", "one"),
+            ("!==", "shifted", "one"),
+            ("<", "shifted", "one"),
+            ("<=", "shifted", "one"),
+            (">", "shifted", "one"),
+            (">=", "shifted", "one"),
+            # A shift's COUNT operand IS read as a number -> fRequireMinimal.
+            ("<<", "one", "shifted"),
+            (">>", "one", "shifted"),
+        ],
+    )
+    def test_non_minimal_operand_aborts(self, op, left, right):
+        with pytest.raises(ValueError, match="non-minimally encoded"):
+            _run_chain(self.PREFIX + [_bin("result", op, left, right)])
+
+
+class TestMinimalOperandsStillAccepted:
+    """CONTROLS. None of these carry a non-minimal encoding into a numeric
+    consumer, so all must keep evaluating exactly as before.
+    """
+
+    def test_minimal_shift_result_still_compares(self):
+        # 2>>1 leaves [0x01] -- that IS the minimal encoding of 1, so the
+        # numeric compare is legal on-chain.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 1),
+            _bin("shifted", ">>", "a", "b"),
+            _const("one", 1),
+            _bin("result", "===", "shifted", "one"),
+        ])
+        assert env["result"] is True
+
+    def test_or_on_non_minimal_equal_length_operands_still_works(self):
+        # `& | ^` are NOT fRequireMinimal -- they take non-minimal bytes and
+        # only require equal length. (2<<8) is the 1-byte [0x00]; OR with
+        # [0x05] gives [0x05], which is minimal, so `=== 5` is legal too.
+        # Pinned by conformance/fuzz-regressions/entries/
+        # 2026-07-14-chained-shift-or-nonminimal -- rejecting this is WRONG.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),
+            _const("c", 5),
+            _bin("ored", "|", "shifted", "c"),
+            _bin("result", "===", "ored", "c"),
+        ])
+        assert env["ored"] == 5
+        assert env["result"] is True
+
+    def test_shift_value_operand_may_be_non_minimal(self):
+        # A shift's VALUE operand is not fRequireMinimal either: (2<<8) is
+        # [0x00], shifting it again is legal and stays 1 byte.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),
+            _const("one", 1),
+            _bin("again", "<<", "shifted", "one"),
+            _const("c", 5),
+            _bin("ored", "|", "again", "c"),
+        ])
+        assert env["ored"] == 5
+
+    def test_invert_of_non_minimal_still_works(self):
+        # OP_INVERT is a byte op; ~(2<<8) = [0xff] = -127, itself minimal.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),
+            _unary("inv", "~", "shifted"),
+            _const("m127", -127),
+            _bin("result", "===", "inv", "m127"),
+        ])
+        assert env["result"] is True
+
+    def test_plain_arithmetic_unaffected(self):
+        env = _run_chain([
+            _const("a", 1),
+            _const("b", 1),
+            _bin("sum", "+", "a", "b"),
+            _const("two", 2),
+            _bin("result", "===", "sum", "two"),
+        ])
+        assert env["result"] is True
+
+
+class TestAliasCarriesScriptBytes:
+    """``@ref:`` alias bindings must carry the threaded stack bytes.
+
+    The lowering turns every named local into an alias, so almost every byte-op
+    result passes through one before it reaches a consumer. The side map is
+    keyed by binding name, so an alias that does not copy the entry drops the
+    real stack bytes -- silently disabling BOTH the non-minimal numeric check
+    AND the chained byte-op threading, on exactly the shape the compiler emits.
+
+    ``conformance/tests/shift-ops`` is a live example: ``left = this.a << 3n;
+    assert(left >= 0n || left < 0n)``. With ``a = 32`` the shift leaves the
+    1-byte ``[0x00]`` and OP_GREATERTHANOREQUAL aborts on chain.
+    """
+
+    def test_aliased_non_minimal_result_aborts_numeric_consumer(self):
+        with pytest.raises(ValueError, match="OP_NUMEQUAL: non-minimally encoded"):
+            _run_chain([
+                _const("a", 1),
+                _const("b", 1),
+                _bin("shifted", ">>", "a", "b"),   # raw [0x00]
+                _alias("s", "shifted"),            # const s = a >> 1
+                _const("zero", 0),
+                _bin("result", "===", "s", "zero"),
+            ])
+
+    def test_aliased_non_minimal_bytes_still_feed_a_byte_op(self):
+        # CONTROL, and a regression for the byte-op threading itself: an alias
+        # that drops the entry makes OP_OR re-derive 0's EMPTY encoding and
+        # abort on a length mismatch the chain never sees.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),   # raw [0x00]
+            _alias("s", "shifted"),            # const s = a << 8
+            _const("c", 5),
+            _bin("ored", "|", "s", "c"),
+            _bin("result", "===", "ored", "c"),
+        ])
+        assert env["ored"] == 5
+        assert env["result"] is True
+
+    def test_aliased_minimal_result_still_accepted(self):
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 1),
+            _bin("shifted", ">>", "a", "b"),   # raw [0x01] -- minimal
+            _alias("s", "shifted"),
+            _const("one", 1),
+            _bin("result", "===", "s", "one"),
+        ])
+        assert env["result"] is True
+
+
+def _call(name, func, *args):
+    return {'name': name, 'value': {'kind': 'call', 'func': func, 'args': list(args)}}
+
+
+class TestNonMinimalOperandThroughUnaryOrBuiltin:
+    """The binary-op gate only sees a value consumed by a BINARY numeric op.
+
+    A non-minimal shift result can reach a UNARY op or a numeric BUILTIN
+    without passing through one, and those opcodes decode with
+    ``fRequireMinimal=True`` as well::
+
+        abs(n >> 1)    OP_ABS
+        bool(n >> 1)   OP_0NOTEQUAL
+        !(n >> 1)      OP_NOT
+        -(n >> 1)      OP_NEGATE
+
+    With ``n = 1`` the shift leaves the 1-byte ``[0x00]``. Reading only the
+    decoded value re-minimises it to ``0``, reports a clean spend, and the
+    deployed script aborts -- the UTXO is unspendable.
+
+    Mirrors the TS reference widening at the ``toBigInt`` / ``toBool`` funnels
+    in packages/runar-testing/src/interpreter/interpreter.ts.
+    """
+
+    # Prefix shared by every case: ``shifted`` = 1 >> 1 -> raw bytes [0x00].
+    PREFIX = [
+        _const("a", 1),
+        _const("b", 1),
+        _bin("shifted", ">>", "a", "b"),
+        _const("zero", 0),
+        _const("one", 1),
+    ]
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            _call("result", "abs", "shifted"),
+            _call("result", "bool", "shifted"),
+            _call("result", "sign", "shifted"),
+            _call("result", "min", "shifted", "one"),
+            _call("result", "min", "one", "shifted"),
+            _call("result", "max", "shifted", "one"),
+            _call("result", "within", "shifted", "zero", "one"),
+            _call("result", "safediv", "shifted", "one"),
+            _call("result", "clamp", "shifted", "zero", "one"),
+            _unary("result", "-", "shifted"),
+            _unary("result", "!", "shifted"),
+        ],
+        ids=[
+            "abs", "bool", "sign", "min-left", "min-right", "max",
+            "within", "safediv", "clamp", "unary-minus", "unary-not",
+        ],
+    )
+    def test_non_minimal_unary_or_builtin_operand_aborts(self, tail):
+        with pytest.raises(ValueError, match="non-minimally encoded"):
+            _run_chain(self.PREFIX + [tail])
+
+    def test_aliased_non_minimal_operand_aborts_through_a_builtin(self):
+        with pytest.raises(ValueError, match="non-minimally encoded"):
+            _run_chain([
+                _const("a", 1),
+                _const("b", 1),
+                _bin("shifted", ">>", "a", "b"),   # raw [0x00]
+                _alias("s", "shifted"),            # const s = a >> 1
+                _call("result", "abs", "s"),
+            ])
+
+
+class TestUnaryAndBuiltinControls:
+    """CONTROLS for the widened gate. Each must keep evaluating."""
+
+    def test_minimal_operand_through_a_builtin_still_accepted(self):
+        # 2>>1 leaves [0x01] -- the minimal encoding of 1, legal at OP_ABS.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 1),
+            _bin("shifted", ">>", "a", "b"),
+            _call("result", "abs", "shifted"),
+        ])
+        assert env["result"] == 1
+
+    def test_bytestring_builtin_arg_never_gated(self):
+        # A ByteString argument can never carry a threaded-bytes entry (only
+        # the NUMERIC byte-op path records one), so the hashing/length
+        # builtins are untouched by the widened gate.
+        env = _run_chain([
+            _const("h", "0102030405"),
+            _call("result", "len", "h"),
+        ])
+        assert env["result"] == 5
+
+    def test_invert_of_non_minimal_still_works_after_widening(self):
+        # `~` is a byte op with its own path -- it must NOT be gated.
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),   # raw [0x00] -- NON-minimal
+            _unary("inv", "~", "shifted"),     # OP_INVERT -> [0xff] = -127
+            _const("m127", -127),
+            _bin("result", "===", "inv", "m127"),
+        ])
+        assert env["result"] is True
+
+    def test_or_of_non_minimal_still_works_after_widening(self):
+        env = _run_chain([
+            _const("a", 2),
+            _const("b", 8),
+            _bin("shifted", "<<", "a", "b"),
+            _alias("s", "shifted"),
+            _const("c", 5),
+            _bin("ored", "|", "s", "c"),
+            _bin("result", "===", "ored", "c"),
+        ])
+        assert env["ored"] == 5
+        assert env["result"] is True
