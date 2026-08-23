@@ -71,8 +71,8 @@ theorem lowerValueP_call_cat_d1d0
     (hLU_b : Stack.Lower.isLastUse [(b, 0), (a, 0)] b 0 = true)
     (hab : a ≠ b) :
     Stack.Lower.lowerValueP progMethods props budget 0
-        [(b, 0), (a, 0)] [] [d] constInts [b, a] d (.call "cat" [a, b])
-      = ([.swap, .swap, .opcode "OP_CAT"], [d], [d]) := by
+        [(b, 0), (a, 0)] [] [d] constInts ([b, a] : Stack.Lower.StackMap) d (.call "cat" [a, b])
+      = ([.swap, .swap, .opcode "OP_CAT"], ([d] : Stack.Lower.StackMap), [d]) := by
   have hL : ∀ (smx : Stack.Lower.StackMap) (ci : Nat) (lu : List (String × Nat))
       (oprot : List String),
       Stack.Lower.loadRefOperand smx a [a, b] ci lu oprot
@@ -84,16 +84,16 @@ theorem lowerValueP_call_cat_d1d0
         = Stack.Lower.loadRefLive smx b ci lu oprot :=
     fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_right smx a b ci lu oprot hab
   have hLoadA : Stack.Lower.loadRefLive [b, a] a 0 [(b, 0), (a, 0)] []
-      = ([.swap], [a, b]) := by
+      = ([.swap], ([a, b] : Stack.Lower.StackMap)) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
-    have hfa : ([b, a] : Stack.Lower.StackMap).findIdx? (· == a) = some 1 := by
+    have hfa : ([b, a] : Stack.Lower.StackMap).findIdx? (· == some a) = some 1 := by
       simp [List.findIdx?, List.findIdx?.go, Ne.symm hab]
     rw [hfa]
     simp [Stack.Lower.listContains, hLU_a]
   have hLoadB : Stack.Lower.loadRefLive [a, b] b 0 [(b, 0), (a, 0)] []
-      = ([.swap], [b, a]) := by
+      = ([.swap], ([b, a] : Stack.Lower.StackMap)) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
-    have hfb : ([a, b] : Stack.Lower.StackMap).findIdx? (· == b) = some 1 := by
+    have hfb : ([a, b] : Stack.Lower.StackMap).findIdx? (· == some b) = some 1 := by
       simp [List.findIdx?, List.findIdx?.go, hab]
     rw [hfb]
     simp [Stack.Lower.listContains, hLU_b]
@@ -125,7 +125,8 @@ theorem cat_consume_fact_right (d a b : String) (src : Option SourceLoc)
 theorem lowerMethodUserRawOps_cat
     (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
     (d a b : String) (src : Option SourceLoc)
-    (hParams : (anfM.params.map (·.name)).reverse = [b, a])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse
+      = ([b, a] : Stack.Lower.StackMap))
     (hBody : anfM.body = catBody d a b src)
     (hab : a ≠ b) :
     Agrees.lowerMethodUserRawOps progMethods props anfM = catOps := by
@@ -135,6 +136,14 @@ theorem lowerMethodUserRawOps_cat
   have hLU_a := cat_consume_fact_left d a b src hab
   have hLU_b := cat_consume_fact_right d a b src hab
   rw [hLU] at hLU_a hLU_b
+  -- NEW-004: `cat` is not a byte-array binop (it is `OP_CAT` on
+  -- ByteStrings), so the body marks no raw slot.
+  rw [show Stack.Lower.collectRawSlots (catBody d a b src) = [] from by
+        simp [catBody, Stack.Lower.collectRawSlots, Stack.Lower.collectRawSlotsGo,
+          Stack.Lower.rawResultValue]]
+  -- Same for the array-literal element table: `cat` binds no array literal.
+  rw [show Stack.Lower.arrayElemsOf (catBody d a b src) = [] from by
+        simp [catBody, Stack.Lower.arrayElemsOf]]
   -- `lowerBindingsP` over the single binding = `lowerValueP ... ++ []`.
   show (Stack.Lower.lowerBindingsP progMethods props Stack.Lower.defaultInlineBudget 0
     (Stack.Lower.computeLastUses (catBody d a b src)) []

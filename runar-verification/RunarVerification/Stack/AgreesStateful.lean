@@ -14,41 +14,35 @@ stateful prologue
     `_cp0 := check_preimage pre ;  _v := assert _cp0`
 
 (the auto-injected entry wrapper of `StatefulSmartContract` methods, with no
-user logic and no state-output epilogue).  Together with the `StatefulBridge`
-ANF-side reduction (`gatedStatefulPrologue_isSome_eq`) these discharge the
-stateful family's omnibus branch for the canonical fragment, replacing the
-`compileSafe_observational_correct_modulo_stateful_codegen` axiom with a
-PROVEN consume theorem (sited in `Pipeline.lean`).
+user logic and no state-output epilogue).  Together with the
+`StatefulBridge` keystone (the `checkPreimage ⟷ checkSig` BIP-143 bridge)
+these discharge the stateful family's omnibus branch for the canonical
+fragment, replacing the `compileSafe_observational_correct_modulo_stateful_codegen`
+axiom with a PROVEN consume theorem (sited in `Pipeline.lean`).
 
-## The constant lowering (BUG-100)
+## The constant lowering
 
 The whole method lowers to a CONSTANT op list: the preimage param is
-consumed in place (depth-0 last-use ⇒ `bringToTop` emits `[]`), the
-auto-injected `check_preimage` becomes `OP_CODESEPARATOR` followed by the
-fixed 760-byte OP_PUSH_TX binding blob (one opaque `.rawBytes` op,
-`Lower.checkPreimageBindingBytes`), and the terminal `assert`'s `OP_VERIFY`
-is elided (public method, body ends in assert):
+consumed in place (depth-0 last-use ⇒ `bringToTop` emits `[]`), the implicit
+`_opPushTxSig` swaps up, the synthetic key `G` is pushed, and the terminal
+`assert`'s `OP_VERIFY` is elided (public method, body ends in assert):
 
-    `[OP_CODESEPARATOR, .rawBytes checkPreimageBindingBytes]`
+    `[OP_CODESEPARATOR, .swap, .push G, OP_CHECKSIGVERIFY]`
 
-On the ANF side the success bit is `Crypto.checkPreimage preimage`
-(`StatefulBridge.gatedStatefulPrologue_isSome_eq`).  On the Stack side it is
-the verdict of the deployed blob, characterised by
-`runOps_checkPreimageBindingRaw_eq`: NO spender witness is loaded — the blob
-derives the ECDSA signature on-chain from `hash256(preimage)` and runs
-`OP_CHECKSIGVERIFY` against `G`, so the two bits agree BY CODEGEN rather than
-under a per-deployment BIP-143 witness assumption.
+Its success bit on the Stack side is exactly `authBackend.checkSig sig G`;
+on the ANF side it is `Crypto.checkPreimage preimage`
+(`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the bridge axiom equates
+the two under a valid BIP-143 context.
 
 Side conditions `pre ≠ "_cp0"` / `pre ≠ "_opPushTxSig"` exclude the
 name-collision corner where the lowering would shadow the auto-injected
 binding or the implicit signature slot (the classifier checks both).
 
-No `sorry`/`admit`. BUG-100 added the two OP_PUSH_TX codegen→runtime binding
-shims declared in this file (`runOps_checkPreimageBindingRaw_eq`,
-`runOps_statefulFullParsedOps_scriptAccepts`) and RETIRED the pre-BUG-100
-witness axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext`,
-which no longer exists — `StatefulBridge` declares zero axioms (net +1:
-70 → 71; see TRUST_MANIFEST.md). -/
+No `sorry`/`admit`. BUG-100 adds two opaque OP_PUSH_TX codegen→runtime
+shims (`runOps_checkPreimageBindingRaw_eq`,
+`runOps_statefulFullParsedOps_scriptAccepts`) that RETIRE the pre-BUG-100
+`StatefulBridge.exists_checkSig_witness_under_validTxContext` witness axiom
+(net +1: 70 → 71; see TRUST_MANIFEST.md). -/
 
 namespace RunarVerification.Stack.AgreesStateful
 
@@ -155,18 +149,16 @@ theorem computeLastUses_statefulPrologue (pre : String) (hne1 : pre ≠ "_cp0") 
     Lower.computeLastUses, Lower.computeLastUses.go, Lower.collectRefs,
     Lower.lastUsesUpdate, hne1]
 
-/-- The `check_preimage` binding lowers to the 2-op BUG-100 prologue
-(`statefulPrologueOps`): preimage consumed in place (d0 last-use), then
-`OP_CODESEPARATOR` and the 760-byte OP_PUSH_TX binding blob as one opaque
-`.rawBytes` op. No `_opPushTxSig` witness is swapped up and no `G` is pushed
-at this level — both live inside the blob. -/
+/-- The `check_preimage` binding lowers to the 4-op prologue: preimage consumed
+in place (d0 last-use), `_opPushTxSig` swapped up (d1 consume), `G` pushed,
+`OP_CHECKSIGVERIFY`. -/
 theorem lowerValueP_checkPreimage_statefulPrologue
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (budget : Nat) (localBindings : List String) (pre : String)
     (hne1 : pre ≠ "_cp0") :
     Lower.lowerValueP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre] "_cp0" (.checkPreimage pre)
-      = (statefulPrologueOps, ["_cp0"], localBindings) := by
+      = (statefulPrologueOps, (["_cp0"] : Stack.Lower.StackMap), localBindings) := by
   unfold Lower.lowerValueP
   simp [Lower.lowerCheckPreimageOpsLive, Lower.loadRefLive, Lower.bringToTop,
     Lower.StackMap.depth?, Lower.isLastUse,
@@ -199,7 +191,7 @@ theorem lowerBindingsP_statefulPrologue
     (Lower.lowerBindingsP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre]
         (StatefulBridge.gatedStatefulPrologueBody pre))
-      = (statefulPrologueOps ++ [.opcode "OP_VERIFY"], []) := by
+      = (statefulPrologueOps ++ [.opcode "OP_VERIFY"], ([] : Stack.Lower.StackMap)) := by
   show (Lower.lowerBindingsP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre]
         [⟨"_cp0", .checkPreimage pre, none⟩, ⟨"_v", .assert "_cp0", none⟩])
@@ -239,6 +231,15 @@ theorem lowerMethod_ops_statefulPrologue
       (StatefulBridge.gatedStatefulPrologueBody pre) = false := by
     simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
       Lower.bindingsUseCodePart]
+  -- Issue #100: the `_codePart` gate is now `bindingsUseCodePart ||
+  -- bindingsReadVarLenState`. The prologue body is preimage/codesep
+  -- plumbing with no `load_prop` at all, so the new disjunct is `false`
+  -- for ANY property set and the initial stack map is unchanged.
+  have hReadsVarLen : Lower.bindingsReadVarLenState progMethods
+      (Lower.varLenPropNames props) progMethods.length
+      (StatefulBridge.gatedStatefulPrologueBody pre) = false := by
+    simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
+      Lower.bindingsReadVarLenState]
   have hConstInts : Lower.collectConstInts
       (StatefulBridge.gatedStatefulPrologueBody pre) = [] := by
     simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
@@ -253,13 +254,23 @@ theorem lowerMethod_ops_statefulPrologue
       Lower.bindingsUseDeserializeState]
   -- BUG-100: initial stack map is just `[pre]` (`usesPreimage=true` but
   -- `usesCode=false`, so the inner `if` gives `userMap`; no `_opPushTxSig`).
-  rw [hUsesPre, hUsesCode, computeLastUses_statefulPrologue pre hne1, hConstInts]
-  simp only [if_true, if_false, List.cons_append, List.nil_append]
+  rw [hUsesPre, hUsesCode, hReadsVarLen,
+    computeLastUses_statefulPrologue pre hne1, hConstInts]
+  simp only [Bool.or_self, if_true, if_false, List.cons_append, List.nil_append]
   rw [show ((StatefulBridge.gatedStatefulPrologueBody pre).map (·.name))
         = ["_cp0", "_v"] by
       simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
         ANFBinding.name]]
   simp only [Bool.false_eq_true, if_false, if_true]
+  -- NEW-004: the stateful prologue is preimage/codesep plumbing with no
+  -- byte-array producer, so the method-wide raw-slot set is empty.
+  rw [show Lower.collectRawSlots (StatefulBridge.gatedStatefulPrologueBody pre) = [] from by
+        simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
+          Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]]
+  -- …and no `array_literal` binding either.
+  rw [show Lower.arrayElemsOf (StatefulBridge.gatedStatefulPrologueBody pre) = [] from by
+        simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
+          Lower.arrayElemsOf]]
   simp only [lowerBindingsP_statefulPrologue progMethods props
     Lower.defaultInlineBudget ["_cp0", "_v"] pre hne1]
   simp [hEndsAssert, hNoDeser, statefulPrologueOps]
@@ -358,12 +369,11 @@ comes back as `.pick`, and int pushes above `OP_16` come back as their
 minimal-LE BYTE pushes — which is why the runtime walk needed the
 consensus CScriptNum coercion (`Eval.asNum?`) on `OP_LESSTHAN`.
 
-No `sorry`/`admit`. BUG-100 added the two OP_PUSH_TX codegen→runtime binding
-shims declared in this file (`runOps_checkPreimageBindingRaw_eq`,
-`runOps_statefulFullParsedOps_scriptAccepts`) and RETIRED the pre-BUG-100
-witness axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext`,
-which no longer exists — `StatefulBridge` declares zero axioms (net +1:
-70 → 71; see TRUST_MANIFEST.md). -/
+No `sorry`/`admit`. BUG-100 adds two opaque OP_PUSH_TX codegen→runtime
+shims (`runOps_checkPreimageBindingRaw_eq`,
+`runOps_statefulFullParsedOps_scriptAccepts`) that RETIRE the pre-BUG-100
+`StatefulBridge.exists_checkSig_witness_under_validTxContext` witness axiom
+(net +1: 70 → 71; see TRUST_MANIFEST.md). -/
 
 open RunarVerification.ANF.Eval
 
@@ -430,7 +440,8 @@ theorem lowerValueP_checkPreimage_statefulFull
         [] localBindings [] [pre, stateVal, sats, "_codePart"]
         "_cp0" (.checkPreimage pre)
       = ([.opcode "OP_CODESEPARATOR", .rawBytes Lower.checkPreimageBindingBytes],
-         ["_cp0", stateVal, sats, "_codePart"], localBindings) := by
+         (["_cp0", stateVal, sats, "_codePart"] : Stack.Lower.StackMap),
+         localBindings) := by
   have e1 : ("" == pre) = false := beq_eq_false_iff_ne.mpr (Ne.symm hPE)
   have e2 : (stateVal == pre) = false := beq_eq_false_iff_ne.mpr (Ne.symm hPV)
   have e3 : (sats == pre) = false := beq_eq_false_iff_ne.mpr (Ne.symm hPS)
@@ -451,7 +462,7 @@ theorem lowerValueP_assert_statefulFull
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] ["_cp0", stateVal, sats, "_codePart"]
         "_v" (.assert "_cp0")
-      = ([.opcode "OP_VERIFY"], [stateVal, sats, "_codePart"], localBindings) := by
+      = ([.opcode "OP_VERIFY"], ([stateVal, sats, "_codePart"] : Stack.Lower.StackMap), localBindings) := by
   unfold Lower.lowerValueP
   simp [Lower.loadRefLive, Lower.bringToTop, Lower.StackMap.depth?,
     Lower.StackMap.popN, Lower.isLastUse, Lower.lastUsesLookup,
@@ -473,7 +484,7 @@ theorem lowerValueP_addOutput_statefulFull
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] [stateVal, sats, "_codePart"]
         "_so0" (.addOutput sats [stateVal] "")
-      = (statefulFullEpilogueOps, ["_so0", "_codePart"], localBindings) := by
+      = (statefulFullEpilogueOps, (["_so0", "_codePart"] : Stack.Lower.StackMap), localBindings) := by
   unfold Lower.lowerValueP
   simp [Lower.lowerAddOutputOpsLive, Lower.addOutputStateValuesLive,
     Lower.loadRefOperand, Lower.operandConsume, Lower.bringToTop,
@@ -500,13 +511,13 @@ theorem lowerBindingsP_statefulFull
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre, stateVal, sats, "_codePart"]
         (statefulFullBody pre sats stateVal)
-      = (statefulFullOps, ["_so0", "_codePart"]) := by
+      = (statefulFullOps, (["_so0", "_codePart"] : Stack.Lower.StackMap)) := by
   show Lower.lowerBindingsP progMethods props budget 0
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre, stateVal, sats, "_codePart"]
         [⟨"_cp0", .checkPreimage pre, none⟩, ⟨"_v", .assert "_cp0", none⟩,
          ⟨"_so0", .addOutput sats [stateVal] "", none⟩]
-      = (statefulFullOps, ["_so0", "_codePart"])
+      = (statefulFullOps, (["_so0", "_codePart"] : Stack.Lower.StackMap))
   rw [Lower.lowerBindingsP.eq_def]
   simp only [lowerValueP_checkPreimage_statefulFull progMethods props budget
     localBindings pre sats stateVal hPE hPS hPV hPC]
@@ -571,12 +582,25 @@ theorem lowerMethod_ops_statefulFull
   rw [hUsesPre, hUsesCode,
     computeLastUses_statefulFull pre sats stateVal hPC hPE hSE hVE hSC hVC
       (Ne.symm hPS) (Ne.symm hPV) hSV, hConstInts]
-  simp only [if_true, List.cons_append, List.nil_append]
+  -- Issue #100: `usesCode` is now `bindingsUseCodePart || bindingsReadVarLenState`
+  -- and this body's `add_output` already makes the first disjunct `true`.
+  simp only [Bool.true_or, if_true, List.cons_append, List.nil_append]
   rw [show ((statefulFullBody pre sats stateVal).map (·.name))
         = ["_cp0", "_v", "_so0"] by
       simp [statefulFullBody, StatefulBridge.gatedStatefulPrologueBody,
         AgreesD2.statefulPrologueBody, AgreesD2.statefulEpilogueBody,
         ANFBinding.name]]
+  -- NEW-004: see the prologue peer — no byte-array producer in the
+  -- stateful full body either.
+  rw [show Lower.collectRawSlots (statefulFullBody pre sats stateVal) = [] from by
+        simp [statefulFullBody, StatefulBridge.gatedStatefulPrologueBody,
+          AgreesD2.statefulPrologueBody, AgreesD2.statefulEpilogueBody,
+          Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]]
+  -- …and no `array_literal` binding either.
+  rw [show Lower.arrayElemsOf (statefulFullBody pre sats stateVal) = [] from by
+        simp [statefulFullBody, StatefulBridge.gatedStatefulPrologueBody,
+          AgreesD2.statefulPrologueBody, AgreesD2.statefulEpilogueBody,
+          Lower.arrayElemsOf]]
   simp only [lowerBindingsP_statefulFull progMethods props
     Lower.defaultInlineBudget ["_cp0", "_v", "_so0"] pre sats stateVal pn hProps
     hPE hPS hPV hPC hSE hVE hSV hSC hVC hVCp hSCp hVA hSA]

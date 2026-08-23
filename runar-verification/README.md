@@ -54,10 +54,11 @@ stored constant was regenerated from the model's genuine output.
 Unlike the discovery-driven gates below, `pipelineGolden` carries a
 **hand-curated fixture inventory** (the `baselineMatches` /
 `cryptoAxiomPending` / `lowerDivergencePending` bucket lists in
-`tests/PipelineGolden.lean`). All 65 discovered fixtures are bucketed
-(40 baseline + 20 crypto-pending + 5 lower-divergence); the gate
-byte-checks the 48 the Lean model reproduces exactly. The discovered
-counts in the status table (65/65) come from the dynamic `readDir` gates
+`tests/PipelineGolden.lean`). All 72 discovered fixtures are bucketed
+(52 baseline + 20 crypto-pending + 0 lower-divergence — the last
+divergence, `multisig`, closed on 2026-08-16); the gate byte-checks the
+60 the Lean model reproduces exactly. The discovered
+counts in the status table come from the dynamic `readDir` gates
 (`goldenLoad` / `roundtrip` / `pipelineConformance`), which auto-track
 the corpus.
 

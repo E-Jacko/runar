@@ -66,24 +66,24 @@ final iteration erases the single `"start"`. The net length of
 `loopOkStrandMap ("sum" :: rest) (m + 1)` is therefore `rest.length + m + 1`.
 
 Stated and proven for the canonical entry `rest` containing exactly one
-`"start"` (`hStart : rest.count "start" = 1`), which is preserved by the
+`"start"` (`hStart : rest.count (some "start") = 1`), which is preserved by the
 `"i"`-prepend recursion. -/
 theorem loopOkStrandMap_length_gen :
-    ∀ (m : Nat) (rest : List String), rest.count "start" = 1 →
-      (loopOkStrandMap ("sum" :: rest) (m + 1)).length = rest.length + m + 1 := by
+    ∀ (m : Nat) (rest : Stack.Lower.StackMap), rest.count (some "start") = 1 →
+      (loopOkStrandMap (some "sum" :: rest) (m + 1)).length = rest.length + m + 1 := by
   intro m
   induction m with
   | zero =>
     intro rest hStart
-    -- final iteration: "sum" :: "i" :: rest.erase "start"
-    show (loopOkStrandMap ("sum" :: rest) 1).length = rest.length + 0 + 1
-    rw [show loopOkStrandMap ("sum" :: rest) 1
-          = "sum" :: "i" :: rest.erase "start" from rfl]
-    -- length = 2 + (rest.erase "start").length, and erase removes exactly one.
-    have hmem : "start" ∈ rest := by
-      have : 0 < rest.count "start" := by rw [hStart]; exact Nat.zero_lt_one
+    -- final iteration: "sum" :: "i" :: rest.erase (some "start")
+    show (loopOkStrandMap (some "sum" :: rest) 1).length = rest.length + 0 + 1
+    rw [show loopOkStrandMap (some "sum" :: rest) 1
+          = some "sum" :: some "i" :: rest.erase (some "start") from rfl]
+    -- length = 2 + (rest.erase (some "start")).length, and erase removes exactly one.
+    have hmem : (some "start") ∈ rest := by
+      have : 0 < rest.count (some "start") := by rw [hStart]; exact Nat.zero_lt_one
       exact List.count_pos_iff.mp this
-    have herase : (rest.erase "start").length = rest.length - 1 :=
+    have herase : (rest.erase (some "start")).length = rest.length - 1 :=
       List.length_erase_of_mem hmem
     simp only [List.length_cons, herase]
     have hpos : 1 ≤ rest.length := List.length_pos_of_mem hmem
@@ -92,10 +92,10 @@ theorem loopOkStrandMap_length_gen :
     intro rest hStart
     -- non-final: loopOkStrandMap ("sum" :: rest) (k+2)
     --            = loopOkStrandMap ("sum" :: "i" :: rest) (k+1)
-    show (loopOkStrandMap ("sum" :: rest) (k + 1 + 1)).length = rest.length + (k + 1) + 1
-    rw [show loopOkStrandMap ("sum" :: rest) (k + 1 + 1)
-          = loopOkStrandMap ("sum" :: "i" :: rest) (k + 1) from rfl]
-    have hStart' : ("i" :: rest).count "start" = 1 := by
+    show (loopOkStrandMap (some "sum" :: rest) (k + 1 + 1)).length = rest.length + (k + 1) + 1
+    rw [show loopOkStrandMap (some "sum" :: rest) (k + 1 + 1)
+          = loopOkStrandMap (some "sum" :: some "i" :: rest) (k + 1) from rfl]
+    have hStart' : ((some "i" : Option String) :: rest).count (some "start") = 1 := by
       rw [List.count_cons, hStart]
       decide
     rw [ih ("i" :: rest) hStart']
@@ -111,7 +111,7 @@ consumed in the final iteration); the three-binding epilogue then nets to
 theorem loopOkStrandMap_length (n : Nat) (hn : 1 ≤ n) :
     (loopOkStrandMap (["sum", "start"] : StackMap) n).length = n + 1 := by
   obtain ⟨m, rfl⟩ : ∃ m, n = m + 1 := ⟨n - 1, by omega⟩
-  have h := loopOkStrandMap_length_gen m (["start"] : List String) (by decide)
+  have h := loopOkStrandMap_length_gen m (["start"] : StackMap) (by decide)
   simp only [List.length_cons, List.length_nil] at h
   omega
 
@@ -119,25 +119,25 @@ theorem loopOkStrandMap_length (n : Nat) (hn : 1 ≤ n) :
 The `binOp "==="` epilogue then loads `sum` at a fixed depth (`1` after the
 `loadProp` push of `expectedSum`), independent of `n`. -/
 theorem loopOkStrandMap_head_gen :
-    ∀ (m : Nat) (rest : List String),
-      (loopOkStrandMap ("sum" :: rest) (m + 1)).head? = some "sum" := by
+    ∀ (m : Nat) (rest : Stack.Lower.StackMap),
+      (loopOkStrandMap (some "sum" :: rest) (m + 1)).head? = some "sum" := by
   intro m
   induction m with
   | zero =>
     intro rest
-    rw [show loopOkStrandMap ("sum" :: rest) 1
-          = "sum" :: "i" :: rest.erase "start" from rfl]
+    rw [show loopOkStrandMap (some "sum" :: rest) 1
+          = some "sum" :: some "i" :: rest.erase (some "start") from rfl]
     rfl
   | succ k ih =>
     intro rest
-    rw [show loopOkStrandMap ("sum" :: rest) (k + 1 + 1)
-          = loopOkStrandMap ("sum" :: "i" :: rest) (k + 1) from rfl]
+    rw [show loopOkStrandMap (some "sum" :: rest) (k + 1 + 1)
+          = loopOkStrandMap (some "sum" :: some "i" :: rest) (k + 1) from rfl]
     exact ih ("i" :: rest)
 
 theorem loopOkStrandMap_head (n : Nat) (hn : 1 ≤ n) :
     (loopOkStrandMap (["sum", "start"] : StackMap) n).head? = some "sum" := by
   obtain ⟨m, rfl⟩ : ∃ m, n = m + 1 := ⟨n - 1, by omega⟩
-  exact loopOkStrandMap_head_gen m (["start"] : List String)
+  exact loopOkStrandMap_head_gen m (["start"] : StackMap)
 
 /-! ## `n = 3` sanity — tie the symbolic substrate back to the bridge -/
 

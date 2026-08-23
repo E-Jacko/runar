@@ -159,6 +159,28 @@ def structuralCallBody
       structuralCallBody lastUses outerProtected rest
         (lowerValue sm name v).2 (currentIndex + 1)
 
+/-- The structural-call fragment admits only `.call func [arg]`, so it
+binds no `array_literal` and the method-wide element table is empty on
+it.  (Unlike the `hRaw` side condition the wrappers below carry — the
+fragment DOES admit byte-array producers — this one is derivable.) -/
+theorem arrayElemsOf_nil_of_structuralCallBody
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralCallBody lastUses outerProtected bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      cases v <;>
+        first
+          | (simpa [Stack.Lower.arrayElemsOf] using hTail)
+          | (exact absurd hv (by simp [structuralCallValue]))
+
 /-! ## Structural narrowing — single binding
 
 For a `.call func [arg]` value satisfying `structuralCallValue`,
@@ -287,11 +309,24 @@ theorem lowerMethodUserRawOps_eq_lowerBindings_structuralCall
     (progMethods : List ANFMethod) (props : List ANFProperty) (m : ANFMethod)
     (hCall :
       structuralCallBody (Stack.Lower.computeLastUses m.body) []
-        m.body (m.params.map (fun p => p.name) |>.reverse) 0) :
+        m.body (m.params.map (fun p => p.name) |>.reverse) 0)
+    -- NEW-004: `structuralCallBody` extends the arith fragment, which ADMITS
+    -- the byte-array producers (`<< >> & | ^ ~`), so an empty raw-slot set
+    -- does not follow from `hCall` and is assumed. Decidable, so a concrete
+    -- body discharges it by `decide`; the math_byte no-len fragment
+    -- discharges it structurally via `collectRawSlots_nil_of_noLen`. What it
+    -- excludes is exactly a method whose byte-array result is read in
+    -- numeric context, where `lowerMethod` emits `OP_BIN2NUM`s the SIMPLE
+    -- lowerer (`lowerBindings`, no `rawSlots` thread) does not.
+    (hRaw : Stack.Lower.collectRawSlots m.body = []) :
     lowerMethodUserRawOps progMethods props m =
       (Stack.Lower.lowerBindings
         (m.params.map (fun p => p.name) |>.reverse) m.body).1 := by
   unfold lowerMethodUserRawOps
+  rw [hRaw]
+  rw [arrayElemsOf_nil_of_structuralCallBody
+        (Stack.Lower.computeLastUses m.body) []
+        m.body (m.params.map (fun p => p.name) |>.reverse) 0 hCall]
   rw [lowerBindingsP_eq_lowerBindings_structuralCall
         progMethods props Stack.Lower.defaultInlineBudget
         (Stack.Lower.computeLastUses m.body) []
@@ -4168,7 +4203,7 @@ theorem loadRef_head_eq_dup
     (s : String × SlotKind) (tsm_rest : TaggedStackMap) :
     loadRef (untagSm (s :: tsm_rest)) s.fst = [.dup] := by
   have hDepth : (untagSm (s :: tsm_rest)).depth? s.fst = some 0 := by
-    show (s.fst :: untagSm tsm_rest).findIdx? (· == s.fst) = some 0
+    show (some s.fst :: untagSm tsm_rest).findIdx? (· == some s.fst) = some 0
     rw [List.findIdx?_cons]
     simp only [beq_self_eq_true, if_pos]
   unfold loadRef
@@ -4655,8 +4690,8 @@ theorem agrees_success_step_mathByteCall
     rw [Stack.Eval.runOps_append, hChunk]
   -- `agreesTagged` preserved by the push transport.
   have hFreshFull : freshIn bn (untagSm ((arg, k) :: tsm_rest)) := by
-    show ¬ bn ∈ untagSm ((arg, k) :: tsm_rest)
-    show ¬ bn ∈ arg :: untagSm tsm_rest
+    show ¬ some bn ∈ untagSm ((arg, k) :: tsm_rest)
+    show ¬ some bn ∈ some arg :: untagSm tsm_rest
     exact hFresh
   have hAgrees1 : agreesTagged ((bn, .binding) :: (arg, k) :: tsm_rest)
       (anfSt.addBinding bn (mathByteResult func av))
@@ -4714,7 +4749,7 @@ theorem smoke_B_step :
   · exact smoke_B_agreesTagged
   · rfl
   · rfl
-  · show ¬ "t0" ∈ ["s0"]; decide
+  · show ¬ (some "t0") ∈ (["s0"] : Stack.Lower.StackMap); decide
   · show (if mathByteBytesInput "len" = true then
             ∃ b : ByteArray, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBytes b
           else ∃ i : Int, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBigint i)
@@ -4813,8 +4848,8 @@ theorem successAgrees_mathByteSingleArg_unconditional :
       rw [hLowerCons, hSmOut]
       -- Transport the coherence to the post-state.
       have hFreshRest : freshIn bn (untagSm ((arg, sKind) :: tsm_rest)) := by
-        show ¬ bn ∈ untagSm ((arg, sKind) :: tsm_rest)
-        show ¬ bn ∈ arg :: untagSm tsm_rest
+        show ¬ some bn ∈ untagSm ((arg, sKind) :: tsm_rest)
+        show ¬ some bn ∈ some arg :: untagSm tsm_rest
         exact hFresh
       have hCoh1 : tsmCoherent (anfSt.addBinding bn (mathByteResult func av))
           ((bn, .binding) :: (arg, sKind) :: tsm_rest) := by
@@ -4867,7 +4902,7 @@ private def smokeCStk : StackState :=
 
 private def smokeCTsm : TaggedStackMap := [("s0", .param)]
 
-private theorem smokeC_untag : untagSm smokeCTsm = ["s0"] := rfl
+private theorem smokeC_untag : untagSm smokeCTsm = (["s0"] : Stack.Lower.StackMap) := rfl
 
 private theorem smokeC_agreesTagged :
     agreesTagged smokeCTsm smokeCAnf smokeCStk := by
@@ -4890,7 +4925,7 @@ private theorem smokeC_fragment :
   -- t0 = toByteString(s0)
   refine ⟨"toByteString", "s0", ("s0", .param), [],
     .vBytes (ByteArray.mk #[0x01, 0x02]), rfl, by decide, rfl, rfl, ⟨rfl, ?_⟩,
-    (by show ¬ "t0" ∈ untagSm (("s0", .param) :: ([] : TaggedStackMap)); decide), ?_⟩
+    (by show ¬ (some "t0") ∈ untagSm (("s0", .param) :: ([] : TaggedStackMap)); decide), ?_⟩
   · show (if mathByteBytesInput "toByteString" = true then
             ∃ b : ByteArray, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBytes b
           else ∃ i : Int, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBigint i)
@@ -4901,7 +4936,7 @@ private theorem smokeC_fragment :
   -- t1 = len(t0)
   refine ⟨"len", "t0", ("t0", .binding), [("s0", .param)],
     .vBytes (ByteArray.mk #[0x01, 0x02]), rfl, by decide, rfl, rfl, ⟨rfl, ?_⟩,
-    (by show ¬ "t1" ∈ untagSm (("t0", .binding) :: [("s0", .param)]); decide), ?_⟩
+    (by show ¬ (some "t1") ∈ untagSm (("t0", .binding) :: [("s0", .param)]); decide), ?_⟩
   · show (if mathByteBytesInput "len" = true then
             ∃ b : ByteArray, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBytes b
           else ∃ i : Int, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBigint i)
@@ -4910,7 +4945,7 @@ private theorem smokeC_fragment :
   -- t2 = abs(t1)
   refine ⟨"abs", "t1", ("t1", .binding), [("t0", .binding), ("s0", .param)],
     .vBigint 2, rfl, by decide, rfl, rfl, ⟨rfl, ?_⟩,
-    (by show ¬ "t2" ∈ untagSm (("t1", .binding) :: [("t0", .binding), ("s0", .param)]); decide),
+    (by show ¬ (some "t2") ∈ untagSm (("t1", .binding) :: [("t0", .binding), ("s0", .param)]); decide),
     ?_⟩
   · show (if mathByteBytesInput "abs" = true then
             ∃ b : ByteArray, (Value.vBigint 2) = .vBytes b
@@ -5163,7 +5198,7 @@ theorem structuralCallBody_of_mathByteSingleArgBody
         · rw [h]; simp
         · rw [h]; simp
       have hDepth : (untagSm ((arg, sKind) :: tsm_rest)).depth? arg = some 0 := by
-        show (arg :: untagSm tsm_rest).findIdx? (· == arg) = some 0
+        show (some arg :: untagSm tsm_rest).findIdx? (· == some arg) = some 0
         rw [List.findIdx?_cons]; simp only [beq_self_eq_true, if_pos]
       have hCopyArg :
           (!listContains outerProtected arg && isLastUse lastUses arg currentIndex) = false :=
@@ -5672,6 +5707,60 @@ theorem bindingsUseCheckPreimage_false_of_noLen :
       | .addDataOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
       | .arrayLiteral a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
       | .rawScript a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+
+/-- NEW-004: a no-len math_byte body holds only `.call func [arg]`
+bindings, and a builtin call is not a byte-array producer, so nothing is
+ever marked raw. Discharges the raw-slot side condition of the
+structural-call bridge for this fragment. -/
+theorem collectRawSlots_nil_of_noLen :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      Stack.Lower.collectRawSlots body = [] := by
+  have go : ∀ (body : List ANFBinding) (acc : List String) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      Stack.Lower.collectRawSlotsGo acc body = acc := by
+    intro body
+    induction body with
+    | nil => intro acc _ _; simp only [Stack.Lower.collectRawSlotsGo]
+    | cons hd rest ih =>
+        intro acc tsm hShape
+        obtain ⟨bn, v, src⟩ := hd
+        match hv : v with
+        | .call func [arg] =>
+            cases tsm with
+            | nil => simp [mathByteSingleArgShapeNoLenBool] at hShape
+            | cons s tsm_rest =>
+                have hShape' :
+                    (mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                      mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)) = true := by
+                  simpa only [mathByteSingleArgShapeNoLenBool] using hShape
+                obtain ⟨_, hRest⟩ := Bool.and_eq_true_iff.mp hShape'
+                simp only [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+                  Bool.false_eq_true, if_false]
+                exact ih acc ((bn, .binding) :: s :: tsm_rest) hRest
+        | .call func [] => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .call func (a0 :: a1 :: aRest) => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .loadParam n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .loadProp n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .loadConst c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .binOp op l r rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .unaryOp op o rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .methodCall n a r => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .ifVal c t e _ => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .loop a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .assert a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .updateProp a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .getStateScript => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .checkPreimage a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .deserializeState a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .addOutput a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .addRawOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .addDataOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .arrayLiteral a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+        | .rawScript a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+  intro body tsm hShape
+  unfold Stack.Lower.collectRawSlots
+  exact go body [] tsm hShape
 
 /-- `bindingsUseCodePart` is `false` on a no-len math_byte body (the
 `computeStateOutput*` guard fails for `abs`/`bin2num`/`toByteString`). -/

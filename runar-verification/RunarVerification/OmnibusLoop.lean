@@ -65,13 +65,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_with_loop
              (RunarVerification.ANF.Eval.Value.vBigint start) :: rest))
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag : (p.methods.filter (·.isPublic)).length < 2 →
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped :
       (anfM.name ≠ "constructor" ∧
         Agrees.emittableArithChainReadyNoDblNeg
           (Lower.computeLastUses anfM.body) anfM.body
-          (List.reverse (anfM.params.map (·.name))) 0 false) →
+          (List.reverse (anfM.params.map (fun p => some p.name))) 0 false) →
       Agrees.entryTsmArithTyped Γ tsm)
     (hIfValTyped :
       ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
@@ -89,7 +89,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_with_loop
       RunarVerification.Stack.AgreesCat.catConsumeShapeBool anfM = true →
         ∃ (bn a b : String) (src : Option SourceLoc)
           (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (anfM.params.map (·.name)).reverse = [b, a] ∧
+          (anfM.params.map (fun p => some p.name)).reverse = ([b, a] : Stack.Lower.StackMap) ∧
           anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src] ∧
           a ≠ b ∧
           initialAnf.resolveRef a = some (.vBytes ba) ∧
@@ -103,13 +103,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_with_loop
           Agrees.entryTsmArithTyped Γ tsm)
     (hMethodCallFrag :
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
-        ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
+        ∃ a : String, (anfM.params.map (fun p => some p.name)).reverse = ([a] : Stack.Lower.StackMap) ∧
              tsm = [(a, Agrees.SlotKind.param)])
     (hHashCallFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
         ∃ (bn arg func : String) (src : Option SourceLoc)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (anfM.params.map (·.name)).reverse = [arg] ∧
+          (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Stack.Lower.StackMap) ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
           (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
@@ -278,7 +278,7 @@ theorem omnibus_covers_loopOk
     (hUntag : ((RunarVerification.Stack.LoopBridge.loopOkProg.methods.filter
         (·.isPublic)).length < 2 →
       Agrees.untagSm tsm =
-        List.reverse (RunarVerification.Stack.LoopBridge.loopOkM.params.map (·.name))))
+        List.reverse (RunarVerification.Stack.LoopBridge.loopOkM.params.map (fun p => some p.name))))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped :
       (RunarVerification.Stack.LoopBridge.loopOkM.name ≠ "constructor" ∧
@@ -286,7 +286,7 @@ theorem omnibus_covers_loopOk
           (Lower.computeLastUses RunarVerification.Stack.LoopBridge.loopOkM.body)
           RunarVerification.Stack.LoopBridge.loopOkM.body
           (List.reverse
-            (RunarVerification.Stack.LoopBridge.loopOkM.params.map (·.name))) 0 false) →
+            (RunarVerification.Stack.LoopBridge.loopOkM.params.map (fun p => some p.name))) 0 false) →
       Agrees.entryTsmArithTyped Γ tsm)
     (hIfValTyped :
       ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
@@ -312,8 +312,8 @@ theorem omnibus_covers_loopOk
           RunarVerification.Stack.LoopBridge.loopOkM = true →
         ∃ (bn a b : String) (src : Option SourceLoc)
           (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (RunarVerification.Stack.LoopBridge.loopOkM.params.map (·.name)).reverse
-            = [b, a] ∧
+          (RunarVerification.Stack.LoopBridge.loopOkM.params.map (fun p => some p.name)).reverse
+            = ([b, a] : Stack.Lower.StackMap) ∧
           RunarVerification.Stack.LoopBridge.loopOkM.body
             = [ANFBinding.mk bn (.call "cat" [a, b]) src] ∧
           a ≠ b ∧
@@ -332,8 +332,8 @@ theorem omnibus_covers_loopOk
       Agrees.methodCallConsumeShapeBool
           RunarVerification.Stack.LoopBridge.loopOkProg.methods
           RunarVerification.Stack.LoopBridge.loopOkM = true →
-        ∃ a, (RunarVerification.Stack.LoopBridge.loopOkM.params.map (·.name)).reverse
-              = [a] ∧
+        ∃ a : String, (RunarVerification.Stack.LoopBridge.loopOkM.params.map (fun p => some p.name)).reverse
+              = ([a] : Stack.Lower.StackMap) ∧
              tsm = [(a, Agrees.SlotKind.param)])
     (hHashCallFrag : (RunarVerification.Stack.LoopBridge.loopOkProg.methods.filter
         (·.isPublic)).length < 2 →
@@ -341,8 +341,8 @@ theorem omnibus_covers_loopOk
           RunarVerification.Stack.LoopBridge.loopOkM = true →
         ∃ (bn arg func : String) (src : Option SourceLoc)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (RunarVerification.Stack.LoopBridge.loopOkM.params.map (·.name)).reverse
-            = [arg] ∧
+          (RunarVerification.Stack.LoopBridge.loopOkM.params.map (fun p => some p.name)).reverse
+            = ([arg] : Stack.Lower.StackMap) ∧
           RunarVerification.Stack.LoopBridge.loopOkM.body
             = [ANFBinding.mk bn (.call func [arg]) src] ∧
           (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧

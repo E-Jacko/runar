@@ -71,14 +71,14 @@ scans the whole tail (recursing through every `else` branch) and emits
 no cleanup ops, returning the tail unchanged. -/
 private theorem removePropEntryAux_not_mem
     (propName : String) :
-    ∀ (d : Nat) (tail : List String),
-      ¬ propName ∈ tail →
+    ∀ (d : Nat) (tail : Stack.Lower.StackMap),
+      ¬ some propName ∈ tail →
       Stack.Lower.removePropEntryAux propName d tail = ([], tail)
   | _, [],        _h => rfl
   | d, x :: xs, h => by
-      have hxNe : ¬ x = propName := by
+      have hxNe : ¬ x = some propName := by
         intro hx; exact h (by rw [hx]; exact List.Mem.head xs)
-      have hxsNot : ¬ propName ∈ xs := by
+      have hxsNot : ¬ some propName ∈ xs := by
         intro hx; exact h (List.Mem.tail x hx)
       have hIH :=
         removePropEntryAux_not_mem propName (d + 1) xs hxsNot
@@ -88,10 +88,10 @@ private theorem removePropEntryAux_not_mem
 /-- Top-level cleanup helper on a renamed stack map `propName :: rest`
 where `propName` is fresh against `rest`: the cleanup is empty. -/
 private theorem removePropEntryOps_freshHead
-    (propName : String) (rest : List String)
-    (h : ¬ propName ∈ rest) :
-    Stack.Lower.removePropEntryOps (propName :: rest) propName
-      = ([], propName :: rest) := by
+    (propName : String) (rest : Stack.Lower.StackMap)
+    (h : ¬ some propName ∈ rest) :
+    Stack.Lower.removePropEntryOps (some propName :: rest) propName
+      = ([], some propName :: rest) := by
   unfold Stack.Lower.removePropEntryOps
   have hAux := removePropEntryAux_not_mem propName 1 rest h
   simp [hAux]
@@ -196,9 +196,9 @@ cleanup search for `propName` in the (renamed) tail finds nothing. -/
 def structuralUpdatePropSingleton (m : ANFMethod) : Prop :=
   ∃ (bn propName ref : String) (src : Option SourceLoc),
     m.body = [⟨bn, .updateProp propName ref, src⟩] ∧
-    ∃ tail : List String,
-      (m.params.map (fun p => p.name)).reverse = ref :: tail ∧
-      ¬ propName ∈ tail
+    ∃ tail : Stack.Lower.StackMap,
+      (m.params.map (fun p => some p.name)).reverse = some ref :: tail ∧
+      ¬ some propName ∈ tail
 
 /-- Bool-as-Prop checker for `structuralUpdatePropSingleton`. The
 parameter-list / tail relationship is unpacked into a concrete
@@ -211,8 +211,8 @@ the lowerer itself uses). -/
 def structuralUpdatePropSingletonBool (m : ANFMethod) : Bool :=
   match m.body with
   | [⟨_bn, .updateProp propName ref, _src⟩] =>
-      match (m.params.map (fun p => p.name)).reverse with
-      | head :: tail => head == ref && !Stack.Lower.listContains tail propName
+      match (m.params.map (fun p => some p.name)).reverse with
+      | head :: tail => head == some ref && !Stack.Lower.listContains (Stack.Lower.StackMap.names tail) propName
       | []           => false
   | _ => false
 
@@ -274,7 +274,7 @@ theorem lowerMethodUserRawOps_structuralUpdatePropSingleton_eq_nil
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
   -- `(ref :: tail).findIdx? (· == ref) = some 0` by definition.
-  have hFind : (ref :: tail).findIdx? (· == ref) = some 0 := by
+  have hFind : (some ref :: tail).findIdx? (· == some ref) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -381,10 +381,10 @@ list is empty and `runOps` is `.ok` on any initial state.
 The Tier-3 case (`propName ∈ rest` with non-empty cleanup) is the
 documented obstacle below. -/
 theorem runOps_removePropEntryOps_eq
-    (propName : String) (rest : List String) (s : StackState)
-    (h : ¬ propName ∈ rest) :
+    (propName : String) (rest : Stack.Lower.StackMap) (s : StackState)
+    (h : ¬ some propName ∈ rest) :
     Stack.Eval.runOps
-        (Stack.Lower.removePropEntryOps (propName :: rest) propName).1 s
+        (Stack.Lower.removePropEntryOps (some propName :: rest) propName).1 s
       = .ok s := by
   rw [removePropEntryOps_freshHead propName rest h]
   exact Stack.Eval.runOps_nil s
@@ -540,7 +540,7 @@ def structuralUpdatePropAnyDepth (m : ANFMethod) (s : StackState) : Prop :=
     -- `load.2.tail` and require `propName ∉ tail'`.
     (∃ headSm restSm, load.2 = headSm :: restSm ∧
       headSm = ref ∧
-      ¬ propName ∈ restSm) ∧
+      ¬ some propName ∈ restSm) ∧
     -- Op-list shape: one of the four bringToTop consume-mode shapes,
     -- matching the runtime stack.
     (load.1 = [] ∨
@@ -702,8 +702,8 @@ mapped prop slot, which is the genuine alignment fact.
 ([.nip], rest2)`. Direct unfold of the `removePropEntryAux` definition
 at the `d = 1, x = propName` branch. -/
 private theorem removePropEntryAux_head_match
-    (propName : String) (rest2 : List String) :
-    Stack.Lower.removePropEntryAux propName 1 (propName :: rest2)
+    (propName : String) (rest2 : Stack.Lower.StackMap) :
+    Stack.Lower.removePropEntryAux propName 1 (some propName :: rest2)
       = ([StackOp.nip], rest2) := by
   unfold Stack.Lower.removePropEntryAux
   simp
@@ -712,9 +712,9 @@ private theorem removePropEntryAux_head_match
 :: rest2`: the cleanup is `[.nip]` and the result stackmap is `propName
 :: rest2` (the bottom duplicate dropped). -/
 private theorem removePropEntryOps_headDup
-    (propName : String) (rest2 : List String) :
-    Stack.Lower.removePropEntryOps (propName :: propName :: rest2) propName
-      = ([StackOp.nip], propName :: rest2) := by
+    (propName : String) (rest2 : Stack.Lower.StackMap) :
+    Stack.Lower.removePropEntryOps (some propName :: some propName :: rest2) propName
+      = ([StackOp.nip], some propName :: rest2) := by
   unfold Stack.Lower.removePropEntryOps
   simp [removePropEntryAux_head_match propName rest2]
 
@@ -749,7 +749,7 @@ def structuralUpdatePropAnyDepthExistingHead
     let sm := (m.params.map (fun p => p.name)).reverse
     let load := Stack.Lower.bringToTop sm ref true
     -- The post-load sm has the form `ref :: propName :: rest2`.
-    (∃ rest2, load.2 = ref :: propName :: rest2) ∧
+    (∃ rest2, load.2 = some ref :: some propName :: rest2) ∧
     -- Op-list shape + matching runtime stack-shape input fact.
     ((∃ vRef vProp rest, s.stack = vRef :: vProp :: rest ∧ load.1 = []) ∨
      (∃ a b rest, s.stack = a :: b :: rest ∧
@@ -1006,15 +1006,15 @@ The predicate captures the d' ≥ 2 cleanup case:
 def structuralUpdatePropAnyDepthExistingDeep
     (m : ANFMethod) (s : StackState) : Prop :=
   ∃ (bn propName ref : String) (src : Option SourceLoc)
-    (pre post : List String),
+    (pre post : Stack.Lower.StackMap),
     m.body = [⟨bn, .updateProp propName ref, src⟩] ∧
     let sm := (m.params.map (fun p => p.name)).reverse
     let load := Stack.Lower.bringToTop sm ref true
     -- Post-load sm: `ref :: pre ++ propName :: post`.
-    load.2 = ref :: (pre ++ propName :: post) ∧
+    load.2 = some ref :: (pre ++ some propName :: post) ∧
     -- propName not in pre, so removePropEntryAux walks pre without
     -- matching, lands on propName at depth pre.length + 1.
-    ¬ propName ∈ pre ∧
+    ¬ some propName ∈ pre ∧
     -- d' ≥ 2: pre.length ≥ 1.
     1 ≤ pre.length ∧
     -- Runtime length bound on the post-load (= initial) stack.
@@ -1037,11 +1037,11 @@ only when the final depth `dStart + pre.length ≥ 2`. The auxiliary
 lemma below states this with that side condition. -/
 
 private theorem removePropEntryAux_deep_match :
-    ∀ (propName : String) (pre post : List String) (dStart : Nat),
-      ¬ propName ∈ pre →
+    ∀ (propName : String) (pre post : Stack.Lower.StackMap) (dStart : Nat),
+      ¬ some propName ∈ pre →
       2 ≤ dStart + pre.length →
       Stack.Lower.removePropEntryAux propName dStart
-          (pre ++ propName :: post)
+          (pre ++ some propName :: post)
         = ([.push (.bigint (Int.ofNat (dStart + pre.length))),
             .opcode "OP_ROLL", .drop],
            pre ++ post)
@@ -1060,7 +1060,7 @@ private theorem removePropEntryAux_deep_match :
       have hxNe : ¬ x = propName := by
         intro hx
         exact hNotMem (by rw [hx]; exact List.Mem.head _)
-      have hPreNot : ¬ propName ∈ pre := by
+      have hPreNot : ¬ some propName ∈ pre := by
         intro hMem
         exact hNotMem (List.Mem.tail _ hMem)
       -- The recursive call uses `dStart + 1` on `pre ++ propName :: post`.
@@ -1092,14 +1092,14 @@ private theorem removePropEntryAux_deep_match :
 `d' = pre.length + 1` and the residual sm is `propName :: pre ++
 post`. -/
 private theorem removePropEntryOps_deepMatch
-    (propName : String) (pre post : List String)
-    (hNotMem : ¬ propName ∈ pre)
+    (propName : String) (pre post : Stack.Lower.StackMap)
+    (hNotMem : ¬ some propName ∈ pre)
     (hPreLen : 1 ≤ pre.length) :
     Stack.Lower.removePropEntryOps
-        (propName :: (pre ++ propName :: post)) propName
+        (some propName :: (pre ++ some propName :: post)) propName
       = ([.push (.bigint (Int.ofNat (pre.length + 1))),
           .opcode "OP_ROLL", .drop],
-         propName :: (pre ++ post)) := by
+         some propName :: (pre ++ post)) := by
   unfold Stack.Lower.removePropEntryOps
   -- The recursion starts at dStart = 1 on the tail.
   have hDep : 2 ≤ 1 + pre.length := by omega
@@ -1448,7 +1448,7 @@ input stack. -/
 def structuralUpdatePropFreshInt (m : ANFMethod) : Prop :=
   ∃ (t bn propName : String) (i : Int) (src1 src2 : Option SourceLoc),
     m.body = [⟨t, .loadConst (.int i), src1⟩, ⟨bn, .updateProp propName t, src2⟩] ∧
-    ¬ propName ∈ (m.params.map (fun p => p.name)).reverse
+    ¬ some propName ∈ (m.params.map (fun p => some p.name)).reverse
 
 /-- **Tier-4a operational lemma.** Under `structuralUpdatePropFreshInt`,
 the program-aware liveness lowerer emits exactly `[.push (.bigint i)]`
@@ -1480,7 +1480,8 @@ private theorem lowerMethodUserRawOps_structuralUpdatePropFreshInt_eq
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
   have hFind :
-      (t :: (m.params.map (fun p => p.name)).reverse).findIdx? (· == t) = some 0 := by
+      (some t :: (m.params.map (fun p => some p.name)).reverse).findIdx? (· == some t)
+        = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -1540,7 +1541,7 @@ lowered ops are `[.push (.bool b)]`. -/
 def structuralUpdatePropFreshBool (m : ANFMethod) : Prop :=
   ∃ (t bn propName : String) (b : Bool) (src1 src2 : Option SourceLoc),
     m.body = [⟨t, .loadConst (.bool b), src1⟩, ⟨bn, .updateProp propName t, src2⟩] ∧
-    ¬ propName ∈ (m.params.map (fun p => p.name)).reverse
+    ¬ some propName ∈ (m.params.map (fun p => some p.name)).reverse
 
 /-- **Tier-4b operational lemma.** Under `structuralUpdatePropFreshBool`,
 the lowered raw body ops are `[.push (.bool b)]`. -/
@@ -1566,7 +1567,8 @@ private theorem lowerMethodUserRawOps_structuralUpdatePropFreshBool_eq
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
   have hFind :
-      (t :: (m.params.map (fun p => p.name)).reverse).findIdx? (· == t) = some 0 := by
+      (some t :: (m.params.map (fun p => some p.name)).reverse).findIdx? (· == some t)
+        = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -1618,7 +1620,7 @@ def structuralUpdatePropFreshBytes (m : ANFMethod) : Prop :=
   ∃ (t bn propName : String) (ba : ByteArray) (src1 src2 : Option SourceLoc),
     m.body = [⟨t, .loadConst (.bytes ba), src1⟩,
               ⟨bn, .updateProp propName t, src2⟩] ∧
-    ¬ propName ∈ (m.params.map (fun p => p.name)).reverse
+    ¬ some propName ∈ (m.params.map (fun p => some p.name)).reverse
 
 /-- **Tier-4c operational lemma.** Under `structuralUpdatePropFreshBytes`,
 the lowered raw body ops are `[.push (.bytes ba)]`. -/
@@ -1644,7 +1646,8 @@ private theorem lowerMethodUserRawOps_structuralUpdatePropFreshBytes_eq
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
   have hFind :
-      (t :: (m.params.map (fun p => p.name)).reverse).findIdx? (· == t) = some 0 := by
+      (some t :: (m.params.map (fun p => some p.name)).reverse).findIdx? (· == some t)
+        = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -2329,7 +2332,7 @@ theorem smoke_agreesTaggedModProps_chain_preserves :
       · refine ⟨?_, rfl, rfl, rfl⟩
         show freshIn "b" (untagSm [("a", SlotKind.binding)])
         unfold freshIn
-        show ¬ "b" ∈ (["a"] : List String)
+        show ¬ (some "b") ∈ (["a"] : Stack.Lower.StackMap)
         decide
       · exact ChainRel.nil
   -- Entry agreement: empty map vs empty stack.
@@ -2581,18 +2584,18 @@ theorem lowerValueP_updateProp_depth0_fresh_chunk_eq_nil
     (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (localBindings : List String) (constInts : List (String × Int))
-    (bn propName ref : String) (tail : List String)
+    (bn propName ref : String) (tail : Stack.Lower.StackMap)
     (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true)
-    (hPropNot : ¬ propName ∈ tail) :
+    (hPropNot : ¬ some propName ∈ tail) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-        [] localBindings constInts (ref :: tail) bn (.updateProp propName ref)).1 = [] := by
+        [] localBindings constInts (some ref :: tail) bn (.updateProp propName ref)).1 = [] := by
   unfold Stack.Lower.lowerValueP
   unfold Stack.Lower.loadRefLive
   rw [listContains_nil ref]
   rw [hLastUse]
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
-  have hFind : (ref :: tail).findIdx? (· == ref) = some 0 := by
+  have hFind : (some ref :: tail).findIdx? (· == some ref) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -2624,13 +2627,13 @@ theorem agrees_success_step_updateProp
     (anfSt : State) (stkSt : StackState)
     (bn propName ref : String)
     (src : Option RunarVerification.ANF.SourceLoc)
-    (smRest : List String) (tsmRest : TaggedStackMap)
+    (smRest : Stack.Lower.StackMap) (tsmRest : TaggedStackMap)
     (anfRest : List ANFBinding) (restOps : List StackOp)
     (v : Value) (stkRest : List Value)
     (hStk : stkSt.stack = v :: stkRest)
     (hSm : untagSm tsmRest = smRest)
     (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true)
-    (hPropNot : ¬ propName ∈ smRest)
+    (hPropNot : ¬ some propName ∈ smRest)
     (hRef : anfSt.resolveRef ref = some v)
     (hPre : agreesTaggedModProps ((ref, SlotKind.binding) :: tsmRest) anfSt stkSt)
     (hPropFresh : propFreshTsm tsmRest propName)
@@ -2639,7 +2642,7 @@ theorem agrees_success_step_updateProp
     ( ( (RunarVerification.ANF.Eval.evalBindings anfSt
             (.mk bn (.updateProp propName ref) src :: anfRest)).toOption.isSome
           ↔ (runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                [] localBindings constInts (ref :: smRest) bn (.updateProp propName ref)).1
+                [] localBindings constInts (some ref :: smRest) bn (.updateProp propName ref)).1
                 ++ restOps) stkSt).toOption.isSome )
       ↔ ( (RunarVerification.ANF.Eval.evalBindings
               ((anfSt.setProp propName v).addBinding bn v) anfRest).toOption.isSome
@@ -2657,13 +2660,13 @@ theorem agrees_success_step_updateProp
   -- The chunk is the empty op list (depth-0 fresh shape).
   have hChunkNil :
       (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-          [] localBindings constInts (ref :: smRest) bn (.updateProp propName ref)).1 = [] :=
+          [] localBindings constInts (some ref :: smRest) bn (.updateProp propName ref)).1 = [] :=
     lowerValueP_updateProp_depth0_fresh_chunk_eq_nil progMethods props budget
       currentIndex lastUses localBindings constInts bn propName ref smRest hLastUse hPropNot
   -- Cons-level packaging: the empty chunk leaves the runtime stack unchanged.
   have hStack :
       runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                [] localBindings constInts (ref :: smRest) bn (.updateProp propName ref)).1
+                [] localBindings constInts (some ref :: smRest) bn (.updateProp propName ref)).1
                 ++ restOps) stkSt
         = runOps restOps stkSt := by
     rw [hChunkNil, List.nil_append]
@@ -2688,10 +2691,10 @@ theorem lowerValueP_updateProp_existingHead_chunk_eq_nip
     (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (localBindings : List String) (constInts : List (String × Int))
-    (bn propName ref : String) (rest2 : List String)
+    (bn propName ref : String) (rest2 : Stack.Lower.StackMap)
     (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-        [] localBindings constInts (ref :: propName :: rest2) bn
+        [] localBindings constInts (some ref :: some propName :: rest2) bn
         (.updateProp propName ref)).1 = [StackOp.nip] := by
   unfold Stack.Lower.lowerValueP
   unfold Stack.Lower.loadRefLive
@@ -2699,7 +2702,7 @@ theorem lowerValueP_updateProp_existingHead_chunk_eq_nip
   rw [hLastUse]
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
-  have hFind : (ref :: propName :: rest2).findIdx? (· == ref) = some 0 := by
+  have hFind : (some ref :: some propName :: rest2).findIdx? (· == some ref) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -2723,7 +2726,7 @@ theorem agrees_success_step_updateProp_existingHead
     (anfSt : State) (stkSt : StackState)
     (bn propName ref : String)
     (src : Option RunarVerification.ANF.SourceLoc)
-    (rest2sm : List String) (tsmRest2 : TaggedStackMap)
+    (rest2sm : Stack.Lower.StackMap) (tsmRest2 : TaggedStackMap)
     (anfRest : List ANFBinding) (restOps : List StackOp)
     (v vStale : Value) (rest : List Value)
     (hStk : stkSt.stack = v :: vStale :: rest)
@@ -2737,7 +2740,7 @@ theorem agrees_success_step_updateProp_existingHead
     ( ( (RunarVerification.ANF.Eval.evalBindings anfSt
             (.mk bn (.updateProp propName ref) src :: anfRest)).toOption.isSome
           ↔ (runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                [] localBindings constInts (ref :: propName :: rest2sm) bn
+                [] localBindings constInts (some ref :: some propName :: rest2sm) bn
                 (.updateProp propName ref)).1 ++ restOps) stkSt).toOption.isSome )
       ↔ ( (RunarVerification.ANF.Eval.evalBindings
               ((anfSt.setProp propName v).addBinding bn v) anfRest).toOption.isSome
@@ -2755,7 +2758,7 @@ theorem agrees_success_step_updateProp_existingHead
   -- The chunk is `[.nip]`.
   have hChunkNip :
       (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-          [] localBindings constInts (ref :: propName :: rest2sm) bn
+          [] localBindings constInts (some ref :: some propName :: rest2sm) bn
           (.updateProp propName ref)).1 = [StackOp.nip] :=
     lowerValueP_updateProp_existingHead_chunk_eq_nip progMethods props budget
       currentIndex lastUses localBindings constInts bn propName ref rest2sm hLastUse
@@ -2764,7 +2767,7 @@ theorem agrees_success_step_updateProp_existingHead
     runOps_nip_eq stkSt v vStale rest hStk
   have hStack :
       runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                [] localBindings constInts (ref :: propName :: rest2sm) bn
+                [] localBindings constInts (some ref :: some propName :: rest2sm) bn
                 (.updateProp propName ref)).1 ++ restOps) stkSt
         = runOps restOps ({ stkSt with stack := v :: rest }) := by
     rw [hChunkNip, Stack.Eval.runOps_append, hNip]
@@ -2807,12 +2810,12 @@ theorem lowerValueP_loadProp_depth0_chunk_eq_dup
     (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (localBindings : List String) (constInts : List (String × Int))
-    (bn n : String) (tail : List String) :
+    (bn n : String) (tail : Stack.Lower.StackMap) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-        [] localBindings constInts (n :: tail) bn (.loadProp n)).1 = [StackOp.dup] := by
+        [] localBindings constInts (some n :: tail) bn (.loadProp n)).1 = [StackOp.dup] := by
   unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
     Stack.Lower.StackMap.depth?
-  have hFind : (n :: tail).findIdx? (· == n) = some 0 := by
+  have hFind : (some n :: tail).findIdx? (· == some n) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -3443,7 +3446,7 @@ theorem successAgrees_updateProp_unconditional
     (hMidAgrees : agreesTaggedModProps ((ref, SlotKind.binding) :: tsmMidRest) anfMid stkMid)
     (hMidRef : anfMid.resolveRef ref = some vRef)
     (hLastUseRef : Stack.Lower.isLastUse lastUses ref cidxMid = true)
-    (hPropNot : ¬ propName ∈ smMidRest)
+    (hPropNot : ¬ some propName ∈ smMidRest)
     (hPropFresh : propFreshTsm tsmMidRest propName)
     (hBnFresh : freshIn bn (untagSm tsmMidRest)) :
     (RunarVerification.ANF.Eval.evalBindings anfSt
@@ -3642,7 +3645,7 @@ private theorem wave57_split_hStkMid :
       "t0" "+" "p0" "p1" none
   have hSm0 :
       (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
-          ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.1 = ["t0"] :=
+          ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.1 = (["t0"] : Stack.Lower.StackMap) :=
     lowerValueP_binOp_d0d1_smOut [] [] 1000 0 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
       "t0" "+" "p0" "p1" none (by decide) (by decide) (by decide) (by decide)
   have hConsPrefix :
@@ -3673,7 +3676,7 @@ private theorem wave57_split_hStkMid :
   -- The t1 chunk: cons-split off the unary, run it to `[vBigint (-7)]`.
   have hSm1 :
       (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
-          ["t0"] "t1" (.unaryOp "-" "t0" none)).2.1 = ["t1"] :=
+          ["t0"] "t1" (.unaryOp "-" "t0" none)).2.1 = (["t1"] : Stack.Lower.StackMap) :=
     lowerValueP_unaryOp_d0_smOut [] [] 1000 1 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["t0"]
       "t1" "-" "t0" none (by decide) (by decide)
   have hLb1 :
@@ -3777,7 +3780,7 @@ theorem wave57_body_split_walk_smoke :
     -- prefix ++ suffix lowering: split at each binding via the smOut lemmas.
     have hSm0 :
         (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
-            ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.1 = ["t0"] :=
+            ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.1 = (["t0"] : Stack.Lower.StackMap) :=
       lowerValueP_binOp_d0d1_smOut [] [] 1000 0 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
         "t0" "+" "p0" "p1" none (by decide) (by decide) (by decide) (by decide)
     have hLb0 :
@@ -3787,7 +3790,7 @@ theorem wave57_body_split_walk_smoke :
         "t0" "+" "p0" "p1" none
     have hSm1 :
         (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
-            ["t0"] "t1" (.unaryOp "-" "t0" none)).2.1 = ["t1"] :=
+            ["t0"] "t1" (.unaryOp "-" "t0" none)).2.1 = (["t1"] : Stack.Lower.StackMap) :=
       lowerValueP_unaryOp_d0_smOut [] [] 1000 1 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["t0"]
         "t1" "-" "t0" none (by decide) (by decide)
     have hLb1 :
@@ -3894,10 +3897,10 @@ private def wave58PrefAnfFinal : State := wave58PrefAnf2.addBinding "t0" (.vBigi
 private theorem wave58_pref_lowerStep_loadProp :
     Stack.Lower.lowerValueP [] [] 1000 0 wave58PrefLU [] [] [] ["count"] "c0"
         (.loadProp "count")
-      = ([StackOp.dup], ["c0", "count"], []) := by
+      = ([StackOp.dup], (["c0", "count"] : Stack.Lower.StackMap), []) := by
   unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
     Stack.Lower.StackMap.depth?
-  have hFind : (["count"] : StackMap).findIdx? (· == "count") = some 0 := by
+  have hFind : (["count"] : StackMap).findIdx? (· == some "count") = some 0 := by
     unfold List.findIdx?; simp [List.findIdx?.go]
   rw [hFind]; rfl
 
@@ -3906,7 +3909,7 @@ private theorem wave58_pref_lowerStep_loadProp :
 private theorem wave58_pref_lowerStep_loadConst :
     Stack.Lower.lowerValueP [] [] 1000 1 wave58PrefLU [] [] [] ["c0", "count"] "c1"
         (.loadConst (.int 1))
-      = ([StackOp.push (.bigint 1)], ["c1", "c0", "count"], []) := by
+      = ([StackOp.push (.bigint 1)], (["c1", "c0", "count"] : Stack.Lower.StackMap), []) := by
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
 
 /-- `lowerValueP` triple for the binOp step (`t0 = c1 + c0` at sm
@@ -3914,7 +3917,7 @@ private theorem wave58_pref_lowerStep_loadConst :
 private theorem wave58_pref_lowerStep_binOp :
     Stack.Lower.lowerValueP [] [] 1000 2 wave58PrefLU [] [] [] ["c1", "c0", "count"] "t0"
         (.binOp "+" "c1" "c0" none)
-      = ([StackOp.swap, .opcode "OP_ADD"], ["t0", "count"], []) := by
+      = ([StackOp.swap, .opcode "OP_ADD"], (["t0", "count"] : Stack.Lower.StackMap), []) := by
   have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
       Stack.Lower.loadRefOperand smx "c1" ["c1", "c0"] ci lu oprot
         = Stack.Lower.loadRefLive smx "c1" ci lu oprot :=
@@ -3929,9 +3932,9 @@ private theorem wave58_pref_lowerStep_binOp :
     Stack.Lower.StackMap.depth?
   have hLU1 : Stack.Lower.isLastUse wave58PrefLU "c1" 2 = true := by decide
   have hLU0 : Stack.Lower.isLastUse wave58PrefLU "c0" 2 = true := by decide
-  have hF1 : (["c1", "c0", "count"] : StackMap).findIdx? (· == "c1") = some 0 := by
+  have hF1 : (["c1", "c0", "count"] : StackMap).findIdx? (· == some "c1") = some 0 := by
     unfold List.findIdx?; simp [List.findIdx?.go]
-  have hF0 : (["c1", "c0", "count"] : StackMap).findIdx? (· == "c0") = some 1 := by
+  have hF0 : (["c1", "c0", "count"] : StackMap).findIdx? (· == some "c0") = some 1 := by
     unfold List.findIdx?; simp [List.findIdx?.go]
   simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
     hLU1, hLU0, hF1, hF0, if_true, Stack.Lower.binopOpcode, Stack.Lower.StackMap.popN,
@@ -4265,7 +4268,7 @@ private def wave58CanonAnfMid : State := wave58CanonAnf2.addBinding "t0" (.vBigi
 private theorem wave58_canon_lowerStep_binOp :
     Stack.Lower.lowerValueP [] [] 1000 2 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
         ["c1", "c0", "count"] "t0" (.binOp "+" "c0" "c1" none)
-      = ([StackOp.swap, StackOp.swap, .opcode "OP_ADD"], ["t0", "count"],
+      = ([StackOp.swap, StackOp.swap, .opcode "OP_ADD"], (["t0", "count"] : Stack.Lower.StackMap),
           (smokeCUpdatePropBody.map (·.name))) := by
   have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
       Stack.Lower.loadRefOperand smx "c0" ["c0", "c1"] ci lu oprot
@@ -4281,9 +4284,9 @@ private theorem wave58_canon_lowerStep_binOp :
     Stack.Lower.StackMap.depth?
   have hLU0 : Stack.Lower.isLastUse wave58CanonLU "c0" 2 = true := by decide
   have hLU1 : Stack.Lower.isLastUse wave58CanonLU "c1" 2 = true := by decide
-  have hF0 : (["c1", "c0", "count"] : StackMap).findIdx? (· == "c0") = some 1 := by
+  have hF0 : (["c1", "c0", "count"] : StackMap).findIdx? (· == some "c0") = some 1 := by
     unfold List.findIdx?; simp [List.findIdx?.go]
-  have hF1 : (["c0", "c1", "count"] : StackMap).findIdx? (· == "c1") = some 1 := by
+  have hF1 : (["c0", "c1", "count"] : StackMap).findIdx? (· == some "c1") = some 1 := by
     unfold List.findIdx?; simp [List.findIdx?.go]
   simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
     hLU0, hLU1, hF0, hF1, if_true, Stack.Lower.binopOpcode]
@@ -4379,7 +4382,7 @@ private theorem wave58_canon_prefix_reduce :
     (by
       unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
         Stack.Lower.StackMap.depth?
-      have hFind : (["count"] : StackMap).findIdx? (· == "count") = some 0 := by
+      have hFind : (["count"] : StackMap).findIdx? (· == some "count") = some 0 := by
         unfold List.findIdx?; simp [List.findIdx?.go]
       rw [hFind]; rfl)
     (Stack.Sim.run_dup_nonEmpty wave58CanonStk (.vBigint 5) [] rfl)
@@ -4394,10 +4397,10 @@ private theorem wave58_canon_prefix_reduce :
 private theorem wave58_canon_loadProp_triple :
     Stack.Lower.lowerValueP [] [] 1000 0 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
         ["count"] "c0" (.loadProp "count")
-      = ([StackOp.dup], ["c0", "count"], (smokeCUpdatePropBody.map (·.name))) := by
+      = ([StackOp.dup], (["c0", "count"] : Stack.Lower.StackMap), (smokeCUpdatePropBody.map (·.name))) := by
   unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
     Stack.Lower.StackMap.depth?
-  have hFind : (["count"] : StackMap).findIdx? (· == "count") = some 0 := by
+  have hFind : (["count"] : StackMap).findIdx? (· == some "count") = some 0 := by
     unfold List.findIdx?; simp [List.findIdx?.go]
   rw [hFind]; rfl
 
@@ -4415,7 +4418,7 @@ private theorem wave58_canon_lowerSplit :
               (.updateProp "count" "t0")).1 := by
   have hSm0 :
       (Stack.Lower.lowerValueP [] [] 1000 0 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
-          ["count"] "c0" (.loadProp "count")).2.1 = ["c0", "count"] := by
+          ["count"] "c0" (.loadProp "count")).2.1 = (["c0", "count"] : Stack.Lower.StackMap) := by
     rw [wave58_canon_loadProp_triple]
   have hLb0 :
       (Stack.Lower.lowerValueP [] [] 1000 0 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
@@ -4423,7 +4426,7 @@ private theorem wave58_canon_lowerSplit :
     rw [wave58_canon_loadProp_triple]
   have hSm1 :
       (Stack.Lower.lowerValueP [] [] 1000 1 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
-          ["c0", "count"] "c1" (.loadConst (.int 1))).2.1 = ["c1", "c0", "count"] := by
+          ["c0", "count"] "c1" (.loadConst (.int 1))).2.1 = (["c1", "c0", "count"] : Stack.Lower.StackMap) := by
     unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
   have hLb1 :
       (Stack.Lower.lowerValueP [] [] 1000 1 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
@@ -4431,7 +4434,7 @@ private theorem wave58_canon_lowerSplit :
     unfold Stack.Lower.lowerValueP; rfl
   have hSm2 :
       (Stack.Lower.lowerValueP [] [] 1000 2 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
-          ["c1", "c0", "count"] "t0" (.binOp "+" "c0" "c1" none)).2.1 = ["t0", "count"] := by
+          ["c1", "c0", "count"] "t0" (.binOp "+" "c0" "c1" none)).2.1 = (["t0", "count"] : Stack.Lower.StackMap) := by
     rw [wave58_canon_lowerStep_binOp]
   have hLb2 :
       (Stack.Lower.lowerValueP [] [] 1000 2 wave58CanonLU [] (smokeCUpdatePropBody.map (·.name)) []
@@ -4576,6 +4579,27 @@ def updatePropConsumeAdmissible (p : String) (op : String) (c : Int) : Bool :=
     && (-1 ≤ c) && (c ≤ 16)
     && (p != "c0") && (p != "c1") && (p != "t0") && (p != "u0")
 
+/-- NEW-004: admissibility pins `op ∈ {"+","-"}`, neither of which is a
+byte-array opcode, so the consume body marks no raw slot. -/
+theorem collectRawSlots_nil_updatePropConsumeBody
+    (p op : String) (c : Int) (h : updatePropConsumeAdmissible p op c = true) :
+    Stack.Lower.collectRawSlots (updatePropConsumeBody p op c) = [] := by
+  have hOp : op = "+" ∨ op = "-" := by
+    unfold updatePropConsumeAdmissible at h
+    simp only [Bool.and_eq_true_iff] at h
+    simpa using h.1.1.1.1.1.1
+  rcases hOp with rfl | rfl <;>
+    simp [updatePropConsumeBody, Stack.Lower.collectRawSlots,
+          Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+          Stack.Lower.isByteArrayBinOp]
+
+/-- `arrayElems` peer: the update-prop consume body is loadProp / loadConst /
+binOp / updateProp, so it binds no `array_literal`. -/
+theorem arrayElemsOf_nil_updatePropConsumeBody
+    (p op : String) (c : Int) :
+    Stack.Lower.arrayElemsOf (updatePropConsumeBody p op c) = [] := by
+  simp [updatePropConsumeBody, Stack.Lower.arrayElemsOf]
+
 /-- **Wave 64 — the decidable BODY-only shape classifier for the update_prop
 consume fragment.**  Recognises EXACTLY the canonical 4-binding
 `prop ± small-const ; update_prop` shape over the fixed temp names
@@ -4637,7 +4661,7 @@ theorem successAgrees_updateProp_consume_unconditional
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (p op : String) (c : Int)
     (initialAnf : State) (initialStack : StackState)
-    (hUntag : untagSm [(p, SlotKind.prop)] = [p])
+    (hUntag : untagSm [(p, SlotKind.prop)] = ([p] : Stack.Lower.StackMap))
     (hAgrees : agreesTagged [(p, SlotKind.prop)] initialAnf initialStack)
     (hAdmis : updatePropConsumeAdmissible p op c = true)
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
@@ -4741,7 +4765,7 @@ theorem successAgrees_updateProp_consume_unconditional
   have hLowerStep3 :
       Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
           ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)
-        = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], ["t0", p], names) := by
+        = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], (["t0", p] : Stack.Lower.StackMap), names) := by
     have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
         Stack.Lower.loadRefOperand smx "c0" ["c0", "c1"] ci lu oprot
           = Stack.Lower.loadRefLive smx "c0" ci lu oprot :=
@@ -4754,16 +4778,18 @@ theorem successAgrees_updateProp_consume_unconditional
     simp only [hOpBridgeL, hOpBridgeR]
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
-    have hF0 : (["c1", "c0", p] : StackMap).findIdx? (· == "c0") = some 1 := by
+    have hF0 : (["c1", "c0", p] : StackMap).findIdx? (· == some "c0") = some 1 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
-    have hF1 : (["c0", "c1", p] : StackMap).findIdx? (· == "c1") = some 1 := by
+    have hF1 : (["c0", "c1", p] : StackMap).findIdx? (· == some "c1") = some 1 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLU_c0, hLU_c1, hF0, hF1, if_true]
     have hNB : (op == "!==") = false := by
       rcases hEmit with h | h <;> subst h <;> rfl
     simp only [hNB, Bool.false_eq_true, if_false, List.append_assoc, List.cons_append,
-      List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
+      List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push,
+      -- NEW-004: no raw slots in scope, so both operand gates collapse.
+      Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self]
   -- The d1d0 chunk runs on stk2 (= [c, i, i]) value-agnostically.
   have hChunk3 :
       runOps [StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)] stk2 = .ok stkMid := by
@@ -4805,7 +4831,7 @@ theorem successAgrees_updateProp_consume_unconditional
   have hLowerStep2 :
       Stack.Lower.lowerValueP progMethods props budget 1 lastUses [] names constInts
           ["c0", p] "c1" (.loadConst (.int c))
-        = ([StackOp.push (.bigint c)], ["c1", "c0", p], names) := by
+        = ([StackOp.push (.bigint c)], (["c1", "c0", p] : Stack.Lower.StackMap), names) := by
     unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
   have hStep2 :
       runOps (Stack.Lower.lowerBindingsP progMethods props budget 1 lastUses [] names constInts
@@ -4831,10 +4857,10 @@ theorem successAgrees_updateProp_consume_unconditional
   have hLowerStep1 :
       Stack.Lower.lowerValueP progMethods props budget 0 lastUses [] names constInts
           [p] "c0" (.loadProp p)
-        = ([StackOp.dup], ["c0", p], names) := by
+        = ([StackOp.dup], (["c0", p] : Stack.Lower.StackMap), names) := by
     unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
-    have hFind : ([p] : StackMap).findIdx? (· == p) = some 0 := by
+    have hFind : ([p] : StackMap).findIdx? (· == some p) = some 0 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
     rw [hFind]; rfl
   have hPropLkInitial : initialAnf.lookupProp p = some (.vBigint i) := hPropVal
@@ -4873,17 +4899,17 @@ theorem successAgrees_updateProp_consume_unconditional
         = (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts [p]
               prefix3).1
           ++ (Stack.Lower.lowerValueP progMethods props budget 3 lastUses [] names constInts
-                ("t0" :: p :: []) "u0" (.updateProp p "t0")).1 := by
+                (some "t0" :: some p :: []) "u0" (.updateProp p "t0")).1 := by
     have hSm0 : (Stack.Lower.lowerValueP progMethods props budget 0 lastUses [] names constInts
-        [p] "c0" (.loadProp p)).2.1 = ["c0", p] := by rw [hLowerStep1]
+        [p] "c0" (.loadProp p)).2.1 = (["c0", p] : Stack.Lower.StackMap) := by rw [hLowerStep1]
     have hLb0 : (Stack.Lower.lowerValueP progMethods props budget 0 lastUses [] names constInts
         [p] "c0" (.loadProp p)).2.2 = names := by rw [hLowerStep1]
     have hSm1 : (Stack.Lower.lowerValueP progMethods props budget 1 lastUses [] names constInts
-        ["c0", p] "c1" (.loadConst (.int c))).2.1 = ["c1", "c0", p] := by rw [hLowerStep2]
+        ["c0", p] "c1" (.loadConst (.int c))).2.1 = (["c1", "c0", p] : Stack.Lower.StackMap) := by rw [hLowerStep2]
     have hLb1 : (Stack.Lower.lowerValueP progMethods props budget 1 lastUses [] names constInts
         ["c0", p] "c1" (.loadConst (.int c))).2.2 = names := by rw [hLowerStep2]
     have hSm2 : (Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
-        ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)).2.1 = ["t0", p] := by rw [hLowerStep3]
+        ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)).2.1 = (["t0", p] : Stack.Lower.StackMap) := by rw [hLowerStep3]
     have hLb2 : (Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
         ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)).2.2 = names := by rw [hLowerStep3]
     rw [hPrefixDef]
@@ -4992,10 +5018,10 @@ theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
       Stack.Lower.lowerValueP progMethods props budget 0
           [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts [p] "c0"
           (ANFValue.loadProp p)
-        = ([StackOp.dup], ["c0", p], ["c0", "c1", "t0", "u0"]) := by
+        = ([StackOp.dup], (["c0", p] : Stack.Lower.StackMap), ["c0", "c1", "t0", "u0"]) := by
     unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
-    have hFind : ([p] : Stack.Lower.StackMap).findIdx? (· == p) = some 0 := by
+    have hFind : ([p] : Stack.Lower.StackMap).findIdx? (· == some p) = some 0 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
     rw [hFind]; rfl
   -- Step 2: loadConst c at depth 1 ⇒ [push c], sm -> ["c1", "c0", p].
@@ -5003,14 +5029,14 @@ theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
       Stack.Lower.lowerValueP progMethods props budget 1
           [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts ["c0", p] "c1"
           (ANFValue.loadConst (.int c))
-        = ([StackOp.push (.bigint c)], ["c1", "c0", p], ["c0", "c1", "t0", "u0"]) := by
+        = ([StackOp.push (.bigint c)], (["c1", "c0", p] : Stack.Lower.StackMap), ["c0", "c1", "t0", "u0"]) := by
     unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
   -- Step 3: binOp d1d0 ⇒ [swap, swap, opcode], sm -> ["t0", p].
   have hStep3 :
       Stack.Lower.lowerValueP progMethods props budget 2
           [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts ["c1", "c0", p] "t0"
           (ANFValue.binOp op "c0" "c1" none)
-        = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], ["t0", p],
+        = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], (["t0", p] : Stack.Lower.StackMap),
            ["c0", "c1", "t0", "u0"]) := by
     have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
         Stack.Lower.loadRefOperand smx "c0" ["c0", "c1"] ci lu oprot
@@ -5024,16 +5050,18 @@ theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
     simp only [hOpBridgeL, hOpBridgeR]
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
-    have hF0 : (["c1", "c0", p] : Stack.Lower.StackMap).findIdx? (· == "c0") = some 1 := by
+    have hF0 : (["c1", "c0", p] : Stack.Lower.StackMap).findIdx? (· == some "c0") = some 1 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
-    have hF1 : (["c0", "c1", p] : Stack.Lower.StackMap).findIdx? (· == "c1") = some 1 := by
+    have hF1 : (["c0", "c1", p] : Stack.Lower.StackMap).findIdx? (· == some "c1") = some 1 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLU_c0, hLU_c1, hF0, hF1, if_true]
     have hNB : (op == "!==") = false := by
       rcases hOp with h | h <;> subst h <;> rfl
     simp only [hNB, Bool.false_eq_true, if_false, List.cons_append,
-      List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
+      List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push,
+      -- NEW-004: no raw slots in scope, so both operand gates collapse.
+      Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self]
   -- Step 4: updateProp p t0 at depth 3 ⇒ [nip], sm -> [p].
   have hStep4 :
       (Stack.Lower.lowerValueP progMethods props budget 3
@@ -5042,7 +5070,7 @@ theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
         = [StackOp.nip] := by
     unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth? Stack.Lower.removePropEntryOps
-    have hFind : (["t0", p] : Stack.Lower.StackMap).findIdx? (· == "t0") = some 0 := by
+    have hFind : (["t0", p] : Stack.Lower.StackMap).findIdx? (· == some "t0") = some 0 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
     rw [hFind]
     simp only [hLU_t0, Stack.Lower.listContains, List.any_nil, Bool.not_false,

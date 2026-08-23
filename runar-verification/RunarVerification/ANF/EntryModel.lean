@@ -778,7 +778,7 @@ yields exactly `params.reverse.map (·.name)` — which is the `StackMap`
 the codegen lowers parameters to (stack order), and precisely the
 `hUntag` premise the `arith_consume` chain requires. -/
 theorem untagSm_mkTsm (params : List ANFParam) :
-    untagSm (mkTsm params) = List.reverse (params.map ANFParam.name) := by
+    untagSm (mkTsm params) = List.reverse (params.map (fun p => some p.name)) := by
   unfold mkTsm
   rw [← List.map_reverse]
   -- `untagSm (xs.map (fun p => (p.name, .param))) = xs.map (·.name)`, here `xs = params.reverse`.
@@ -1095,7 +1095,7 @@ theorem smoke_agreesTagged_mkEntry :
 /-- **Smoke — `hUntag` holds concretely.**  `untagSm (mkTsm smokeParams)`
 reduces to the reversed parameter-name list `["f", "a"]`, confirming the
 `untagSm_mkTsm` shape fires on real data (the stack-order `StackMap`). -/
-example : untagSm (mkTsm smokeParams) = ["f", "a"] := by decide
+example : untagSm (mkTsm smokeParams) = (["f", "a"] : Stack.Lower.StackMap) := by decide
 
 /-- **Smoke — the stack entry is non-vacuous.**  Its stack carries the two
 coerced param values in stack order (top = last param `f`'s flag, then
