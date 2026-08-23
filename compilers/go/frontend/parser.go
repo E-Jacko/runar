@@ -181,6 +181,25 @@ func Parse(source []byte, fileName string) *ParseResult {
 		fileName: fileName,
 	}
 
+	// tree-sitter is error-tolerant: malformed source still yields a tree, with
+	// the bad region marked ERROR/MISSING. Walking such a tree silently DROPS
+	// whatever failed to resolve (a statement parser returning nil is simply
+	// not appended), so `this.value = ;` used to compile to a script with the
+	// state write missing, and a malformed `assert(...)` to a script with the
+	// guard missing. Refuse the file instead — one check for every malformed
+	// shape, rather than a nil-guard per statement kind.
+	if root.HasError() {
+		if bad := firstBadNode(root); bad != nil {
+			p.addError(fmt.Sprintf(
+				"syntax error at line %d: unparseable %s near %q",
+				bad.StartPoint().Row+1, bad.Type(), p.snippet(bad),
+			))
+		} else {
+			p.addError("syntax error: source is not valid Rúnar")
+		}
+		return &ParseResult{Errors: p.errors}
+	}
+
 	contract := p.findContract(root)
 	if contract == nil {
 		p.addError("no class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found")
@@ -201,6 +220,37 @@ type parseContext struct {
 	source   []byte
 	fileName string
 	errors   []Diagnostic
+}
+
+// firstBadNode returns the first ERROR or MISSING node in the tree, so the
+// diagnostic can point at the offending line instead of the whole file.
+func firstBadNode(n *sitter.Node) *sitter.Node {
+	if n.IsError() || n.IsMissing() {
+		return n
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if bad := firstBadNode(n.Child(i)); bad != nil {
+			return bad
+		}
+	}
+	return nil
+}
+
+// snippet renders a short, single-line excerpt of the node's source span for
+// the diagnostic message.
+func (p *parseContext) snippet(n *sitter.Node) string {
+	start, end := int(n.StartByte()), int(n.EndByte())
+	if start < 0 || end > len(p.source) || start >= end {
+		return ""
+	}
+	text := strings.TrimSpace(string(p.source[start:end]))
+	if idx := strings.IndexAny(text, "\r\n"); idx >= 0 {
+		text = text[:idx]
+	}
+	if len(text) > 40 {
+		text = text[:40] + "..."
+	}
+	return text
 }
 
 func (p *parseContext) addError(msg string) {
