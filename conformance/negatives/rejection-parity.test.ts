@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readdirSync, existsSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import {
+  findGoBinary,
+  findJavaJarPath,
+  findRubyBinary,
+  findRustBinary,
+  findZigBinary,
+} from '../runner/runner.js';
 
 /**
  * Cross-tier REJECTION parity.
@@ -26,41 +33,46 @@ import { resolve, join } from 'node:path';
 const REPO = resolve(__dirname, '../..');
 const DIR = __dirname;
 
+/**
+ * Tier binaries are resolved through the RUNNER's own finders, never by
+ * hardcoded paths. CI does not lay the tree out the way a local build does: the
+ * conformance job downloads compiler artifacts to the REPO ROOT (`runar-go`,
+ * `runar-compiler-rust`, `runar-zig`) and the Java compiler as a jar under
+ * `compilers/java/build/libs/`, while a local build leaves them under
+ * `compilers/<tier>/`. Hardcoding the local layout found exactly one tier in
+ * CI, which the vacuity self-check below caught.
+ */
 interface Tier {
   id: string;
-  bin: string;
-  args: (src: string) => string[];
+  bin: string | null;
+  argv: (bin: string, src: string) => string[];
   cwd?: string;
 }
 
+const javaJar = findJavaJarPath();
+
 const TIERS: Tier[] = [
-  { id: 'go', bin: join(REPO, 'compilers/go/runar-go'), args: (s) => ['--source', s, '--hex'] },
-  {
-    id: 'rust',
-    bin: join(REPO, 'compilers/rust/target/release/runar-compiler-rust'),
-    args: (s) => ['--source', s, '--hex'],
-  },
-  {
-    id: 'zig',
-    bin: join(REPO, 'compilers/zig/zig-out/bin/runar-zig'),
-    args: (s) => ['compile', s, '--hex'],
-  },
+  { id: 'go', bin: findGoBinary(), argv: (b, s) => [b, '--source', s, '--hex'] },
+  { id: 'rust', bin: findRustBinary(), argv: (b, s) => [b, '--source', s, '--hex'] },
+  { id: 'zig', bin: findZigBinary(), argv: (b, s) => [b, 'compile', s, '--hex'] },
   {
     id: 'ruby',
-    bin: join(REPO, 'compilers/ruby/bin/runar-compiler-ruby'),
-    args: (s) => ['--source', s, '--hex'],
+    bin: findRubyBinary(),
+    argv: (b, s) => [b, '--source', s, '--hex'],
     cwd: join(REPO, 'compilers/ruby'),
   },
+  // Java ships as a jar, so the binary is `java` and the jar is an argument.
   {
     id: 'java',
-    bin: join(REPO, 'compilers/java/build/install/runar-java/bin/runar-java'),
-    args: (s) => ['--source', s, '--hex'],
+    bin: javaJar ? 'java' : null,
+    argv: (_b, s) => ['-jar', javaJar!, '--source', s, '--hex'],
   },
 ];
 
 function accepts(tier: Tier, src: string): boolean {
+  const [cmd, ...args] = tier.argv(tier.bin!, src);
   try {
-    execFileSync(tier.bin, tier.args(src), {
+    execFileSync(cmd!, args, {
       cwd: tier.cwd ?? REPO,
       stdio: 'pipe',
       timeout: 120_000,
@@ -80,7 +92,7 @@ describe('cross-tier rejection parity', () => {
     expect(fixtures.length).toBeGreaterThanOrEqual(12);
   });
 
-  const available = TIERS.filter((t) => existsSync(t.bin));
+  const available = TIERS.filter((t) => t.bin !== null);
 
   it('at least two tiers are built, or the comparison is vacuous', () => {
     expect(available.length).toBeGreaterThanOrEqual(2);
