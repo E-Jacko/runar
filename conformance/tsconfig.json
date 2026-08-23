@@ -37,9 +37,23 @@
   // would mean PROMOTING A REGRESSION BREAKS THE BUILD, for the same reason the
   // exclusion above exists — and editing the contract to placate tsc would
   // destroy the very shape being pinned.
+  // `negatives/*.runar.ts` is the cross-tier rejection corpus: every fixture
+  // there is DELIBERATELY malformed or violates the language subset, because
+  // its whole purpose is that all seven tiers must REFUSE it. Two of them are
+  // syntactically invalid TypeScript by construction (`this.value = ;` and
+  // `assert(claim ==)` — the shapes the Go tier used to silently DROP), so
+  // typechecking them fails with TS1109 "Expression expected". That is the
+  // fixture working as intended, not a defect. Same category as the two
+  // exclusions above: the corpus is read as TEXT and fed to each compiler CLI,
+  // never imported as a module, and "fixing" the syntax would delete the
+  // shape being pinned.
+  //
+  // `negatives/rejection-parity.test.ts` is NOT excluded — the harness is real
+  // TypeScript and stays typechecked.
   "exclude": [
     "node_modules",
     "fuzz-findings*",
-    "fuzz-regressions/entries/*/contract.runar.ts"
+    "fuzz-regressions/entries/*/contract.runar.ts",
+    "negatives/*.runar.ts"
   ]
 }

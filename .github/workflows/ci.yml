@@ -820,6 +820,15 @@ jobs:
         env:
           JAVA_JAR: ${{ steps.java-jar.outputs.path }}
         run: conformance/node_modules/.bin/tsx conformance/runner/index.ts --tests-dir conformance/tests --parser-only
+      - name: Cross-tier rejection parity (programs that must NOT compile)
+        # The parser-only step above proves every tier ACCEPTS what it should.
+        # Nothing proved they agree on what to REFUSE, and that gap let a Go
+        # statement-drop reach RC: malformed input was silently discarded and
+        # the tier emitted a locking script the other six rejected. This runs
+        # the negative corpus against every built tier.
+        env:
+          JAVA_JAR: ${{ steps.java-jar.outputs.path }}
+        run: cd conformance && npx vitest run negatives/
       - name: Run multi-format source conformance (all 7 compilers, all 9 formats)
         # Adds the TypeScript compiler to the central conformance job (it was
         # previously absent) and exercises every compiler's frontend against
