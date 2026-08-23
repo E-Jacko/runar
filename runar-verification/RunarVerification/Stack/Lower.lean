@@ -57,19 +57,53 @@ The TS lowering pass threads a `stackMap : Map<string, number>` where
 each entry tracks the depth of an in-scope binding from the top of the
 runtime stack. Inserting a new binding pushes onto the map at depth 0
 and shifts all others up by one; consuming a stack value pops one
-entry. We model this as a flat ordered list of names, head = top of
+entry. We model this as a flat ordered list of slots, head = top of
 stack.
+
+A slot is `some name` when the reference's `stackMap` entry carries a
+name, and `none` when it is ANONYMOUS. The TS reference pushes `null`
+at 291 of its 383 `push` sites — an anonymous slot occupies a stack
+position but cannot be addressed by name — and the issue #149 reconcile
+`restoreInheritedLayout` (`05-stack-lower.ts:1212-1300`) ABORTS, emitting
+nothing, the moment either the parent's post-`if` model or the arm's
+inherited region holds one (`if (n === null) return` at `1236`,
+`if (w === null) return` at `1263`). Those bail-outs are load-bearing
+correctness: without an anonymous slot in the representation the model
+would re-sort in exactly the cases where the reference deliberately does
+nothing.
+
+`Option String` rather than a bespoke `Slot` inductive on purpose: it
+inherits `BEq`/`DecidableEq`/`Repr`, keeps every `decide` over a literal
+stack map working, and — because Lean coerces `String` to `Option String`
+at the leaves of a list literal whose expected type is known — leaves the
+existing literal spellings (`["f", "a"]`) untouched.
+
+Every slot the model pushes today is still NAMED (`StackMap.push`), so
+introducing the representation moves ZERO emitted bytes; `pushAnon` is
+the constructor a future faithful port of `restoreInheritedLayout` needs.
 -/
 
-abbrev StackMap := List String
+abbrev StackMap := List (Option String)
 
-/-- Depth-from-top of `name` in `sm`, or `none` if absent. -/
+/-- Depth-from-top of `name` in `sm`, or `none` if absent. Anonymous
+slots are never found: they have no name to match. -/
 def StackMap.depth? (sm : StackMap) (name : String) : Option Nat :=
-  sm.findIdx? (· == name)
+  sm.findIdx? (· == some name)
 
 /-- Push a fresh binding name onto the top of the tracked stack. -/
 def StackMap.push (sm : StackMap) (name : String) : StackMap :=
-  name :: sm
+  some name :: sm
+
+/-- Push an ANONYMOUS slot: it occupies a stack position but no
+`depth?` / `findFrom?` lookup can address it. Mirrors the reference's
+`push(null)`. -/
+def StackMap.pushAnon (sm : StackMap) : StackMap :=
+  none :: sm
+
+/-- The names in `sm`, anonymous slots dropped. Used where a stack map
+feeds a name-only structure (`outerProtected`, `consumedNames`). -/
+def StackMap.names (sm : StackMap) : List String :=
+  sm.filterMap id
 
 /--
 Remove the entry at the given depth (counted from the top), shifting all
@@ -196,6 +230,53 @@ end
 
 /-- Look up `name` in the const-int map; return `none` if absent. -/
 def constIntsLookup (m : List (String × Int)) (name : String) : Option Int :=
+  (m.find? (fun p => p.1 == name)).map (·.2)
+
+/-! ### `arrayElems` — element refs of `array_literal` bindings
+
+Mirrors `LoweringContext.arrayElements` (`05-stack-lower.ts:565`), the
+map `lowerArrayLiteral` (`05-stack-lower.ts:2140-2146`) populates and
+`lowerCheckMultiSig` (`05-stack-lower.ts:1928-1936`) reads.
+
+An `array_literal` binding is metadata-only in the reference: it emits
+nothing and pushes NOTHING onto the stack map, because the map can only
+model one slot per binding while an array binding spans N runtime slots.
+The element refs stay on the map under their own binding names, and
+`checkMultiSig` pulls each one to the top at the use site.
+
+Like `constInts` / `rawSlots`, the table is method-wide and immutable for
+the duration of one `lowerMethod` call: built once at `lowerMethod` entry
+and threaded UNCHANGED through `lowerValueP` / `lowerBindingsP` (the
+inlined-methodCall arm merges the callee's contributions the same way
+`rawSlots` does, because TS inlines into the SAME `LoweringContext`). -/
+
+mutual
+
+/-- Collect `(name, elements)` pairs for every `name = array_literal
+elements` binding reachable from `bs`, descending into if-branches and
+loop bodies so an array defined in an outer scope stays visible to an
+inner-scope `checkMultiSig`. -/
+def arrayElemsOf : List ANFBinding → List (String × List String)
+  | []                     => []
+  | (.mk name v _) :: rest =>
+      let here : List (String × List String) :=
+        match v with
+        | .arrayLiteral elems  => [(name, elems)]
+        | .ifVal _ thn els _   => arrayElemsOf thn ++ arrayElemsOf els
+        -- A zero-count loop is never lowered, so the reference's
+        -- `lowerArrayLiteral` never runs for its body and the entries never
+        -- reach `arrayElements`. Same gate `collectRawSlotsGo` applies.
+        | .loop 0 _ _          => []
+        | .loop _ body _       => arrayElemsOf body
+        | _                    => []
+      here ++ arrayElemsOf rest
+
+end
+
+/-- Look up an `array_literal` binding's element refs; `none` if the ref
+does not name an array literal. -/
+def arrayElemsLookup (m : List (String × List String)) (name : String) :
+    Option (List String) :=
   (m.find? (fun p => p.1 == name)).map (·.2)
 
 /--
@@ -358,15 +439,32 @@ def clampLastUsesForOuter (m : List (String × Nat))
     (outerRefs : List String) (clampTo : Nat) : List (String × Nat) :=
   outerRefs.foldl (init := m) fun acc r => lastUsesUpdate acc r clampTo
 
+/-- Remove the shallowest slot carrying each of `names`, in order. Mirrors TS
+`lowerIf`'s post-`OP_ENDIF` parent reconcile (`05-stack-lower.ts:2928-2934`).
+
+`abbrev`, not `def`: it is a spelling of a fold the `.ifVal` arm used inline in
+two places and that `Agrees.lean` has to name in a hypothesis. A shared constant
+makes the two sides syntactically equal — two textually identical inline
+`match`es elaborate to two DIFFERENT auxiliary matchers, which `rw` cannot
+bridge — while reducibility keeps every existing `rfl` / `decide` working. -/
+abbrev removeNames (sm : StackMap) (names : List String) : StackMap :=
+  names.foldl (init := sm) fun m n =>
+    match m.depth? n with
+    | some d => m.removeAtDepth d
+    | none   => m
+
 /-- Names present in `before` but absent from `after`. Used by `lowerIf`
 to identify parent-scope items that one branch consumed (asymmetrically)
 so the other branch can emit matching ROLL+DROP cleanup. -/
-def consumedNames (before : List String) (after : List String) :
+def consumedNames (before : StackMap) (after : StackMap) :
     List String :=
-  before.foldl (init := ([] : List String)) fun acc n =>
-    if listContains acc n then acc
-    else if listContains after n then acc
-    else acc ++ [n]
+  before.foldl (init := ([] : List String)) fun acc slot =>
+    match slot with
+    | none   => acc          -- an anonymous slot has no name to consume
+    | some n =>
+        if listContains acc n then acc
+        else if listContains after.names n then acc
+        else acc ++ [n]
 
 /-- Insertion-sort descending on `Nat`. -/
 def sortDesc : List Nat → List Nat
@@ -415,11 +513,327 @@ def removeConsumedAtDepths (sm : StackMap) (names : List String) :
         (ops ++ rest, smF)
   go sm sorted
 
+/-- Physically drop the slot at depth `d`, mirroring TS `dropSlotAtDepth`
+(`05-stack-lower.ts:2314-2333`).
+
+The per-depth op shape is the one `removeConsumedAtDepths` above already
+uses — the same TS emitter feeds both — including the `d = 2` `OP_ROT`
+form the reference's peephole pass folds `[push 2, OP_ROLL]` into. -/
+def dropSlotAtDepth (sm : StackMap) (d : Nat) : (List StackOp × StackMap) :=
+  let ops : List StackOp :=
+    if d = 0 then [.drop]
+    else if d = 1 then [.nip]
+    else if d = 2 then [.opcode "OP_ROT", .drop]
+    else [.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop]
+  (ops, sm.removeAtDepth d)
+
+/-- Trim a declared-results branch arm down to `target` physical slots by
+repeatedly dropping the slot immediately BELOW the `k` result slots.
+
+Mirrors TS `lowerIf` (`05-stack-lower.ts:2620-2624`):
+```
+for (const ctx of [thenCtx, elseCtx]) {
+  while (ctx.stackMap.depth > targetDepth) ctx.dropSlotAtDepth(nDeclared);
+}
+```
+Everything beneath the `k` results is dead by construction: the arm's
+`__merge$` block copied each declared result before rebinding it, and a
+branch-local binding is not visible after the `if`. `fuel` bounds the
+`while` — each step removes one slot, so the arm's own depth suffices. -/
+def trimArmToDepth (k target : Nat) : Nat → StackMap → (List StackOp × StackMap)
+  | 0, sm => ([], sm)
+  | fuel + 1, sm =>
+      if sm.length > target then
+        let (ops, sm') := dropSlotAtDepth sm k
+        let (rest, smF) := trimArmToDepth k target fuel sm'
+        (ops ++ rest, smF)
+      else
+        ([], sm)
+
+/-- Occurrences of `name` in `sm`. Mirrors TS `lowerIf`'s local `countNames`
+(`05-stack-lower.ts:2576-2583`), which skips anonymous slots. -/
+def StackMap.countName (sm : StackMap) (name : String) : Nat :=
+  sm.foldl (init := 0) fun acc slot => if slot == some name then acc + 1 else acc
+
+/-- Worker for `inheritedModel`. `skipped` records, per name, how many
+occurrences have already been dropped — the reference decrements a shared
+`excess` map instead, which is the same thing counted from the other end. -/
+def inheritedModelGo (smParent smArm : StackMap) :
+    StackMap → List (String × Nat) → StackMap
+  | [],             _       => []
+  | none :: rest,   skipped => none :: inheritedModelGo smParent smArm rest skipped
+  | some n :: rest, skipped =>
+      let excess := smParent.countName n - smArm.countName n
+      let already := (lastUsesLookup skipped n).getD 0
+      if already < excess then
+        inheritedModelGo smParent smArm rest (lastUsesUpdate skipped n (already + 1))
+      else
+        some n :: inheritedModelGo smParent smArm rest skipped
+
+/--
+TS `lowerIf`'s `inheritedModel` (`05-stack-lower.ts:2807-2822`): the parent's
+post-`if` model — its slots minus, per name, the occurrences the arms gave up,
+dropped SHALLOWEST-first. Anonymous parent slots are never dropped.
+
+An arm whose own map IS this model produced no result of its own, which is what
+tells `padBelowResult` that its pad belongs on TOP rather than tucked under a
+result (NEW-019). Depth cannot distinguish the two shapes — both reach phase 3
+one slot short — so the reference compares positionally, and so do we.
+-/
+def inheritedModel (smParent smArm : StackMap) : StackMap :=
+  inheritedModelGo smParent smArm smParent []
+
+/--
+Depth-balance pads for the shallower arm of an `if`, mirroring TS `lowerIf`
+phase 3 (`05-stack-lower.ts:2853-2884`).
+
+The reference pads in a `while`, ONE slot per iteration, until the two arms
+agree — a conditional write of N state fields leaves N result values on the
+then-arm, so the else-arm owes N preserved slots (issue #99 Bug 1). The model
+used to emit exactly one pad regardless of the deficit. Each pad is
+`push <empty bytes>` plus the anonymous slot it occupies
+(`armCtx.stackMap.push(null)`).
+
+`padsBelow` / `padsOnTop` drive the reference's `padBelowResult`
+(`05-stack-lower.ts:2833-2840`): for a VALUE-producing conditional the pad must
+not land on top of the arm's own result and BECOME the result (NEW-017), so it
+is SWAPped underneath — unless the arm produced no result at all, in which case
+the swap would displace the whole inherited region instead (NEW-019).
+
+`n = 0` is the common case (arms already agree) and reduces to `([], sm)`
+whatever the flags say, which is what keeps the clean-shape lemmas working.
+-/
+def padArm (padsBelow padsOnTop : Bool) : Nat → StackMap → (List StackOp × StackMap)
+  | 0,     sm => ([], sm)
+  | n + 1, sm =>
+      let smPad := sm.pushAnon
+      let (swapOps, smSwapped) : (List StackOp × StackMap) :=
+        if padsOnTop || !padsBelow then ([], smPad)
+        else
+          match smPad with
+          | a :: b :: rest => ([StackOp.swap], b :: a :: rest)
+          | _              => ([], smPad)     -- TS `armCtx.stackMap.depth < 2`
+      let (rest, smF) := padArm padsBelow padsOnTop n smSwapped
+      (.push (.bytes ByteArray.empty) :: (swapOps ++ rest), smF)
+
+@[simp] theorem padArm_zero (padsBelow padsOnTop : Bool) (sm : StackMap) :
+    padArm padsBelow padsOnTop 0 sm = ([], sm) := rfl
+
+/-- Arms that already agree owe no pad. This is what discharges the
+depth-balance step in the `.ifVal` clean-shape lemmas, where the pre-`padArm`
+`if thnDepth > elsDepth then … else if …` was discharged by `omega`. -/
+theorem padArm_of_eq {a b : Nat} (h : a = b) (padsBelow padsOnTop : Bool)
+    (sm : StackMap) :
+    padArm padsBelow padsOnTop (a - b) sm = ([], sm) := by
+  subst h; simp
+
+/-! ### `restoreInheritedLayout` — issue #149's arm-layout reconcile
+
+An arm may have ROTATED the region it inherited from the enclosing `if`: a
+declared-results `if` nested inside it ROLL+DROPs its own stale slot out from
+under its results, and that scan reaches into the inherited region. The arm then
+comes back with the same names at the same depth in a DIFFERENT ORDER, which
+nothing else in `lowerIf` can see — the reconcile compares name multisets, the
+balance check compares depths, and an `if` that declares no results and changes
+no depth skips every adoption branch. Both faces are fund-safety bugs: the else
+path fails `OP_VERIFY` on a spend the source allows, and a guard evaluates TRUE
+on inputs the source rejects.
+
+Ported from `05-stack-lower.ts:1212-1300`, called at `:2974` on BOTH arms after
+the parent reconcile. The permutation is over SLOT POSITIONS, not names: the
+inherited region legitimately holds a stale duplicate of a declared result's
+name, and an unrolled loop leaves one identically-named slot per iteration, so
+only the mapping from the parent's names to region positions is by name and it
+matches the j-th occurrence to the j-th occurrence.
+
+The two `return`s on an ANONYMOUS slot (`:1236`, `:1263`) are load-bearing: a
+slot with no name cannot be matched to a model slot, and re-sorting past it
+would move a value the reference deliberately leaves alone. Expressing them is
+why `StackMap` had to carry anonymity.
+-/
+
+/-- The arm's inherited region, top-down, or `none` if it holds an anonymous
+slot (TS `if (n === null) return`, `05-stack-lower.ts:1236`). -/
+def regionOf : StackMap → Option (List String)
+  | []             => some []
+  | none :: _      => none
+  | some n :: rest => (regionOf rest).map (n :: ·)
+
+/-- Positions in `region` holding `name`, shallowest first (TS `occurrences`). -/
+def regionPositions (region : List String) (name : String) : List Nat :=
+  (region.foldl (init := ((0 : Nat), ([] : List Nat))) fun (j, acc) n =>
+    (j + 1, if n == name then acc ++ [j] else acc)).2
+
+/-- Build the target permutation: the arm's own results (positions `< k`) map to
+themselves, then each model slot maps to the region position holding that name,
+j-th occurrence to j-th occurrence. `none` for the two abort conditions — an
+ANONYMOUS model slot, or a model slot the region does not hold. -/
+def restoreTargetGo (k : Nat) (region : List String) :
+    StackMap → List (String × Nat) → List Nat → Option (List Nat)
+  | [],             _,     acc => some acc
+  | none :: _,      _,     _   => none   -- TS `if (w === null) return` (:1263)
+  | some w :: ws,   taken, acc =>
+      let occ := regionPositions region w
+      let next := (lastUsesLookup taken w).getD 0
+      match occ[next]? with
+      | none   => none                   -- TS `if (!at || next >= at.length) return`
+      | some j => restoreTargetGo k region ws (lastUsesUpdate taken w (next + 1))
+                    (acc ++ [k + j])
+
+/-- Deepest position that actually differs; everything below it is already right
+and must not be disturbed. `none` = already aligned, emits nothing. -/
+def deepestMismatch (target : List Nat) : Option Nat :=
+  (target.foldl (init := ((0 : Nat), (none : Option Nat)))
+    (fun st t => (st.1 + 1, if t == st.1 then st.2 else some st.1))).2
+
+private theorem deepestMismatch_fold_range (k : Nat) :
+    (List.range k).foldl
+        (fun (st : Nat × Option Nat) (t : Nat) =>
+          (st.1 + 1, if t == st.1 then st.2 else some st.1))
+        (0, none)
+      = (k, none) := by
+  induction k with
+  | zero => rfl
+  | succ n ih => rw [List.range_succ, List.foldl_append, ih]; simp
+
+/-- The identity permutation is already aligned, so the reconcile emits
+nothing. -/
+theorem deepestMismatch_range (k : Nat) : deepestMismatch (List.range k) = none := by
+  unfold deepestMismatch
+  rw [deepestMismatch_fold_range]
+
+/-- Move the slot at depth `d` to the top, the net map effect of TS's
+`push(null); pop(); removeAtDepth(d); push(rolled)`. -/
+def rollToTop (sm : StackMap) (d : Nat) : StackMap :=
+  match sm[d]? with
+  | some slot => slot :: sm.removeAtDepth d
+  | none      => sm
+
+/-- Bring the slots that belong at `m, m-1, …, 0` to the top in that order.
+Tracked by ORIGINAL slot position (`order`), because names repeat across the
+split. A ROLL from depth `d` leaves every slot deeper than `d` at its index, so
+the untouched tail stays untouched. Emits the fused `.roll d`, whose bytes are
+the reference's `push d, OP_ROLL` pair — the two agree on `d`, so the
+reference's own `PUSH 2, Roll{2} → Rot` / `PUSH 1, Roll{1} → Swap` peephole
+folds fire exactly where `rollPickRewriteOne` folds ours. -/
+def restoreRollsGo (target : List Nat) :
+    List Nat → (List Nat × List StackOp × StackMap) → (List Nat × List StackOp × StackMap)
+  | [],      st => st
+  | i :: is, st =>
+      let (order, ops, sm) := st
+      let st' :=
+        match target[i]? with
+        | none      => (order, ops, sm)
+        | some slot =>
+            match order.findIdx? (· == slot) with
+            | none         => (order, ops, sm)
+            | some 0       => (order, ops, sm)   -- TS `if (d === 0) continue`
+            | some (d + 1) =>
+                (slot :: order.eraseIdx (d + 1),
+                 ops ++ [StackOp.roll (d + 1)],
+                 rollToTop sm (d + 1))
+      restoreRollsGo target is st'
+
+/-- Re-sort an arm's inherited region back into the parent's slot order.
+`parentMap` is the POST-reconcile parent; `stillHeld` the names the then-arm
+still holds (TS `postBranchNames`). Returns the ops to append INSIDE the arm
+plus the arm's updated map. -/
+def restoreInheritedLayout (parentMap : StackMap) (stillHeld : List String)
+    (armSm : StackMap) : (List StackOp × StackMap) :=
+  -- The parent's post-`if` model: its slots minus the ones the arms consumed.
+  -- Anonymous slots are never reconciled away, so they stay.
+  let want : StackMap :=
+    parentMap.filter fun p =>
+      match p with
+      | none   => true
+      | some n => listContains stillHeld n
+  let armDepth := armSm.length
+  if armDepth < want.length then ([], armSm)   -- TS `if (k < 0) return`
+  else
+    let k := armDepth - want.length
+    match regionOf (armSm.drop k) with
+    | none        => ([], armSm)
+    | some region =>
+      match restoreTargetGo k region want [] (List.range k) with
+      | none        => ([], armSm)
+      | some target =>
+        match deepestMismatch target with
+        | none   => ([], armSm)
+        | some m =>
+            let (_, ops, smF) :=
+              restoreRollsGo target ((List.range (m + 1)).reverse)
+                (List.range armDepth, [], armSm)
+            (ops, smF)
+
+/-- An empty parent model has nothing to reconcile against: `want` is empty, the
+whole arm is its own result region, and the target permutation is the identity.
+Emits nothing and leaves the arm map alone. -/
+theorem restoreInheritedLayout_parent_nil (stillHeld : List String) (armSm : StackMap) :
+    restoreInheritedLayout [] stillHeld armSm = ([], armSm) := by
+  unfold restoreInheritedLayout
+  simp only [List.filter_nil, List.length_nil, Nat.not_lt_zero,
+    Nat.sub_zero, List.drop_length]
+  simp only [regionOf, restoreTargetGo, deepestMismatch_range]
+  simp
+
 /-- Shallowest depth `≥ start` holding `name`, if any. -/
 def StackMap.findFrom? (sm : StackMap) (start : Nat) (name : String) : Option Nat :=
-  match (sm.drop start).findIdx? (fun n => n == name) with
+  match (sm.drop start).findIdx? (fun n => n == some name) with
   | some i => some (start + i)
   | none   => none
+
+/-- Lift the slot at depth `d` to the top, preserving every other slot's
+relative order. Mirrors the reference's `removeAtDepth(d)` followed by pushing
+the lifted slot back (`05-stack-lower.ts:2566-2567`). Out-of-range `d` is the
+identity, matching `removeAtDepth`. -/
+def StackMap.liftFromDepth (sm : StackMap) (d : Nat) : StackMap :=
+  match sm[d]? with
+  | none   => sm
+  | some x => x :: sm.removeAtDepth d
+
+/-! ### `sinkBelow` — issue #149's arm-layout repair
+
+An arm may have ROTATED the region it inherited from the enclosing `if`: the
+ROLL+DROP scan in phase 1 above reaches PAST the declared-result block to find
+a stale slot, and the copy does not reorder the slots it crossed. The results
+come back with the same names at the same depth in a DIFFERENT ORDER — invisible
+to the reconcile (which compares name multisets) and to Layer C (which compares
+depths). Everything after `OP_ENDIF` is generated against one assumed layout, so
+the other path runs to the end and fails `OP_VERIFY`: funds locked.
+
+The reference repairs it by sinking the whole result block back under the
+`sinkBelow` slots it crossed, rolling the deepest item of the
+`(nDeclared + sinkBelow)` window to the top, `sinkBelow` times
+(`05-stack-lower.ts:2559-2569`). That lifts the crossed slots back above the
+results while preserving their own relative order, so BOTH paths of the
+enclosing `if` leave the same slot order.
+
+Applied UNCONDITIONALLY, not gated on this `if`'s own else: the asymmetry that
+makes #149 unspendable belongs to the ENCLOSING `if`, and `lowerIf` has no view
+of its parent here. Gating on an empty else was measured and is wrong — the
+#149 inner `if` has a real else, so the gate would disable the repair exactly
+where it is needed.
+
+No anonymous-slot bail-out is required. The phase-1 scan matches on a NAME
+(`findFrom?`), and an anonymous slot never name-matches, so a `none` slot is
+simply never selected as the stale one; there is no case in which the model
+would re-sort where the reference does nothing. -/
+def sinkResultBlock (n : Nat) (sinkBelow : Nat) (sm : StackMap) :
+    List StackOp × StackMap :=
+  if sinkBelow == 0 then ([], sm)
+  else
+    let w := n + sinkBelow
+    (List.range sinkBelow).foldl
+      (init := (([] : List StackOp), sm))
+      fun (ops, m) _ =>
+        (ops ++ [.push (.bigint (Int.ofNat (w - 1))), .opcode "OP_ROLL"],
+         m.liftFromDepth (w - 1))
+
+/-- `sinkBelow = 0` is the common case — no result crossed an inherited slot —
+and must emit nothing, so an `if` that needs no repair keeps its old bytes. -/
+theorem sinkResultBlock_zero (n : Nat) (sm : StackMap) :
+    sinkResultBlock n 0 sm = ([], sm) := by
+  unfold sinkResultBlock; simp
 
 /--
 Adopt a multi-result `if`'s DECLARED result slots into the stack map.
@@ -442,13 +856,155 @@ def adoptDeclaredResults (sm : StackMap) (results : List String) :
     List StackOp × StackMap :=
   let n := results.length
   let smWith := results.foldl StackMap.push sm
-  results.reverse.foldl
-    (init := (([] : List StackOp), smWith))
-    fun (ops, m) name =>
-      match m.findFrom? n name with
-      | some d => (ops ++ [.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop],
-                   m.removeAtDepth d)
-      | none   => (ops, m)
+  -- Phase 1: ROLL+DROP each stale parent slot the results shadow, tracking how
+  -- far below the result block the scan reached (`sinkBelow`).
+  let (ops, m, sinkBelow) :=
+    results.reverse.foldl
+      (init := (([] : List StackOp), smWith, 0))
+      fun (ops, m, sink) name =>
+        match m.findFrom? n name with
+        | some d =>
+            (ops ++ [.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop],
+             m.removeAtDepth d,
+             max sink (d - n))
+        | none   => (ops, m, sink)
+  -- Phase 2: restore the inherited layout (issue #149).
+  let (sinkOps, mF) := sinkResultBlock n sinkBelow m
+  (ops ++ sinkOps, mF)
+
+/--
+Issue #150 — the if-WITHOUT-else "then-arm rebound a parent-held name"
+shape, recognised AFTER the phase-2 consumption cleanups.
+
+TS `lowerIf` treats this shape in two coupled halves:
+
+* phase 3 (`05-stack-lower.ts:2710-2729`) pads the shorter arm, and when
+  the else-arm has NO bindings of its own and the then-arm's result slot
+  carries a name the else-arm still holds, it pads with a PICKed **copy**
+  of that name rather than the generic empty-bytes placeholder — so the
+  not-taken path preserves the OLD value in the same slot the taken path
+  leaves the NEW one;
+* the post-`OP_ENDIF` reconcile (`05-stack-lower.ts:3083-3107`) then
+  names the parent slot after that value and physically ROLL+DROPs the
+  now-stale original out from under it.
+
+`shadowRebind` above already ports both halves, but only for the case
+where the then-arm consumed NOTHING from the parent. When it did (a loop
+body's second iteration consumes the previous iteration's residue), the
+model fell through to the generic depth-balance, pushed `OP_0` instead of
+the copy, reconciled nothing, and left the parent naming the `if`'s own
+temporary while the stale slot stayed live underneath — every later read
+of the merged local then resolved one slot too deep.
+
+Returns `(pickDepth, staleDepth, name)`:
+* `pickDepth` — depth of `name` in the post-cleanup ELSE map, i.e. what
+  the phase-3 copy PICKs (TS `elseCtx.findDepth(thenName)`);
+* `staleDepth` — depth of the stale parent slot AFTER the parent adopts
+  `name` on top, i.e. `parentDepth + 1` (TS scans from depth 1 in the map
+  it has just pushed `thenTop` onto);
+* `name` — the then-arm's result slot (TS `thenTop`).
+
+`none` for every other shape, so the generic path stays definitionally
+what it was. Requires `nResults = 1` (`smThn.length = smParent.length + 1`)
+because the N ≥ 2 shape is TS's separate multi-result reconcile, and a
+one-slot pad deficit (`smThn.length = smEls.length + 1`) because the
+model's depth balance emits a single placeholder.
+
+TS's own guard `elseBindings.length === 0` is NOT a parameter here: the
+caller matches on `els` itself, so a non-empty else reduces to the
+pre-existing generic term definitionally (same reason the `results`
+match is written on the constructor rather than on `results.isEmpty`).
+-/
+def ifWithoutElseCopy (bindingName : String)
+    (smParent smThn smEls : StackMap) : Option (Nat × Nat × String) :=
+  if smThn.length != smEls.length + 1 then none
+  else if smThn.length != smParent.length + 1 then none
+  else
+    match smThn with
+    | []            => none
+    | none :: _     => none   -- an anonymous top has no name to copy
+    | some nm :: _ =>
+        if nm == bindingName then none
+        else
+          match smEls.depth? nm, smParent.depth? nm with
+          | some vd, some pd => some (vd, pd + 1, nm)
+          | _, _             => none
+
+/--
+Issue #99 Bug 1 — the if-WITHOUT-else shape where the then-arm left **N ≥ 2**
+results. Returns `N` (the reference's `nResults`), `none` for N ≤ 1.
+
+A conditional write of N state fields (`if (flag > 0n) { this.a = …;
+this.b = … }`) leaves N values on the then-arm and owes the empty else-arm N
+preserved ones. TS handles it in two coupled halves that both loop over N,
+and both of the model's single-slot shortcuts (`shadowRebind` and
+`ifWithoutElseCopy`) collapse the loop to its N = 1 instance:
+
+* phase 3 (`05-stack-lower.ts:2853-2872`) is a `while` over the depth
+  deficit — see `ifWithoutElseCopyPad`;
+* the post-`OP_ENDIF` reconcile (`:3022-3053`) adopts all N and ROLL+DROPs
+  the N stale parent slots they shadow. That loop is *character for
+  character* the `nDeclared >= 1` loop at `:3000-3020`, so the model reuses
+  `adoptDeclaredResults` for it — the only difference is where the N names
+  come from (the arm's top-N slots here, the node's `results` there).
+
+Gating on `2 ≤ N` is TS's own `nResults >= 2` (`:3022`). Below it the
+reference falls through to its single-result branches, which is what the two
+existing shortcuts model, so they keep their exact terms and bytes. -/
+def ifWithoutElseMultiResults (smParent smThn : StackMap) : Option Nat :=
+  match smThn.length - smParent.length with
+  | 0     => none
+  | 1     => none
+  | k + 2 => some (k + 2)
+
+/--
+TS `lowerIf` phase 3 for the empty-else arm (`05-stack-lower.ts:2853-2872`).
+
+The reference pads in a `while (thenDepth > elseDepth)`, and on EACH
+iteration re-reads `thenCtx.stackMap.peekAtDepth(thenDepth - elseDepth - 1)`
+and `elseCtx.findDepth(thenName)` against the else map it has just grown. So
+the preserved copies land deepest-result-first, and each one shifts the
+depths the next lookup sees. `r` is the remaining deficit, which makes the
+current `resultDepth` exactly `r - 1`.
+
+A then-slot whose name the else arm does NOT hold (or an anonymous one)
+falls back to the reference's generic empty-bytes placeholder. TS's
+`padBelowResult` cannot fire on this path: it is gated on
+`elseBindings.length > 0` (`:2760`) and this is the empty-else case.
+
+`vd == 0 ⇒ .dup` / `vd == 1 ⇒ .over` pre-apply the peephole folds TS's own
+`push vd / pick vd` pair takes (`optimizer/peephole.ts`, pushed value ==
+pick depth, so the fold DOES fire here — unlike the ROLL cleanups, where it
+cannot). Two adjacent `.over`s then fold again to `OP_2DUP`
+(`Peephole.applyDoubleOver`), which is what an N = 2 conditional write
+emits. -/
+def ifWithoutElseCopyPad (smThn : StackMap) :
+    Nat → StackMap → (List StackOp × StackMap)
+  | 0,     smEls => ([], smEls)
+  | r + 1, smEls =>
+      let (padOps, smEls') : List StackOp × StackMap :=
+        match smThn[r]? with
+        | some (some nm) =>
+            match smEls.depth? nm with
+            | some 0  => ([StackOp.dup], smEls.push nm)
+            | some 1  => ([StackOp.over], smEls.push nm)
+            | some vd => ([StackOp.pickStruct vd], smEls.push nm)
+            | none    => ([StackOp.push (.bytes ByteArray.empty)], smEls.pushAnon)
+        | _ => ([StackOp.push (.bytes ByteArray.empty)], smEls.pushAnon)
+      let (restOps, smF) := ifWithoutElseCopyPad smThn r smEls'
+      (padOps ++ restOps, smF)
+
+/-- The then-arm's top `k` slot names, DEEPEST FIRST — the list
+`adoptDeclaredResults` wants (`results[0]` is its deepest). An anonymous
+slot takes `bindingName`, mirroring TS's
+`thenCtx.stackMap.peekAtDepth(i) ?? bindingName` (`05-stack-lower.ts:3029`).
+-/
+def armResultNames (smThn : StackMap) (bindingName : String) (k : Nat) :
+    List String :=
+  ((List.range k).map fun i =>
+      match smThn[i]? with
+      | some (some n) => n
+      | _             => bindingName).reverse
 
 /-- Compute the set of parent-scope refs that branches must NOT consume.
 
@@ -476,7 +1032,10 @@ index in the outer body. -/
 def computeBranchProtected (smBranch : StackMap)
     (lastUses : List (String × Nat)) (currentIndex : Nat)
     (parentOuterProtected : List String) : List String :=
-  smBranch.foldl (init := ([] : List String)) fun acc ref =>
+  smBranch.foldl (init := ([] : List String)) fun acc slot =>
+    match slot with
+    | none     => acc        -- an anonymous slot cannot be a protected ref
+    | some ref =>
     if listContains acc ref then acc
     else
       let aliveAfter : Bool :=
@@ -1449,6 +2008,11 @@ def lowerComputeStateOutputHashOps (sm : StackMap) (bindingName : String)
   let smFinal := (smI.popN 1).push bindingName
   (sA ++ sB ++ sC ++ sD ++ sE ++ sF ++ sG ++ sH ++ sI ++ sJ ++ sK, smFinal)
 
+/-- BUG-010's exclusive upper bound on the Rabin padding. Mirrors
+`RABIN_PADDING_LIMIT` in `packages/runar-compiler/src/passes/rabin-codegen.ts`.
+Emits as `PUSH3(000001)` — 65536 needs 3 script-number bytes. -/
+def rabinPaddingLimit : Int := 65536
+
 /-- Lowering for `verifyRabinSig(msg, sig, padding, pubKey)`.
 
 Rabin signature verification checks `(sig^2 + padding) mod pubKey == SHA256(msg)`.
@@ -1460,9 +2024,11 @@ sequence brings the four args to the top of the stack via
 
   bottom→top: msg(3) sig(2) padding(1) pubKey(0)
 
-then emits:
+then emits (`emitVerifyRabinSig`, `rabin-codegen.ts:53-70`):
 
-  OP_SWAP  OP_ROT  OP_DUP  OP_MUL  OP_ADD
+  OP_SWAP
+  OP_DUP  OP_0  <65536>  OP_WITHIN  OP_VERIFY   -- BUG-010 padding gate
+  OP_ROT  OP_DUP  OP_MUL  OP_ADD
   OP_SWAP  OP_MOD  OP_SWAP  OP_SHA256  OP_EQUAL
 
 Net stack-map effect: pop 4 arg slots, push the boolean result under
@@ -1481,17 +2047,20 @@ def lowerVerifyRabinSigOpsLive (sm : StackMap) (bindingName : String)
   let (loadPk, sm4) :=
     loadRefOperand sm3 pubKey rabinOperands currentIndex lastUses outerProtected
   -- Stack bottom→top: msg sig padding pubKey
-  -- KNOWN DIVERGENCE (2026-06-25): BUG-010 added a 5-opcode `OP_WITHIN` range
-  -- check (`0 ≤ padding < 65536`) right after this first `swap` in the 7 real
-  -- compilers, and regenerated the `oracle-price` golden. This model lowering
-  -- does NOT yet emit that gate, so `oracle-price` is tracked in
-  -- `lowerDivergencePending` (PipelineGolden). Porting it (insert
-  -- `dup, push 0, push 65536, OP_WITHIN, OP_VERIFY` here) is byte-exact but
-  -- requires re-proving `Stack/Rabin.runOps_rabinBodyOps_eq` with a
-  -- `0 ≤ padding < 65536` hypothesis threading the within+verify gate — a
-  -- per-primitive codegen-to-spec follow-up.
+  --
+  -- BUG-010's `OP_WITHIN` padding range check (`0 ≤ padding < 65536`) sits
+  -- right after the first `swap`, matching `emitVerifyRabinSig`
+  -- (`packages/runar-compiler/src/passes/rabin-codegen.ts:53-70`) opcode for
+  -- opcode. `push (.bigint 0)` emits the same `0x00` byte the reference's
+  -- `OP_0` does (`Script/Emit.encodePushBigInt`), and 65536 emits as
+  -- `PUSH3(000001)`.
   let body : List StackOp :=
     [ StackOp.swap                    -- msg sig pubKey padding
+    , StackOp.dup                     -- … padding padding
+    , StackOp.push (.bigint 0)        -- … padding padding 0
+    , StackOp.push (.bigint rabinPaddingLimit)  -- … 0 65536
+    , StackOp.opcode "OP_WITHIN"      -- … padding (0 ≤ padding < 65536)
+    , StackOp.opcode "OP_VERIFY"      -- msg sig pubKey padding
     , StackOp.rot                     -- msg pubKey padding sig
     , StackOp.dup                     -- msg pubKey padding sig sig
     , StackOp.opcode "OP_MUL"         -- msg pubKey padding sig^2
@@ -1809,12 +2378,30 @@ def addOutputStateValuesLive (currentIndex : Nat)
         if propTypeIsNumeric p.type then
           [push (Int.ofNat (propTypeFixedSize p.type)), opc "OP_NUM2BIN"]
         else
-          []
+          -- A ByteString state field is serialized with a Bitcoin push-data
+          -- length prefix, exactly as `getStateScriptPropLive` does — TS
+          -- `lowerAddOutput` calls `emitPushDataEncode()` on the
+          -- `prop.type === 'ByteString'` arm (`05-stack-lower.ts:3721-3724`).
+          -- Without it the continuation output commits the raw bytes and the
+          -- SDK's length-prefixed state cannot be re-parsed.
+          --
+          -- Matched on the CONSTRUCTOR (not `p.type = .byteString`) so every
+          -- other property type still reduces definitionally to the `[]` this
+          -- arm produced before — the `Agrees*` reductions that pin a concrete
+          -- non-ByteString type are unaffected.
+          match p.type with
+          | .byteString => pushDataEncodeOps
+          | _           => []
       -- After load: top is the value (named on sm1).
       -- After conv (numeric): NUM2BIN pops 2 / pushes 1 → net 0 on sm,
       -- but the TS `lowerAddOutput` calls `stackMap.push(null)` then pops
       -- after NUM2BIN — net 0 anyway. We model the post-conv top as the
       -- (anonymous) converted value: pop the named value, push anon.
+      --
+      -- The ByteString arm needs no peer: TS's `emitPushDataEncode` restores
+      -- `smEndTarget`, which is `sm1` with the top ANONYMIZED and the depth
+      -- unchanged — and the very next step (`smAfterCat`) pops that slot,
+      -- so naming it or not cannot be observed downstream.
       let smAfterConv :=
         if propTypeIsNumeric p.type then (sm1.popN 1).push "_conv" else sm1
       -- After OP_CAT: pops 2 / pushes 1 (the new accumulator).
@@ -2171,10 +2758,10 @@ emitting `[push d, .roll (d + 1)]` would double-push the depth literal
 auction / add-raw-output / cross-covenant fixtures pre-Phase 3z-G). We
 emit `[.push d, .opcode "OP_ROLL", .drop]` to match TS byte-for-byte. -/
 def removePropEntryAux (propName : String) :
-    Nat → List String → (List StackOp × List String)
+    Nat → StackMap → (List StackOp × StackMap)
   | _,  []        => ([], [])
   | d,  x :: xs   =>
-      if x = propName then
+      if x = some propName then
         if d = 1 then
           ([.nip], xs)
         else
@@ -2861,41 +3448,38 @@ OP_0                       -- Bitcoin's CHECKMULTISIG dummy
 OP_CHECKMULTISIG
 ```
 
-The Lean `lowerArrayLiteral` (see `lowerArrayElems`) coalesces the array
-elements into a single concatenated payload via `OP_CAT`, so by the time
-we reach the `checkMultiSig` call the two array slots on the stack are
-each a single byte-string. We mirror the TS *shape* faithfully — push
-the dummy `0`, bring each array slot to TOS, push a placeholder count
-for each, and emit `OP_CHECKMULTISIG`.
+`args[0]` / `args[1]` name `array_literal` bindings, which are NOT stack
+slots (see `lowerValueP`'s `.arrayLiteral` arm): their element refs live
+on the stack map under their own binding names. We pull each element to
+TOS via `bringToTop` in the layout order above, exactly as TS does, with
+the consume decision taken through `operandConsume` against the COMBINED
+element list (TS `msigOperands = [...sigElems, ...pkElems]`) so a ref
+repeated across the two arrays is copied at every position.
 
-Byte-exact match against the TS golden is intentionally out of scope at
-this tier: the dedicated `arrayLengths` tracking that TS uses to compute
-the per-array count pushes is not threaded through `lowerValueP`. The
-counts emitted here are `0` placeholders. The fixture remains in the
-crypto-pending bucket (no `compileSafe` rejection, no byte-exact gate). -/
+The three non-element pushes (dummy, nSigs, nPKs) occupy anonymous slots
+— TS `stackMap.push(null)` — so no lookup can address them. -/
 
 def lowerCheckMultiSigOpsLive (sm : StackMap) (bindingName : String)
-    (sigs pubkeys : String)
+    (sigElems pkElems : List String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
+  let msigOperands : List String := sigElems ++ pkElems
   -- Dummy `0` required by Bitcoin's OP_CHECKMULTISIG off-by-one bug.
   let dummy : List StackOp := [StackOp.push (.bigint 0)]
-  let sm0 : StackMap := sm.push "_checkmultisig_dummy"
-  -- Bring sigs array to TOS. The repeated-operand gate checks against
-  -- the combined operand list (TS `msigOperands = [...sigElems,
-  -- ...pkElems]`; the Lean model operates on the two array refs).
-  let (loadSigs, sm1) := loadRefOperand sm0 sigs [sigs, pubkeys] currentIndex lastUses outerProtected
-  -- Placeholder nSigs count. Byte-exact emit requires `arrayLengths`
-  -- tracking which is not yet threaded through `lowerValueP`.
-  let nSigs : List StackOp := [StackOp.push (.bigint 0)]
-  let sm2 : StackMap := sm1.push "_checkmultisig_nsigs"
-  -- Bring pubkeys array to TOS.
-  let (loadPks, sm3) := loadRefOperand sm2 pubkeys [sigs, pubkeys] currentIndex lastUses outerProtected
-  -- Placeholder nPKs count (same reason as nSigs).
-  let nPks : List StackOp := [StackOp.push (.bigint 0)]
-  let sm4 : StackMap := sm3.push "_checkmultisig_npks"
-  -- Stack map net: pop dummy + sigs + nSigs + pks + nPKs (5 slots), push bindingName.
-  let smFinal : StackMap := (sm4.popN 5).push bindingName
+  let sm0 : StackMap := sm.pushAnon
+  -- Bring each sig element to TOS in declaration order.
+  let (loadSigs, sm1) :=
+    lowerArgsLive currentIndex lastUses outerProtected msigOperands sm0 sigElems
+  let nSigs : List StackOp := [StackOp.push (.bigint (Int.ofNat sigElems.length))]
+  let sm2 : StackMap := sm1.pushAnon
+  -- Bring each pubkey element to TOS in declaration order.
+  let (loadPks, sm3) :=
+    lowerArgsLive currentIndex lastUses outerProtected msigOperands sm2 pkElems
+  let nPks : List StackOp := [StackOp.push (.bigint (Int.ofNat pkElems.length))]
+  let sm4 : StackMap := sm3.pushAnon
+  -- OP_CHECKMULTISIG consumes dummy + N sigs + nSigs + M pks + nPKs.
+  let consumed : Nat := 1 + sigElems.length + 1 + pkElems.length + 1
+  let smFinal : StackMap := (sm4.popN consumed).push bindingName
   (dummy ++ loadSigs ++ nSigs ++ loadPks ++ nPks
     ++ [StackOp.opcode "OP_CHECKMULTISIG"], smFinal)
 
@@ -3046,6 +3630,196 @@ The `consume` flag for each ref is computed by `loadRefLive`:
   consume = (ref ∉ outerProtected) ∧ isLastUse(ref, currentIndex, lastUses)
 -/
 
+/-! ### `rawSlots` — slots holding a non-minimal numeric buffer (NEW-004)
+
+Mirrors `LoweringContext.rawSlots`
+(`packages/runar-compiler/src/passes/05-stack-lower.ts:595`).
+
+`OP_LSHIFT` / `OP_RSHIFT` / `OP_AND` / `OP_OR` / `OP_XOR` / `OP_INVERT`
+return a buffer as WIDE as their operand, so once the significant bits
+leave that width the result is a buffer like `[0x00]` or `[0x80]` —
+numerically zero, but NOT the minimal script-number encoding of zero
+(the empty buffer). Every numeric-context opcode reads its operands
+with `requireMinimal` and aborts, so a contract whose guard reads one
+compiles, deploys, and can never be spent.
+
+The repair is `OP_BIN2NUM`, applied at the point of USE (`bringToTop`)
+and never at the producing opcode: a byte-array op consumes its
+operands as raw bytes and requires them to match in WIDTH, so
+re-minimising a result that feeds another byte-array op would silently
+revert PR #141 — `(x<<8)|5` would start aborting on a length mismatch
+and the provably unspendable `(x<<8)&0` would start reporting as
+spendable. Only those consumers read raw; see `rawAllowedBinOpLeft` /
+`rawAllowedBinOpRight` below.
+
+TS scopes the set per `LoweringContext` (each `if` arm gets a copy and
+the union is merged back at `05-stack-lower.ts:2521-2522`). We model it
+as ONE flat, method-wide set, which is extensionally the same thing:
+the TS set is ADD-ONLY (nothing is ever removed), ANF binding names are
+unique within a method — the very property TS relies on when it calls a
+carried-over arm-local name "inert" — and ANF defines every name before
+it is used. So at any use site the flat set and the TS scope-at-that-
+point contain the same names. -/
+
+/-- TS `BYTE_ARRAY_BINOPS` (`05-stack-lower.ts:169`). -/
+def isByteArrayBinOp (op : String) : Bool :=
+  op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>"
+
+/-- TS `SHIFT_BINOPS` (`05-stack-lower.ts:170`). -/
+def isShiftBinOp (op : String) : Bool :=
+  op == "<<" || op == ">>"
+
+/-- The LEFT operand of a byte-array binop is read as raw bytes
+(`05-stack-lower.ts:1717`, `allowRaw = byteArrayOp`). -/
+def rawAllowedBinOpLeft (op : String) : Bool := isByteArrayBinOp op
+
+/-- The RIGHT operand is read as raw bytes for `& | ^` but NOT for the
+shifts, whose right operand is the shift COUNT and is read as a number
+(`05-stack-lower.ts:1710`, `rightIsRawOperand = byteArrayOp && !SHIFT`). -/
+def rawAllowedBinOpRight (op : String) : Bool :=
+  isByteArrayBinOp op && !isShiftBinOp op
+
+/-- A binding whose value leaves a raw (possibly non-minimal) NUMERIC
+buffer on the stack. A `bytes`-typed `& | ^ ~` is a ByteString
+operation whose width is the whole point, so it is never raw
+(`05-stack-lower.ts:1749`, `1804`). -/
+@[simp] def rawResultValue : ANFValue → Bool
+  | .binOp op _ _ rt   => isByteArrayBinOp op && rt != some "bytes"
+  | .unaryOp op _ rt   => op == "~" && rt != some "bytes"
+  | _                  => false
+
+/-- The stack-map name a binding leaves on TOP, if it pushes one.
+`assert` pushes nothing (it loads, `OP_VERIFY`s, and pops);
+`updateProp` renames the top to the PROPERTY name; a declared-results
+`if` adopts its result slots rather than its own binding name. Used to
+mirror TS `adoptRawArmResult` (`05-stack-lower.ts:1764-1786`). -/
+@[simp] def topSlotName (name : String) : ANFValue → Option String
+  | .assert _             => none
+  | .updateProp p _       => some p
+  | .ifVal _ _ _ []       => some name
+  | .ifVal _ _ _ results  => results.getLast?
+  | _                     => some name
+
+/-- The name an arm leaves on top of the stack: the last binding in the
+arm that pushes a slot. -/
+@[simp] def armTopName : List ANFBinding → Option String
+  | []                  => none
+  | (.mk n v _) :: rest =>
+      match armTopName rest with
+      | some t => some t
+      | none   => topSlotName n v
+
+/-- Forward fold building the method-wide raw-slot set. Order matters:
+a `@ref` alias inherits the marker of its referent, which ANF always
+binds earlier (`05-stack-lower.ts:1648-1650`) — an alias is pure data
+movement, not a use, so normalising there would decide the encoding on
+the aliased value's behalf before its real consumer is known. -/
+@[simp] def collectRawSlotsGo (acc : List String) : List ANFBinding → List String
+  | []                     => acc
+  | (.mk name v _) :: rest =>
+      let acc' : List String :=
+        match v with
+        | .loadConst (.refAlias r) =>
+            if listContains acc r then name :: acc else acc
+        | .ifVal _ thn els _ =>
+            -- Each arm inherits the parent markers and the union is
+            -- merged back — only one arm runs, so a slot the parent
+            -- reads afterwards is raw if EITHER arm can leave a
+            -- byte-array result in it.
+            let accBoth := collectRawSlotsGo (collectRawSlotsGo acc thn) els
+            -- TS `adoptRawArmResult`: a value-`if` is adopted under the
+            -- `if`'s OWN binding name, so a raw marker on the arm's top
+            -- slot would otherwise be dropped on the floor.
+            let tops := [armTopName thn, armTopName els].filterMap id
+            if tops.any (fun t => listContains accBoth t) then name :: accBoth
+            else accBoth
+        -- A zero-count loop is never lowered, so TS never marks anything
+        -- in its body (`lowerLoop` adds markers from inside the iteration
+        -- loop, which does not run). Iterations beyond the first re-lower
+        -- the same body and re-add the same names, so one pass suffices.
+        | .loop 0 _ _        => acc
+        | .loop _ body _     => collectRawSlotsGo acc body
+        | _ => if rawResultValue v then name :: acc else acc
+      collectRawSlotsGo acc' rest
+
+/-- Method-wide raw-slot set for `bs`. Built once at `lowerMethod` entry
+and threaded through `lowerValueP` / `lowerBindingsP` like `constInts`. -/
+@[simp] def collectRawSlots (bs : List ANFBinding) : List String :=
+  collectRawSlotsGo [] bs
+
+/-- Re-minimise a just-loaded slot when it holds a raw byte-array
+result. Depth-neutral: one buffer in, one script number out. Mirrors
+`bringToTop`'s `!allowRaw && this.rawSlots.has(name)` guard
+(`05-stack-lower.ts:1091-1095`). Defaulting to normalisation makes the
+safe choice the automatic one: a forgotten use site emits a redundant
+`OP_BIN2NUM`, which costs one byte and cannot change a value, rather
+than emitting an unspendable script. -/
+def normalizeRaw (rawSlots : List String) (name : String)
+    (ops : List StackOp) : List StackOp :=
+  if listContains rawSlots name then ops ++ [.opcode "OP_BIN2NUM"] else ops
+
+/-- The raw-slot set visible while lowering the binding named
+`bindingName`, i.e. while its OPERANDS are being loaded.
+
+TS adds a binding's own marker AFTER emitting its opcode
+(`05-stack-lower.ts:1749`, `1804`, `bringToTop` having already run at
+`1714`/`1718`/`1791`), so the marker a binding is about to add is not in
+scope for its own operand reads. Our set is method-wide, so we drop it
+explicitly.
+
+For well-formed ANF this is byte-neutral — binding names are unique and
+distinct from params, so `bindingName` is never one of its own operands
+— but it keeps the flat set faithful to TS's scoped one even for a
+binding that SHADOWS a name it reads (`x = x << 2`), where the operand
+is the OLD `x` and carries no marker yet. -/
+def rawSlotsInScope (rawSlots : List String) (bindingName : String) :
+    List String :=
+  rawSlots.filter (fun s => s != bindingName)
+
+/-- With no raw slots there is nothing to bring into scope. -/
+@[simp] theorem rawSlotsInScope_nil (bindingName : String) :
+    rawSlotsInScope [] bindingName = [] := rfl
+
+/-- A binding's own marker is exactly what `rawSlotsInScope` drops. -/
+@[simp] theorem rawSlotsInScope_singleton_self (bindingName : String) :
+    rawSlotsInScope [bindingName] bindingName = [] := by
+  simp [rawSlotsInScope]
+
+/-- A singleton value-`if` body marks nothing raw when neither arm does:
+the arms are folded first, and the `adoptRawArmResult` carry-over can only
+fire on a name the arms already marked. -/
+theorem collectRawSlots_singleton_ifVal_of_arms
+    (bn cond : String) (thn els : List ANFBinding) (results : List String)
+    (src : Option SourceLoc)
+    (hThn : collectRawSlotsGo [] thn = [])
+    (hEls : collectRawSlotsGo [] els = []) :
+    collectRawSlots [ANFBinding.mk bn (.ifVal cond thn els results) src] = [] := by
+  simp only [collectRawSlots, collectRawSlotsGo, hThn, hEls, listContains,
+             List.any_nil]
+  -- Every candidate top is tested against the EMPTY set, so the adopt
+  -- carry-over cannot fire whatever the arms leave on top.
+  have hAny : ((List.filterMap id [armTopName thn, armTopName els]).any
+      fun _ => false) = false := by
+    cases armTopName thn <;> cases armTopName els <;> rfl
+  rw [hAny]
+  rfl
+
+/-- A one-binding body contributes at most its OWN name to the raw set
+(`collectRawSlotsGo` prepends `name` or nothing), and that name is out of
+scope for that binding's own operands — so the whole gate collapses
+whichever way the byte-array test goes. This is the shape the
+single-binding lowering lemmas face once `collectRawSlots` is unfolded. -/
+@[simp] theorem rawSlotsInScope_ite_singleton_self
+    (c : Prop) [Decidable c] (bindingName : String) :
+    rawSlotsInScope (if c then [bindingName] else []) bindingName = [] := by
+  by_cases h : c <;> simp [h]
+
+/-- With no raw slots in scope there is nothing to re-minimise, so the
+lowering is exactly the pre-NEW-004 one. This is what lets every proof
+stated at the `rawSlots := []` default keep reducing unchanged. -/
+@[simp] theorem normalizeRaw_nil (name : String) (ops : List StackOp) :
+    normalizeRaw [] name ops = ops := rfl
+
 mutual
 
 /-- Mirrors TS `LoweringContext.localBindings` (`05-stack-lower.ts:856-857`).
@@ -3068,8 +3842,11 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) (localBindings : List String)
     (constInts : List (String × Int))
-    (sm : StackMap) (bindingName : String) :
-    ANFValue → (List StackOp × StackMap × List String)
+    (sm : StackMap) (bindingName : String) (value : ANFValue)
+    (rawSlots : List String := []) (insideBranch : Bool := false)
+    (arrayElems : List (String × List String) := []) :
+    (List StackOp × StackMap × List String) :=
+  match value with
   | .loadParam n =>
       -- Phase 7.1: thread outerProtected so params used in sibling
       -- inner scopes (e.g. both branches of separate ifs) aren't
@@ -3092,7 +3869,9 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           let sm2 := match sm1 with
                      | _ :: rest => bindingName :: rest
                      | []        => [bindingName]
-          (load, sm2, localBindings)
+          -- A property slot can be raw: a shadow rebind `count = @ref:tN`
+          -- carries the marker onto the property name.
+          (normalizeRaw (rawSlotsInScope rawSlots bindingName) n load, sm2, localBindings)
       | none =>
           match props.find? (·.name = n) with
           | some prop =>
@@ -3141,15 +3920,26 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       -- Repeated-operand gate (PRs #62/#67/#68): a ref reading BOTH
       -- operand positions (`t := x + x`) is COPIED at every position;
       -- consume only when the ref occurs exactly once in `[l, r]`.
-      let (lOps, sm1) := loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
-      let (rOps, sm2) := loadRefOperand sm1 r [l, r] currentIndex lastUses outerProtected
+      let (lOps₀, sm1) := loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
+      let (rOps₀, sm2) := loadRefOperand sm1 r [l, r] currentIndex lastUses outerProtected
+      -- NEW-004: re-minimise a raw operand unless THIS op reads it as raw
+      -- bytes. `& | ^` read both operands raw; `<< >>` read the LEFT
+      -- operand raw but the right one is the shift COUNT, read as a number.
+      let lOps := if rawAllowedBinOpLeft op then lOps₀
+                  else normalizeRaw (rawSlotsInScope rawSlots bindingName) l lOps₀
+      let rOps := if rawAllowedBinOpRight op then rOps₀
+                  else normalizeRaw (rawSlotsInScope rawSlots bindingName) r rOps₀
       let base := lOps ++ rOps ++ [.opcode (binopOpcode op rt)]
       let ops := if op == "!==" then base ++ [.opcode "OP_NOT"] else base
       -- Binop pops 2, pushes 1 (the named result).
       let sm3 := (sm2.popN 2).push bindingName
       (ops, sm3, localBindings)
   | .unaryOp op operand _ =>
-      let (load, sm1) := loadRefLive sm operand currentIndex lastUses outerProtected
+      let (load₀, sm1) := loadRefLive sm operand currentIndex lastUses outerProtected
+      -- `OP_INVERT` flips its operand's bytes in place — same raw-in /
+      -- raw-out contract as the binary byte-array opcodes.
+      let load := if op == "~" then load₀
+                  else normalizeRaw (rawSlotsInScope rawSlots bindingName) operand load₀
       let ops := load ++ [.opcode (unaryOpcode op)]
       let sm2 := (sm1.popN 1).push bindingName
       (ops, sm2, localBindings)
@@ -3586,17 +4376,24 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
             currentIndex lastUses outerProtected
       else if func = "checkMultiSig" then
         -- Multisig: dedicated dispatch mirroring TS `lowerCheckMultiSig`
-        -- (`05-stack-lower.ts:1619-1663`). Args: `[sigsArrayRef, pubkeysArrayRef]`
-        -- (each ref is an `array_literal` binding). Emits the canonical
-        -- `OP_0 dummy + sigs + nSigs + pubkeys + nPKs + OP_CHECKMULTISIG`
-        -- shape with placeholder zero counts (full `arrayLengths` tracking
-        -- to come in a follow-up; the fixture is not in the byte-exact
-        -- baseline).
+        -- (`05-stack-lower.ts:1619-1663`). Args: `[sigsArrayRef,
+        -- pubkeysArrayRef]` — each names an `array_literal` binding, so the
+        -- ELEMENT refs come from the method-wide `arrayElems` table rather
+        -- than from the stack map (the array binding itself has no slot).
         match args with
         | [sigsRef, pubkeysRef] =>
-            withLB <|
-              lowerCheckMultiSigOpsLive sm bindingName sigsRef pubkeysRef
-                currentIndex lastUses outerProtected
+            match arrayElemsLookup arrayElems sigsRef,
+                  arrayElemsLookup arrayElems pubkeysRef with
+            | some sigElems, some pkElems =>
+                withLB <|
+                  lowerCheckMultiSigOpsLive sm bindingName sigElems pkElems
+                    currentIndex lastUses outerProtected
+            | _, _ =>
+                -- TS throws `checkMultiSig: array_literal metadata missing`
+                -- here; the model's equivalent is a marker opcode no emitter
+                -- can encode, so the shape cannot pass silently.
+                ([.opcode "OP_RUNAR_CHECKMULTISIG_NO_ARRAY_METADATA"],
+                 sm.push bindingName, localBindings)
         | _ =>
             ([.opcode "OP_RUNAR_CHECKMULTISIG_ARITY"], sm.push bindingName, localBindings)
       else
@@ -3653,9 +4450,19 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
               -- outer-scope map. The outer map keeps its entries (visible
               -- through scope) while the callee adds its own literals.
               let bodyConstInts := constInts ++ collectConstInts m.body
+              -- Same merge for the raw-slot markers: TS inlines the callee
+              -- into the SAME `LoweringContext`, so the callee's byte-array
+              -- results are marked in the very set the inlined body reads.
+              let bodyRawSlots := rawSlots ++ collectRawSlots m.body
+              -- …and for the array-literal element table: TS inlines the
+              -- callee into the SAME `LoweringContext`, so the callee's
+              -- `array_literal` bindings land in the very map its own
+              -- `checkMultiSig` reads.
+              let bodyArrayElems := arrayElems ++ arrayElemsOf m.body
               let (bodyOps, smAfterBody) :=
                 lowerBindingsP progMethods props budget' 0 bodyLastUses outerProtected
-                  innerLocalBindings bodyConstInts smArgs m.body
+                  innerLocalBindings bodyConstInts smArgs m.body bodyRawSlots insideBranch
+                  bodyArrayElems
               -- After inlining, the callee body has either left its return
               -- value on top (named after its last binding) or — if its
               -- last binding was an assert — left whatever was below
@@ -3679,7 +4486,10 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
               (objDropOps ++ argLoads ++ bodyOps, smFinal, innerLocalBindings)
   | .ifVal cond thn els results =>
       -- Bring the cond to top (consume on last use, modulo outerProtected).
-      let (condOps, sm1) := loadRefLive sm cond currentIndex lastUses outerProtected
+      let (condOps₀, sm1) := loadRefLive sm cond currentIndex lastUses outerProtected
+      -- OP_IF reads the cond as a boolean, so a raw byte-array result is
+      -- re-minimised here like any other numeric-context read.
+      let condOps := normalizeRaw (rawSlotsInScope rawSlots bindingName) cond condOps₀
       -- The IF block consumes the cond, so peel it off the stack map for
       -- the branch lowering. Branches inherit `sm1` minus the cond top —
       -- which matches Bitcoin Script's IF semantics: cond is popped at
@@ -3693,7 +4503,20 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       -- inside the empty-else then-branch). Pre-fix we used the full
       -- `smBranch` here, which over-protected and forced PICK where
       -- TS emits ROLL, causing a +1 stack-depth drift downstream.
-      let innerProtected := computeBranchProtected smBranch lastUses currentIndex outerProtected
+      -- Issue #150: a DECLARED result is read by BOTH arms' `__merge$`
+      -- block, and that read is reconciliation, not a use — TS protects
+      -- every declared result the parent still holds so each arm COPIES it
+      -- (`05-stack-lower.ts:2470-2472`) and both arms leave exactly K
+      -- equally-named result slots. Without it an arm ROLLs the slot away,
+      -- the merge block emits nothing, and the arm comes back short.
+      -- Matched on `results` so the no-results case stays DEFINITIONALLY
+      -- the pre-existing term the Agrees* proofs reduce through.
+      let innerProtected :=
+        match results with
+        | [] => computeBranchProtected smBranch lastUses currentIndex outerProtected
+        | _ :: _ =>
+            computeBranchProtected smBranch lastUses currentIndex outerProtected
+              ++ results.filter (fun n => (smBranch.depth? n).isSome)
       let thnLastUses := computeLastUses thn
       let elsLastUses := computeLastUses els
       -- TS `lowerIf` creates a new `LoweringContext` per branch, so each
@@ -3701,8 +4524,17 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       -- 1688). Mirror that.
       let thnLocal := thn.map (fun b => b.name)
       let elsLocal := els.map (fun b => b.name)
-      let (thnOps, smThn) := lowerBindingsP progMethods props budget 0 thnLastUses innerProtected thnLocal constInts smBranch thn
-      let (elsOps, smEls) := lowerBindingsP progMethods props budget 0 elsLastUses innerProtected elsLocal constInts smBranch els
+      -- Each arm inherits the parent's raw-slot markers
+      -- (`05-stack-lower.ts:2485`, `2503`); `collectRawSlots` already folded
+      -- both arms' own contributions into the method-wide set.
+      -- Issue #150: `true` is TS `lowerIf`'s `thenCtx._insideBranch = true` /
+      -- `elseCtx._insideBranch = true` (`05-stack-lower.ts:2481`, `2502`) —
+      -- the ONLY two places the reference sets the flag, and the only two
+      -- places it builds a sub-context. Loops and inlined private methods
+      -- lower into the SAME context there, which is why every other call
+      -- site below propagates the incoming value instead of resetting it.
+      let (thnOps, smThn) := lowerBindingsP progMethods props budget 0 thnLastUses innerProtected thnLocal constInts smBranch thn rawSlots true arrayElems
+      let (elsOps, smEls) := lowerBindingsP progMethods props budget 0 elsLastUses innerProtected elsLocal constInts smBranch els rawSlots true arrayElems
       -- Phase 3z-F: empty-else shadow-rebind synthesis. When the THEN
       -- branch's top-of-stack name was already in `smBranch` (a property
       -- shadow-rebind like `count = @ref:t5`) and `els = []`, TS
@@ -3724,9 +4556,21 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         match b.value with
         | .loadConst (.bytes ba) => ba.size = 0
         | _ => false
+      -- Issue #99 Bug 1: the shape above is the SINGLE-result instance of
+      -- TS's post-`OP_ENDIF` reconcile — the `else if (thenCtx.stackMap.depth
+      -- > this.stackMap.depth)` branches at `05-stack-lower.ts:3054-3106`,
+      -- which the reference only reaches once its `nResults >= 2` branch
+      -- (`:3022`) has declined. `singleResult` is that gate. Without it a
+      -- conditional write of N ≥ 2 fields matched here on its TOP name alone:
+      -- the model synthesised ONE copy for an N-slot deficit and NIPped ONE
+      -- of the N stale slots, so the arms left the stack at different depths
+      -- and every later read resolved (N-1) slots off. `cond-write-multi-field`
+      -- is the fixture written for exactly that shape.
+      let singleResult : Bool := smThn.length == smBranch.length + 1
       let shadowRebind : Option (StackMap × Nat × String) :=
         match els, smThn with
-        | [], topName :: _ =>
+        | [], some topName :: _ =>
+            if !singleResult then none else
             match smBranch.depth? topName with
             | some d =>
                 -- Only treat as shadow-rebind if NO parent items were
@@ -3735,7 +4579,8 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
                 if consumedByThen.isEmpty then some (smBranch, d, topName)
                 else none
             | none => none
-        | [b], topName :: _ =>
+        | [b], some topName :: _ =>
+            if !singleResult then none else
             if isEmptyBytesRebind b topName then
               match smBranch.depth? topName with
               | some d =>
@@ -3758,24 +4603,38 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           -- `[push d, pick]` pair. Adding an explicit `[.push d]` before
           -- it would double-emit the depth (the bug closed here).
           --
+          -- Issue #150 (d == 1): TS's pair is `push 1, pick 1` — the two
+          -- values AGREE, so the TS peephole's "PUSH 1, Pick{1} → Over"
+          -- rule fires (`optimizer/peephole.ts:371-375`) and the reference
+          -- emits a single `OP_OVER`. Emit the folded form directly, the
+          -- same way `removeConsumedAtDepths` writes `.opcode "OP_ROT"`
+          -- for its own d == 2 fold: `.pickStruct` is deliberately outside
+          -- `rollPickRewriteOne`, so leaving `[.pickStruct 1]` here kept
+          -- the unfolded `OP_1 OP_PICK` (2 bytes vs 1).
+          --
           -- cleanup: TS emits `push(d'), roll(d'+1), drop` where d' is
           -- the post-ENDIF stale depth = `d + 1` (the elseSynth pushed
           -- a new top, displacing the original `topName` by 1). Bytes:
-          -- `OP_<d+1> OP_ROLL OP_DROP`. `StackOp.roll k` already encodes
-          -- as `pushBigInt(k) ++ OP_ROLL` (`Script/Emit.lean:176`), so
-          -- `[.roll (d+1), .drop]` matches TS bytes exactly. The pre-fix
-          -- `[.push d, .roll (d+1), .drop]` emitted an extraneous leading
-          -- `OP_<d>` (4 bytes vs 3).
+          -- `OP_<d+1> OP_ROLL OP_DROP`.
           --
-          -- d == 1 cleanup (theoretical — no current fixture exercises
-          -- it): post-ENDIF stale depth = 2 ⇒ `[.roll 2, .drop]`, NOT
-          -- `[.nip]` as previously coded.
+          -- Issue #150: emitted as an explicit `[.push (d+1), .opcode
+          -- "OP_ROLL", .drop]` — the same shape `adoptDeclaredResults`
+          -- uses for this identical TS loop — and NOT as `[.roll (d+1),
+          -- .drop]`. The two are byte-equal for `d + 1 ≥ 3`, but at
+          -- `d + 1 = 2` our fused `.roll 2` is fold-eligible and
+          -- `rollPickRewriteOne` rewrites it to `.rot` (1 byte). TS CANNOT
+          -- fold here: its pushed value (d') and its roll depth (d'+1)
+          -- DISAGREE, and "PUSH 2, Roll{2} → Rot"
+          -- (`optimizer/peephole.ts:352-357`) requires them equal. The
+          -- reference therefore keeps `OP_2 OP_ROLL`, and so must we —
+          -- `loop-if-merged-locals` reaches this at d == 1.
           let elseSynth : List StackOp :=
             if d == 0 then [.dup]
+            else if d == 1 then [.over]
             else [.pickStruct d]
           let cleanup : List StackOp :=
             if d == 0 then [.nip]
-            else [.roll (d + 1), .drop]
+            else [.push (.bigint (Int.ofNat (d + 1))), .opcode "OP_ROLL", .drop]
           let smCleaned : StackMap := (smBranch.removeAtDepth d).push topName
           (condOps ++ [.ifOp thnOps (some elseSynth)] ++ cleanup, smCleaned, localBindings)
       | none =>
@@ -3798,7 +4657,10 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           --              ⇒ ELSE consumed them; THEN must drop them too.
           let parentInBoth (refSm : StackMap) (otherSm : StackMap) :
               List String :=
-            smBranch.foldl (init := ([] : List String)) fun acc n =>
+            smBranch.foldl (init := ([] : List String)) fun acc slot =>
+              match slot with
+              | none   => acc   -- anonymous: no name for either arm to drop
+              | some n =>
               if listContains acc n then acc
               else
                 match refSm.depth? n, otherSm.depth? n with
@@ -3811,22 +4673,83 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           let (thnCleanupOps, smThnAfter) :=
             removeConsumedAtDepths smThn dropsForThn
           -- Depth balance: if THEN deeper, push empty bytes in ELSE; vice versa.
+          --
+          -- Issue #150 gap 1. The pad OCCUPIES a stack slot, and the reference
+          -- RECORDS it: `emitOp({op:'push', value: new Uint8Array(0)});
+          -- armCtx.stackMap.push(null)` (`05-stack-lower.ts:2872`, `:2878`).
+          -- That is the ONE `push(null)` of the reference's 291 that survives
+          -- onto a map a later phase reads (the post-`OP_ENDIF` reconcile, the
+          -- `nResults` depth test, and `restoreInheritedLayout`) — every other
+          -- one is transient, pushed for a depth literal and popped on the next
+          -- line. Emitting the op without recording the slot left the model's
+          -- arm maps one slot shallower than the reference's wherever a pad
+          -- fired. `pushAnon`, not `push`: the pad has no name, and the
+          -- reconcile's `if (n === null) return` bail-outs are exactly what
+          -- must stay expressible.
+          --
+          -- Issue #150 gap 2. The reference pads in a `while` — one slot per
+          -- iteration until the arms agree — so an N-slot deficit gets N pads.
+          -- The model emitted exactly one. `padArm` is that loop; `Nat`
+          -- subtraction truncates, so at most one side is non-zero.
+          --
+          -- Issue #150 gap 3. `padBelowResult` (`05-stack-lower.ts:2833-2840`)
+          -- SWAPs the pad under the arm's own result, for the VALUE-producing
+          -- shape only: `results.length === 0 && thenBindings.length > 0 &&
+          -- elseBindings.length > 0` (`:2760`). An arm that produced NO result
+          -- has none to protect, and tucking the pad under its top slot would
+          -- displace the whole inherited region (NEW-019) — that arm is
+          -- recognised POSITIONALLY, by its map being exactly the parent's
+          -- post-`if` model, because both shapes reach here one slot short.
+          -- Evaluated ONCE, before any pad, so an arm owed several slots places
+          -- all of them consistently.
           let thnDepth := smThnAfter.length
           let elsDepth := smElsAfter.length
-          let (extraEls, extraThn) : (List StackOp × List StackOp) :=
-            if thnDepth > elsDepth then ([.push (.bytes ByteArray.empty)], [])
-            else if elsDepth > thnDepth then ([], [.push (.bytes ByteArray.empty)])
-            else ([], [])
+          let inhModel := inheritedModel smBranch smThnAfter
+          let padsBelow : Bool := results.isEmpty && !thn.isEmpty && !els.isEmpty
+          let (extraEls, smElsPad) :=
+            padArm padsBelow (smElsAfter == inhModel) (thnDepth - elsDepth) smElsAfter
+          let (extraThn, smThnPad) :=
+            padArm padsBelow (smThnAfter == inhModel) (elsDepth - thnDepth) smThnAfter
           let elsFinalOps := elsOps ++ elsCleanupOps ++ extraEls
           let thnFinalOps := thnOps ++ thnCleanupOps ++ extraThn
           -- Reconcile parent sm: drop entries consumed by THEN (use THEN
-          -- as canonical reference, mirroring TS line 1813).
-          let parentConsumed := consumedNames smBranch smThn
-          let smParentReconciled : StackMap :=
-            parentConsumed.foldl (init := smBranch) fun m n =>
-              match m.depth? n with
-              | some d => m.removeAtDepth d
-              | none   => m
+          -- as canonical reference, mirroring TS `lowerIf`'s post-ENDIF
+          -- reconcile, `05-stack-lower.ts:2925-2935`).
+          --
+          -- NEW-014: reconcile against the POST-cleanup THEN map. TS emits
+          -- phase 1's compensating ROLL+DROPs *into* `thenCtx` and updates
+          -- `thenCtx.stackMap` with them, so by the time it reconciles, the
+          -- reference map has already given up every slot EITHER arm gave
+          -- up. Reading the PRE-cleanup `smThn` here left a slot in the
+          -- parent that neither arm still holds, and the depth test below
+          -- then read `armDepth == parentDepth` and registered no result at
+          -- all: a value-producing `if` whose consumer resolved to
+          -- `OP_RUNAR_UNRESOLVED_*`. Reachable from ordinary source since
+          -- `&&`/`||` desugar to a conditional whose else-arm reads a
+          -- parent local for the last time (`a >= 0n || a < 0n`), so
+          -- `bitwise-ops`, `boolean-logic` and `shift-ops` stopped
+          -- compiling in the model. The declared-results path below already
+          -- reconciles against its post-cleanup map (`smThnTrim`).
+          let parentConsumed := consumedNames smBranch smThnPad
+          let smParentReconciled : StackMap := removeNames smBranch parentConsumed
+          -- Issue #149 / #150 step 3: re-sort each arm's inherited region back
+          -- into the parent's slot order. The reference runs this on BOTH arms
+          -- AFTER the parent reconcile and AFTER `emitOp({op:'if', …})`,
+          -- mutating the arm's already-emitted op array BY REFERENCE
+          -- (`05-stack-lower.ts:2974`), so the ops land INSIDE the branch.
+          -- Rolls only permute, so no depth test below changes and the
+          -- restored maps feed nothing the model reads — they are named `_` to
+          -- say so rather than silently dropped.
+          --
+          -- `stillHeld` is TS's `postBranchNames` (`:2927`): the names the THEN
+          -- arm still holds after phase 1/2 and the pad.
+          -- The reference repairs #149 in the PARENT, after `OP_ENDIF`, by
+          -- sinking the adopted result block back under the inherited slots it
+          -- crossed (`sinkResultBlock`, called from `adoptDeclaredResults`).
+          -- Nothing is emitted inside either arm, so both arms contribute an
+          -- empty op list here.
+          let thnRestoreOps : List StackOp := []
+          let elsRestoreOps : List StackOp := []
           -- Determine the post-IF stack.
           --
           -- Multi-result branch node (`results` non-empty): the parent
@@ -3837,8 +4760,15 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           --
           -- Otherwise (single-result `if`): if the branches added a
           -- value, the parent names it `bindingName`.
+          --
+          -- The emptiness test is on the PRE-restore else, deliberately: TS
+          -- decides `else: elseOps.length > 0 ? elseOps : undefined` before the
+          -- restore runs, so an else-arm that was empty at that moment stays
+          -- `undefined` and never receives the restore's ops, even though its
+          -- stackMap was updated. Replicated, not repaired — it is the
+          -- reference's bytes we must match.
           let elseOpt : Option (List StackOp) :=
-            if elsFinalOps.isEmpty then none else some elsFinalOps
+            if elsFinalOps.isEmpty then none else some (elsFinalOps ++ elsRestoreOps)
           -- Matched on `results` (not `results.isEmpty`) so that the
           -- single-result case reduces DEFINITIONALLY to the term the
           -- pre-existing Agrees* proofs already reason about — an
@@ -3846,19 +4776,151 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           -- their `rfl`/`simp` steps.
           match results with
           | [] =>
+              -- Issue #150: the empty-else COPY pad + post-ENDIF stale
+              -- reconcile that `shadowRebind` above ports only for the
+              -- "then consumed nothing" case. See `ifWithoutElseCopy`.
+              -- Matched on `els` (not `els.isEmpty`) so a branch WITH an
+              -- else reduces definitionally to the pre-existing generic
+              -- term, exactly as the `results` match above does.
+              match els with
+              | _ :: _ =>
+                  let smPostIf : StackMap :=
+                    if smThnPad.length > smParentReconciled.length then
+                      smParentReconciled.push bindingName
+                    else
+                      smParentReconciled
+                  (condOps ++ [.ifOp (thnFinalOps ++ thnRestoreOps) elseOpt],
+                   smPostIf, localBindings)
+              | [] =>
+              -- Issue #99 Bug 1: N ≥ 2 results first. TS reaches its
+              -- single-result branches only after `nResults >= 2` declines
+              -- (`05-stack-lower.ts:3022` vs `:3054`), so this must be tried
+              -- BEFORE `ifWithoutElseCopy` — and `ifWithoutElseMultiResults`
+              -- returning `none` for N ≤ 1 is what makes the single-result
+              -- case reduce definitionally to the term that was here before.
+              match ifWithoutElseMultiResults smParentReconciled smThnAfter with
+              | some k =>
+                  -- Phase 3: one preserved copy per owed slot, deepest first.
+                  -- The deficit is measured against the POST-cleanup else map
+                  -- (TS's `while (thenDepth > elseDepth)` runs after phase 1),
+                  -- which is `k` only when the else arm gave up nothing.
+                  let (padOps, smElsCopy) :=
+                    ifWithoutElseCopyPad smThnAfter
+                      (smThnAfter.length - smElsAfter.length) smElsAfter
+                  let elsCopyOps := elsOps ++ elsCleanupOps ++ padOps
+                  -- The else arm's post-phase-3 map is the COPY pad, not the
+                  -- generic `smElsPad`, so its restore is computed against it.
+                  -- Repaired in the parent by `sinkResultBlock`; the arm
+                  -- emits nothing (see the declared-results site above).
+                  let elsCopyRestoreOps : List StackOp := []
+                  -- Post-ENDIF: adopt all N, then ROLL+DROP the N stale parent
+                  -- slots they shadow. TS's `:3022-3053` loop is the same loop
+                  -- as the declared-results `:3000-3020` one, so this is
+                  -- literally `adoptDeclaredResults` over the arm's top-N
+                  -- names instead of over the node's `results`.
+                  let (adoptOps, smPostIf) :=
+                    adoptDeclaredResults smParentReconciled
+                      (armResultNames smThnAfter bindingName k)
+                  (condOps
+                     ++ [.ifOp (thnFinalOps ++ thnRestoreOps)
+                           (some (elsCopyOps ++ elsCopyRestoreOps))]
+                     ++ adoptOps,
+                   smPostIf, localBindings)
+              | none =>
+              match ifWithoutElseCopy bindingName
+                      smParentReconciled smThnAfter smElsAfter with
+              | some (vd, staleD, nm) =>
+                  -- Pad the else with a COPY of `nm` (TS phase 3). The
+                  -- `vd == 1` fold to `.over` is TS's own peephole rule
+                  -- firing on its matching `push 1 / pick 1` pair — see
+                  -- the `elseSynth` note above.
+                  let copyOps : List StackOp :=
+                    if vd == 0 then [.dup]
+                    else if vd == 1 then [.over]
+                    else [.pickStruct vd]
+                  -- Post-ENDIF stale removal. Explicit `push / OP_ROLL`
+                  -- (not the fused `.roll`) for the same reason as the
+                  -- `shadowRebind` cleanup: TS's pushed value and roll
+                  -- depth DISAGREE here, so its rot-fold cannot fire.
+                  let cleanupOps : List StackOp :=
+                    if staleD == 1 then [.nip]
+                    else [.push (.bigint (Int.ofNat staleD)), .opcode "OP_ROLL", .drop]
+                  let elsCopyOps := elsOps ++ elsCleanupOps ++ copyOps
+                  -- The else arm's post-phase-3 map is the COPY pad, not the
+                  -- generic `smElsPad`, so its restore is computed against it.
+                  -- Repaired in the parent by `sinkResultBlock`; the arm
+                  -- emits nothing (see the declared-results site above).
+                  let elsCopyRestoreOps : List StackOp := []
+                  let smPostIf : StackMap :=
+                    (smParentReconciled.push nm).removeAtDepth staleD
+                  (condOps
+                     ++ [.ifOp (thnFinalOps ++ thnRestoreOps)
+                           (some (elsCopyOps ++ elsCopyRestoreOps))]
+                     ++ cleanupOps,
+                   smPostIf, localBindings)
+              | none =>
               let smPostIf : StackMap :=
-                if smThnAfter.length > smParentReconciled.length then
+                if smThnPad.length > smParentReconciled.length then
                   smParentReconciled.push bindingName
                 else
                   smParentReconciled
-              (condOps ++ [.ifOp thnFinalOps elseOpt], smPostIf, localBindings)
+              (condOps ++ [.ifOp (thnFinalOps ++ thnRestoreOps) elseOpt],
+               smPostIf, localBindings)
           | _ :: _ =>
-              let (adoptOps, smPostIf) := adoptDeclaredResults smParentReconciled results
-              (condOps ++ [.ifOp thnFinalOps elseOpt] ++ adoptOps,
+              -- Issue #150: with DECLARED results, TS trims each arm down to
+              -- the parent's surviving depth plus the K result slots
+              -- (`05-stack-lower.ts:2612-2624`), dropping at depth K — the
+              -- slot immediately below the result block. That removal happens
+              -- INSIDE each arm and is driven by the declared arity alone, so
+              -- it fires even when both arms rebind the same merged local and
+              -- the asymmetric-consumption reconciliation above therefore
+              -- finds nothing to do. Omitting it left every declared-results
+              -- arm one slot too deep — one missing `OP_NIP` per arm.
+              --
+              -- The phase-3 depth balance and the parent reconcile are
+              -- recomputed from the TRIMMED arms, matching the TS ordering
+              -- (trim at 2620, balance at 2710, reconcile at 2771).
+              let nDeclared := results.length
+              let consumedFromParent := (consumedNames smBranch smThnAfter).length
+              let targetDepth := smBranch.length - consumedFromParent + nDeclared
+              let (thnTrimOps, smThnTrim) :=
+                trimArmToDepth nDeclared targetDepth smThnAfter.length smThnAfter
+              let (elsTrimOps, smElsTrim) :=
+                trimArmToDepth nDeclared targetDepth smElsAfter.length smElsAfter
+              -- Same phase-3 balance as the `results = []` path above: the
+              -- reference runs ONE `while` for both, after the trim
+              -- (`05-stack-lower.ts:2620` trims, `2853` pads), and records each
+              -- pad as an anonymous slot.
+              -- `padBelowResult` is gated on `results.length === 0`
+              -- (`05-stack-lower.ts:2760`), so it can never fire on this path;
+              -- the flags are passed in their inert form rather than computed.
+              let (extraEls', smElsTrimPad) :=
+                padArm false true (smThnTrim.length - smElsTrim.length) smElsTrim
+              let (extraThn', smThnTrimPad) :=
+                padArm false true (smElsTrim.length - smThnTrim.length) smThnTrim
+              let elsResultOps := elsOps ++ elsCleanupOps ++ elsTrimOps ++ extraEls'
+              let thnResultOps := thnOps ++ thnCleanupOps ++ thnTrimOps ++ extraThn'
+              let parentConsumedTrim := consumedNames smBranch smThnTrimPad
+              let smParentTrimmed : StackMap := removeNames smBranch parentConsumedTrim
+              -- Issue #149 / #150 step 3, declared-results peer. Same call, same
+              -- ordering: after the parent reconcile, before the adopt.
+              let stillHeldTrim := smThnTrimPad.names
+              let (thnRestoreOps', _) :=
+                restoreInheritedLayout smParentTrimmed stillHeldTrim smThnTrimPad
+              let (elsRestoreOps', _) :=
+                restoreInheritedLayout smParentTrimmed stillHeldTrim smElsTrimPad
+              let elseResultOpt : Option (List StackOp) :=
+                if elsResultOps.isEmpty then none
+                else some (elsResultOps ++ elsRestoreOps')
+              let (adoptOps, smPostIf) := adoptDeclaredResults smParentTrimmed results
+              (condOps ++ [.ifOp (thnResultOps ++ thnRestoreOps') elseResultOpt]
+                 ++ adoptOps,
                smPostIf, localBindings)
   | .assert ref =>
       let (load, sm1) := loadRefLive sm ref currentIndex lastUses outerProtected
-      let ops := load ++ [.opcode "OP_VERIFY"]
+      -- `OP_VERIFY` reads a script number, so a raw operand is re-minimised
+      -- (TS `bringToTop` defaults `allowRaw = false`).
+      let ops := normalizeRaw (rawSlotsInScope rawSlots bindingName) ref load ++ [.opcode "OP_VERIFY"]
       let sm2 := sm1.popN 1
       (ops, sm2, localBindings)
   | .updateProp propName ref =>
@@ -3868,20 +4930,40 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       --    finds the updated value.
       -- 3. If the OLD `propName` entry survives below (depth ≥ 1), the TS
       --    reference removes it via NIP (depth 1) or [push d, roll d+1,
-      --    drop] (depth ≥ 2). The TS pass `liftBranchUpdateProps` lifts
-      --    branch-local update_props to the top level, so the
-      --    `_insideBranch=true` skip-cleanup path of TS is unreachable
-      --    in the IRs we lower; we always perform the cleanup here.
+      --    drop] (depth ≥ 2) — but ONLY when it is not lowering inside an
+      --    `if` arm (`!this._insideBranch`, `05-stack-lower.ts:3312`).
+      --    Inside an arm the stale slot is kept ON PURPOSE, because it is
+      --    what `lowerIf`'s same-property detection reads after OP_ENDIF.
+      --
+      --    Issue #150: this arm used to claim the skip path was
+      --    unreachable, on the grounds that `liftBranchUpdateProps` hoists
+      --    branch-local `update_prop`s to the top level. It does not hoist
+      --    all of them — that pass only rewrites chains of TWO OR MORE and
+      --    does not recurse into loop bodies — and `assert-false-guard` is
+      --    the fixture written to sit in both holes: every one of its
+      --    `update_prop`s stays inside an arm, the model cleaned up all of
+      --    them, and it came out 38 bytes over the golden.
       -- The binding name `_bindingName` is the t-temporary the IR assigns
       -- to the update_prop result; subsequent code references the prop by
       -- its property name, not the temporary.
       let (load, sm1) := loadRefLive sm ref currentIndex lastUses outerProtected
       let smRenamed : StackMap :=
         match sm1 with
-        | _ :: rest => propName :: rest
-        | []        => [propName]
-      let (cleanup, sm2) := removePropEntryOps smRenamed propName
-      (load ++ cleanup, sm2, localBindings)
+        | _ :: rest => some propName :: rest
+        | []        => [some propName]
+      -- Matched on the constructor (not `if insideBranch then …`) so the
+      -- `false` case reduces DEFINITIONALLY to the pre-existing term —
+      -- the same containment the `results` / `els` matches above rely on,
+      -- and what lets the `insideBranch` optParam default carry every
+      -- existing `Agrees*` proof term through unchanged.
+      let (cleanup, sm2) :=
+        match insideBranch with
+        | false => removePropEntryOps smRenamed propName
+        | true  => (([] : List StackOp), smRenamed)
+      -- NEW-004/NEW-007: a property written from a byte-array result is
+      -- re-minimised on the way in, so the state continuation commits the
+      -- minimal encoding.
+      (normalizeRaw (rawSlotsInScope rawSlots bindingName) ref load ++ cleanup, sm2, localBindings)
   | .loop count body iterVar =>
       -- Loop-fidelity rewrite (2026-06-11; replaces the Phase 3z-F
       -- lower-once-and-replay arm): per-ITERATION re-lowering against the
@@ -3942,15 +5024,23 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       let loopLocal := localBindings ++ body.map (fun b => b.name)
       let (ops, smPostLoop) :=
         lowerLoopItersP progMethods props budget finalLU nonFinalLU
-          loopLocal constInts body iterVar count sm count
+          loopLocal constInts body iterVar count sm count rawSlots insideBranch
+          arrayElems
       -- Loops are statements, not expressions — no stack value is produced
       -- (TS 2172-2175) and the enclosing localBindings set is restored
       -- (TS 2171). The post-loop sm is the THREADED map from the final
       -- iteration, including any stranded iter-var entries (TS leaves
       -- them on `this.stackMap`; the public-method epilogue NIPs them).
       (ops, smPostLoop, localBindings)
-  | .arrayLiteral elems =>
-      (lowerArrayElems sm elems, sm.push bindingName, localBindings)
+  | .arrayLiteral _ =>
+      -- Metadata-only, mirroring TS `lowerArrayLiteral`
+      -- (`05-stack-lower.ts:2140-2146`): emit NOTHING and push NOTHING onto
+      -- the stack map. A map slot models one runtime slot, but an array
+      -- binding spans N of them, so laying the elements out here would
+      -- desync the two. The elements stay on the map under their own
+      -- binding names and `arrayElemsOf` has already recorded which they
+      -- are; `checkMultiSig` pulls each to the top at the use site.
+      ([], sm, localBindings)
   -- Phase 3w-b: framework intrinsics with concrete lowering. The
   -- liveness-aware variants (`*OpsLive`) thread `currentIndex` /
   -- `lastUses` / `outerProtected` so PICK→ROLL collapse on dead refs
@@ -3982,7 +5072,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
   -- value carries no temp refs.
   | .rawScript bytes _ _     =>
       ([.rawBytes bytes], sm.push bindingName, localBindings)
-termination_by v => (budget, sizeOf v, 0)
+termination_by (budget, sizeOf value, 0)
 
 /-- Per-iteration loop unrolling for the program-aware lowerer. Mirrors
 the iteration loop `for (let i = 0; i < count; i++)` of TS `lowerLoop`
@@ -4006,36 +5096,45 @@ localBindings ∪ body binding names (TS 2136-2138); `outerProtected` is
 def lowerLoopItersP (progMethods : List ANFMethod) (props : List ANFProperty)
     (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
     (loopLocal : List String) (constInts : List (String × Int))
-    (body : List ANFBinding) (iterVar : String) (count : Nat) :
-    StackMap → Nat → (List StackOp × StackMap)
-  | sm, 0 => ([], sm)
-  | sm, remaining + 1 =>
+    (body : List ANFBinding) (iterVar : String) (count : Nat)
+    (sm : StackMap) (n : Nat) (rawSlots : List String := [])
+    (insideBranch : Bool := false)
+    (arrayElems : List (String × List String) := []) :
+    (List StackOp × StackMap) :=
+  match n with
+  | 0 => ([], sm)
+  | remaining + 1 =>
       let i := count - (remaining + 1)
       let lu := if remaining == 0 then naturalLU else nonFinalLU
       let smInner := sm.push iterVar
       let (bodyOps, smBody) :=
-        lowerBindingsP progMethods props budget 0 lu [] loopLocal constInts smInner body
+        lowerBindingsP progMethods props budget 0 lu [] loopLocal constInts smInner body rawSlots insideBranch arrayElems
       let (dropOps, smIter) := iterVarCleanup smBody iterVar
       let (restOps, smFinal) :=
         lowerLoopItersP progMethods props budget naturalLU nonFinalLU
-          loopLocal constInts body iterVar count smIter remaining
+          loopLocal constInts body iterVar count smIter remaining rawSlots insideBranch
+          arrayElems
       ([StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ dropOps ++ restOps,
        smFinal)
-termination_by _ n => (budget, sizeOf body, n)
+termination_by (budget, sizeOf body, n)
 
 def lowerBindingsP (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) (localBindings : List String)
-    (constInts : List (String × Int)) (sm : StackMap) :
-    List ANFBinding → (List StackOp × StackMap)
+    (constInts : List (String × Int)) (sm : StackMap)
+    (bs : List ANFBinding) (rawSlots : List String := [])
+    (insideBranch : Bool := false)
+    (arrayElems : List (String × List String) := []) :
+    (List StackOp × StackMap) :=
+  match bs with
   | [] => ([], sm)
   | (.mk name v _) :: rest =>
       let (ops, sm', localBindings') :=
-        lowerValueP progMethods props budget currentIndex lastUses outerProtected localBindings constInts sm name v
+        lowerValueP progMethods props budget currentIndex lastUses outerProtected localBindings constInts sm name v rawSlots insideBranch arrayElems
       let (ops', sm'') :=
-        lowerBindingsP progMethods props budget (currentIndex + 1) lastUses outerProtected localBindings' constInts sm' rest
+        lowerBindingsP progMethods props budget (currentIndex + 1) lastUses outerProtected localBindings' constInts sm' rest rawSlots insideBranch arrayElems
       (ops ++ ops', sm'')
-termination_by bs => (budget, sizeOf bs, 0)
+termination_by (budget, sizeOf bs, 0)
 
 end
 
@@ -4096,6 +5195,57 @@ def bindingsUseCodePart : List ANFBinding → Bool
       here || bindingsUseCodePart rest
 
 /--
+Whether a method body READS a mutable variable-length (`ByteString`)
+state field, via `load_prop`. Mirrors TS `methodReadsVarLenState`
+(`05-stack-lower.ts:5980-6003`).
+
+Issue #100: such a method needs `_codePart` even when it builds NO
+continuation output. `lowerDeserializeState`'s variable-length path
+locates the mutable-state region inside the BIP-143 scriptCode by
+subtracting `_codePart`'s length; without `_codePart` on the stack it
+takes its `none` fallback, drops the scriptCode and skips state
+decoding entirely — so a terminal var-length read silently returns the
+DEPLOY-time value instead of the live on-chain one.
+
+C18: the read may sit entirely inside a private helper reached by
+`method_call`. Private methods are INLINED by `lowerValueP`, so their
+`load_prop` executes in the caller's stack context at runtime — a
+public method whose only var-len read is behind a helper must still
+provision `_codePart`. `fuel` bounds that descent (the reference uses a
+`seen` set for the same purpose); `progMethods.length` is always
+enough, since a descent that revisited a method is exactly what the
+reference's cycle guard cuts off.
+-/
+def bindingsReadVarLenState (progMethods : List ANFMethod)
+    (varLenProps : List String) : Nat → List ANFBinding → Bool
+  | _,    []                  => false
+  | fuel, (.mk _ v _) :: rest =>
+      let here : Bool :=
+        match v with
+        | .loadProp n         => listContains varLenProps n
+        | .ifVal _ thn els _  =>
+            bindingsReadVarLenState progMethods varLenProps fuel thn
+              || bindingsReadVarLenState progMethods varLenProps fuel els
+        | .loop _ body _      =>
+            bindingsReadVarLenState progMethods varLenProps fuel body
+        | .methodCall _ mn _  =>
+            match fuel with
+            | 0         => false
+            | fuel' + 1 =>
+                match lookupMethod progMethods mn with
+                | some tgt =>
+                    bindingsReadVarLenState progMethods varLenProps fuel' tgt.body
+                | none     => false
+        | _                   => false
+      here || bindingsReadVarLenState progMethods varLenProps fuel rest
+termination_by fuel bs => (fuel, sizeOf bs)
+
+/-- The mutable `ByteString` property names — TS `lowerMethod`'s
+`varLenProps` set (`05-stack-lower.ts:6033-6035`). -/
+def varLenPropNames (props : List ANFProperty) : List String :=
+  (props.filter (fun p => !p.readonly && p.type = .byteString)).map (·.name)
+
+/--
 Whether a method body contains a `deserialize_state` binding. Mirrors the
 TS `lowerMethod` post-pass at `05-stack-lower.ts:4937-4942`:
 
@@ -4135,12 +5285,21 @@ def lowerMethod (progMethods : List ANFMethod) (props : List ANFProperty) (m : A
   -- `_opPushTxSig` witness — see TS lowerMethod at `05-stack-lower.ts:4956-4980`):
   --   * `_codePart` — the code portion of the locking script, prepended only
   --                   when add_output / add_raw_output / computeStateOutput*
-  --                   reference it.
+  --                   reference it, OR (issue #100) when the method READS a
+  --                   mutable variable-length state field, whose
+  --                   deserialization needs it for the preimage-relative
+  --                   state offset.
   -- It sits at the bottom of the stack; in our top-first list it is at the
   -- *tail*. The user params (which get DUP/PICK loads) remain on top.
   let userMap : StackMap := m.params.map (·.name) |>.reverse
   let usesPreimage := bindingsUseCheckPreimage m.body
+  -- TS `lowerMethod` (`05-stack-lower.ts:6036-6040`):
+  --   usesCodePart = methodUsesCheckPreimage(...)
+  --                  && (methodUsesCodePart(body) || methodReadsVarLenState(body, varLenProps, …))
+  -- The `methodUsesCheckPreimage` conjunct is the `if usesPreimage` below.
   let usesCode     := bindingsUseCodePart m.body
+                        || bindingsReadVarLenState progMethods
+                             (varLenPropNames props) progMethods.length m.body
   -- Nested form (BUG-100): a `check_preimage` method prepends `_codePart` only
   -- when the continuation builders need it, and NEVER `_opPushTxSig`. The
   -- outer `if usesPreimage` is kept so non-stateful methods reduce through the
@@ -4148,7 +5307,7 @@ def lowerMethod (progMethods : List ANFMethod) (props : List ANFProperty) (m : A
   let initialMap : StackMap :=
     if usesPreimage then
       if usesCode then
-        userMap ++ ["_codePart"]
+        userMap ++ ([some "_codePart"] : StackMap)
       else
         userMap
     else
@@ -4163,8 +5322,19 @@ def lowerMethod (progMethods : List ANFMethod) (props : List ANFProperty) (m : A
   -- bodies. Used by the Merkle codegen dispatch arm to extract the
   -- depth literal that becomes the unrolled-loop bound.
   let bodyConstInts := collectConstInts m.body
+  -- NEW-004: slots holding a byte-array result whose bytes may not be the
+  -- minimal script-number encoding of their value. Collected once for the
+  -- whole method and threaded like `constInts`; every numeric-context read
+  -- of one is re-minimised with `OP_BIN2NUM`.
+  let bodyRawSlots := collectRawSlots m.body
+  -- Element refs of every `array_literal` binding in the method body.
+  -- Collected once for the whole method and threaded like `constInts`;
+  -- `checkMultiSig` reads it to pull each element to the top at the use
+  -- site (the array binding itself is metadata-only and never occupies a
+  -- stack-map slot).
+  let bodyArrayElems := arrayElemsOf m.body
   let (rawOps, finalSm) :=
-    lowerBindingsP progMethods props defaultInlineBudget 0 bodyLastUses [] topLevelLocal bodyConstInts initialMap m.body
+    lowerBindingsP progMethods props defaultInlineBudget 0 bodyLastUses [] topLevelLocal bodyConstInts initialMap m.body bodyRawSlots false bodyArrayElems
   -- Terminal-assert elision:
   -- A public method whose body ends in `.assert _` drops the trailing
   -- `OP_VERIFY` — the boolean stays on top of the stack as the script's

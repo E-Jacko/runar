@@ -283,6 +283,18 @@ def cGroupMod (t : Tracker) (aName resultName : String) (g : GroupParams) :
   let t := cPushGroupN t "_gmod_n" g
   t.rawBlock 2 (some resultName) groupModOpsP
 
+/-- Reduce the scalar already on TOP to `[0, n-1]`: `((k mod n) + n) mod n`.
+
+`OP_MOD` takes the sign of the DIVIDEND, so `k mod n` alone lands in
+`(-n, n)`; the `+ n, mod n` normalises the negative half. One push of `n`
+covers both reductions. Mirrors TS `cEmitScalarReduce`
+(`p256-p384-codegen.ts:265-277`) — same block as `cGroupMod`, minus the
+`toTop` its caller already did. -/
+def cEmitScalarReduce (t : Tracker) (resultName : String) (g : GroupParams) :
+    Tracker :=
+  let t := cPushGroupN t "_n_red" g
+  t.rawBlock 2 (some resultName) groupModOpsP
+
 def cGroupMul (t : Tracker) (aName bName resultName : String) (g : GroupParams) :
     Tracker :=
   let t := t.toTop aName
@@ -384,15 +396,91 @@ def cComposePoint (t : Tracker) (xName yName resultName : String)
 /-! ## Affine point addition. Mirrors TS `cAffineAdd`
 (`p256-p384-codegen.ts:364-400`). -/
 
+/-- GAP-301 coordinate canonicity, leaving `_canon` on the tracker.
+
+`cDecomposePoint` BIN2NUMs each coordinate as an unsigned value that may be
+`≥ p`; the curve equation reduces it mod p, so `(x + p)‖y` would pass as a
+point it is not the canonical encoding of. Require `x < p` AND `y < p`
+(coordinates are unsigned, so the lower bound holds by construction). The
+caller ANDs `_canon` into its result, so the check still returns a boolean.
+Mirrors TS `cEmitCanonicityGuard` (`p256-p384-codegen.ts:400-416`). -/
+def cEmitCanonicityGuard (t : Tracker) (xName yName : String)
+    (c : CurveParams) : Tracker :=
+  let t := t.copyToTop xName "_x_lt"
+  let t := cPushFieldP t "_p_for_x" c
+  let t := t.rawBlock 2 (some "_x_canon") [.opcode "OP_LESSTHAN"]
+  let t := t.copyToTop yName "_y_lt"
+  let t := cPushFieldP t "_p_for_y" c
+  let t := t.rawBlock 2 (some "_y_canon") [.opcode "OP_LESSTHAN"]
+  let t := t.toTop "_x_canon"
+  let t := t.toTop "_y_canon"
+  t.rawBlock 2 (some "_canon") [.opcode "OP_BOOLAND"]
+
+
 def cAffineAdd (t : Tracker) (c : CurveParams) : Tracker :=
-  -- s_num = qy - py
+  -- The chord slope `s = (qy - py) / (qx - px)` is UNDEFINED when P == Q: the
+  -- denominator is zero and the correct slope is the TANGENT,
+  -- `(3px² + a) / (2py)` — and `a = -3` on both NIST curves. Without the
+  -- select, `p256Add(P, P)` produced a wrong point and every contract that
+  -- doubled deployed an unspendable script. Both cases are `s = num / den`, so
+  -- only the NUMERATOR and DENOMINATOR are selected and the single expensive
+  -- `cFieldInv` still runs exactly once:
+  --
+  --   cond   = (px == qx) AND (py == qy)     1 when doubling, else 0
+  --   num    = cond ? 3px² - 3 : (qy - py)
+  --   den    = cond ? 2py      : (qx - px)
+  --
+  -- selected as `b + cond*(a - b)` over the field, so the emitted op sequence
+  -- — and the tracker's static stack model — is identical on both paths.
+  --
+  -- THIRD CASE, P == -Q (px == qx, py != qy): testing `px == qx` ALONE would
+  -- take the tangent path and return 2P, an on-curve but WRONG point. P + (-P)
+  -- is the point at infinity, represented here as the ALL-ZERO blob (what
+  -- `pNNNMul(P, 0n)` returns), so mask the result with
+  -- `notinf = NOT(xeq - cond)`. Mirrors TS `cAffineAdd`
+  -- (`p256-p384-codegen.ts:422-552`).
+  let t := t.copyToTop "px" "_px_eq"
+  let t := t.copyToTop "qx" "_qx_eq"
+  let t := t.rawBlock 2 (some "_xeq") [.opcode "OP_NUMEQUAL"]
+  let t := t.copyToTop "py" "_py_eq"
+  let t := t.copyToTop "qy" "_qy_eq"
+  let t := t.rawBlock 2 (some "_yeq") [.opcode "OP_NUMEQUAL"]
+  let t := t.copyToTop "_xeq" "_xeq_c"
+  let t := t.toTop "_yeq"
+  let t := t.rawBlock 2 (some "_cond") [.opcode "OP_BOOLAND"]
+  -- notinf = NOT(xeq - cond): 1 exactly when px == qx and the points differ.
+  let t := t.toTop "_xeq"
+  let t := t.copyToTop "_cond" "_cond_c"
+  let t := t.rawBlock 2 (some "_notinf")
+              [.opcode "OP_SUB", .opcode "OP_NOT"]
+  -- chord numerator / denominator
   let t := t.copyToTop "qy" "_qy1"
   let t := t.copyToTop "py" "_py1"
-  let t := cFieldSub t "_qy1" "_py1" "_s_num" c
-  -- s_den = qx - px
+  let t := cFieldSub t "_qy1" "_py1" "_num_chord" c
   let t := t.copyToTop "qx" "_qx1"
   let t := t.copyToTop "px" "_px1"
-  let t := cFieldSub t "_qx1" "_px1" "_s_den" c
+  let t := cFieldSub t "_qx1" "_px1" "_den_chord" c
+  -- tangent numerator / denominator: 3px² + a (a = -3) and 2py
+  let t := t.copyToTop "px" "_px_t"
+  let t := cFieldSqr t "_px_t" "_px_sq" c
+  let t := cFieldMulConst t "_px_sq" 3 "_3px_sq" c
+  let t := t.pushInt "_a_neg" 3
+  let t := cFieldSub t "_3px_sq" "_a_neg" "_num_tan" c
+  let t := t.copyToTop "py" "_py_t"
+  let t := cFieldMulConst t "_py_t" 2 "_den_tan" c
+  -- num = num_chord + cond*(num_tan - num_chord)
+  let t := t.copyToTop "_num_chord" "_num_chord_c"
+  let t := cFieldSub t "_num_tan" "_num_chord_c" "_num_diff" c
+  let t := t.copyToTop "_cond" "_cond_n"
+  let t := cFieldMul t "_num_diff" "_cond_n" "_num_sel" c
+  let t := cFieldAdd t "_num_chord" "_num_sel" "_s_num" c
+  -- den = den_chord + cond*(den_tan - den_chord)
+  let t := t.copyToTop "_den_chord" "_den_chord_c"
+  let t := cFieldSub t "_den_tan" "_den_chord_c" "_den_diff" c
+  let t := t.toTop "_cond"
+  let t := t.rename "_cond_d"
+  let t := cFieldMul t "_den_diff" "_cond_d" "_den_sel" c
+  let t := cFieldAdd t "_den_chord" "_den_sel" "_s_den" c
   -- s = s_num / s_den mod p
   let t := cFieldInv t "_s_den" "_s_den_inv" c
   let t := cFieldMul t "_s_num" "_s_den_inv" "_s" c
@@ -415,7 +503,15 @@ def cAffineAdd (t : Tracker) (c : CurveParams) : Tracker :=
   let t := t.toTop "py" |>.drop
   let t := t.toTop "qx" |>.drop
   let t := t.toTop "qy" |>.drop
-  t
+  -- P == -Q → force the all-zero point (see the header comment). A bare
+  -- OP_MUL with no reduction: rx, ry are already in [0, p) and notinf is
+  -- 0 or 1, so the product is canonical either way.
+  let t := t.toTop "rx"
+  let t := t.copyToTop "_notinf" "_notinf_x"
+  let t := t.rawBlock 2 (some "rx") [.opcode "OP_MUL"]
+  let t := t.toTop "ry"
+  let t := t.toTop "_notinf"
+  t.rawBlock 2 (some "ry") [.opcode "OP_MUL"]
 
 /-! ## Jacobian doubling (a = -3 optimization). Mirrors TS
 `cJacobianDouble` (`p256-p384-codegen.ts:414-473`). -/
@@ -489,9 +585,14 @@ def cJacobianToAffine (t : Tracker) (rxName ryName : String) (c : CurveParams) :
 /-! ## Jacobian mixed addition body (for inside `OP_IF`). Mirrors TS
 `buildJacobianAddAffineInline` (`p256-p384-codegen.ts:498-564`). -/
 
-def buildJacobianAddAffineBody (initNm : Array (Option String))
-    (c : CurveParams) : List StackOp :=
-  let it : Tracker := { nm := initNm, ops := #[] }
+/-- The mixed-add itself, on a tracker the caller owns.
+
+`keepHR` additionally leaves copies of H and R on the stack: both are zero
+exactly when the Jacobian accumulator is the same curve point as the affine
+operand — the one case these formulas cannot compute. Mirrors TS
+`jacobianAddAffineBody` (`p256-p384-codegen.ts:661-731`). -/
+def jacobianAddAffineOn (it : Tracker) (keepHR : Bool)
+    (c : CurveParams) : Tracker :=
   let it := it.copyToTop "jz" "_jz_for_z1cu"
   let it := it.copyToTop "jz" "_jz_for_z3"
   let it := it.copyToTop "jy" "_jy_for_y3"
@@ -511,6 +612,11 @@ def buildJacobianAddAffineBody (initNm : Array (Option String))
   let it := cFieldSub it "_U2" "jx" "_H" c
   -- R = S2 - jy
   let it := cFieldSub it "_S2" "jy" "_R" c
+  let it :=
+    if keepHR then
+      let it := it.copyToTop "_H" "_H_keep"
+      it.copyToTop "_R" "_R_keep"
+    else it
   let it := it.copyToTop "_H" "_H_for_h3"
   let it := it.copyToTop "_H" "_H_for_z3"
   -- H2 = H²
@@ -539,8 +645,78 @@ def buildJacobianAddAffineBody (initNm : Array (Option String))
   -- Rename
   let it := it.toTop "_X3" |>.rename "jx"
   let it := it.toTop "_Y3" |>.rename "jy"
-  let it := it.toTop "_Z3" |>.rename "jz"
-  it.ops.toList
+  it.toTop "_Z3" |>.rename "jz"
+
+/-- Mixed-add ops for use inside `OP_IF`. Mirrors TS
+`buildJacobianAddAffineInline` (`p256-p384-codegen.ts:649-651`). -/
+def buildJacobianAddAffineBody (initNm : Array (Option String))
+    (c : CurveParams) : List StackOp :=
+  (jacobianAddAffineOn { nm := initNm, ops := #[] } false c).ops.toList
+
+/-- Branchless select of one Jacobian coordinate: `add + cond*(dbl - add)`.
+Consumes `addName`, `dblName` and `condName`. Mirrors TS `cSelectCoord`
+(`p256-p384-codegen.ts:737-744`). -/
+def cSelectCoord (t : Tracker) (addName dblName condName resultName : String)
+    (c : CurveParams) : Tracker :=
+  let t := t.copyToTop addName "_sel_add_c"
+  let t := cFieldSub t dblName "_sel_add_c" "_sel_diff" c
+  let t := cFieldMul t "_sel_diff" condName "_sel_scaled" c
+  cFieldAdd t addName "_sel_scaled" resultName c
+
+/-- The ladder's LAST conditional step: mixed-add, but correct when the
+accumulator already equals the point being added.
+
+The Jacobian mixed-add cannot double: it computes `H = U2 - X1`, so for equal
+operands `H = 0` and `Z3 = Z1*H = 0` — the point at infinity — and since
+`cFieldInv` is Fermat (inv(0) = 0), `cJacobianToAffine` turns that into the
+ALL-ZERO point instead of 2P (`p256Mul(P, 2n)` returned 64 zero bytes).
+
+Only the last step needs it: after step `i` the accumulator holds `c_i*P` with
+`c_i = k' >> i`, `k' = k + 3n`; both curves have cofactor 1, so `ord(P) = n`
+and the degenerate cases are exactly `c_i ≡ 0, 1, 2 (mod n)`, which over
+`k ∈ [0, n-1]` only `i = 0` can reach. THE ARGUMENT IS CONDITIONED ON
+`k ∈ [0, n-1]`, which holds only because `cEmitMul` reduces `k` mod n first
+(`cEmitScalarReduce`) — the two must never be separated. Mirrors TS
+`buildJacobianAddOrDoubleInline` (`p256-p384-codegen.ts:797-846`). -/
+def buildJacobianAddOrDoubleBody (initNm : Array (Option String))
+    (c : CurveParams) : List StackOp :=
+  let it : Tracker := { nm := initNm, ops := #[] }
+  -- Keep the pre-add accumulator: it is what must be DOUBLED in the
+  -- exceptional case, and the add below consumes jx/jy/jz.
+  let it := it.copyToTop "jx" "_sx"
+  let it := it.copyToTop "jy" "_sy"
+  let it := it.copyToTop "jz" "_sz"
+  let it := jacobianAddAffineOn it true c
+  -- cond = (H == 0) AND (R == 0). Requiring R == 0 too keeps the
+  -- accumulator == -P case (k = 0) on the add path, where Z3 = 0 correctly
+  -- signals the point at infinity.
+  let it := it.toTop "_H_keep"
+  let it := it.pushInt "_zero_h" 0
+  let it := it.rawBlock 2 (some "_h_is0") [.opcode "OP_NUMEQUAL"]
+  let it := it.toTop "_R_keep"
+  let it := it.pushInt "_zero_r" 0
+  let it := it.rawBlock 2 (some "_r_is0") [.opcode "OP_NUMEQUAL"]
+  let it := it.toTop "_h_is0"
+  let it := it.toTop "_r_is0"
+  let it := it.rawBlock 2 (some "_cond") [.opcode "OP_BOOLAND"]
+  -- Move the add result aside so cJacobianDouble can work on jx/jy/jz again,
+  -- this time holding the saved accumulator.
+  let it := it.toTop "jx" |>.rename "_add_x"
+  let it := it.toTop "jy" |>.rename "_add_y"
+  let it := it.toTop "jz" |>.rename "_add_z"
+  let it := it.toTop "_sx" |>.rename "jx"
+  let it := it.toTop "_sy" |>.rename "jy"
+  let it := it.toTop "_sz" |>.rename "jz"
+  let it := cJacobianDouble it c
+  let it := it.toTop "jx" |>.rename "_dbl_x"
+  let it := it.toTop "jy" |>.rename "_dbl_y"
+  let it := it.toTop "jz" |>.rename "_dbl_z"
+  let it := it.copyToTop "_cond" "_cond_x"
+  let it := cSelectCoord it "_add_x" "_dbl_x" "_cond_x" "jx" c
+  let it := it.copyToTop "_cond" "_cond_y"
+  let it := cSelectCoord it "_add_y" "_dbl_y" "_cond_y" "jy" c
+  let it := it.toTop "_cond" |>.rename "_cond_z"
+  (cSelectCoord it "_add_z" "_dbl_z" "_cond_z" "jz" c).ops.toList
 
 /-! ## Scalar multiplication.
 
@@ -576,7 +752,11 @@ def cMulIter (t : Tracker) (bit : Nat) (c : CurveParams) : Tracker :=
   -- tracker.
   let t := t.toTop "_bit"
   let nmAfterPop := t.nm.pop
-  let addOps := buildJacobianAddAffineBody nmAfterPop c
+  -- Only the final step can be handed two equal operands — see
+  -- `buildJacobianAddOrDoubleBody` for why, and for what it costs not to.
+  let addOps :=
+    if bit = 0 then buildJacobianAddOrDoubleBody nmAfterPop c
+    else buildJacobianAddAffineBody nmAfterPop c
   let ifOp : StackOp := .ifOp addOps (some [])
   { nm := nmAfterPop, ops := t.ops.push ifOp }
 
@@ -596,8 +776,15 @@ Mirrors TS `cEmitMul` (`p256-p384-codegen.ts:579-657`). -/
 def cEmitMulOps (c : CurveParams) (g : GroupParams) : List StackOp :=
   let t : Tracker := Tracker.init [some "_pt", some "_k"]
   let t := cDecomposePoint t "_pt" "ax" "ay" c
-  -- k' = k + 3n
+  -- k' = k + 3n, which guarantees the fixed high bit the MSB-first ladder
+  -- unrolls for. `k ∈ [1, n-1]` is a PRECONDITION the caller cannot enforce
+  -- (the scalar is usually an unlock argument), so reduce it first: a scalar
+  -- ≥ ~n sets a bit above the loop's top, the loop never sees it, and the
+  -- ladder silently returns a DIFFERENT multiple of P. Mirrors TS
+  -- `cEmitScalarReduce` (`p256-p384-codegen.ts:265-277`), called from
+  -- `cEmitMul` (877-878).
   let t := t.toTop "_k"
+  let t := cEmitScalarReduce t "_kr" g
   let t := t.pushInt "_n" g.n
   let t := t.rawBlock 2 (some "_kn") [.opcode "OP_ADD"]
   let t := t.pushInt "_n2" g.n
@@ -684,6 +871,20 @@ def decompressPubKey (t : Tracker) (pkName qxName qyName : String)
   let t := t.rawBlock 1 none [.push (.bigint 1), .opcode "OP_SPLIT"]
   let t : Tracker :=
     { t with nm := (t.nm.push (some "_dk_prefix")).push (some "_dk_xbytes") }
+  -- SEC1 §2.3.4: the prefix must be exactly 0x02 or 0x03. The parity
+  -- reduction below (`BIN2NUM, 2 MOD`) accepts far more — 0x00 / 0x04 / 0x82
+  -- alias to "even", and BIN2NUM(0x83) = -3, whose `mod 2` can never equal
+  -- `_dk_y_par`, silently selecting the OTHER root. Test the byte itself.
+  -- Mirrors TS `decompressPubKey` (`p256-p384-codegen.ts:1030-1040`).
+  let t := t.copyToTop "_dk_prefix" "_dk_pfx_in"
+  let t := t.rawBlock 1 (some "_dk_pfx_ok")
+              [ .dup
+              , .push (.bytes (ByteArray.mk #[0x02]))
+              , .opcode "OP_EQUAL"
+              , .swap
+              , .push (.bytes (ByteArray.mk #[0x03]))
+              , .opcode "OP_EQUAL"
+              , .opcode "OP_BOOLOR" ]
   -- Convert prefix → parity (0/1)
   let t := t.toTop "_dk_prefix"
   let t := t.rawBlock 1 (some "_dk_parity")
@@ -712,7 +913,11 @@ def decompressPubKey (t : Tracker) (pkName qxName qyName : String)
   let t := cFieldSub t "_dk_x3" "_dk_3x" "_dk_x3m3x" c
   let t := t.pushInt "_dk_b" curveB
   let t := cFieldAdd t "_dk_x3m3x" "_dk_b" "_dk_y2" c
-  -- y = (y²)^sqrtExp mod p
+  -- y = (y²)^sqrtExp mod p. `cFieldPow` CONSUMES its base, so keep a copy of
+  -- y² for the residue check at the end. It has to sit BELOW `_dk_y_cand`:
+  -- the parity select is an OP_IF whose branches are a bare drop / nip, so
+  -- nothing may come between `_dk_y_cand` and the negated candidate.
+  let t := t.copyToTop "_dk_y2" "_dk_y2_keep"
   let t := cFieldPow t "_dk_y2" sqrtExp "_dk_y_cand" c
   -- Check parity match
   let t := t.copyToTop "_dk_y_cand" "_dk_y_check"
@@ -744,14 +949,92 @@ def decompressPubKey (t : Tracker) (pkName qxName qyName : String)
   let nm1 := eraseRight t.nm "_dk_neg_y"
   let nm2 := renameRight nm1 "_dk_y_cand" qyName
   let nm3 := renameRight nm2 "_dk_x_save" qxName
-  { t with nm := nm3 }
+  let t : Tracker := { t with nm := nm3 }
+  -- valid = (qy² == y²) AND (qx < p) AND (prefix ∈ {0x02, 0x03}).
+  -- The selected qy is y_cand or p - y_cand, so squaring it tests the same
+  -- residue property either way. First conjunct rejects an x whose RHS is a
+  -- quadratic non-residue (the recovered point is then OFF the curve), the
+  -- second a non-canonical encoding of an otherwise fine x, the third a
+  -- prefix byte the parity reduction would alias or invert. A flag, not an
+  -- OP_VERIFY, so `verifyECDSA_P256(...) || fallback` stays writable.
+  -- Mirrors TS `decompressPubKey` (`p256-p384-codegen.ts:1146-1168`).
+  let t := t.copyToTop qyName "_dk_y_sq_in"
+  let t := cFieldSqr t "_dk_y_sq_in" "_dk_y_sq" c
+  let t := t.toTop "_dk_y_sq"
+  let t := t.toTop "_dk_y2_keep"
+  let t := t.rawBlock 2 (some "_dk_res_ok") [.opcode "OP_NUMEQUAL"]
+  let t := t.copyToTop qxName "_dk_x_lt"
+  let t := cPushFieldP t "_dk_p_lt" c
+  let t := t.rawBlock 2 (some "_dk_x_ok") [.opcode "OP_LESSTHAN"]
+  let t := t.toTop "_dk_res_ok"
+  let t := t.toTop "_dk_x_ok"
+  let t := t.rawBlock 2 (some "_dk_curve_ok") [.opcode "OP_BOOLAND"]
+  let t := t.toTop "_dk_pfx_ok"
+  t.rawBlock 2 (some "_dk_valid") [.opcode "OP_BOOLAND"]
 
 /-! ## ECDSA verification. Mirrors TS `cEmitVerifyECDSA`
-(`p256-p384-codegen.ts:830-983`). -/
+(`p256-p384-codegen.ts:1293-1490`). -/
+
+/-- Length gate for an untrusted byte argument: leaves `[flag, clamped]`.
+
+`flag` is `OP_SIZE(v) == want`; `clamped` is `v` forced to exactly `want`
+bytes by `v ‖ 00*want`, split at `want`, tail dropped — truncating a long
+value and zero-extending a short one. The clamp is what lets the gate stay a
+FLAG: everything downstream peels a fixed number of bytes, so an unclamped
+short argument would ABORT the script mid-reversal instead of returning
+false. Mirrors TS `cEmitLengthGate` (`p256-p384-codegen.ts:1194-1210`). -/
+def cEmitLengthGate (t : Tracker) (name : String) (want : Nat)
+    (flagName : String) : Tracker :=
+  let t := t.toTop name
+  let t := t.rawBlock 1 none
+              [ .opcode "OP_SIZE"
+              , .push (.bigint (Int.ofNat want))
+              , .opcode "OP_NUMEQUAL"
+              , .swap
+              , .push (.bytes (ByteArray.mk (Array.replicate want (0 : UInt8))))
+              , .opcode "OP_CAT"
+              , .push (.bigint (Int.ofNat want))
+              , .opcode "OP_SPLIT"
+              , .drop ]
+  { t with nm := (t.nm.push (some flagName)).push (some name) }
+
+/-- SEC1 §4.1.4 step 1 / FIPS 186-5 §6.4.2: `1 ≤ r ≤ n-1` and `1 ≤ s ≤ n-1`.
+Consumes nothing, leaves `_range_ok`.
+
+This is a universal-forgery guard, not hygiene: `cGroupInv` is Fermat, so
+inv(0) = 0 rather than an error, and an all-zero signature collapses both
+ladders to O and compares 0 against 0 — verifying for ANY message under ANY
+public key. Both conjuncts are load-bearing (`r = 0, s = n` is a second
+spelling that an `s ≠ 0` test alone would miss). Mirrors TS
+`cEmitSigRangeGate` (`p256-p384-codegen.ts:1245-1275`). -/
+def cEmitSigRangeGate (t : Tracker) (g : GroupParams) : Tracker :=
+  let t := t.copyToTop "_r" "_r_nz_in"
+  let t := t.rawBlock 1 (some "_r_nz") [.opcode "OP_0NOTEQUAL"]
+  let t := t.copyToTop "_r" "_r_lt_in"
+  let t := cPushGroupN t "_n_for_r" g
+  let t := t.rawBlock 2 (some "_r_lt") [.opcode "OP_LESSTHAN"]
+  let t := t.rawBlock 2 (some "_r_ok") [.opcode "OP_BOOLAND"]
+  let t := t.copyToTop "_s" "_s_nz_in"
+  let t := t.rawBlock 1 (some "_s_nz") [.opcode "OP_0NOTEQUAL"]
+  let t := t.copyToTop "_s" "_s_lt_in"
+  let t := cPushGroupN t "_n_for_s" g
+  let t := t.rawBlock 2 (some "_s_lt") [.opcode "OP_LESSTHAN"]
+  let t := t.rawBlock 2 (some "_s_ok") [.opcode "OP_BOOLAND"]
+  t.rawBlock 2 (some "_range_ok") [.opcode "OP_BOOLAND"]
 
 def cEmitVerifyECDSAOps (c : CurveParams) (g : GroupParams)
     (curveB sqrtExp gx gy : Int) : List StackOp :=
   let t : Tracker := Tracker.init [some "_msg", some "_sig", some "_pk"]
+  -- Step 0: length gate. `_sig` and `_pk` are bare ByteString in the builtin
+  -- table and the type checker imposes no width, so both arrive
+  -- attacker-sized. Clamp them and remember whether they were the right size.
+  -- Without it `sig ‖ junk` verified identically to `sig`, and a short `sig`
+  -- aborted the script outright.
+  let t := cEmitLengthGate t "_pk" (c.coordBytes + 1) "_pk_len_ok"
+  let t := cEmitLengthGate t "_sig" (c.coordBytes * 2) "_sig_len_ok"
+  let t := t.toTop "_pk_len_ok"
+  let t := t.toTop "_sig_len_ok"
+  let t := t.rawBlock 2 (some "_len_ok") [.opcode "OP_BOOLAND"]
   -- Step 1: e = SHA-256(msg) as integer
   let t := t.toTop "_msg"
   let eOps : List StackOp :=
@@ -776,8 +1059,19 @@ def cEmitVerifyECDSAOps (c : CurveParams) (g : GroupParams)
   let t := t.rawBlock 1 (some "_r") convOps
   let t := t.toTop "_s_bytes"
   let t := t.rawBlock 1 (some "_s") convOps
-  -- Step 3: decompress pubkey
+  -- Step 2b: 1 ≤ r, s ≤ n-1. Without this an all-zero signature verifies for
+  -- any message under any pubkey — see `cEmitSigRangeGate`.
+  let t := cEmitSigRangeGate t g
+  -- Step 3: decompress pubkey. Also yields `_dk_valid`: 0 when the pubkey
+  -- bytes do not decompress to a canonical on-curve point.
   let t := decompressPubKey t "_pk" "_qx" "_qy" c curveB sqrtExp
+  -- Collapse the three argument verdicts into one flag, so everything below
+  -- carries a single item.
+  let t := t.toTop "_len_ok"
+  let t := t.toTop "_range_ok"
+  let t := t.rawBlock 2 (some "_arg_ok") [.opcode "OP_BOOLAND"]
+  let t := t.toTop "_dk_valid"
+  let t := t.rawBlock 2 (some "_input_ok") [.opcode "OP_BOOLAND"]
   -- Step 4: w = s^{-1} mod n
   let t := cGroupInv t "_s" "_w" g
   -- Step 5: u1 = e * w mod n
@@ -793,7 +1087,10 @@ def cEmitVerifyECDSAOps (c : CurveParams) (g : GroupParams)
     bigintToBytes gx c.coordBytes ++ bigintToBytes gy c.coordBytes
   let t := t.pushBytes "_G" gPoint
   let t := t.toTop "_u1"
-  -- Stash _r_save, _u2, _qy, _qx on alt (in that order so cEmitMul sees [_G, _u1])
+  -- Stash _input_ok, _r_save, _u2, _qy, _qx on alt (in that order so cEmitMul
+  -- sees [_G, _u1]). `_input_ok` goes DEEPEST — the altstack is LIFO and it is
+  -- popped last.
+  let t := t.toTop "_input_ok" |>.toAlt
   let t := t.toTop "_r_save" |>.toAlt
   let t := t.toTop "_u2" |>.toAlt
   let t := t.toTop "_qy" |>.toAlt
@@ -839,10 +1136,18 @@ def cEmitVerifyECDSAOps (c : CurveParams) (g : GroupParams)
   -- Drop ry; reduce rx mod n; restore _r_save; compare.
   let t := t.toTop "ry" |>.drop
   let t := cGroupMod t "rx" "_rx_mod_n" g
+  -- Restore r, then the argument verdict beneath it.
   let t := t.fromAlt "_r_save"
+  let t := t.fromAlt "_input_ok"
   let t := t.toTop "_rx_mod_n"
   let t := t.toTop "_r_save"
-  let t := t.rawBlock 2 (some "_result") [.opcode "OP_EQUAL"]
+  let t := t.rawBlock 2 (some "_sig_ok") [.opcode "OP_EQUAL"]
+  -- Arguments that were the wrong length, out of range, or did not decompress
+  -- to a canonical on-curve point can never verify, whatever the ladder made
+  -- of them.
+  let t := t.toTop "_input_ok"
+  let t := t.toTop "_sig_ok"
+  let t := t.rawBlock 2 (some "_result") [.opcode "OP_BOOLAND"]
   t.ops.toList
 
 /-! ## P-256 public API (mirroring `p256-p384-codegen.ts:986-1106`). -/
@@ -881,6 +1186,7 @@ def emitP256Negate : List StackOp :=
 def emitP256OnCurve : List StackOp :=
   let t : Tracker := Tracker.init [some "_pt"]
   let t := cDecomposePoint t "_pt" "_x" "_y" p256Params
+  let t := cEmitCanonicityGuard t "_x" "_y" p256Params
   let t := cFieldSqr t "_y" "_y2" p256Params
   let t := t.copyToTop "_x" "_x_copy"
   let t := t.copyToTop "_x" "_x_copy2"
@@ -892,7 +1198,11 @@ def emitP256OnCurve : List StackOp :=
   let t := cFieldAdd t "_x3m3x" "_b" "_rhs" p256Params
   let t := t.toTop "_y2"
   let t := t.toTop "_rhs"
-  let t := t.rawBlock 2 (some "_result") [.opcode "OP_EQUAL"]
+  let t := t.rawBlock 2 (some "_curve_eq") [.opcode "OP_EQUAL"]
+  -- on-curve = canonical AND curve-equation
+  let t := t.toTop "_canon"
+  let t := t.toTop "_curve_eq"
+  let t := t.rawBlock 2 (some "_result") [.opcode "OP_BOOLAND"]
   t.ops.toList
 
 /-- P-256 compressed encoding: 64-byte point → 33-byte compressed pubkey. -/
@@ -952,6 +1262,7 @@ def emitP384Negate : List StackOp :=
 def emitP384OnCurve : List StackOp :=
   let t : Tracker := Tracker.init [some "_pt"]
   let t := cDecomposePoint t "_pt" "_x" "_y" p384Params
+  let t := cEmitCanonicityGuard t "_x" "_y" p384Params
   let t := cFieldSqr t "_y" "_y2" p384Params
   let t := t.copyToTop "_x" "_x_copy"
   let t := t.copyToTop "_x" "_x_copy2"
@@ -963,7 +1274,11 @@ def emitP384OnCurve : List StackOp :=
   let t := cFieldAdd t "_x3m3x" "_b" "_rhs" p384Params
   let t := t.toTop "_y2"
   let t := t.toTop "_rhs"
-  let t := t.rawBlock 2 (some "_result") [.opcode "OP_EQUAL"]
+  let t := t.rawBlock 2 (some "_curve_eq") [.opcode "OP_EQUAL"]
+  -- on-curve = canonical AND curve-equation
+  let t := t.toTop "_canon"
+  let t := t.toTop "_curve_eq"
+  let t := t.rawBlock 2 (some "_result") [.opcode "OP_BOOLAND"]
   t.ops.toList
 
 /-- P-384 compressed encoding: 96-byte point → 49-byte compressed pubkey. -/

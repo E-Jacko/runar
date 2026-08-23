@@ -80,7 +80,7 @@ theorem lowerValueP_call_sha256_consume_d0
         outerProtected localBindings constInts
         (untagSm ((arg, k) :: tsm_rest)) bn (.call "sha256" [arg])).1
       = [StackOp.opcode "OP_SHA256"] := by
-  have hUntag : untagSm ((arg, k) :: tsm_rest) = arg :: untagSm tsm_rest := rfl
+  have hUntag : untagSm ((arg, k) :: tsm_rest) = some arg :: untagSm tsm_rest := rfl
   have hDepthTop : Lower.StackMap.depth? (arg :: untagSm tsm_rest) arg = some 0 := by
     unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
   have hExt : Lower.isExtractor "sha256" = false := by decide +kernel
@@ -101,7 +101,7 @@ theorem lowerValueP_call_hash160_consume_d0
         outerProtected localBindings constInts
         (untagSm ((arg, k) :: tsm_rest)) bn (.call "hash160" [arg])).1
       = [StackOp.opcode "OP_HASH160"] := by
-  have hUntag : untagSm ((arg, k) :: tsm_rest) = arg :: untagSm tsm_rest := rfl
+  have hUntag : untagSm ((arg, k) :: tsm_rest) = some arg :: untagSm tsm_rest := rfl
   have hDepthTop : Lower.StackMap.depth? (arg :: untagSm tsm_rest) arg = some 0 := by
     unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
   have hExt : Lower.isExtractor "hash160" = false := by decide +kernel
@@ -122,7 +122,7 @@ theorem lowerValueP_call_ripemd160_consume_d0
         outerProtected localBindings constInts
         (untagSm ((arg, k) :: tsm_rest)) bn (.call "ripemd160" [arg])).1
       = [StackOp.opcode "OP_RIPEMD160"] := by
-  have hUntag : untagSm ((arg, k) :: tsm_rest) = arg :: untagSm tsm_rest := rfl
+  have hUntag : untagSm ((arg, k) :: tsm_rest) = some arg :: untagSm tsm_rest := rfl
   have hDepthTop : Lower.StackMap.depth? (arg :: untagSm tsm_rest) arg = some 0 := by
     unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
   have hExt : Lower.isExtractor "ripemd160" = false := by decide +kernel
@@ -143,7 +143,7 @@ theorem lowerValueP_call_hash256_consume_d0
         outerProtected localBindings constInts
         (untagSm ((arg, k) :: tsm_rest)) bn (.call "hash256" [arg])).1
       = [StackOp.opcode "OP_HASH256"] := by
-  have hUntag : untagSm ((arg, k) :: tsm_rest) = arg :: untagSm tsm_rest := rfl
+  have hUntag : untagSm ((arg, k) :: tsm_rest) = some arg :: untagSm tsm_rest := rfl
   have hDepthTop : Lower.StackMap.depth? (arg :: untagSm tsm_rest) arg = some 0 := by
     unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
   have hExt : Lower.isExtractor "hash256" = false := by decide +kernel
@@ -201,11 +201,16 @@ theorem single_call_consume_fact (bn arg func : String) (src : Option SourceLoc)
 theorem lowerMethodUserRawOps_single_sha256
     (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
     (bn arg : String) (src : Option SourceLoc)
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse
+      = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "sha256" [arg]) src]) :
     Agrees.lowerMethodUserRawOps progMethods props anfM = [StackOp.opcode "OP_SHA256"] := by
   unfold Agrees.lowerMethodUserRawOps
   rw [hBody, hParams]
+  -- NEW-004: a single hash call marks no raw slot, so the method-wide set
+  -- is empty and the lift lemma (stated at the default) applies.
+  simp only [Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]
+  simp only [Lower.arrayElemsOf, List.nil_append]
   exact lowerBindingsP_single_lift progMethods props Lower.defaultInlineBudget 0
     (Lower.computeLastUses [ANFBinding.mk bn (.call "sha256" [arg]) src]) []
     ([ANFBinding.mk bn (.call "sha256" [arg]) src].map (·.name))
@@ -221,11 +226,16 @@ theorem lowerMethodUserRawOps_single_sha256
 theorem lowerMethodUserRawOps_single_hash160
     (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
     (bn arg : String) (src : Option SourceLoc)
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse
+      = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "hash160" [arg]) src]) :
     Agrees.lowerMethodUserRawOps progMethods props anfM = [StackOp.opcode "OP_HASH160"] := by
   unfold Agrees.lowerMethodUserRawOps
   rw [hBody, hParams]
+  -- NEW-004: a single hash call marks no raw slot, so the method-wide set
+  -- is empty and the lift lemma (stated at the default) applies.
+  simp only [Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]
+  simp only [Lower.arrayElemsOf, List.nil_append]
   exact lowerBindingsP_single_lift progMethods props Lower.defaultInlineBudget 0
     (Lower.computeLastUses [ANFBinding.mk bn (.call "hash160" [arg]) src]) []
     ([ANFBinding.mk bn (.call "hash160" [arg]) src].map (·.name))
@@ -241,11 +251,16 @@ theorem lowerMethodUserRawOps_single_hash160
 theorem lowerMethodUserRawOps_single_ripemd160
     (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
     (bn arg : String) (src : Option SourceLoc)
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse
+      = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "ripemd160" [arg]) src]) :
     Agrees.lowerMethodUserRawOps progMethods props anfM = [StackOp.opcode "OP_RIPEMD160"] := by
   unfold Agrees.lowerMethodUserRawOps
   rw [hBody, hParams]
+  -- NEW-004: a single hash call marks no raw slot, so the method-wide set
+  -- is empty and the lift lemma (stated at the default) applies.
+  simp only [Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]
+  simp only [Lower.arrayElemsOf, List.nil_append]
   exact lowerBindingsP_single_lift progMethods props Lower.defaultInlineBudget 0
     (Lower.computeLastUses [ANFBinding.mk bn (.call "ripemd160" [arg]) src]) []
     ([ANFBinding.mk bn (.call "ripemd160" [arg]) src].map (·.name))
@@ -261,11 +276,16 @@ theorem lowerMethodUserRawOps_single_ripemd160
 theorem lowerMethodUserRawOps_single_hash256
     (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
     (bn arg : String) (src : Option SourceLoc)
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse
+      = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "hash256" [arg]) src]) :
     Agrees.lowerMethodUserRawOps progMethods props anfM = [StackOp.opcode "OP_HASH256"] := by
   unfold Agrees.lowerMethodUserRawOps
   rw [hBody, hParams]
+  -- NEW-004: a single hash call marks no raw slot, so the method-wide set
+  -- is empty and the lift lemma (stated at the default) applies.
+  simp only [Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]
+  simp only [Lower.arrayElemsOf, List.nil_append]
   exact lowerBindingsP_single_lift progMethods props Lower.defaultInlineBudget 0
     (Lower.computeLastUses [ANFBinding.mk bn (.call "hash256" [arg]) src]) []
     ([ANFBinding.mk bn (.call "hash256" [arg]) src].map (·.name))
@@ -625,7 +645,7 @@ theorem lowerValueP_call_sha256_consume_d0_full
     (hConsume : Lower.isLastUse lastUses arg currentIndex = true) :
     Lower.lowerValueP progMethods props budget currentIndex lastUses
         [] localBindings constInts (arg :: smRest) bn (.call "sha256" [arg])
-      = ([StackOp.opcode "OP_SHA256"], bn :: smRest, localBindings) := by
+      = ([StackOp.opcode "OP_SHA256"], some bn :: smRest, localBindings) := by
   have hDepthTop : Lower.StackMap.depth? (arg :: smRest) arg = some 0 := by
     unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
   have hExt : Lower.isExtractor "sha256" = false := by decide +kernel
@@ -643,7 +663,7 @@ theorem lowerValueP_call_hash160_consume_d0_full
     (hConsume : Lower.isLastUse lastUses arg currentIndex = true) :
     Lower.lowerValueP progMethods props budget currentIndex lastUses
         [] localBindings constInts (arg :: smRest) bn (.call "hash160" [arg])
-      = ([StackOp.opcode "OP_HASH160"], bn :: smRest, localBindings) := by
+      = ([StackOp.opcode "OP_HASH160"], some bn :: smRest, localBindings) := by
   have hDepthTop : Lower.StackMap.depth? (arg :: smRest) arg = some 0 := by
     unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
   have hExt : Lower.isExtractor "hash160" = false := by decide +kernel
@@ -665,7 +685,7 @@ theorem lowerValueP_hashAssert_binop
         [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
         [] localBindings constInts [d, expected] ok
         (.binOp "===" d expected (some "bytes"))
-      = ([.swap, .opcode "OP_EQUAL"], [ok], localBindings) := by
+      = ([.swap, .opcode "OP_EQUAL"], ([ok] : Lower.StackMap), localBindings) := by
   have h := hNames
   simp only [hashAssertNamesOk, Bool.and_eq_true, bne_iff_ne, ne_eq] at h
   obtain ⟨⟨⟨⟨⟨hDA, hDE⟩, hDO⟩, hOA⟩, hOE⟩, hAE⟩ := h
@@ -708,12 +728,12 @@ theorem lowerBindingsP_hashAssert
     (hCallWit : Lower.lowerValueP progMethods props budget 0
         [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
         [] localBindings constInts [arg, expected] d (.call func [arg])
-      = ([StackOp.opcode op], [d, expected], localBindings)) :
+      = ([StackOp.opcode op], ([d, expected] : Lower.StackMap), localBindings)) :
     Lower.lowerBindingsP progMethods props budget 0
         [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
         [] localBindings constInts [arg, expected]
         (hashAssertBody d ok anm arg expected func s1 s2 s3)
-      = ([.opcode op, .swap, .opcode "OP_EQUAL", .opcode "OP_VERIFY"], []) := by
+      = ([.opcode op, .swap, .opcode "OP_EQUAL", .opcode "OP_VERIFY"], ([] : Lower.StackMap)) := by
   show Lower.lowerBindingsP progMethods props budget 0
         [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
         [] localBindings constInts [arg, expected]
@@ -753,7 +773,7 @@ theorem lowerMethod_ops_hashAssert
         [] [d, ok, anm] (Lower.collectConstInts
           (hashAssertBody d ok anm arg expected func s1 s2 s3))
         [arg, expected] d (.call func [arg])
-      = ([StackOp.opcode op], [d, expected], [d, ok, anm])) :
+      = ([StackOp.opcode op], ([d, expected] : Lower.StackMap), [d, ok, anm])) :
     (Lower.lowerMethod progMethods props anfM).ops = hashAssertOps op := by
   unfold Lower.lowerMethod
   rw [hParams, hBody, hPub]
@@ -777,6 +797,14 @@ theorem lowerMethod_ops_hashAssert
   rw [show ((hashAssertBody d ok anm arg expected func s1 s2 s3).map (·.name))
         = [d, ok, anm] by simp [hashAssertBody, ANFBinding.name]]
   simp only [Bool.false_eq_true, if_false]
+  -- NEW-004: the hash-assert body is calls + assert, no byte-array
+  -- producer, so the method-wide raw-slot set is empty.
+  rw [show Lower.collectRawSlots (hashAssertBody d ok anm arg expected func s1 s2 s3) = [] from by
+        simp [hashAssertBody, Lower.collectRawSlots, Lower.collectRawSlotsGo,
+              Lower.rawResultValue]]
+  -- …and no `array_literal` binding, so the element table is empty too.
+  rw [show Lower.arrayElemsOf (hashAssertBody d ok anm arg expected func s1 s2 s3) = [] from by
+        simp [hashAssertBody, Lower.arrayElemsOf]]
   rw [lowerBindingsP_hashAssert progMethods props Lower.defaultInlineBudget
     [d, ok, anm] (Lower.collectConstInts
       (hashAssertBody d ok anm arg expected func s1 s2 s3))
@@ -1099,17 +1127,17 @@ theorem lowerBindingsP_hashChain
     (d1 d2 arg f1 f2 op1 op2 : String) (s1 s2 : Option SourceLoc)
     (hCallWit1 : Lower.lowerValueP progMethods props budget 0
         [(d1, 1), (arg, 0)] [] localBindings constInts [arg] d1 (.call f1 [arg])
-      = ([StackOp.opcode op1], [d1], localBindings))
+      = ([StackOp.opcode op1], ([d1] : Lower.StackMap), localBindings))
     (hCallWit2 : Lower.lowerValueP progMethods props budget 1
         [(d1, 1), (arg, 0)] [] localBindings constInts [d1] d2 (.call f2 [d1])
-      = ([StackOp.opcode op2], [d2], localBindings)) :
+      = ([StackOp.opcode op2], ([d2] : Lower.StackMap), localBindings)) :
     Lower.lowerBindingsP progMethods props budget 0 [(d1, 1), (arg, 0)]
         [] localBindings constInts [arg] (hashChainBody d1 d2 arg f1 f2 s1 s2)
-      = (hashChainOps op1 op2, [d2]) := by
+      = (hashChainOps op1 op2, ([d2] : Lower.StackMap)) := by
   show Lower.lowerBindingsP progMethods props budget 0 [(d1, 1), (arg, 0)]
         [] localBindings constInts [arg]
         [⟨d1, .call f1 [arg], s1⟩, ⟨d2, .call f2 [d1], s2⟩]
-      = (hashChainOps op1 op2, [d2])
+      = (hashChainOps op1 op2, ([d2] : Lower.StackMap))
   rw [Lower.lowerBindingsP.eq_def]
   simp only [hCallWit1]
   rw [Lower.lowerBindingsP.eq_def]
@@ -1135,12 +1163,12 @@ theorem lowerMethod_ops_hashChain
         [(d1, 1), (arg, 0)] [] [d1, d2]
         (Lower.collectConstInts (hashChainBody d1 d2 arg f1 f2 s1 s2))
         [arg] d1 (.call f1 [arg])
-      = ([StackOp.opcode op1], [d1], [d1, d2]))
+      = ([StackOp.opcode op1], ([d1] : Lower.StackMap), [d1, d2]))
     (hCallWit2 : Lower.lowerValueP progMethods props Lower.defaultInlineBudget 1
         [(d1, 1), (arg, 0)] [] [d1, d2]
         (Lower.collectConstInts (hashChainBody d1 d2 arg f1 f2 s1 s2))
         [d1] d2 (.call f2 [d1])
-      = ([StackOp.opcode op2], [d2], [d1, d2])) :
+      = ([StackOp.opcode op2], ([d2] : Lower.StackMap), [d1, d2])) :
     (Lower.lowerMethod progMethods props anfM).ops = hashChainOps op1 op2 := by
   have hF : (f1 = "sha256" ∧ f2 = "hash160") ∨ (f1 = "hash160" ∧ f2 = "sha256")
       ∨ (f1 = "hash160" ∧ f2 = "hash160") ∨ (f1 = "sha256" ∧ f2 = "sha256") := by
@@ -1174,6 +1202,13 @@ theorem lowerMethod_ops_hashChain
   rw [show ((hashChainBody d1 d2 arg f1 f2 s1 s2).map (·.name))
         = [d1, d2] by simp [hashChainBody, ANFBinding.name]]
   simp only [Bool.false_eq_true, if_false]
+  -- NEW-004: the hash-chain body is two calls, no byte-array producer.
+  rw [show Lower.collectRawSlots (hashChainBody d1 d2 arg f1 f2 s1 s2) = [] from by
+        simp [hashChainBody, Lower.collectRawSlots, Lower.collectRawSlotsGo,
+              Lower.rawResultValue]]
+  -- …and no `array_literal` binding, so the element table is empty too.
+  rw [show Lower.arrayElemsOf (hashChainBody d1 d2 arg f1 f2 s1 s2) = [] from by
+        simp [hashChainBody, Lower.arrayElemsOf]]
   rw [lowerBindingsP_hashChain progMethods props Lower.defaultInlineBudget
     [d1, d2] (Lower.collectConstInts (hashChainBody d1 d2 arg f1 f2 s1 s2))
     d1 d2 arg f1 f2 op1 op2 s1 s2 hCallWit1 hCallWit2]

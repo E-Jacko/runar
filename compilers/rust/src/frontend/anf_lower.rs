@@ -161,7 +161,8 @@ fn literal_bigint(expr: &Expression) -> Option<num_bigint::BigInt> {
 
 /// Serialise a `num_bigint::BigInt` to a `serde_json::Value` for IR-JSON.
 ///
-/// Values within `i64` range serialise as JSON numbers. Larger values
+/// Values a bare JSON number carries losslessly — magnitude at most
+/// `Number.MAX_SAFE_INTEGER` — serialise as JSON numbers. Larger values
 /// serialise as a JS-style decimal `BigInt` literal — the decimal digits
 /// followed by a literal `n` suffix, quoted as a JSON string. The `n`
 /// suffix is the cross-tier discriminator that distinguishes a decimal
@@ -169,18 +170,27 @@ fn literal_bigint(expr: &Expression) -> Option<num_bigint::BigInt> {
 /// strings made of ASCII digits in the all-decimal case, e.g. `"3030"`
 /// is both a valid decimal and a valid hex bytestring).
 ///
+/// `i64` is NOT the boundary: a bare JSON number is decoded into an
+/// IEEE-754 double by every JS consumer (and by Go's `encoding/json`
+/// when the target is `interface{}`), so `9007199254740993` — well
+/// inside `i64` — comes back as `9007199254740992`.
+///
 /// Mirrors:
-///   - Go: `compilers/go/frontend/anf_lower.go::makeLoadConstInt`
+///   - Go: `compilers/go/ir/types.go::BigIntToRawJSON`
 ///   - Python: `compilers/python/runar_compiler/frontend/anf_lower.py::_make_load_const_int`
 ///   - TS: `conformance/runner/runner.ts` BigInt canonicalisation
-fn bigint_to_json(v: &num_bigint::BigInt) -> serde_json::Value {
+pub(crate) fn bigint_to_json(v: &num_bigint::BigInt) -> serde_json::Value {
     use num_traits::ToPrimitive;
-    if let Some(i) = v.to_i64() {
-        serde_json::Value::Number(serde_json::Number::from(i))
-    } else {
-        serde_json::Value::String(format!("{}n", v))
+    match v.to_i64() {
+        Some(i) if i.unsigned_abs() <= JS_MAX_SAFE_INTEGER => {
+            serde_json::Value::Number(serde_json::Number::from(i))
+        }
+        _ => serde_json::Value::String(format!("{}n", v)),
     }
 }
+
+/// `Number.MAX_SAFE_INTEGER` (2^53 - 1).
+pub(crate) const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Mirrors `flattenAddOutputArgs` in `04-anf-lower.ts`: when
 /// `this.addOutput` is called as `this.addOutput(satoshis, .{ v1, v2, ... })`

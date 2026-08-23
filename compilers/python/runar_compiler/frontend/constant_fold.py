@@ -18,6 +18,7 @@ from runar_compiler.ir.types import (
     ANFMethod,
     ANFProgram,
     ANFValue,
+    bigint_json_value,
 )
 from runar_compiler.ir.unknown_anf_kind_error import UnknownANFKindError
 
@@ -365,9 +366,12 @@ def _const_to_anf_value(cv: ConstValue) -> ANFValue:
     """Convert a ConstValue to a load_const ANFValue."""
     tag, val = cv
     if tag == "int":
+        # Same JS-safe-integer boundary as ``_make_load_const_int``: a folded
+        # constant is written to the same IR JSON and read by the same
+        # double-backed consumers.
         return ANFValue(
             kind="load_const",
-            raw_value=json.dumps(val),
+            raw_value=json.dumps(bigint_json_value(val)),
             const_big_int=val,
             const_int=val,
         )

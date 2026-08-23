@@ -1814,27 +1814,38 @@ module RunarCompiler
     # ANFValue constructors (module-level helpers)
     # -------------------------------------------------------------------
 
+    # Number.MAX_SAFE_INTEGER (2**53 - 1) -- the largest magnitude a bare JSON
+    # number survives. int64 is NOT the boundary: 9_007_199_254_740_993 fits
+    # int64 but comes back as ...992 from any double-backed JSON reader.
+    JS_MAX_SAFE_INTEGER_LOAD_CONST = 9_007_199_254_740_991
+
+    # Canonical IR-JSON encoding of an integer: the bare integer when a JSON
+    # number carries it losslessly, else the JS BigInt `"<n>n"` decimal
+    # string. Mirrors compilers/go/ir/types.go::BigIntToRawJSON and
+    # compilers/python/runar_compiler/ir/types.py::bigint_json_value.
+    #
+    # @param val [Integer]
+    # @return [Integer, String]
+    def self._bigint_json_value(val)
+      return val if val.abs <= JS_MAX_SAFE_INTEGER_LOAD_CONST
+
+      "#{val}n"
+    end
+
     # @param val [Integer]
     # @return [IR::ANFValue]
-    INT64_MAX_LOAD_CONST = 9_223_372_036_854_775_807
-    INT64_MIN_LOAD_CONST = -9_223_372_036_854_775_808
-
     def self._make_load_const_int(val)
       # JSON numbers in JavaScript are IEEE-754 doubles (~53 bits of integer
       # precision), and Go's encoding/json silently degrades JSON numbers
-      # above 2^53 into scientific notation. Emit values that exceed the
-      # int64 range as a quoted decimal string with the canonical JS BigInt
+      # above 2^53 into scientific notation. Emit values a bare JSON number
+      # cannot carry as a quoted decimal string with the canonical JS BigInt
       # `n` suffix so 256-bit constants (e.g. the secp256k1 group order
       # used in schnorr-zkp's s-bound assert) survive the JSON round-trip
       # losslessly AND so consuming IR decoders can distinguish a decimal-
       # encoded big integer from a hex-encoded ByteString literal. Mirrors
       # compilers/python/runar_compiler/frontend/anf_lower.py::_make_load_const_int
       # and compilers/go/frontend/anf_lower.go::makeLoadConstInt.
-      raw = if val > INT64_MAX_LOAD_CONST || val < INT64_MIN_LOAD_CONST
-              JSON.generate("#{val}n")
-            else
-              JSON.generate(val)
-            end
+      raw = JSON.generate(_bigint_json_value(val))
       IR::ANFValue.new(kind: "load_const").tap do |v|
         v.raw_value = raw
         v.const_big_int = val

@@ -1314,9 +1314,26 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
     }
 }
 
+/// `Number.MAX_SAFE_INTEGER` (2^53 - 1) — the largest magnitude a bare JSON
+/// number survives. Every JSON consumer that decodes into a JS number (or into
+/// Go's `interface{}`, which is `float64`) is an IEEE-754 double, so `i64` is
+/// NOT the boundary: `9007199254740993` fits `i64` and still reads back as
+/// `9007199254740992`.
+const js_max_safe_integer: i128 = 9007199254740991;
+
 fn writeConstValue(writer: anytype, value: types.ConstValue) !void {
     switch (value) {
-        .integer => |i| try writer.print("{d}", .{i}),
+        .integer => |i| {
+            if (i > js_max_safe_integer or i < -js_max_safe_integer) {
+                // Past the safe-integer boundary a bare JSON number is lossy —
+                // emit the same canonical `"<n>n"` string the `big_integer`
+                // arm below uses, which is also what TS / Go / Rust / Python /
+                // Ruby / Java emit in this window.
+                try writer.print("\"{d}n\"", .{i});
+            } else {
+                try writer.print("{d}", .{i});
+            }
+        },
         .big_integer => |s| {
             // Canonical JS BigInt encoding: quoted decimal string with the
             // trailing `n` discriminator. Matches the TS / Go / Python

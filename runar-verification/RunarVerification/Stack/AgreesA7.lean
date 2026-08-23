@@ -349,6 +349,53 @@ theorem runOps_lowerBindingsP_structuralLoopBody_id
             lastUses outerProtected localBindings constInts sm name v).2.2
           s hRest
 
+/-- NEW-004: the loop fragment admits only `.loop`, and `collectRawSlotsGo`
+skips a zero-count loop entirely (it is never lowered) and recurses into an
+EMPTY body otherwise — so nothing is ever marked raw. -/
+theorem collectRawSlots_nil_of_structuralLoopBody :
+    ∀ bs : List ANFBinding, structuralLoopBody bs →
+      Stack.Lower.collectRawSlots bs = [] := by
+  have go : ∀ bs : List ANFBinding, structuralLoopBody bs →
+      Stack.Lower.collectRawSlotsGo [] bs = [] := by
+    intro bs
+    induction bs with
+    | nil => intro _; simp [Stack.Lower.collectRawSlotsGo]
+    | cons b rest ih =>
+        obtain ⟨name, v, src⟩ := b
+        intro h
+        obtain ⟨hv, hrest⟩ := h
+        have hTail := ih hrest
+        match v, hv with
+        | .loop 0 _ _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo] using hTail
+        | .loop 1 body _, hb =>
+            subst hb
+            simpa [Stack.Lower.collectRawSlotsGo] using hTail
+  intro bs h
+  unfold Stack.Lower.collectRawSlots
+  exact go bs h
+
+/-- `arrayElems` peer: a `count ≤ 1` loop is either never lowered
+(`count = 0`, which `arrayElemsOf` skips like `collectRawSlotsGo`) or has
+an EMPTY body, so it contributes no `array_literal` element entry. -/
+theorem arrayElemsOf_nil_of_structuralLoopBody :
+    ∀ bs : List ANFBinding, structuralLoopBody bs →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih hrest
+      match v, hv with
+      | .loop 0 _ _, _ =>
+          simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loop 1 body _, hb =>
+          subst hb
+          simpa [Stack.Lower.arrayElemsOf] using hTail
+
 /-- Method-shaped specialization: `runOps` of an all-supported-loop body's
 raw method op-list is identity on the starting stack. -/
 theorem runOps_lowerMethodUserRawOps_structuralLoopBody_id
@@ -356,6 +403,8 @@ theorem runOps_lowerMethodUserRawOps_structuralLoopBody_id
     (hLoop : structuralLoopBody m.body) (s : StackState) :
     runOps (lowerMethodUserRawOps progMethods props m) s = .ok s := by
   unfold lowerMethodUserRawOps
+  rw [collectRawSlots_nil_of_structuralLoopBody m.body hLoop]
+  rw [arrayElemsOf_nil_of_structuralLoopBody m.body hLoop]
   exact runOps_lowerBindingsP_structuralLoopBody_id progMethods props
     Stack.Lower.defaultInlineBudget (Stack.Lower.computeLastUses m.body) []
     (Stack.Lower.collectConstInts m.body)
@@ -771,12 +820,58 @@ theorem runOps_lowerBindingsP_structuralLoopBodyExt_id
             lastUses outerProtected localBindings constInts sm name v).2.2
           s hRest
 
+/-- NEW-004 peer for the Tier 2-widened fragment: any count with an EMPTY
+body, so `collectRawSlotsGo` still adds nothing. -/
+theorem collectRawSlots_nil_of_structuralLoopBodyExt :
+    ∀ bs : List ANFBinding, structuralLoopBodyExt bs →
+      Stack.Lower.collectRawSlots bs = [] := by
+  have go : ∀ bs : List ANFBinding, structuralLoopBodyExt bs →
+      Stack.Lower.collectRawSlotsGo [] bs = [] := by
+    intro bs
+    induction bs with
+    | nil => intro _; simp [Stack.Lower.collectRawSlotsGo]
+    | cons b rest ih =>
+        obtain ⟨name, v, src⟩ := b
+        intro h
+        obtain ⟨hv, hrest⟩ := h
+        have hTail := ih hrest
+        match v, hv with
+        | .loop 0 _ _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo] using hTail
+        | .loop (_ + 1) body _, hb =>
+            subst hb
+            simpa [Stack.Lower.collectRawSlotsGo] using hTail
+  intro bs h
+  unfold Stack.Lower.collectRawSlots
+  exact go bs h
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_structuralLoopBodyExt`. -/
+theorem arrayElemsOf_nil_of_structuralLoopBodyExt :
+    ∀ bs : List ANFBinding, structuralLoopBodyExt bs →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih hrest
+      match v, hv with
+      | .loop 0 _ _, _ =>
+          simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loop (_ + 1) body _, hb =>
+          subst hb
+          simpa [Stack.Lower.arrayElemsOf] using hTail
+
 /-- Method-shaped specialization of the Tier 2-widened identity. -/
 theorem runOps_lowerMethodUserRawOps_structuralLoopBodyExt_id
     (progMethods : List ANFMethod) (props : List ANFProperty) (m : ANFMethod)
     (hLoop : structuralLoopBodyExt m.body) (s : StackState) :
     runOps (lowerMethodUserRawOps progMethods props m) s = .ok s := by
   unfold lowerMethodUserRawOps
+  rw [collectRawSlots_nil_of_structuralLoopBodyExt m.body hLoop]
+  rw [arrayElemsOf_nil_of_structuralLoopBodyExt m.body hLoop]
   exact runOps_lowerBindingsP_structuralLoopBodyExt_id progMethods props
     Stack.Lower.defaultInlineBudget (Stack.Lower.computeLastUses m.body) []
     (Stack.Lower.collectConstInts m.body)
@@ -1070,12 +1165,17 @@ theorem lowerLoopItersP_singletonConst_eq
       simp [Stack.Lower.lowerLoopItersP, loopConstAssemble, constStrandMap]
   | n + 1, sm => by
       unfold Stack.Lower.lowerLoopItersP loopConstAssemble constStrandMap
+      -- `StackMap` slots are `Option String`, so the body's depth-0 gate
+      -- compares `some xName` with `some iterVar`.
+      have hNeO : ((some xName : Option String) == some iterVar) = false :=
+        beq_eq_false_iff_ne.mpr
+          (fun h => (beq_eq_false_iff_ne.mp hNe) (Option.some.inj h))
       simp only [lowerBindingsP_singletonConst progMethods props budget
             (if (n == 0) = true then naturalLU else nonFinalLU)
             [] loopLocal constInts (iterVar :: sm) xName c hC,
                  Stack.Lower.iterVarCleanup,
                  Stack.Lower.StackMap.push, Stack.Lower.StackMap.depth?,
-                 List.findIdx?_cons, hNe, beq_self_eq_true, if_true, if_false,
+                 List.findIdx?_cons, hNeO, beq_self_eq_true, if_true, if_false,
                  Option.map_some, Bool.false_eq_true, Nat.zero_add]
       rw [lowerLoopItersP_singletonConst_eq xName iterVar c hC hNe
             progMethods props budget naturalLU nonFinalLU loopLocal constInts
@@ -1205,6 +1305,16 @@ theorem runOps_lowerMethodUserRawOps_loopOnly_singletonConst_isSome
   -- Rewrite the body via `hBody`, then close with the body-level wrapper.
   -- Every occurrence of `m.body` is substituted by the concrete singleton.
   rw [hBody]
+  -- NEW-004: a loop whose body is a single literal push marks nothing raw,
+  -- for either iteration count.
+  rw [show Stack.Lower.collectRawSlots [ANFBinding.mk loopName
+        (.loop count [ANFBinding.mk xName (.loadConst c) none] iterVar) none] = [] from by
+        cases count <;> cases c <;>
+          simp [Stack.Lower.collectRawSlots, Stack.Lower.collectRawSlotsGo,
+                Stack.Lower.listContains]]
+  rw [show Stack.Lower.arrayElemsOf [ANFBinding.mk loopName
+        (.loop count [ANFBinding.mk xName (.loadConst c) none] iterVar) none] = [] from by
+        cases count <;> simp [Stack.Lower.arrayElemsOf]]
   exact runOps_lowerBindingsP_loopOnly_singletonConst_isSome progMethods props
     Stack.Lower.defaultInlineBudget 0
     _ [] _ _
@@ -1952,7 +2062,7 @@ private theorem depth?_push_ne (sm : StackMap) (name n : String)
     (Stack.Lower.StackMap.push sm name).depth? n = some (d + 1) := by
   unfold Stack.Lower.StackMap.push Stack.Lower.StackMap.depth?
   rw [List.findIdx?_cons]
-  have hHead : (name == n) = false := by
+  have hHead : ((some name : Option String) == some n) = false := by
     simpa [beq_iff_eq] using hNe
   rw [hHead]
   -- The else-branch returns `(sm.findIdx? _ ).map (·+1)`. Pull the
@@ -2161,7 +2271,7 @@ private theorem bringToTop_true_smInner_depth1
     (hIterFresh : iterVar ≠ n)
     (hDepth : (sm.push iterVar).depth? n = some 1) :
     ∃ rest, (Stack.Lower.bringToTop (sm.push iterVar) n true).2
-              = n :: iterVar :: rest := by
+              = some n :: iterVar :: rest := by
   -- depth(n) = 1 in iterVar :: sm means sm = n :: rest.
   cases hSm : sm with
   | nil =>
@@ -2194,16 +2304,16 @@ private theorem bringToTop_true_smInner_depth2
     (sm : StackMap) (iterVar n : String)
     (hDepth : (sm.push iterVar).depth? n = some 2) :
     (Stack.Lower.bringToTop (sm.push iterVar) n true).2
-      = n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm 1 := by
+      = some n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm 1 := by
   unfold Stack.Lower.bringToTop
   rw [hDepth]
   simp only [if_true]
   show ((Stack.Lower.StackMap.push sm iterVar).removeAtDepth 2).push n
-        = n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm 1
+        = some n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm 1
   unfold Stack.Lower.StackMap.push
   -- (iterVar :: sm).removeAtDepth 2 = iterVar :: sm.removeAtDepth 1.
   have hRm : Stack.Lower.StackMap.removeAtDepth (iterVar :: sm) 2
-              = iterVar :: Stack.Lower.StackMap.removeAtDepth sm 1 := by
+              = some iterVar :: Stack.Lower.StackMap.removeAtDepth sm 1 := by
     show Stack.Lower.StackMap.removeAtDepth (iterVar :: sm) (1 + 1) = _
     rfl
   rw [hRm]
@@ -2214,17 +2324,17 @@ private theorem bringToTop_true_smInner_depthD
     (hd : 3 ≤ d)
     (hDepth : (sm.push iterVar).depth? n = some d) :
     (Stack.Lower.bringToTop (sm.push iterVar) n true).2
-      = n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm (d - 1) := by
+      = some n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm (d - 1) := by
   unfold Stack.Lower.bringToTop
   rw [hDepth]
   match d, hd with
   | d' + 3, _ =>
       simp only [if_true]
       show ((Stack.Lower.StackMap.push sm iterVar).removeAtDepth (d' + 3)).push n
-            = n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm (d' + 3 - 1)
+            = some n :: iterVar :: Stack.Lower.StackMap.removeAtDepth sm (d' + 3 - 1)
       unfold Stack.Lower.StackMap.push
       have hRm : Stack.Lower.StackMap.removeAtDepth (iterVar :: sm) (d' + 3)
-                 = iterVar :: Stack.Lower.StackMap.removeAtDepth sm (d' + 2) := by
+                 = some iterVar :: Stack.Lower.StackMap.removeAtDepth sm (d' + 2) := by
         show Stack.Lower.StackMap.removeAtDepth (iterVar :: sm) ((d' + 2) + 1) = _
         rfl
       rw [hRm]
@@ -2304,7 +2414,7 @@ theorem lowerLoopItersP_one_eq
 theorem cleanupGate_buried (x iv : String) (sm : StackMap)
     (hNe : (x == iv) = false) :
     Stack.Lower.iterVarCleanup (x :: iv :: sm) iv
-      = (([] : List StackOp), (x :: iv :: sm)) := by
+      = (([] : List StackOp), (some x :: some iv :: sm)) := by
   unfold Stack.Lower.iterVarCleanup
   simp [Stack.Lower.StackMap.depth?, List.findIdx?_cons, hNe]
 
@@ -2333,7 +2443,7 @@ theorem lowerValueP_loop_one_singletonRefProp_ops_eq
   have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
     depth?_push_ne sm iterVar n hIterFresh d hDepth
   have hSmCopy : (Stack.Lower.loadRefLiveCopy (sm.push iterVar) n).2
-      = n :: iterVar :: sm := by
+      = some n :: iterVar :: sm := by
     unfold Stack.Lower.loadRefLiveCopy
     rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]
     rfl
@@ -2342,7 +2452,7 @@ theorem lowerValueP_loop_one_singletonRefProp_ops_eq
         (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadProp n) none])
         [] (localBindings ++ [ANFBinding.mk xName (.loadProp n) none].map (fun b => b.name))
         constInts (sm.push iterVar) [ANFBinding.mk xName (.loadProp n) none]
-        = (Stack.Lower.loadRef (sm.push iterVar) n, xName :: iterVar :: sm) := by
+        = (Stack.Lower.loadRef (sm.push iterVar) n, some xName :: some iterVar :: sm) := by
     rw [lowerBindingsP_singletonRefProp progMethods props budget
           (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadProp n) none])
           []
@@ -2397,7 +2507,7 @@ theorem lowerValueP_loop_one_singletonRefRefAlias_ops_eq
   have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
     depth?_push_ne sm iterVar n hIterFresh d hDepth
   have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
-      = n :: iterVar :: sm := by
+      = some n :: iterVar :: sm := by
     rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]
     rfl
   have hBody :
@@ -2409,7 +2519,7 @@ theorem lowerValueP_loop_one_singletonRefRefAlias_ops_eq
           (fun b => b.name))
         constInts (sm.push iterVar)
         [ANFBinding.mk xName (.loadConst (.refAlias n)) none]
-        = (Stack.Lower.loadRef (sm.push iterVar) n, xName :: iterVar :: sm) := by
+        = (Stack.Lower.loadRef (sm.push iterVar) n, some xName :: some iterVar :: sm) := by
     rw [lowerBindingsP_singletonRefRefAlias progMethods props budget
           (Stack.Lower.computeLastUses
             [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
@@ -2463,7 +2573,7 @@ theorem lowerValueP_loop_one_singletonRefParam_ops_eq
     depth?_push_ne sm iterVar n hIterFresh d hDepth
   -- The consume-path post-map starts `n :: iterVar :: _` at every depth.
   have hSmShape : ∃ rest, (Stack.Lower.bringToTop (sm.push iterVar) n true).2
-      = n :: iterVar :: rest := by
+      = some n :: iterVar :: rest := by
     match d with
     | 0 => exact bringToTop_true_smInner_depth1 sm iterVar n hIterFresh hDepthInner
     | 1 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm 1,
@@ -2480,7 +2590,7 @@ theorem lowerValueP_loop_one_singletonRefParam_ops_eq
         constInts (sm.push iterVar)
         [ANFBinding.mk xName (.loadParam n) none]
         = (loopParamConsumeOps (sm.push iterVar) n,
-           xName :: iterVar :: rest) := by
+           some xName :: some iterVar :: rest) := by
     rw [lowerBindingsP_singletonRefParam progMethods props budget
           (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadParam n) none])
           []
@@ -2529,7 +2639,7 @@ theorem tier3b_refProp_count2_pin :
     ∧ ((Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
         [] [] [] [] ["p", "q"] "L"
         (.loop 2 [ANFBinding.mk "x" (.loadProp "q") none] "i")).2.1
-      = ["x", "i", "x", "i", "p", "q"]) := by
+      = (["x", "i", "x", "i", "p", "q"] : Stack.Lower.StackMap)) := by
   refine ⟨by native_decide, by native_decide⟩
 
 /-- refAlias ×2 with the target IN the enclosing localBindings
@@ -2545,7 +2655,7 @@ theorem tier3b_refAlias_consume_count2_pin :
     ∧ ((Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
         [] [] ["q"] [] ["p", "q"] "L"
         (.loop 2 [ANFBinding.mk "x" (.loadConst (.refAlias "q")) none] "i")).2.1
-      = ["x", "i", "x", "i", "p"]) := by
+      = (["x", "i", "x", "i", "p"] : Stack.Lower.StackMap)) := by
   refine ⟨by native_decide, by native_decide⟩
 
 /-- refAlias ×2 with the target NOT in the enclosing localBindings:
@@ -2570,7 +2680,7 @@ theorem tier3b_refParam_count2_pin :
     ∧ ((Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
         [] [] [] [] ["p", "q"] "L"
         (.loop 2 [ANFBinding.mk "x" (.loadParam "q") none] "i")).2.1
-      = ["x", "i", "x", "i", "p"]) := by
+      = (["x", "i", "x", "i", "p"] : Stack.Lower.StackMap)) := by
   refine ⟨by native_decide, by native_decide⟩
 
 /-- Must-ACCEPT pin: a loop body reading outer non-param locals as RAW
@@ -2674,7 +2784,7 @@ theorem lowerLoopItersP_singletonRefProp_eq
         depth?_push_ne sm iterVar n hIterNe d hDepth
       -- Body map after the copy: `xName :: iterVar :: sm`.
       have hSmCopy : (Stack.Lower.loadRefLiveCopy (sm.push iterVar) n).2
-          = n :: iterVar :: sm := by
+          = some n :: iterVar :: sm := by
         unfold Stack.Lower.loadRefLiveCopy
         rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]
         rfl
@@ -2695,7 +2805,7 @@ theorem lowerLoopItersP_singletonRefProp_eq
         depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
       -- Recurse on the grown map (`xName :: iterVar :: sm = push (push sm iv) x`).
       simp only []
-      rw [show (xName :: iterVar :: sm)
+      rw [show (some xName :: some iterVar :: sm)
             = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
       rw [lowerLoopItersP_singletonRefProp_eq xName iterVar n hXNe hIterNe
             hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
@@ -2861,7 +2971,7 @@ theorem lowerLoopItersP_singletonRefParam_eq
       -- consume map under `xName`), no drop. Obtain the `n :: iv :: rest`
       -- shape of the consume map to apply `cleanupGate_buried`.
       have hSmShape : ∃ rest, (Stack.Lower.bringToTop (sm.push iterVar) n true).2
-          = n :: iterVar :: rest := by
+          = some n :: iterVar :: rest := by
         match d with
         | 0 => exact bringToTop_true_smInner_depth1 sm iterVar n hIterNe hDepthInner
         | 1 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm 1,
@@ -2878,7 +2988,7 @@ theorem lowerLoopItersP_singletonRefParam_eq
       have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
         depth?_push_ne sm iterVar n hIterNe d hDepth
       have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
-          = n :: iterVar :: sm := by
+          = some n :: iterVar :: sm := by
         rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]; rfl
       have hCopyOps : (Stack.Lower.bringToTop (sm.push iterVar) n false).1
           = Stack.Lower.loadRef (sm.push iterVar) n :=
@@ -2898,7 +3008,7 @@ theorem lowerLoopItersP_singletonRefParam_eq
             = some (d + 2) :=
         depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
       simp only []
-      rw [show (xName :: iterVar :: sm)
+      rw [show (some xName :: some iterVar :: sm)
             = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
       rw [lowerLoopItersP_singletonRefParam_eq xName iterVar n hXNe hIterNe
             hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
@@ -3009,7 +3119,7 @@ theorem lowerLoopItersP_singletonRefAliasCopy_eq
       have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
         depth?_push_ne sm iterVar n hIterNe d hDepth
       have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
-          = n :: iterVar :: sm := by
+          = some n :: iterVar :: sm := by
         rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]; rfl
       -- The per-step gate: `if m == 0 then naturalLU else nonFinalLU`; both false.
       have hGateStep :
@@ -3033,7 +3143,7 @@ theorem lowerLoopItersP_singletonRefAliasCopy_eq
             = some (d + 2) :=
         depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
       simp only []
-      rw [show (xName :: iterVar :: sm)
+      rw [show (some xName :: some iterVar :: sm)
             = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
       rw [lowerLoopItersP_singletonRefAliasCopy_eq xName iterVar n hXNe hIterNe
             hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
@@ -3148,7 +3258,7 @@ theorem lowerLoopItersP_singletonRefAliasConsume_eq
             naturalLU [] loopLocal constInts (sm.push iterVar) xName n (d + 1)
             hDepthInner hConsumeFinal, beq_self_eq_true, if_true]
       have hSmShape : ∃ rest, (Stack.Lower.bringToTop (sm.push iterVar) n true).2
-          = n :: iterVar :: rest := by
+          = some n :: iterVar :: rest := by
         match d with
         | 0 => exact bringToTop_true_smInner_depth1 sm iterVar n hIterNe hDepthInner
         | 1 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm 1,
@@ -3163,7 +3273,7 @@ theorem lowerLoopItersP_singletonRefAliasConsume_eq
       have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
         depth?_push_ne sm iterVar n hIterNe d hDepth
       have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
-          = n :: iterVar :: sm := by
+          = some n :: iterVar :: sm := by
         rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]; rfl
       have hCopyOps : (Stack.Lower.bringToTop (sm.push iterVar) n false).1
           = Stack.Lower.loadRef (sm.push iterVar) n :=
@@ -3183,7 +3293,7 @@ theorem lowerLoopItersP_singletonRefAliasConsume_eq
             = some (d + 2) :=
         depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
       simp only []
-      rw [show (xName :: iterVar :: sm)
+      rw [show (some xName :: some iterVar :: sm)
             = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
       rw [lowerLoopItersP_singletonRefAliasConsume_eq xName iterVar n hXNe hIterNe
             hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
@@ -3588,16 +3698,16 @@ theorem loopOkBody_binopTail_eq
      let sm3 := (sm2.popN 2).push "t2"
      let (loadT2, sm4a) := Stack.Lower.bringToTop sm3 "t2" true
      let sm4 := match sm4a with
-                | _ :: r => "sum" :: r
+                | _ :: r => some "sum" :: r
                 | []     => ["sum"]
      (loadSum ++ loadT1 ++ [StackOp.opcode "OP_ADD"] ++ loadT2, sm4))
-      = (loopOkBinopTail, "sum" :: "i" :: rest) := by
+      = (loopOkBinopTail, some "sum" :: some "i" :: rest) := by
   -- loadSum: sum at depth 2 → ROT (consume); sm1 = "sum"::"t1"::"i"::rest.
   have hSumDepth : Stack.Lower.StackMap.depth? ("t1" :: "i" :: "sum" :: rest) "sum" = some 2 := by
     unfold Stack.Lower.StackMap.depth?; simp [List.findIdx?_cons]
   have hSumLoad :
       Stack.Lower.loadRefLive ("t1" :: "i" :: "sum" :: rest) "sum" (0 + 1) lu []
-        = ([StackOp.rot], "sum" :: "t1" :: "i" :: rest) := by
+        = ([StackOp.rot], some "sum" :: some "t1" :: some "i" :: rest) := by
     unfold Stack.Lower.loadRefLive
     rw [hSumGate]
     simp only [Stack.Lower.bringToTop, hSumDepth]
@@ -3605,14 +3715,14 @@ theorem loopOkBody_binopTail_eq
     show ([StackOp.rot],
             Stack.Lower.StackMap.push
               (Stack.Lower.StackMap.removeAtDepth ("t1" :: "i" :: "sum" :: rest) 2) "sum")
-          = ([StackOp.rot], "sum" :: "t1" :: "i" :: rest)
+          = ([StackOp.rot], some "sum" :: some "t1" :: some "i" :: rest)
     rfl
   -- loadT1: t1 at depth 1 in sm1 → SWAP; sm2 = "t1"::"sum"::"i"::rest.
   have hT1Depth : Stack.Lower.StackMap.depth? ("sum" :: "t1" :: "i" :: rest) "t1" = some 1 := by
     unfold Stack.Lower.StackMap.depth?; simp [List.findIdx?_cons]
   have hT1Load :
       Stack.Lower.loadRefLive ("sum" :: "t1" :: "i" :: rest) "t1" (0 + 1) lu []
-        = ([StackOp.swap], "t1" :: "sum" :: "i" :: rest) := by
+        = ([StackOp.swap], some "t1" :: some "sum" :: some "i" :: rest) := by
     unfold Stack.Lower.loadRefLive
     rw [hT1Gate]
     simp only [Stack.Lower.bringToTop, hT1Depth]
@@ -3629,9 +3739,9 @@ theorem loopOkBody_binopTail_eq
   -- Assemble: ([rot]++[swap]++[OP_ADD]++[], "sum"::"i"::rest) = (loopOkBinopTail, ...).
   show ([StackOp.rot] ++ [StackOp.swap] ++ [StackOp.opcode "OP_ADD"] ++ [],
           match (("t2" :: "i" :: rest : StackMap)) with
-          | _ :: r => "sum" :: r
+          | _ :: r => some "sum" :: r
           | []     => ["sum"])
-        = (loopOkBinopTail, "sum" :: "i" :: rest)
+        = (loopOkBinopTail, some "sum" :: some "i" :: rest)
   simp only [List.append_nil, loopOkBinopTail]
   rfl
 
@@ -3666,9 +3776,9 @@ theorem loopOkBody_binopTail_map
               (((Stack.Lower.loadRefLive
                     (Stack.Lower.loadRefLive ("t1" :: "i" :: "sum" :: rest) "sum" (0 + 1) lu []).2
                     "t1" (0 + 1) lu []).2.popN 2).push "t2") "t2" true).2 with
-       | _ :: r => "sum" :: r
+       | _ :: r => some "sum" :: r
        | []     => ["sum"])
-      = "sum" :: "i" :: rest :=
+      = some "sum" :: some "i" :: rest :=
   congrArg Prod.snd (loopOkBody_binopTail_eq rest lu hSumGate hT1Gate)
 
 /-- **Whole-body per-iteration reduction.** Lowering `loopOkBody` against
@@ -3685,7 +3795,7 @@ theorem lowerBindingsP_loopOkBody_iter_eq
       Stack.Lower.bringToTop ("i" :: "sum" :: rest) "start"
           (!Stack.Lower.listContains ([] : List String) "start"
             && Stack.Lower.isLastUse lu "start" 0)
-        = (loadStart, "start" :: "i" :: "sum" :: restAfter))
+        = (loadStart, some "start" :: some "i" :: some "sum" :: restAfter))
     (hSumGate : (!Stack.Lower.listContains ([] : List String) "sum"
         && Stack.Lower.isLastUse lu "sum" (0 + 1)) = true)
     (hT1Gate : (!Stack.Lower.listContains ([] : List String) "t1"
@@ -3696,7 +3806,7 @@ theorem lowerBindingsP_loopOkBody_iter_eq
         && Stack.Lower.isLastUse lu "t2" 2) = true) :
     Stack.Lower.lowerBindingsP [] [] Stack.Lower.defaultInlineBudget 0 lu []
         loopLocal [] ("i" :: "sum" :: rest) loopOkBody
-      = (loadStart ++ loopOkBinopTail, "sum" :: "i" :: restAfter) := by
+      = (loadStart ++ loopOkBinopTail, some "sum" :: some "i" :: restAfter) := by
   rw [lowerBindingsP_loopOkBody_eq [] [] Stack.Lower.defaultInlineBudget lu
         loopLocal [] ("i" :: "sum" :: rest) hRefAlias]
   -- Zeta-reduce the body lemma's internal `let cStart` etc. so the
@@ -3724,10 +3834,10 @@ gates are always-true (`hSumGate`/`hT1Gate`/`hRefAlias`). -/
 form `"i" :: "sum" :: replicate k "i" ++ "start" :: tail`. -/
 private theorem loopOkBody_start_depth (k : Nat) (tail : StackMap) :
     Stack.Lower.StackMap.depth?
-      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+      (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start"
       = some (2 + k) := by
   unfold Stack.Lower.StackMap.depth?
-  have hRep : ∀ j : Nat, List.findIdx? (· == "start") (List.replicate j "i" ++ "start" :: tail)
+  have hRep : ∀ j : Nat, List.findIdx? (· == some "start") (List.replicate j (some "i") ++ some "start" :: tail)
                 = some j := by
     intro j
     induction j with
@@ -3735,11 +3845,13 @@ private theorem loopOkBody_start_depth (k : Nat) (tail : StackMap) :
     | succ k' ih =>
         rw [List.replicate_succ, List.cons_append]
         simp only [List.findIdx?_cons,
-                   show ("i" == "start") = false from by decide, Bool.false_eq_true, if_false]
+                   show ((some "i" : Option String) == some "start") = false from by decide,
+                   Bool.false_eq_true, if_false]
         rw [ih]; rfl
   simp only [List.cons_append, List.findIdx?_cons,
-             show ("i" == "start") = false from by decide,
-             show ("sum" == "start") = false from by decide, Bool.false_eq_true, if_false]
+             show ((some "i" : Option String) == some "start") = false from by decide,
+             show ((some "sum" : Option String) == some "start") = false from by decide,
+             Bool.false_eq_true, if_false]
   rw [hRep k]
   simp only [Option.map_some]
   congr 1
@@ -3750,14 +3862,14 @@ private theorem loopOkBody_start_depth (k : Nat) (tail : StackMap) :
 ++ tail`. -/
 private theorem loopOkBody_removeAtDepth_inner (n : Nat) (tail : StackMap) :
     Stack.Lower.StackMap.removeAtDepth
-      (List.replicate n "i" ++ "start" :: tail) n
-      = List.replicate n "i" ++ tail := by
+      (List.replicate n (some "i") ++ some "start" :: tail) n
+      = List.replicate n (some "i") ++ tail := by
   induction n with
   | zero => simp [Stack.Lower.StackMap.removeAtDepth]
   | succ n' ih =>
       rw [List.replicate_succ, List.cons_append]
       show Stack.Lower.StackMap.removeAtDepth
-            ("i" :: (List.replicate n' "i" ++ "start" :: tail)) (n' + 1) = _
+            (some "i" :: (List.replicate n' (some "i") ++ some "start" :: tail)) (n' + 1) = _
       unfold Stack.Lower.StackMap.removeAtDepth
       rw [ih]
       simp [List.replicate_succ, List.cons_append]
@@ -3768,15 +3880,15 @@ keeps the iter-var prefix, so the pushed result is
 private theorem loopOkBody_removeAtDepth_start (k' : Nat) (tail : StackMap) :
     Stack.Lower.StackMap.push
       (Stack.Lower.StackMap.removeAtDepth
-        ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) (k' + 3))
+        (some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ some "start" :: tail) (k' + 3))
       "start"
-      = "start" :: "i" :: "sum" :: List.replicate (k' + 1) "i" ++ tail := by
+      = some "start" :: some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ tail := by
   have hStep :
       Stack.Lower.StackMap.removeAtDepth
-        ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) (k' + 3)
-        = "i" :: "sum" :: List.replicate (k' + 1) "i" ++ tail := by
+        (some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ some "start" :: tail) (k' + 3)
+        = some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ tail := by
     show Stack.Lower.StackMap.removeAtDepth
-          ("i" :: "sum" :: (List.replicate (k' + 1) "i" ++ "start" :: tail)) ((k' + 1) + 2) = _
+          (some "i" :: some "sum" :: (List.replicate (k' + 1) (some "i") ++ some "start" :: tail)) ((k' + 1) + 2) = _
     unfold Stack.Lower.StackMap.removeAtDepth Stack.Lower.StackMap.removeAtDepth
     rw [loopOkBody_removeAtDepth_inner (k' + 1) tail]
     simp [List.cons_append]
@@ -3787,16 +3899,16 @@ private theorem loopOkBody_removeAtDepth_start (k' : Nat) (tail : StackMap) :
 `"start" :: "i" :: "sum" :: replicate k "i" ++ tail` on top. -/
 private theorem loopOkBody_startConsume_load (k : Nat) (tail : StackMap) :
     (Stack.Lower.bringToTop
-      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true)
+      (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true)
       = ((Stack.Lower.bringToTop
-            ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1,
-         "start" :: "i" :: "sum" :: List.replicate k "i" ++ tail) := by
+            (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true).1,
+         some "start" :: some "i" :: some "sum" :: List.replicate k (some "i") ++ tail) := by
   have hD := loopOkBody_start_depth k tail
   -- Prove the map (.snd) component; the .fst is rfl-equal by construction.
   have hSnd :
       (Stack.Lower.bringToTop
-        ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).2
-        = "start" :: "i" :: "sum" :: List.replicate k "i" ++ tail := by
+        (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true).2
+        = some "start" :: some "i" :: some "sum" :: List.replicate k (some "i") ++ tail := by
     unfold Stack.Lower.bringToTop
     rw [hD]
     cases k with
@@ -3805,7 +3917,7 @@ private theorem loopOkBody_startConsume_load (k : Nat) (tail : StackMap) :
         show (Stack.Lower.StackMap.push
                 (Stack.Lower.StackMap.removeAtDepth
                   ("i" :: "sum" :: "start" :: tail) 2) "start")
-              = "start" :: "i" :: "sum" :: tail
+              = some "start" :: some "i" :: some "sum" :: tail
         rfl
     | succ k' =>
         have hd3 : (2 + (k' + 1)) = k' + 3 := by omega
@@ -3813,9 +3925,9 @@ private theorem loopOkBody_startConsume_load (k : Nat) (tail : StackMap) :
         simp only
         show (Stack.Lower.StackMap.push
                 (Stack.Lower.StackMap.removeAtDepth
-                  ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) (k' + 3))
+                  (some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ some "start" :: tail) (k' + 3))
                 "start")
-              = "start" :: "i" :: "sum" :: List.replicate (k' + 1) "i" ++ tail
+              = some "start" :: some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ tail
         rw [loopOkBody_removeAtDepth_start k' tail]
   exact Prod.ext rfl hSnd
 
@@ -3823,10 +3935,10 @@ private theorem loopOkBody_startConsume_load (k : Nat) (tail : StackMap) :
 underlying map. -/
 private theorem loopOkBody_startCopy_load (k : Nat) (tail : StackMap) :
     (Stack.Lower.bringToTop
-      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" false)
+      (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" false)
       = (Stack.Lower.loadRef
-          ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start",
-         "start" :: "i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) := by
+          (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start",
+         some "start" :: some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) := by
   have hD := loopOkBody_start_depth k tail
   apply Prod.ext
   · exact bringToTop_false_ops_eq_loadRef _ "start" (2 + k) hD
@@ -3838,13 +3950,13 @@ private theorem loopOkBody_startCopy_load (k : Nat) (tail : StackMap) :
 `(replicate k "i" ++ "start" :: tail).erase "start" = replicate k "i" ++
 tail`. -/
 private theorem loopOkBody_strand_erase (k : Nat) (tail : StackMap) :
-    (List.replicate k "i" ++ "start" :: tail).erase "start"
-      = List.replicate k "i" ++ tail := by
+    (List.replicate k (some "i") ++ some "start" :: tail).erase "start"
+      = List.replicate k (some "i") ++ tail := by
   induction k with
   | zero => simp [List.erase_cons]
   | succ k' ih =>
       rw [List.replicate_succ, List.cons_append, List.erase_cons]
-      simp only [show ("i" == "start") = false from by decide]
+      simp only [show ("i" == some "start") = false from by decide]
       rw [ih]
       rfl
 
@@ -3879,9 +3991,9 @@ theorem lowerLoopItersP_loopOkBody_eq
       Stack.Lower.lowerLoopItersP [] [] Stack.Lower.defaultInlineBudget naturalLU
         nonFinalLU loopLocal []
         loopOkBody "i" count
-        ("sum" :: (List.replicate k "i" ++ "start" :: tail)) m
-        = (loopOkAssemble count ("sum" :: (List.replicate k "i" ++ "start" :: tail)) m,
-           loopOkStrandMap ("sum" :: (List.replicate k "i" ++ "start" :: tail)) m)
+        (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) m
+        = (loopOkAssemble count (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) m,
+           loopOkStrandMap (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) m)
   | 0, k, tail => by
       simp [Stack.Lower.lowerLoopItersP, loopOkAssemble, loopOkStrandMap]
   | 1, k, tail => by
@@ -3890,28 +4002,28 @@ theorem lowerLoopItersP_loopOkBody_eq
       -- bringToTop consume removes `start` at depth (2+k).
       have hStartLoad :
           Stack.Lower.bringToTop
-            ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+            (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start"
             (!Stack.Lower.listContains ([] : List String) "start"
               && Stack.Lower.isLastUse naturalLU "start" 0)
           = ((Stack.Lower.bringToTop
-                ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1,
-             "start" :: "i" :: "sum" :: List.replicate k "i" ++ tail) := by
+                (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true).1,
+             some "start" :: some "i" :: some "sum" :: List.replicate k (some "i") ++ tail) := by
         rw [hStartConsume]
         exact loopOkBody_startConsume_load k tail
       unfold Stack.Lower.lowerLoopItersP
       simp only [Stack.Lower.StackMap.push, beq_self_eq_true, if_true, List.cons_append]
       rw [lowerBindingsP_loopOkBody_iter_eq
-            (List.replicate k "i" ++ "start" :: tail) naturalLU loopLocal
+            (List.replicate k (some "i") ++ some "start" :: tail) naturalLU loopLocal
             (Stack.Lower.bringToTop
-              ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1
-            (List.replicate k "i" ++ tail)
+              (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true).1
+            (List.replicate k (some "i") ++ tail)
             (by
               have h := hStartLoad
               -- The `++` reassociation: "sum" :: (replicate k ++ "start"::tail).
               simpa [List.cons_append] using h)
             hSumGateN hT1GateN hRefAliasN]
       -- iterVar cleanup: "i" buried at depth 1 under "sum", no drop.
-      rw [cleanupGate_buried "sum" "i" (List.replicate k "i" ++ tail) (by decide)]
+      rw [cleanupGate_buried "sum" "i" (List.replicate k (some "i") ++ tail) (by decide)]
       simp only [Stack.Lower.lowerLoopItersP, List.append_nil]
       -- Match the assemble/strand `m = 1` (final) cases.
       unfold loopOkAssemble loopOkStrandMap
@@ -3919,19 +4031,19 @@ theorem lowerLoopItersP_loopOkBody_eq
       · simp only [Stack.Lower.StackMap.push, List.cons_append, List.append_assoc,
                    List.nil_append, List.singleton_append]
       · -- "sum" :: "i" :: (replicate k ++ tail) = "sum" :: "i" :: (replicate k ++ "start"::tail).erase "start"
-        show ("sum" :: "i" :: (List.replicate k "i" ++ tail) : StackMap)
-              = "sum" :: "i" :: (List.replicate k "i" ++ "start" :: tail).erase "start"
+        show (some "sum" :: some "i" :: (List.replicate k (some "i") ++ tail) : StackMap)
+              = some "sum" :: some "i" :: (List.replicate k (some "i") ++ some "start" :: tail).erase "start"
         rw [loopOkBody_strand_erase k tail]
   | m + 2, k, tail => by
       -- Non-final iteration: lu = nonFinalLU, start COPIED (PICK).
       have hStartLoad :
           Stack.Lower.bringToTop
-            ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+            (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start"
             (!Stack.Lower.listContains ([] : List String) "start"
               && Stack.Lower.isLastUse nonFinalLU "start" 0)
           = (Stack.Lower.loadRef
-                ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start",
-             "start" :: "i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) := by
+                (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start",
+             some "start" :: some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) := by
         rw [hStartCopy]
         exact loopOkBody_startCopy_load k tail
       unfold Stack.Lower.lowerLoopItersP
@@ -3939,21 +4051,21 @@ theorem lowerLoopItersP_loopOkBody_eq
       simp only [Stack.Lower.StackMap.push, Nat.add_one_ne_zero, beq_iff_eq, if_false,
                  reduceCtorEq, Bool.false_eq_true, List.cons_append]
       rw [lowerBindingsP_loopOkBody_iter_eq
-            (List.replicate k "i" ++ "start" :: tail) nonFinalLU loopLocal
+            (List.replicate k (some "i") ++ some "start" :: tail) nonFinalLU loopLocal
             (Stack.Lower.loadRef
-              ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start")
-            (List.replicate k "i" ++ "start" :: tail)
+              (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start")
+            (List.replicate k (some "i") ++ some "start" :: tail)
             (by simpa [List.cons_append] using hStartLoad)
             hSumGateNF hT1GateNF hRefAliasNF]
       -- iterVar cleanup buried.
-      rw [cleanupGate_buried "sum" "i" (List.replicate k "i" ++ "start" :: tail) (by decide)]
+      rw [cleanupGate_buried "sum" "i" (List.replicate k (some "i") ++ some "start" :: tail) (by decide)]
       -- Reduce the Prod projections so the recursion call surfaces.
       simp only []
       -- Recurse: next map = "sum" :: "i" :: (replicate k "i" ++ "start" :: tail)
       --        = "sum" :: (replicate (k+1) "i" ++ "start" :: tail).
       have hGrow :
-          ("sum" :: "i" :: (List.replicate k "i" ++ "start" :: tail) : StackMap)
-            = ("sum" :: (List.replicate (k + 1) "i" ++ "start" :: tail)) := by
+          (some "sum" :: some "i" :: (List.replicate k (some "i") ++ some "start" :: tail) : StackMap)
+            = (some "sum" :: (List.replicate (k + 1) (some "i") ++ some "start" :: tail)) := by
         rw [List.replicate_succ, List.cons_append]
       rw [hGrow]
       rw [lowerLoopItersP_loopOkBody_eq naturalLU nonFinalLU loopLocal count
@@ -3988,7 +4100,7 @@ theorem lowerValueP_loop_loopOkBody_ops_eq
   -- The loop arm threads loopLocal = localBindings ++ body-names. Reduce via
   -- the closed form at k = 0 (map `"sum" :: ([] ++ "start" :: tail)`).
   have hmap : ("sum" :: "start" :: tail : StackMap)
-      = "sum" :: (List.replicate 0 "i" ++ "start" :: tail) := by
+      = some "sum" :: (List.replicate 0 (some "i") ++ some "start" :: tail) := by
     rw [List.replicate_zero, List.nil_append]
   rw [hmap]
   -- `t2` is a body-bound name, so it is in `localBindings ++ body-names`
@@ -4042,7 +4154,7 @@ theorem lowerValueP_loop_loopOkBody_count3_matches_pin :
         [] [] ["t0", "sum"] [] ["sum", "start"] "t9"
         (.loop 3 loopOkBody "i")).1)
       = "0052797b7c935153797b7c9352547a7b7c93" := by
-  rw [show (["sum", "start"] : Stack.Lower.StackMap) = "sum" :: "start" :: [] from rfl]
+  rw [show (["sum", "start"] : Stack.Lower.StackMap) = some "sum" :: some "start" :: [] from rfl]
   rw [lowerValueP_loop_loopOkBody_ops_eq 0 [] [] ["t0", "sum"] "t9" 3 []
         (by native_decide)]
   exact loopOkAssemble_count3_hex
@@ -4324,7 +4436,7 @@ theorem tier3c_neutral_ops_pin :
         [] [] [] [] ["a"] "L"
         (.loop 3 [ANFBinding.mk "t" (.loadConst (.int 1)) none,
                   ANFBinding.mk "tv" (.assert "t") none] "i")).2.1
-      = ["a"]) := by
+      = (["a"] : Stack.Lower.StackMap)) := by
   refine ⟨by native_decide, by native_decide⟩
 
 /-- **Smoke (neutral runtime).** The neutral chain above runs to the
@@ -5064,7 +5176,7 @@ private theorem runOps_loopOkCopyChunk_walk
     runOps
         ([.push (.bigint (Int.ofNat i))]
           ++ Stack.Lower.loadRef
-              ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+              (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start"
           ++ loopOkBinopTail)
         { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
       = .ok { s with stack :=
@@ -5088,7 +5200,7 @@ private theorem runOps_loopOkCopyChunk_walk
   simp only []
   -- loadRef start (COPY at depth 2+k): pushes startV on top of sPush.
   have hDepth : Stack.Lower.StackMap.depth?
-      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+      (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start"
       = some (2 + k) := loopOkBody_start_depth k tail
   have hLen : (2 + k) < sPush.stack.length := by
     show (2 + k) < ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
@@ -5100,7 +5212,7 @@ private theorem runOps_loopOkCopyChunk_walk
         :: iStrands ++ (.vBigint startI) :: rest)[2 + k]! = _
     exact loopOkStack_get_start (.vBigint (Int.ofNat i)) sumI startI iStrands rest k hk
   rw [Stack.Agrees.runOps_loadRef_at_depth
-        ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" (2 + k)
+        (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" (2 + k)
         (.vBigint startI) sPush hDepth hLen hAt]
   simp only []
   -- binop tail: start :: i :: sum :: below ⇒ (sum+start) :: i :: below.
@@ -5144,7 +5256,7 @@ private theorem runOps_loopOkConsumeChunk_walk
     runOps
         ([.push (.bigint (Int.ofNat i))]
           ++ (Stack.Lower.bringToTop
-              ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1
+              (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true).1
           ++ loopOkBinopTail)
         { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
       = .ok { s with stack :=
@@ -5171,7 +5283,7 @@ private theorem runOps_loopOkConsumeChunk_walk
   -- The consume op list: `.rot` (k=0) or `.roll (2+k)` (k≥1); both move the
   -- element at index `2+k` to the top, erasing it.
   have hDepth : Stack.Lower.StackMap.depth?
-      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+      (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start"
       = some (2 + k) := loopOkBody_start_depth k tail
   have hLen : (2 + k) < sPush.stack.length := by
     show (2 + k) < ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
@@ -5194,17 +5306,17 @@ private theorem runOps_loopOkConsumeChunk_walk
   -- The consume runtime step (covers both `.rot` and `.roll`).
   have hConsumeStep : runOps
         (Stack.Lower.bringToTop
-          ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1
+          (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) "start" true).1
         sPush = .ok sRolled := by
     cases k with
     | zero =>
         -- depth 2 → `.rot`.
         have hbt : (Stack.Lower.bringToTop
-              ("i" :: "sum" :: List.replicate 0 "i" ++ "start" :: tail) "start" true).1
+              (some "i" :: some "sum" :: List.replicate 0 (some "i") ++ some "start" :: tail) "start" true).1
               = [StackOp.rot] := by
           unfold Stack.Lower.bringToTop
           rw [show Stack.Lower.StackMap.depth?
-                ("i" :: "sum" :: List.replicate 0 "i" ++ "start" :: tail) "start"
+                (some "i" :: some "sum" :: List.replicate 0 (some "i") ++ some "start" :: tail) "start"
                 = some (2 + 0) from hDepth]
           rfl
         rw [hbt]
@@ -5228,11 +5340,11 @@ private theorem runOps_loopOkConsumeChunk_walk
     | succ k' =>
         -- depth 2+(k'+1) = k'+3 ≥ 3 → `.roll (2+(k'+1))`.
         have hbt : (Stack.Lower.bringToTop
-              ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) "start" true).1
+              (some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ some "start" :: tail) "start" true).1
               = [StackOp.roll (2 + (k' + 1))] := by
           unfold Stack.Lower.bringToTop
           rw [show Stack.Lower.StackMap.depth?
-                ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) "start"
+                (some "i" :: some "sum" :: List.replicate (k' + 1) "i" ++ some "start" :: tail) "start"
                 = some (2 + (k' + 1)) from hDepth]
           rw [show 2 + (k' + 1) = k' + 3 from by omega]
           rfl
@@ -5328,7 +5440,7 @@ private theorem runOps_loopOkAssemble_postStack
       (hk : iStrands.length = k) (s : StackState),
       runOps
           (loopOkAssemble count
-            ("sum" :: (List.replicate k "i" ++ "start" :: tail)) m)
+            (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) m)
           { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
         = (if m = 0 then
             .ok { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
@@ -5341,11 +5453,11 @@ private theorem runOps_loopOkAssemble_postStack
       -- Single FINAL iteration: loopOkAssemble's `0, sm` arm = CONSUME chunk.
       simp only [if_neg (by decide : (1 : Nat) ≠ 0)]
       -- Unfold loopOkAssemble at m = 1: the `0, sm` final arm.
-      rw [loopOkAssemble_one count ("sum" :: (List.replicate k "i" ++ "start" :: tail))]
+      rw [loopOkAssemble_one count (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail))]
       have hbtPush : Stack.Lower.StackMap.push
-            ("sum" :: (List.replicate k "i" ++ "start" :: tail)) "i"
-            = ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) := by
-        show ("i" :: "sum" :: (List.replicate k "i" ++ "start" :: tail)) = _
+            (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) "i"
+            = (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) := by
+        show (some "i" :: some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) = _
         simp [List.cons_append]
       rw [hbtPush]
       rw [runOps_loopOkConsumeChunk_walk (count - 1) k sumI startI iStrands rest tail hk s]
@@ -5353,20 +5465,20 @@ private theorem runOps_loopOkAssemble_postStack
   | m + 2, k, sumI, startI, iStrands, rest, hk, s => by
       -- Non-final COPY iteration; recurse with k+1.
       rw [if_neg (by omega : (m + 2 : Nat) ≠ 0)]
-      rw [loopOkAssemble_succ_succ count (List.replicate k "i" ++ "start" :: tail) m]
+      rw [loopOkAssemble_succ_succ count (List.replicate k (some "i") ++ some "start" :: tail) m]
       rw [Stack.Sim.runOps_append]
       have hldPush : Stack.Lower.StackMap.push
-            ("sum" :: (List.replicate k "i" ++ "start" :: tail)) "i"
-            = ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) := by
-        show ("i" :: "sum" :: (List.replicate k "i" ++ "start" :: tail)) = _
+            (some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) "i"
+            = (some "i" :: some "sum" :: List.replicate k (some "i") ++ some "start" :: tail) := by
+        show (some "i" :: some "sum" :: (List.replicate k (some "i") ++ some "start" :: tail)) = _
         simp [List.cons_append]
       rw [hldPush]
       rw [runOps_loopOkCopyChunk_walk (count - (m + 2)) k sumI startI iStrands rest tail hk s]
       simp only []
       -- Recurse: next map = "sum" :: "i" :: (replicate k ...) =
       --          "sum" :: (replicate (k+1) ...); strand grows by the new index.
-      rw [show ("sum" :: "i" :: (List.replicate k "i" ++ "start" :: tail) : StackMap)
-            = "sum" :: (List.replicate (k + 1) "i" ++ "start" :: tail) from by
+      rw [show (some "sum" :: some "i" :: (List.replicate k (some "i") ++ some "start" :: tail) : StackMap)
+            = some "sum" :: (List.replicate (k + 1) (some "i") ++ some "start" :: tail) from by
           rw [List.replicate_succ, List.cons_append]]
       rw [runOps_loopOkAssemble_postStack count tail (m + 1) (k + 1)
             (sumI + startI) startI
@@ -5440,7 +5552,7 @@ theorem runOps_loopOkAssemble_sum_eq
             (.vBigint (sum0 + (count : Int) * start0)) :: below } := by
   -- Instantiate the n-induction at k = 0 (iStrands = [], map "sum"::"start"::tail).
   have hmap : ("sum" :: "start" :: tail : StackMap)
-      = "sum" :: (List.replicate 0 "i" ++ "start" :: tail) := by
+      = some "sum" :: (List.replicate 0 (some "i") ++ some "start" :: tail) := by
     rw [List.replicate_zero, List.nil_append]
   have hstk : ((.vBigint sum0) :: (.vBigint start0) :: rest)
       = (.vBigint sum0) :: ([] : List Value) ++ (.vBigint start0) :: rest := by
@@ -5692,7 +5804,7 @@ theorem runOps_loopOkAssemble_explicit
             (.vBigint (sum0 + (count : Int) * start0)) :: strands ++ rest }
       ∧ strands.length = count := by
   have hmap : ("sum" :: "start" :: tail : StackMap)
-      = "sum" :: (List.replicate 0 "i" ++ "start" :: tail) := by
+      = some "sum" :: (List.replicate 0 (some "i") ++ some "start" :: tail) := by
     rw [List.replicate_zero, List.nil_append]
   have hstk : ((.vBigint sum0) :: (.vBigint start0) :: rest)
       = (.vBigint sum0) :: ([] : List Value) ++ (.vBigint start0) :: rest := by

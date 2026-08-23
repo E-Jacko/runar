@@ -1815,11 +1815,58 @@ function assertAllCompilersAvailableInCi(): void {
 function canonicalizeJson(json: string): string {
   if (!json) return '';
   try {
-    const parsed = JSON.parse(json);
+    const parsed = JSON.parse(json, canonicalizeBigIntReviver);
     return JSON.stringify(sortKeys(parsed), null, 2);
   } catch {
     return json; // Return as-is if not valid JSON
   }
+}
+
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * `JSON.parse` reviver that makes the comparison LOSSLESS across the two
+ * spellings of an integer the IR uses, and picks the SAME spelling the golden
+ * stamper picks (see the TS-tier artifact reviver above):
+ *
+ *   - magnitude <= Number.MAX_SAFE_INTEGER → bare JSON number
+ *   - anything larger                      → `"<decimal>n"` string
+ *
+ * Without it a plain `JSON.parse` forced every tier's IR through an IEEE-754
+ * double before the comparison, so `9007199254740993` silently became
+ * `9007199254740992` and the gate reported the two tiers that got it RIGHT as
+ * the outliers (NEW-009). `context.source` carries the verbatim number token,
+ * which is the only way to see the digits JS has already rounded away.
+ *
+ * The `n` suffix is unambiguous: ANF ByteString literals are hex, and `n` is
+ * not a hex digit, so `^-?\d+n$` can only be a decimal bigint.
+ */
+function canonicalizeBigIntReviver(
+  this: unknown,
+  _key: string,
+  value: unknown,
+  context?: { source?: string },
+): unknown {
+  if (typeof value === 'number' && typeof context?.source === 'string') {
+    const src = context.source;
+    if (/^-?\d+$/.test(src)) {
+      const asBigInt = BigInt(src);
+      if (asBigInt > MAX_SAFE_BIGINT || asBigInt < -MAX_SAFE_BIGINT) {
+        return `${asBigInt}n`;
+      }
+      // Re-derive from the source text: `value` itself may already be rounded.
+      return Number(asBigInt);
+    }
+    return value;
+  }
+  if (typeof value === 'string' && /^-?\d+n$/.test(value)) {
+    const asBigInt = BigInt(value.slice(0, -1));
+    if (asBigInt >= -MAX_SAFE_BIGINT && asBigInt <= MAX_SAFE_BIGINT) {
+      return Number(asBigInt);
+    }
+    return `${asBigInt}n`;
+  }
+  return value;
 }
 
 /** Recursively sort object keys for deterministic serialization.

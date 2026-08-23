@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -329,7 +330,16 @@ func sourceToIRJSON(sourcePath string, opts compiler.CompileOptions) ([]byte, er
 		return nil, fmt.Errorf("JSON error: %v", err)
 	}
 	var raw map[string]interface{}
-	if err := json.Unmarshal(fullJSON, &raw); err != nil {
+	// UseNumber() keeps every JSON number as its verbatim source text.
+	// Without it encoding/json decodes numbers into float64 for an
+	// interface{} target, which silently rounds every integer above 2^53 —
+	// `9007199254740993` re-marshals as `9007199254740992`, so `--emit-ir`
+	// hands a corrupted constant to whichever tier consumes it while this
+	// binary's own `--hex` (which never round-trips through the map) stays
+	// correct.
+	dec := json.NewDecoder(bytes.NewReader(fullJSON))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("JSON error: %v", err)
 	}
 	ensureIRFields(raw)

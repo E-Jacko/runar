@@ -219,7 +219,7 @@ theorem lowerAddOutputOps_applyStateOutputEvent
     (hAgrees : Agrees.agreesTagged tsm anfSt stkSt)
     (hFresh : Agrees.freshIn bn (Agrees.untagSm tsm)) :
     (Lower.lowerAddOutputOps (Agrees.untagSm tsm) bn
-        satoshisRef stateValueRefs props).2 = bn :: Agrees.untagSm tsm ∧
+        satoshisRef stateValueRefs props).2 = some bn :: Agrees.untagSm tsm ∧
     Agrees.agreesTagged ((bn, Agrees.SlotKind.binding) :: tsm)
       (State.addBinding
         { anfSt with outputs := anfSt.outputs ++ [Output.state satoshis stateValues] }
@@ -241,7 +241,7 @@ theorem lowerValue_addRawOutput_applyRawScriptOutputEvent
     (hFresh : Agrees.freshIn bn (Agrees.untagSm tsm)) :
     (Lower.lowerValue (Agrees.untagSm tsm) bn
         (.addRawOutput satoshisRef scriptBytesRef)).2 =
-          bn :: Agrees.untagSm tsm ∧
+          some bn :: Agrees.untagSm tsm ∧
     Agrees.agreesTagged ((bn, Agrees.SlotKind.binding) :: tsm)
       (State.addBinding
         { anfSt with outputs := anfSt.outputs ++ [Output.rawScript satoshis scriptBytes] }
@@ -263,7 +263,7 @@ theorem lowerValue_addDataOutput_applyDataOnlyOutputEvent
     (hFresh : Agrees.freshIn bn (Agrees.untagSm tsm)) :
     (Lower.lowerValue (Agrees.untagSm tsm) bn
         (.addDataOutput satoshisRef scriptBytesRef)).2 =
-          bn :: Agrees.untagSm tsm ∧
+          some bn :: Agrees.untagSm tsm ∧
     Agrees.agreesTagged ((bn, Agrees.SlotKind.binding) :: tsm)
       (State.addBinding
         { anfSt with outputs := anfSt.outputs ++ [Output.dataOnly satoshis scriptBytes] }

@@ -579,9 +579,9 @@ theorem lower_observational_correct_copy
     (hCopy :
       Agrees.structuralCopyBody (Lower.computeLastUses m.body) []
         (m.body.map (fun b => b.name)) m.body
-        (List.reverse (m.params.map (fun p => p.name))) 0)
+        (List.reverse (m.params.map (fun p => some p.name))) 0)
     -- Tagged stack-map alignment at method entry.
-    (hUntagSm : Agrees.untagSm tsm = List.reverse (m.params.map (fun p => p.name)))
+    (hUntagSm : Agrees.untagSm tsm = List.reverse (m.params.map (fun p => some p.name)))
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
     -- ANF-state readiness: for each loadParam/loadProp in the body, the lookup succeeds;
     -- and every name in the initial stack map is resolvable via resolveRef.
@@ -592,10 +592,10 @@ theorem lower_observational_correct_copy
       ∀ b ∈ m.body, ∀ n, b.value = .loadProp n →
         ∃ pv, initialAnf.lookupProp n = some pv)
     (hRefReady :
-      ∀ n, (Lower.StackMap.depth? (List.reverse (m.params.map (fun p => p.name))) n).isSome = true →
+      ∀ n, (Lower.StackMap.depth? (List.reverse (m.params.map (fun p => some p.name))) n).isSome = true →
         ∃ val, initialAnf.resolveRef n = some val)
     -- SSA freshness: body names do not shadow the param map and are pairwise distinct.
-    (hBodyFresh : ∀ b ∈ m.body, b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+    (hBodyFresh : ∀ b ∈ m.body, some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hBodyNodup : (m.body.map (fun b => b.name)).Nodup) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindings initialAnf m.body)
@@ -608,7 +608,7 @@ theorem lower_observational_correct_copy
   have hAnf :
       (RunarVerification.ANF.Eval.evalBindings initialAnf m.body).toOption.isSome :=
     Agrees.evalBindings_structuralCopyBody_isSome
-      m.body (List.reverse (m.params.map (fun p => p.name))) 0
+      m.body (List.reverse (m.params.map (fun p => some p.name))) 0
       (Lower.computeLastUses m.body) []
       (m.body.map (fun b => b.name))
       initialAnf hCopy hParamDomain hPropDomain hRefReady hBodyFresh hBodyNodup
@@ -2195,10 +2195,10 @@ theorem compileSafe_single_public_observational_correct_unconditional_ref
         (anfM.body.map (·.name))
         (Stack.Lower.collectConstInts anfM.body)
         anfM.body
-        (List.reverse (anfM.params.map (·.name))) 0)
+        (List.reverse (anfM.params.map (fun p => some p.name))) 0)
     -- Tagged stack-map alignment at method entry.
     (hUntagSm :
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
     -- ANF-state readiness.
     (hParamDomain :
@@ -2210,12 +2210,12 @@ theorem compileSafe_single_public_observational_correct_unconditional_ref
     (hRefReady :
       ∀ n,
         (Stack.Lower.StackMap.depth?
-          (List.reverse (anfM.params.map (·.name))) n).isSome = true →
+          (List.reverse (anfM.params.map (fun p => some p.name))) n).isSome = true →
         ∃ val, initialAnf.resolveRef n = some val)
     -- SSA freshness.
     (hBodyFresh :
       ∀ b ∈ anfM.body,
-        b.name ∉ List.reverse (anfM.params.map (·.name)))
+        some b.name ∉ List.reverse (anfM.params.map (fun p => some p.name)))
     (hBodyNodup : (anfM.body.map (·.name)).Nodup)
     -- M3 domain predicates on the LOWERED body.
     (hNoIf : Peephole.noIfOp ((Lower.lower p).bodyOf anfM.name))
@@ -2266,7 +2266,7 @@ theorem compileSafe_single_public_observational_correct_unconditional_ref
         (anfM.body.map (·.name))
         (Stack.Lower.collectConstInts anfM.body)
         anfM.body
-        (List.reverse (anfM.params.map (·.name))) 0
+        (List.reverse (anfM.params.map (fun p => some p.name))) 0
         initialAnf
         hRef hParamDomain hPropDomain hRefReady hBodyNodup
     -- Stack side: runMethod is isSome.
@@ -3063,7 +3063,8 @@ def valueLoopMapNeutralB (progMethods : List ANFMethod) (props : List ANFPropert
       let smF := (Lower.lowerBindingsP progMethods props budget 0 naturalLU []
         bodyLocal constInts smInner body).2
       !bindingsUseLoopB body
-        && !Lower.listContains smNF iterVar && !Lower.listContains smF iterVar
+        && !Lower.listContains (Lower.StackMap.names smNF) iterVar
+        && !Lower.listContains (Lower.StackMap.names smF) iterVar
         && smNF == sm && smF == sm
   | .ifVal _ thn els _ => !(bindingsUseLoopB thn || bindingsUseLoopB els)
   | _ => true
@@ -3280,7 +3281,7 @@ theorem loopCx_structural_accepts :
       (loopCxM.body.map (·.name))
       (Lower.collectConstInts loopCxM.body)
       loopCxM.body
-      (List.reverse (loopCxM.params.map (·.name)))
+      (List.reverse (loopCxM.params.map (fun p => some p.name)))
       0 = true := by
   native_decide
 
@@ -3296,7 +3297,7 @@ theorem loopCx_guard_rejects :
       (loopCxM.body.map (·.name))
       (Lower.collectConstInts loopCxM.body)
       loopCxM.body
-      (List.reverse (loopCxM.params.map (·.name)))
+      (List.reverse (loopCxM.params.map (fun p => some p.name)))
       0 = false := by
   native_decide
 
@@ -3591,17 +3592,17 @@ def cryptoCallLoopResidueB (p : ANFProgram) (anfM : ANFMethod) : Bool :=
       (anfM.body.map (·.name))
       (Lower.collectConstInts anfM.body)
       anfM.body
-      (List.reverse (anfM.params.map (·.name)))
+      (List.reverse (anfM.params.map (fun p => some p.name)))
       0
     && (!Agrees.emittableArithChainReadyNoDblNeg
           (Lower.computeLastUses anfM.body) anfM.body
-          (List.reverse (anfM.params.map (·.name))) 0 false)
+          (List.reverse (anfM.params.map (fun p => some p.name))) 0 false)
     && (!Agrees.ifValArithBodyBool
           p.methods p.properties
           Lower.defaultInlineBudget 0
           (Lower.computeLastUses anfM.body) []
           (Lower.collectConstInts anfM.body)
-          (List.reverse (anfM.params.map (·.name)))
+          (List.reverse (anfM.params.map (fun p => some p.name)))
           anfM.body)
     && (!Stack.AgreesCat.catConsumeShapeBool anfM)
     && (!Agrees.updatePropConsumeShapeBool anfM.body)
@@ -3653,7 +3654,7 @@ def cryptoCallResidueB (p : ANFProgram) (anfM : ANFMethod) : Bool :=
             Lower.defaultInlineBudget 0
             (Lower.computeLastUses anfM.body) []
             (Lower.collectConstInts anfM.body)
-            (List.reverse (anfM.params.map (·.name)))
+            (List.reverse (anfM.params.map (fun p => some p.name)))
             anfM.body
         || cryptoCallLoopResidueB p anfM
         || cryptoCallNoFragmentBodyB p anfM)
@@ -3887,7 +3888,7 @@ theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
         (anfM.body.map (·.name))
         (Lower.collectConstInts anfM.body)
         anfM.body
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         0 = true)
     (_hLoopNeutral :
       bodyLoopMapNeutralB
@@ -3897,7 +3898,7 @@ theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
         (anfM.body.map (·.name))
         (Lower.collectConstInts anfM.body)
         anfM.body
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         0 = true)
     -- Value-terminated-body keyed truthiness premise (2026-06-11
     -- truthy-top success-bit repair; same role as on the crypto_call
@@ -3965,11 +3966,10 @@ theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
 -- (`runOps_statefulPrologueOps_isSome`), the M3 peephole-identity, the M4
 -- concrete parse round-trip, and that provenance hypothesis (formerly D2.a's
 -- universal bridge axiom `checkPreimage_iff_checkSig_under_validTxContext`,
--- which forced `checkSig` constant; its witness-existence successor
--- `StatefulBridge.exists_checkSig_witness_under_validTxContext` was itself
--- RETIRED by BUG-100 on 2026-07-06, so the TCB entries here are now the two
--- `AgreesStateful` OP_PUSH_TX binding shims and `StatefulBridge` declares
--- zero axioms).  Residual stateful
+-- which forced `checkSig` constant; the surviving TCB entry is the
+-- witness-existence axiom
+-- `StatefulBridge.exists_checkSig_witness_under_validTxContext`, which only
+-- powers the smoke).  Residual stateful
 -- bodies — user logic after the prologue, state-output epilogues
 -- (D2.b's `auto_state_output_at_method_exit_correct` is ALREADY a theorem),
 -- multi-public stateful programs — fall through to the sound crypto_call /
@@ -4694,10 +4694,10 @@ private theorem arith_consume_completion
       Agrees.emittableArithChainReadyNoDblNeg
         (Stack.Lower.computeLastUses anfM.body)
         anfM.body
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         0 false)
     (hUntag :
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
@@ -4713,7 +4713,7 @@ private theorem arith_consume_completion
         (noMethodCallBindings_true_of_arithOnly anfM.body
           (arithOnlyBody_of_emittableArithChainReadyNoDblNeg
             (Stack.Lower.computeLastUses anfM.body) anfM.body
-            (List.reverse (anfM.params.map (·.name))) 0 false hChain))]
+            (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain))]
   -- Abbreviation: the raw lowered op list of the method body.
   let RAW :=
       (Stack.Lower.lowerBindingsP p.methods p.properties
@@ -4721,7 +4721,7 @@ private theorem arith_consume_completion
         (Stack.Lower.computeLastUses anfM.body) []
         (anfM.body.map (fun b => b.name))
         (Stack.Lower.collectConstInts anfM.body)
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         anfM.body).1
   have hRAW :
       RAW =
@@ -4730,13 +4730,13 @@ private theorem arith_consume_completion
           (Stack.Lower.computeLastUses anfM.body) []
           (anfM.body.map (fun b => b.name))
           (Stack.Lower.collectConstInts anfM.body)
-          (List.reverse (anfM.params.map (·.name)))
+          (List.reverse (anfM.params.map (fun p => some p.name)))
           anfM.body).1 := rfl
   -- The body is arith-only, so it triggers no implicit params / post-pass.
   have hArithOnly : arithOnlyBody anfM.body :=
     arithOnlyBody_of_emittableArithChainReadyNoDblNeg
       (Stack.Lower.computeLastUses anfM.body) anfM.body
-      (List.reverse (anfM.params.map (·.name))) 0 false hChain
+      (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain
   have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false :=
     bindingsUseCheckPreimage_false_of_arithOnly anfM.body hArithOnly
   have hNoCode : Lower.bindingsUseCodePart anfM.body = false :=
@@ -4753,10 +4753,10 @@ private theorem arith_consume_completion
   have hReady :
       Agrees.emittableArithChainReady
         (Stack.Lower.computeLastUses anfM.body) anfM.body
-        (List.reverse (anfM.params.map (·.name))) 0 :=
+        (List.reverse (anfM.params.map (fun p => some p.name))) 0 :=
     Agrees.emittableArithChainReadyNoDblNeg_imp_ready
       (Stack.Lower.computeLastUses anfM.body) anfM.body
-      (List.reverse (anfM.params.map (·.name))) 0 false hChain
+      (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain
   -- The wave-38 op-shape: `AreRunarEmittable RAW` and `peepholeMethodOps RAW = RAW`.
   have hShape :
       Parse.AreRunarEmittable RAW
@@ -4770,7 +4770,7 @@ private theorem arith_consume_completion
       (Stack.Lower.computeLastUses anfM.body)
       (Stack.Lower.collectConstInts anfM.body)
       anfM.body (anfM.body.map (fun b => b.name))
-      (List.reverse (anfM.params.map (·.name))) 0 false hChain
+      (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain
   obtain ⟨hEmittable, hPeepId⟩ := hShape
   -- `peepholeMethodOps RAW = RAW`.
   have hMethodOpsId : peepholeMethodOps RAW = RAW := by
@@ -4792,7 +4792,15 @@ private theorem arith_consume_completion
     rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
           p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
           hNoDeserialize]
-    rw [hRAW]; rfl
+    -- NEW-004: the emittable arith chain (`+ - *`, unary `-`) marks no raw
+    -- slot, so the method-wide set is empty.
+    unfold Agrees.lowerMethodUserRawOps
+    rw [Agrees.collectRawSlots_nil_of_emittableArithChainReadyNoDblNeg
+          (Stack.Lower.computeLastUses anfM.body) anfM.body
+          (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain]
+    rw [Agrees.arrayElemsOf_nil_of_emittableArithChainReadyNoDblNeg
+          (Stack.Lower.computeLastUses anfM.body) anfM.body
+          (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain]
   have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
     rw [hBodyOfRaw, hMethodOpsRaw]
   -- Leg M2: ANF eval agrees with `runOps RAW`.
@@ -4808,7 +4816,7 @@ private theorem arith_consume_completion
         p.methods p.properties Stack.Lower.defaultInlineBudget
         (Stack.Lower.computeLastUses anfM.body)
         (Stack.Lower.collectConstInts anfM.body) Γ
-        anfM.body (List.reverse (anfM.params.map (·.name)))
+        anfM.body (List.reverse (anfM.params.map (fun p => some p.name)))
         (anfM.body.map (fun b => b.name)) 0 tsm initialAnf initialStack
         hUntag hAgrees hReady hTypedEntry hTsmTyped hCoh
     exact hWalk
@@ -4895,10 +4903,10 @@ theorem compileSafe_observational_correct_arith_consume
       Agrees.emittableArithChainReadyNoDblNeg
         (Stack.Lower.computeLastUses anfM.body)
         anfM.body
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         0 false)
     (hUntag :
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
@@ -4915,7 +4923,7 @@ theorem compileSafe_observational_correct_arith_consume
     bodyEndsInAssert_false_of_arithOnly anfM.body
       (arithOnlyBody_of_emittableArithChainReadyNoDblNeg
         (Stack.Lower.computeLastUses anfM.body) anfM.body
-        (List.reverse (anfM.params.map (·.name))) 0 false hChain)
+        (List.reverse (anfM.params.map (fun p => some p.name))) 0 false hChain)
   exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
 
 /-! ## Path 2 Tier 1 Wave 63 — update_prop consume M4 image emittability
@@ -5177,10 +5185,10 @@ private theorem updateProp_consume_completion
     (hName : anfM.name ≠ "constructor")
     (prop op : String) (c : Int)
     (hBodyEq : anfM.body = Agrees.updatePropConsumeBody prop op c)
-    (hSM : List.reverse (anfM.params.map (·.name)) = [prop])
+    (hSM : List.reverse (anfM.params.map (fun p => some p.name)) = ([prop] : Lower.StackMap))
     (hAdmis : Agrees.updatePropConsumeAdmissible prop op c = true)
     (hAgrees : Agrees.agreesTagged [(prop, Agrees.SlotKind.prop)] initialAnf initialStack)
-    (hUntag : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = [prop])
+    (hUntag : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = ([prop] : Lower.StackMap))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped : Agrees.entryTsmArithTyped Γ [(prop, Agrees.SlotKind.prop)])
     (hCoh : Agrees.tsmCoherent initialAnf [(prop, Agrees.SlotKind.prop)]) :
@@ -5250,7 +5258,10 @@ private theorem updateProp_consume_completion
           hNoDeserialize]
     show Agrees.lowerMethodUserRawOps p.methods p.properties anfM = RAW
     unfold Agrees.lowerMethodUserRawOps
-    rw [hSM, hBodyEq, hRAW]
+    rw [hSM, hBodyEq]
+    -- NEW-004: admissibility pins the op to `+`/`-`, so no raw slot.
+    rw [Agrees.collectRawSlots_nil_updatePropConsumeBody prop op c hAdmis]
+    rw [Agrees.arrayElemsOf_nil_updatePropConsumeBody prop op c]
   have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
     rw [hBodyOfRaw, hMethodOpsRaw]
   -- RAW reduces to the prop-name-free shape.
@@ -5348,10 +5359,10 @@ theorem compileSafe_observational_correct_updateProp_consume
     (hName : anfM.name ≠ "constructor")
     (prop op : String) (c : Int)
     (hBodyEq : anfM.body = Agrees.updatePropConsumeBody prop op c)
-    (hSM : List.reverse (anfM.params.map (·.name)) = [prop])
+    (hSM : List.reverse (anfM.params.map (fun p => some p.name)) = ([prop] : Lower.StackMap))
     (hAdmis : Agrees.updatePropConsumeAdmissible prop op c = true)
     (hAgrees : Agrees.agreesTagged [(prop, Agrees.SlotKind.prop)] initialAnf initialStack)
-    (hUntag : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = [prop])
+    (hUntag : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = ([prop] : Lower.StackMap))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped : Agrees.entryTsmArithTyped Γ [(prop, Agrees.SlotKind.prop)])
     (hCoh : Agrees.tsmCoherent initialAnf [(prop, Agrees.SlotKind.prop)])
@@ -5530,7 +5541,7 @@ private theorem methodCall_consume_completion
     (hShape : Agrees.methodCallConsumeShapeBool p.methods anfM = true)
     (hAgrees : Agrees.agreesTagged [(a, Agrees.SlotKind.param)] initialAnf initialStack)
     (hAName : (Agrees.methodCallConsumeShapeBool p.methods anfM = true) →
-        (anfM.params.map (·.name)).reverse = [a])
+        (anfM.params.map (fun p => some p.name)).reverse = ([a] : Lower.StackMap))
     (hCoh : Agrees.tsmCoherent initialAnf [(a, Agrees.SlotKind.param)]) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -5541,12 +5552,12 @@ private theorem methodCall_consume_completion
     Agrees.methodCallConsumeShapeBool_extract p.methods anfM hShape
   -- The classifier's reversed param name is `a` (from the keyed premise),
   -- and the extraction's `a'` is the same param name; reconcile them.
-  have hSm : (anfM.params.map (·.name)).reverse = [a] := hAName hShape
+  have hSm : (anfM.params.map (fun p => some p.name)).reverse = ([a] : Lower.StackMap) := hAName hShape
   have hAeq : a' = a := by
     rw [hPa] at hSm
     simp only [List.map_cons, List.map_nil, List.reverse_cons,
       List.reverse_nil, List.nil_append] at hSm
-    exact (List.cons.injEq .. ▸ hSm).1
+    exact Option.some.inj (List.cons.injEq .. ▸ hSm).1
   subst hAeq
   -- The ANF lookup of the callee (needed by the ANF half of the walk).
   have hLkAnf : RunarVerification.ANF.Eval.lookupMethod p.methods method = some m' := by
@@ -5618,12 +5629,18 @@ private theorem methodCall_consume_completion
           = (Stack.Lower.lowerBindingsP p.methods p.properties (7 + 1)
               0 (Stack.Lower.computeLastUses anfM.body) []
               (anfM.body.map (·.name))
-              (Stack.Lower.collectConstInts anfM.body) [a']
+              (Stack.Lower.collectConstInts anfM.body) ([a'] : Lower.StackMap)
               anfM.body).1 := by
       unfold Agrees.lowerMethodUserRawOps
       have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
-      have hSmRev : (anfM.params.map (fun pp' => pp'.name)).reverse = [a'] := by
+      have hSmRev : (anfM.params.map (fun pp' => some pp'.name)).reverse
+          = ([a'] : Lower.StackMap) := by
         rw [hPa]; rfl
+      -- NEW-004: a singleton `.methodCall` body marks no raw slot.
+      rw [Agrees.collectRawSlots_nil_of_methodCallConsumeShapeBool
+            p.methods anfM hShape]
+      rw [Agrees.arrayElemsOf_nil_of_methodCallConsumeShapeBool
+            p.methods anfM hShape]
       rw [hBudget, hSmRev]
     rw [hRawEq]
     exact hWalk
@@ -5716,7 +5733,7 @@ theorem compileSafe_observational_correct_methodCall_consume
     (hShape : Agrees.methodCallConsumeShapeBool p.methods anfM = true)
     (hAgrees : Agrees.agreesTagged [(a, Agrees.SlotKind.param)] initialAnf initialStack)
     (hAName : (Agrees.methodCallConsumeShapeBool p.methods anfM = true) →
-        (anfM.params.map (·.name)).reverse = [a])
+        (anfM.params.map (fun p => some p.name)).reverse = ([a] : Lower.StackMap))
     (hCoh : Agrees.tsmCoherent initialAnf [(a, Agrees.SlotKind.param)])
     (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
@@ -5867,7 +5884,7 @@ private theorem hashCall_consume_sha256_completion
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "sha256" [arg]) src])
     (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
     (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
@@ -5906,7 +5923,7 @@ theorem hashCall_consume_sha256
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "sha256" [arg]) src])
     (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
     (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
@@ -5934,7 +5951,7 @@ private theorem hashCall_consume_hash160_completion
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "hash160" [arg]) src])
     (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
     (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
@@ -5967,7 +5984,7 @@ theorem hashCall_consume_hash160
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "hash160" [arg]) src])
     (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
     (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
@@ -5997,7 +6014,7 @@ private theorem hashCall_consume_hash256_completion
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "hash256" [arg]) src])
     (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
     (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
@@ -6030,7 +6047,7 @@ theorem hashCall_consume_hash256
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "hash256" [arg]) src])
     (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
     (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
@@ -6216,7 +6233,7 @@ theorem hashAssert_consume_core
         (Lower.collectConstInts
           (AgreesHashCall.hashAssertBody d ok anm arg expected func s1 s2 s3))
         [arg, expected] d (.call func [arg])
-      = ([StackOp.opcode op], [d, expected], [d, ok, anm])) :
+      = ([StackOp.opcode op], ([d, expected] : Stack.Lower.StackMap), [d, ok, anm])) :
     acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
@@ -6555,12 +6572,12 @@ theorem hashChain_consume_core
         [(d1, 1), (arg, 0)] [] [d1, d2]
         (Lower.collectConstInts (AgreesHashCall.hashChainBody d1 d2 arg f1 f2 s1 s2))
         [arg] d1 (.call f1 [arg])
-      = ([StackOp.opcode op1], [d1], [d1, d2]))
+      = ([StackOp.opcode op1], ([d1] : Stack.Lower.StackMap), [d1, d2]))
     (hCallWit2 : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 1
         [(d1, 1), (arg, 0)] [] [d1, d2]
         (Lower.collectConstInts (AgreesHashCall.hashChainBody d1 d2 arg f1 f2 s1 s2))
         [d1] d2 (.call f2 [d1])
-      = ([StackOp.opcode op2], [d2], [d1, d2]))
+      = ([StackOp.opcode op2], ([d2] : Stack.Lower.StackMap), [d1, d2]))
     (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
         topTruthy s.stack = true) :
@@ -6635,13 +6652,13 @@ theorem hashChain_consume_sha256d_core
         (Lower.collectConstInts
           (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2))
         [arg] d1 (.call "sha256" [arg])
-      = ([StackOp.opcode "OP_SHA256"], [d1], [d1, d2]))
+      = ([StackOp.opcode "OP_SHA256"], ([d1] : Stack.Lower.StackMap), [d1, d2]))
     (hCallWit2 : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 1
         [(d1, 1), (arg, 0)] [] [d1, d2]
         (Lower.collectConstInts
           (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2))
         [d1] d2 (.call "sha256" [d1])
-      = ([StackOp.opcode "OP_SHA256"], [d2], [d1, d2]))
+      = ([StackOp.opcode "OP_SHA256"], ([d2] : Stack.Lower.StackMap), [d1, d2]))
     (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
         topTruthy s.stack = true) :
@@ -6930,15 +6947,11 @@ is the AUTH backend's verdict (`runOps_statefulPrologueOps_isSome`); the ANF
 success bit is the PREIMAGE backend's verdict
 (`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the two agree via the
 per-deployment sig-provenance hypothesis `hSig` carried by the keyed
-`hStatefulFrag` premise.  History of that hypothesis: it was a universal
-bridge axiom (which forced `authBackend.checkSig` constant), TIGHTENED
-2026-06-10 to a witness-existence axiom, and that axiom was RETIRED
-outright by BUG-100 (2026-07-06) — `StatefulBridge` now declares zero
-axioms.  The preimage↔transaction binding is ENFORCED BY CODEGEN instead,
-characterised by the two shims in `AgreesStateful`
-(`runOps_checkPreimageBindingRaw_eq`,
-`runOps_statefulFullParsedOps_scriptAccepts`).  No sub-omnibus axiom
-appears in the discharge. -/
+`hStatefulFrag` premise (TIGHTENED 2026-06-10 — previously a universal
+bridge axiom that forced `authBackend.checkSig` constant; the surviving
+axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext` only
+asserts a witness EXISTS per valid context, and powers the smoke).  No
+sub-omnibus axiom appears in the discharge. -/
 
 /-- The 4-pass peephole pipeline is the identity on the constant stateful
 prologue ops (BUG-100: `OP_CODESEPARATOR` followed by the opaque 760-byte
@@ -7005,15 +7018,12 @@ The bit chain is direct (no runMethod leg needed): the ANF side is
 side is `authBackend.checkSig sigV G`
 (`AgreesStateful.runOps_statefulPrologueOps_scriptAccepts`, constant
 prologue ops, M3 peephole-identity, M4 concrete parse round-trip), and
-the per-deployment sig-provenance hypothesis `hSig` (the signature
-verifies against the synthetic key exactly when the preimage backend
-accepts — discharged per fixture by the conformance harness) equates the
-two.  Since BUG-100 the smoke no longer draws its witness from
-`StatefulBridge.exists_checkSig_witness_under_validTxContext`: that axiom
-is RETIRED and `StatefulBridge` declares zero axioms.  The signature is
-derived on-chain from `hash256(preimage)` by the emitted binding blob, so
-the correspondence is a codegen bridge
-(`AgreesStateful.runOps_checkPreimageBindingRaw_eq`). -/
+the per-deployment sig-provenance hypothesis `hSig` (the spender's
+`_opPushTxSig` witness verifies against the synthetic key exactly when
+the preimage backend accepts — discharged per fixture by the conformance
+harness, and for the smoke by the witness
+`StatefulBridge.exists_checkSig_witness_under_validTxContext` provides)
+equates the two. -/
 theorem compileSafe_observational_correct_stateful_consume
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (_hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
@@ -7372,7 +7382,7 @@ theorem lowerMethod_ops_passthrough
       (Lower.computeLastUses [ANFBinding.mk bn (.loadParam x) src]) [] [bn]
       (Lower.collectConstInts [ANFBinding.mk bn (.loadParam x) src])
       [x] bn (.loadParam x)
-      = ([], [bn], [bn]) := by
+      = ([], ([bn] : Stack.Lower.StackMap), [bn]) := by
     unfold Lower.lowerValueP
     simp [Lower.loadRefLiveParam, Lower.bringToTop, Lower.StackMap.depth?,
       Lower.isLastUse, Lower.lastUsesLookup, Lower.listContains,
@@ -7390,6 +7400,12 @@ theorem lowerMethod_ops_passthrough
     simp [Lower.bindingsUseDeserializeState]
   rw [hUsesPre]
   simp only [Bool.false_eq_true, if_false]
+  -- NEW-004: a single `loadParam` marks no raw slot.
+  rw [show Lower.collectRawSlots [ANFBinding.mk bn (.loadParam x) src] = [] from by
+        simp [Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]]
+  -- …and no `array_literal` binding either.
+  rw [show Lower.arrayElemsOf [ANFBinding.mk bn (.loadParam x) src] = [] from by
+        simp [Lower.arrayElemsOf]]
   rw [Lower.lowerBindingsP.eq_def]
   simp only [hWit]
   rw [Lower.lowerBindingsP.eq_def]
@@ -8240,25 +8256,25 @@ private theorem ifval_consume_completion
       Agrees.ifValArithBody p.methods p.properties Lower.defaultInlineBudget 0
         (Lower.computeLastUses anfM.body) []
         (Lower.collectConstInts anfM.body)
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         anfM.body)
     (hUntag :
       Agrees.untagSm ((cond, k) :: branchTsm)
-        = List.reverse (anfM.params.map (·.name)))
+        = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped : Agrees.entryTsmArithTyped Γ branchTsm)
     (hCoh : Agrees.tsmCoherent initialAnf ((cond, k) :: branchTsm))
     (hCondBool : RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond)
     (hCondHead :
       Stack.Lower.StackMap.depth?
-        (List.reverse (anfM.params.map (·.name))) cond = some 0)
+        (List.reverse (anfM.params.map (fun p => some p.name))) cond = some 0)
     (hLast :
       Stack.Lower.isLastUse (Lower.computeLastUses anfM.body) cond 0 = true)
     (hIPThn :
-      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (fun p => some p.name)))
         cond 0 (Lower.computeLastUses anfM.body) [] = [])
     (hIPEls :
-      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (fun p => some p.name)))
         cond 0 (Lower.computeLastUses anfM.body) [] = []) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -8272,7 +8288,7 @@ private theorem ifval_consume_completion
   let lastUses     := Lower.computeLastUses BODY
   let localBindings := BODY.map (·.name)
   let constInts    := Lower.collectConstInts BODY
-  let SM : Stack.Lower.StackMap := List.reverse (anfM.params.map (·.name))
+  let SM : Stack.Lower.StackMap := List.reverse (anfM.params.map (fun p => some p.name))
   -- The fragment's branch-arith conjuncts.
   obtain ⟨hThnChain, hElsChain, hClean⟩ := hFrag
   -- Each branch is `arithOnlyBody` (head binding of branch is binOp/unaryOp).
@@ -8367,7 +8383,27 @@ private theorem ifval_consume_completion
           p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
           hNoDeserialize]
     unfold Agrees.lowerMethodUserRawOps
-    rw [hBodyEq, hRAW]
+    -- NEW-004: both arms are emittable arith chains, so no raw slot.
+    rw [hBodyEq]
+    -- NEW-004: both arms are emittable arith chains (`+ - *`, unary `-`),
+    -- so neither marks a raw slot and neither does the adopted result.
+    have hRawThn : Lower.collectRawSlotsGo [] thn = [] := by
+      have := Agrees.collectRawSlots_nil_of_emittableArithChainReadyNoDblNeg
+        (Lower.computeLastUses thn) thn _ 0 false hThnChain
+      simpa [Lower.collectRawSlots] using this
+    have hRawEls : Lower.collectRawSlotsGo [] els = [] := by
+      have := Agrees.collectRawSlots_nil_of_emittableArithChainReadyNoDblNeg
+        (Lower.computeLastUses els) els _ 0 false hElsChain
+      simpa [Lower.collectRawSlots] using this
+    have hArrThn : Lower.arrayElemsOf thn = [] :=
+      Agrees.arrayElemsOf_nil_of_emittableArithChainReadyNoDblNeg
+        (Lower.computeLastUses thn) thn _ 0 false hThnChain
+    have hArrEls : Lower.arrayElemsOf els = [] :=
+      Agrees.arrayElemsOf_nil_of_emittableArithChainReadyNoDblNeg
+        (Lower.computeLastUses els) els _ 0 false hElsChain
+    simp only [Lower.arrayElemsOf, hArrThn, hArrEls, List.append_nil]
+    rw [Lower.collectRawSlots_singleton_ifVal_of_arms
+          bn cond thn els [] src hRawThn hRawEls]
   have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
     rw [hBodyOfRaw, hMethodOpsRaw]
   -- Leg M2: ANF eval agrees with `runOps RAW` (the wave-44 entry walk).
@@ -8462,25 +8498,25 @@ theorem compileSafe_observational_correct_ifval_consume
       Agrees.ifValArithBody p.methods p.properties Lower.defaultInlineBudget 0
         (Lower.computeLastUses anfM.body) []
         (Lower.collectConstInts anfM.body)
-        (List.reverse (anfM.params.map (·.name)))
+        (List.reverse (anfM.params.map (fun p => some p.name)))
         anfM.body)
     (hUntag :
       Agrees.untagSm ((cond, k) :: branchTsm)
-        = List.reverse (anfM.params.map (·.name)))
+        = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped : Agrees.entryTsmArithTyped Γ branchTsm)
     (hCoh : Agrees.tsmCoherent initialAnf ((cond, k) :: branchTsm))
     (hCondBool : RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond)
     (hCondHead :
       Stack.Lower.StackMap.depth?
-        (List.reverse (anfM.params.map (·.name))) cond = some 0)
+        (List.reverse (anfM.params.map (fun p => some p.name))) cond = some 0)
     (hLast :
       Stack.Lower.isLastUse (Lower.computeLastUses anfM.body) cond 0 = true)
     (hIPThn :
-      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (fun p => some p.name)))
         cond 0 (Lower.computeLastUses anfM.body) [] = [])
     (hIPEls :
-      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (fun p => some p.name)))
         cond 0 (Lower.computeLastUses anfM.body) [] = [])
     (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
@@ -8544,7 +8580,7 @@ private theorem mathByte_consume_completion
       AgreesA4.structuralCallBody (Stack.Lower.computeLastUses anfM.body) []
         anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0)
     (hUntag :
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (hFrag : AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf) :
     successAgrees
@@ -8581,7 +8617,11 @@ private theorem mathByte_consume_completion
   have hUserRaw :
       Agrees.lowerMethodUserRawOps p.methods p.properties anfM = RAW := by
     rw [AgreesA4.lowerMethodUserRawOps_eq_lowerBindings_structuralCall
-          p.methods p.properties anfM hStructCall, hRAW, hUntag]
+          p.methods p.properties anfM hStructCall
+          -- NEW-004: a no-len math_byte body is builtin calls only, so it
+          -- marks no raw slot.
+          (AgreesA4.collectRawSlots_nil_of_noLen anfM.body tsm hShapeNoLen),
+        hRAW, hUntag]
   -- The wave-51 emit-shape bridge: `RAW` is `mathByteEmitNoNip`.
   have hEmitNoNip :
       AgreesA4.mathByteEmitNoNip RAW = true := by
@@ -8696,7 +8736,7 @@ theorem compileSafe_observational_correct_mathByte_consume
       AgreesA4.structuralCallBody (Stack.Lower.computeLastUses anfM.body) []
         anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0)
     (hUntag :
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (hFrag : AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
     (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
@@ -8781,7 +8821,7 @@ private theorem cat_consume_completion
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [b, a])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([b, a] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src])
     (hab : a ≠ b)
     (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
@@ -8893,7 +8933,7 @@ theorem compileSafe_observational_correct_cat_consume
     (initialAnf : State) (initialStack : StackState)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
     (hName : anfM.name ≠ "constructor")
-    (hParams : (anfM.params.map (·.name)).reverse = [b, a])
+    (hParams : (anfM.params.map (fun p => some p.name)).reverse = ([b, a] : Lower.StackMap))
     (hBody : anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src])
     (hab : a ≠ b)
     (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
@@ -9121,7 +9161,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- update_prop, if_val) sits in the single-public subtree and derives
     -- the antecedent from its own `hSinglePublic` context.
     (hUntag : (p.methods.filter (·.isPublic)).length < 2 →
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     -- **Wave 39 arith typed-entry premise (keyed).**  The arith branch needs
     -- every entry slot `.bigint`-typed; this is only meaningful when the body
@@ -9133,7 +9173,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       (anfM.name ≠ "constructor" ∧
         Agrees.emittableArithChainReadyNoDblNeg
           (Lower.computeLastUses anfM.body) anfM.body
-          (List.reverse (anfM.params.map (·.name))) 0 false) →
+          (List.reverse (anfM.params.map (fun p => some p.name))) 0 false) →
       Agrees.entryTsmArithTyped Γ tsm)
     -- **Wave 45 if_val typed-entry premise (keyed).**  For a single-`.ifVal`
     -- arith-branch body the entry tsm is cond-headed (`tsm = (cond,k)::branchTsm`),
@@ -9175,7 +9215,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       RunarVerification.Stack.AgreesCat.catConsumeShapeBool anfM = true →
         ∃ (bn a b : String) (src : Option SourceLoc)
           (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (anfM.params.map (·.name)).reverse = [b, a] ∧
+          (anfM.params.map (fun p => some p.name)).reverse = ([b, a] : Lower.StackMap) ∧
           anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src] ∧
           a ≠ b ∧
           initialAnf.resolveRef a = some (.vBytes ba) ∧
@@ -9208,7 +9248,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- fixture from the param-typed entry.
     (hMethodCallFrag :
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
-        ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
+        ∃ a : String, (anfM.params.map (fun p => some p.name)).reverse = ([a] : Lower.StackMap) ∧
              tsm = [(a, Agrees.SlotKind.param)])
     -- **crypto_call hash-peel premise (keyed).**  For a body in the single-hash-call
     -- consume fragment (decided by `hashCallConsumeShapeBool` — one param, one
@@ -9227,7 +9267,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
         ∃ (bn arg func : String) (src : Option SourceLoc)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (anfM.params.map (·.name)).reverse = [arg] ∧
+          (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap) ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
           (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
@@ -9290,11 +9330,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- Keyed on the DECIDABLE classifier, it is VACUOUS for every
     -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
     -- consumer is the conformance harness, which discharges it per fixture from
-    -- the deployment context.  (Pre-BUG-100 the witness-existence axiom
-    -- `StatefulBridge.exists_checkSig_witness_under_validTxContext` showed the
-    -- bundle satisfiable for every valid context; that axiom was RETIRED on
-    -- 2026-07-06 — satisfiability now comes from the emitted binding blob,
-    -- which derives the signature on-chain from `hash256(preimage)`.)
+    -- the deployment context (the witness-existence axiom
+    -- `StatefulBridge.exists_checkSig_witness_under_validTxContext` shows the
+    -- bundle satisfiable for every valid context).
     (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
@@ -9430,7 +9468,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
   let localBindings := anfM.body.map (·.name)
   let constInts    := Lower.collectConstInts anfM.body
   let initialSm : Lower.StackMap :=
-    List.reverse (anfM.params.map (·.name))
+    List.reverse (anfM.params.map (fun p => some p.name))
   -- Priority-ordered case-split. Stateful and dispatch take precedence
   -- because they reflect program-level shape obligations that override
   -- the structural body classification.
@@ -9613,7 +9651,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           anfM.name ≠ "constructor" ∧
           Agrees.emittableArithChainReadyNoDblNeg
             (Lower.computeLastUses anfM.body) anfM.body
-            (List.reverse (anfM.params.map (·.name))) 0 false
+            (List.reverse (anfM.params.map (fun p => some p.name))) 0 false
       · exact compileSafe_observational_correct_arith_consume
           p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
           Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry
@@ -9683,8 +9721,8 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             by_cases hNameUP : anfM.name ≠ "constructor"
             · obtain ⟨hTsmEq, _hWt⟩ := hUpdatePropFrag hUpdatePropShape prop op c hBodyEq
               subst hTsmEq
-              have hUntagUP : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = [prop] := rfl
-              have hSM : List.reverse (anfM.params.map (·.name)) = [prop] := by
+              have hUntagUP : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = ([prop] : Lower.StackMap) := rfl
+              have hSM : List.reverse (anfM.params.map (fun p => some p.name)) = ([prop] : Lower.StackMap) := by
                 rw [← hUntag, hUntagUP]
               have hWtUP : Agrees.entryTsmArithTyped Γ [(prop, Agrees.SlotKind.prop)] := _hWt
               exact compileSafe_observational_correct_updateProp_consume
@@ -9767,10 +9805,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               -- branches are self-contained (`ifValInnerProtected = []`).
               by_cases hResidual :
                   Stack.Lower.StackMap.depth?
-                      (List.reverse (anfM.params.map (·.name))) cond = some 0 ∧
+                      (List.reverse (anfM.params.map (fun p => some p.name))) cond = some 0 ∧
                   Stack.Lower.isLastUse (Lower.computeLastUses anfM.body) cond 0 = true ∧
                   Agrees.ifValInnerProtected
-                      (List.reverse (anfM.params.map (·.name))) cond 0
+                      (List.reverse (anfM.params.map (fun p => some p.name))) cond 0
                       (Lower.computeLastUses anfM.body) [] = []
               · obtain ⟨hCondHead, hLastU, hIPThn⟩ := hResidual
                 obtain ⟨k, branchTsm, hTsmEq, hCondBool, hBranchTyped⟩ :=
@@ -9787,12 +9825,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     p.methods p.properties Lower.defaultInlineBudget 0
                     (Lower.computeLastUses anfM.body) []
                     (Lower.collectConstInts anfM.body)
-                    (List.reverse (anfM.params.map (·.name)))
+                    (List.reverse (anfM.params.map (fun p => some p.name)))
                     anfM.body = true :=
                   (Agrees.ifValArithBodyBool_iff p.methods p.properties
                     Lower.defaultInlineBudget 0 (Lower.computeLastUses anfM.body) []
                     (Lower.collectConstInts anfM.body)
-                    (List.reverse (anfM.params.map (·.name))) anfM.body).mpr hFrag
+                    (List.reverse (anfM.params.map (fun p => some p.name))) anfM.body).mpr hFrag
                 have hResidue : cryptoCallResidueB p anfM = true := by
                   simp only [cryptoCallResidueB, hPublic, Bool.true_and]
                   simp [hIfValBool]
@@ -9817,27 +9855,27 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   · -- `¬emittableArith` (Prop) from `¬hArithConsume` + `name≠constr`.
                     have hArithF : ¬ Agrees.emittableArithChainReadyNoDblNeg
                         (Lower.computeLastUses anfM.body) anfM.body
-                        (List.reverse (anfM.params.map (·.name))) 0 false :=
+                        (List.reverse (anfM.params.map (fun p => some p.name))) 0 false :=
                       fun hP => hArithConsume ⟨hNm, hP⟩
                     -- `ifValArithBodyBool = false` from `¬hIfValFrag` + `name≠constr`.
                     have hIfValF : Agrees.ifValArithBodyBool
                         p.methods p.properties Lower.defaultInlineBudget 0
                         (Lower.computeLastUses anfM.body) []
                         (Lower.collectConstInts anfM.body)
-                        (List.reverse (anfM.params.map (·.name)))
+                        (List.reverse (anfM.params.map (fun p => some p.name)))
                         anfM.body = false := by
                       cases hI : Agrees.ifValArithBodyBool
                           p.methods p.properties Lower.defaultInlineBudget 0
                           (Lower.computeLastUses anfM.body) []
                           (Lower.collectConstInts anfM.body)
-                          (List.reverse (anfM.params.map (·.name)))
+                          (List.reverse (anfM.params.map (fun p => some p.name)))
                           anfM.body
                       · rfl
                       · exact absurd ⟨hNm, (Agrees.ifValArithBodyBool_iff p.methods
                           p.properties Lower.defaultInlineBudget 0
                           (Lower.computeLastUses anfM.body) []
                           (Lower.collectConstInts anfM.body)
-                          (List.reverse (anfM.params.map (·.name))) anfM.body).mp hI⟩
+                          (List.reverse (anfM.params.map (fun p => some p.name))) anfM.body).mp hI⟩
                           hIfValFrag
                     have hCatF : Stack.AgreesCat.catConsumeShapeBool anfM = false :=
                       Bool.eq_false_iff.mpr hCatShape
@@ -9856,7 +9894,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   (bodyLoopMapNeutralB_of_noLoop p.methods p.properties
                     Lower.defaultInlineBudget (Lower.computeLastUses anfM.body) []
                     (anfM.body.map (·.name)) (Lower.collectConstInts anfM.body)
-                    anfM.body (List.reverse (anfM.params.map (·.name))) 0
+                    anfM.body (List.reverse (anfM.params.map (fun p => some p.name))) 0
                     (bindingsUseLoopB_false_of_program p anfM hMem hNoLoop))
                   hValueTruthy hResidue
               · -- **Wave 66 consume-`method_call` branch (replaces the retired
@@ -10044,13 +10082,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- Single-public-gated (2026-06-12 premise-shape repair); forwarded
     -- verbatim to the omnibus, see the comment there.
     (hUntag : (p.methods.filter (·.isPublic)).length < 2 →
-      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (fun p => some p.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped :
       (anfM.name ≠ "constructor" ∧
         Agrees.emittableArithChainReadyNoDblNeg
           (Lower.computeLastUses anfM.body) anfM.body
-          (List.reverse (anfM.params.map (·.name))) 0 false) →
+          (List.reverse (anfM.params.map (fun p => some p.name))) 0 false) →
       Agrees.entryTsmArithTyped Γ tsm)
     (hIfValTyped :
       ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
@@ -10068,7 +10106,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       RunarVerification.Stack.AgreesCat.catConsumeShapeBool anfM = true →
         ∃ (bn a b : String) (src : Option SourceLoc)
           (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (anfM.params.map (·.name)).reverse = [b, a] ∧
+          (anfM.params.map (fun p => some p.name)).reverse = ([b, a] : Lower.StackMap) ∧
           anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src] ∧
           a ≠ b ∧
           initialAnf.resolveRef a = some (.vBytes ba) ∧
@@ -10082,7 +10120,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           Agrees.entryTsmArithTyped Γ tsm)
     (hMethodCallFrag :
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
-        ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
+        ∃ a : String, (anfM.params.map (fun p => some p.name)).reverse = ([a] : Lower.StackMap) ∧
              tsm = [(a, Agrees.SlotKind.param)])
     -- **crypto_call hash-peel premise (keyed).**  For a body in the single-hash-call
     -- consume fragment (decided by `hashCallConsumeShapeBool` — one param, one
@@ -10101,7 +10139,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
         ∃ (bn arg func : String) (src : Option SourceLoc)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
-          (anfM.params.map (·.name)).reverse = [arg] ∧
+          (anfM.params.map (fun p => some p.name)).reverse = ([arg] : Lower.StackMap) ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
           (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧

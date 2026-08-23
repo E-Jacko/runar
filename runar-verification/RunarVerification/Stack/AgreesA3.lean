@@ -524,9 +524,9 @@ ANF state. -/
 the reversed parameter list starts with `n`. The remainder of the
 parameter list (`tail`) is exposed for the alignment hypothesis. -/
 def singletonAssertAtDepth0 (m : ANFMethod) (n bn : String)
-    (tail : List String) (src : Option SourceLoc) : Prop :=
+    (tail : Stack.Lower.StackMap) (src : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .assert n, src⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n :: tail
+  (m.params.map (fun p => some p.name)).reverse = some n :: tail
 
 /-! ### Auxiliary lemmas about the singleton-assert body's lowering -/
 
@@ -618,7 +618,7 @@ to `[.opcode "OP_VERIFY"]`. -/
 
 private theorem lowerMethodUserRawOps_singleton_assert
     (progMethods : List ANFMethod) (props : List ANFProperty)
-    (m : ANFMethod) (n bn : String) (tail : List String)
+    (m : ANFMethod) (n bn : String) (tail : Stack.Lower.StackMap)
     (src : Option SourceLoc)
     (hSingle : singletonAssertAtDepth0 m n bn tail src) :
     lowerMethodUserRawOps progMethods props m = [.opcode "OP_VERIFY"] := by
@@ -639,7 +639,7 @@ private theorem lowerMethodUserRawOps_singleton_assert
   simp only [Bool.not_false, Bool.true_and]
   unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
   -- `(n :: tail).findIdx? (· == n) = some 0`
-  have hFind : (n :: tail).findIdx? (· == n) = some 0 := by
+  have hFind : (some n :: tail).findIdx? (· == some n) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   rw [hFind]
@@ -743,10 +743,10 @@ bridge applies). The cap binding's value is a const literal, which
 `lowerValueP` lowers to a single `.push` op that `runOps` cannot
 fail on. -/
 def singletonAssertWithCap (m : ANFMethod)
-    (n bn bcap : String) (tail : List String)
+    (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .assert n, src⟩, ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n :: tail ∧
   bn ≠ bcap ∧ bcap ≠ n
 
 /-! ### Lowering reductions for `singletonAssertWithCap` -/
@@ -813,7 +813,7 @@ private theorem bodyEndsInAssert_singletonAssertWithCap
 set_option maxHeartbeats 1600000 in
 private theorem lowerMethodUserRawOps_singletonAssertWithCap
     (progMethods : List ANFMethod) (props : List ANFProperty)
-    (m : ANFMethod) (n bn bcap : String) (tail : List String)
+    (m : ANFMethod) (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (src srcCap : Option SourceLoc)
     (hCap : singletonAssertWithCap m n bn bcap tail src srcCap) :
     lowerMethodUserRawOps progMethods props m
@@ -824,7 +824,7 @@ private theorem lowerMethodUserRawOps_singletonAssertWithCap
   rw [computeLastUses_singletonAssertWithCap bn bcap n src srcCap]
   rw [collectConstInts_singletonAssertWithCap bn bcap n src srcCap]
   -- The depth-0 lookup of n in the param stack map is `some 0`.
-  have hFind : (n :: tail).findIdx? (· == n) = some 0 := by
+  have hFind : (some n :: tail).findIdx? (· == some n) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   -- Step 1: unfold the outer lowerBindingsP cons on the assert binding.
@@ -895,7 +895,7 @@ binOp / unaryOp) follows the same template once the
 theorem runMethod_lower_public_unique_no_post_structuralArith_real_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n bn bcap : String) (tail : List String)
+    (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State)
     (hMem : m ∈ methods)
@@ -1026,10 +1026,10 @@ private theorem initialStack_top_vBool_of_agreesTagged
 /-- Composite body shape for a single `unaryOp "-" n rt` binding at depth 0
 followed by the sentinel-true cap. -/
 def singletonUnaryNegateWithCap (m : ANFMethod)
-    (n bn bcap : String) (tail : List String)
+    (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .unaryOp "-" n rt, src⟩, ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n :: tail ∧
   bn ≠ bcap ∧ bcap ≠ n
 
 /-- `computeLastUses` on `[unaryBinding, capBinding]` records `[(n, 0)]`. -/
@@ -1092,7 +1092,7 @@ private theorem bodyEndsInAssert_singletonUnaryNegateWithCap
 set_option maxHeartbeats 1600000 in
 private theorem lowerMethodUserRawOps_singletonUnaryNegateWithCap
     (progMethods : List ANFMethod) (props : List ANFProperty)
-    (m : ANFMethod) (n bn bcap : String) (tail : List String)
+    (m : ANFMethod) (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonUnaryNegateWithCap m n bn bcap tail rt src srcCap) :
     lowerMethodUserRawOps progMethods props m
@@ -1103,7 +1103,7 @@ private theorem lowerMethodUserRawOps_singletonUnaryNegateWithCap
   rw [computeLastUses_singletonUnaryNegateWithCap bn bcap n rt src srcCap]
   rw [collectConstInts_singletonUnaryNegateWithCap bn bcap n rt src srcCap]
   -- Depth-0 lookup of n in the param stack map is some 0.
-  have hFind : (n :: tail).findIdx? (· == n) = some 0 := by
+  have hFind : (some n :: tail).findIdx? (· == some n) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   -- Step 1: unfold lowerBindingsP cons on the unary head.
@@ -1160,7 +1160,7 @@ structurally — no `hRunOk` / `hSimulates`. -/
 theorem runMethod_lower_public_unique_no_post_singletonUnaryNegate_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n bn bcap : String) (tail : List String)
+    (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (i : Int)
     (hMem : m ∈ methods)
@@ -1203,10 +1203,10 @@ theorem runMethod_lower_public_unique_no_post_singletonUnaryNegate_isSome
 /-- Composite body shape for a single `unaryOp "!" n rt` binding at depth 0
 followed by the sentinel-true cap. -/
 def singletonUnaryNotWithCap (m : ANFMethod)
-    (n bn bcap : String) (tail : List String)
+    (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .unaryOp "!" n rt, src⟩, ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n :: tail ∧
   bn ≠ bcap ∧ bcap ≠ n
 
 private theorem computeLastUses_singletonUnaryNotWithCap
@@ -1263,7 +1263,7 @@ private theorem bodyEndsInAssert_singletonUnaryNotWithCap
 set_option maxHeartbeats 1600000 in
 private theorem lowerMethodUserRawOps_singletonUnaryNotWithCap
     (progMethods : List ANFMethod) (props : List ANFProperty)
-    (m : ANFMethod) (n bn bcap : String) (tail : List String)
+    (m : ANFMethod) (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonUnaryNotWithCap m n bn bcap tail rt src srcCap) :
     lowerMethodUserRawOps progMethods props m
@@ -1273,7 +1273,7 @@ private theorem lowerMethodUserRawOps_singletonUnaryNotWithCap
   rw [hBody, hRev]
   rw [computeLastUses_singletonUnaryNotWithCap bn bcap n rt src srcCap]
   rw [collectConstInts_singletonUnaryNotWithCap bn bcap n rt src srcCap]
-  have hFind : (n :: tail).findIdx? (· == n) = some 0 := by
+  have hFind : (some n :: tail).findIdx? (· == some n) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   unfold Stack.Lower.lowerBindingsP
@@ -1316,7 +1316,7 @@ Tier-2 sub-fragment.** -/
 theorem runMethod_lower_public_unique_no_post_singletonUnaryNot_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n bn bcap : String) (tail : List String)
+    (n bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (b : Bool)
     (hMem : m ∈ methods)
@@ -1393,11 +1393,11 @@ binding at depth pair (1, 0) followed by the sentinel-true cap. The
 `opName` parameter is the surface arithmetic operator (`"+"`, `"-"`,
 `"*"`, …) that the lowerer translates via `binopOpcode`. -/
 def singletonBinOpWithCap (m : ANFMethod)
-    (opName : String) (n1 n2 bn bcap : String) (tail : List String)
+    (opName : String) (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .binOp opName n1 n2 rt, src⟩,
             ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n2 :: n1 :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n2 :: some n1 :: tail ∧
   n1 ≠ n2 ∧ bn ≠ bcap ∧ bcap ≠ n1 ∧ bcap ≠ n2
 
 /-- `collectRefs (.binOp opName n1 n2 rt) = [n1, n2]`. -/
@@ -1541,7 +1541,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinOpWithCap
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap m opName n1 n2 bn bcap tail rt src srcCap)
     (hNotNeqBytes : (opName == "!==") = false) :
@@ -1554,14 +1554,14 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
   -- Depth-1 lookup of n1 in [n2, n1, ...tail] is some 1.
-  have hFind1 : (n2 :: n1 :: tail).findIdx? (· == n1) = some 1 := by
+  have hFind1 : (some n2 :: some n1 :: tail).findIdx? (· == some n1) = some 1 := by
     have hne2 : (n2 == n1) = false := by
       have h : n2 ≠ n1 := fun h => hne h.symm
       simp [beq_iff_eq, h]
     unfold List.findIdx?
     simp [List.findIdx?.go, hne2]
   -- Depth-1 lookup of n2 in [n1, n2, ...tail] (after the first swap) is some 1.
-  have hFind2 : (n1 :: n2 :: tail).findIdx? (· == n2) = some 1 := by
+  have hFind2 : (some n1 :: some n2 :: tail).findIdx? (· == some n2) = some 1 := by
     have hne1 : (n1 == n2) = false := by
       have h : n1 ≠ n2 := hne
       simp [beq_iff_eq, h]
@@ -1570,7 +1570,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap
   -- Build a `loadRefLive`-result lemma for n1 at depth 1, consume-mode.
   have hLoadN1 :
       Stack.Lower.loadRefLive (n2 :: n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n1 :: n2 :: tail) := by
+        = ([.swap], some n1 :: some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne]
     simp only [Bool.not_false, Bool.true_and]
@@ -1580,7 +1580,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap
   -- Same for n2 at depth 1 of the swapped sm.
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: tail) := by
+        = ([.swap], some n2 :: some n1 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -1626,7 +1626,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinNeqWithCap
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap m opName n1 n2 bn bcap tail rt src srcCap)
     (hIsNeq : opName = "!==") :
@@ -1638,13 +1638,13 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap
   rw [hBody, hRev]
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
-  have hFind1 : (n2 :: n1 :: tail).findIdx? (· == n1) = some 1 := by
+  have hFind1 : (some n2 :: some n1 :: tail).findIdx? (· == some n1) = some 1 := by
     have hne2 : (n2 == n1) = false := by
       have h : n2 ≠ n1 := fun h => hne h.symm
       simp [beq_iff_eq, h]
     unfold List.findIdx?
     simp [List.findIdx?.go, hne2]
-  have hFind2 : (n1 :: n2 :: tail).findIdx? (· == n2) = some 1 := by
+  have hFind2 : (some n1 :: some n2 :: tail).findIdx? (· == some n2) = some 1 := by
     have hne1 : (n1 == n2) = false := by
       have h : n1 ≠ n2 := hne
       simp [beq_iff_eq, h]
@@ -1652,7 +1652,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap
     simp [List.findIdx?.go, hne1]
   have hLoadN1 :
       Stack.Lower.loadRefLive (n2 :: n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n1 :: n2 :: tail) := by
+        = ([.swap], some n1 :: some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne]
     simp only [Bool.not_false, Bool.true_and]
@@ -1661,7 +1661,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap
     simp
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: tail) := by
+        = ([.swap], some n2 :: some n1 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -1747,19 +1747,19 @@ unconditionally; the four-op sequence's success follows by
 /-- Singleton `+` body shape (alias of `singletonBinOpWithCap` with
 `opName := "+"`). -/
 def singletonBinAddWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "+" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `-` body shape. -/
 def singletonBinSubWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "-" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `*` body shape. -/
 def singletonBinMulWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "*" n1 n2 bn bcap tail rt src srcCap
 
@@ -1915,7 +1915,7 @@ succeeds unconditionally. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinAdd_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -1965,7 +1965,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinSub_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2014,7 +2014,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMul_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2085,73 +2085,73 @@ return-type-polymorphic) plus the per-opcode `runOpcode_*_intInt` from
 
 /-- Singleton `/` body shape. -/
 def singletonBinDivWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "/" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `%` body shape. -/
 def singletonBinModWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "%" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `<` body shape. -/
 def singletonBinLtWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "<" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `<=` body shape. -/
 def singletonBinLeWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "<=" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `>` body shape. -/
 def singletonBinGtWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m ">" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `>=` body shape. -/
 def singletonBinGeWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m ">=" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `===` body shape — integer return type (rt ≠ some "bytes"). -/
 def singletonBinEqWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "===" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `!==` body shape — integer return type (rt ≠ some "bytes"). -/
 def singletonBinNeqWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "!==" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `&&` body shape. -/
 def singletonBinAndWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "&&" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `||` body shape. -/
 def singletonBinOrWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "||" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `<<` body shape. -/
 def singletonBinShlWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m "<<" n1 n2 bn bcap tail rt src srcCap
 
 /-- Singleton `>>` body shape. -/
 def singletonBinShrWithCap (m : ANFMethod)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   singletonBinOpWithCap m ">>" n1 n2 bn bcap tail rt src srcCap
 
@@ -2718,7 +2718,7 @@ a separate `binopOpcode` reduction. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinDiv_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2768,7 +2768,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMod_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2818,7 +2818,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLt_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2867,7 +2867,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLe_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2916,7 +2916,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGt_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -2965,7 +2965,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGe_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3017,7 +3017,7 @@ Requires `rt ≠ some "bytes"` so the lowerer's `===` branch picks
 theorem runMethod_lower_public_unique_no_post_singletonBinEq_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3080,7 +3080,7 @@ Requires `rt ≠ some "bytes"` so the lowerer's `!==` branch picks
 theorem runMethod_lower_public_unique_no_post_singletonBinNeq_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3139,7 +3139,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinAnd_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3188,7 +3188,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinOr_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3237,7 +3237,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShl_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3286,7 +3286,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShr_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -3381,11 +3381,11 @@ binding at depth pair (0, 1) followed by the sentinel-true cap. Differs
 from `singletonBinOpWithCap` only in `hRev`: params reversed is
 `n1 :: n2 :: tail` rather than `n2 :: n1 :: tail`. -/
 def singletonBinOpWithCap_d0d1 (m : ANFMethod)
-    (opName : String) (n1 n2 bn bcap : String) (tail : List String)
+    (opName : String) (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .binOp opName n1 n2 rt, src⟩,
             ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n1 :: n2 :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n1 :: some n2 :: tail ∧
   n1 ≠ n2 ∧ bn ≠ bcap ∧ bcap ≠ n1 ∧ bcap ≠ n2
 
 /-! ### Lowering of `singletonBinOpWithCap_d0d1`:
@@ -3402,7 +3402,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0d1 m opName n1 n2 bn bcap tail rt src srcCap)
     (hNotNeqBytes : (opName == "!==") = false) :
@@ -3415,12 +3415,12 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
   -- Depth-0 lookup of n1 in [n1, n2, ...tail] is some 0.
-  have hFind1 : (n1 :: n2 :: tail).findIdx? (· == n1) = some 0 := by
+  have hFind1 : (some n1 :: some n2 :: tail).findIdx? (· == some n1) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   -- Depth-1 lookup of n2 in [n1, n2, ...tail] (sm unchanged after the
   -- depth-0 consume) is some 1.
-  have hFind2 : (n1 :: n2 :: tail).findIdx? (· == n2) = some 1 := by
+  have hFind2 : (some n1 :: some n2 :: tail).findIdx? (· == some n2) = some 1 := by
     have hne1 : (n1 == n2) = false := by
       have h : n1 ≠ n2 := hne
       simp [beq_iff_eq, h]
@@ -3429,7 +3429,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
   -- Load n1 at depth 0, consume — bringToTop returns ([], sm) unchanged.
   have hLoadN1 :
       Stack.Lower.loadRefLive (n1 :: n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([], n1 :: n2 :: tail) := by
+        = ([], some n1 :: some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne]
     simp only [Bool.not_false, Bool.true_and]
@@ -3439,7 +3439,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
   -- Load n2 at depth 1 of the unchanged sm, consume — bringToTop emits .swap.
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: tail) := by
+        = ([.swap], some n2 :: some n1 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -3482,7 +3482,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0d1
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0d1 m opName n1 n2 bn bcap tail rt src srcCap)
     (hIsNeq : opName = "!==") :
@@ -3494,10 +3494,10 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0d1
   rw [hBody, hRev]
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
-  have hFind1 : (n1 :: n2 :: tail).findIdx? (· == n1) = some 0 := by
+  have hFind1 : (some n1 :: some n2 :: tail).findIdx? (· == some n1) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
-  have hFind2 : (n1 :: n2 :: tail).findIdx? (· == n2) = some 1 := by
+  have hFind2 : (some n1 :: some n2 :: tail).findIdx? (· == some n2) = some 1 := by
     have hne1 : (n1 == n2) = false := by
       have h : n1 ≠ n2 := hne
       simp [beq_iff_eq, h]
@@ -3505,7 +3505,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0d1
     simp [List.findIdx?.go, hne1]
   have hLoadN1 :
       Stack.Lower.loadRefLive (n1 :: n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([], n1 :: n2 :: tail) := by
+        = ([], some n1 :: some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne]
     simp only [Bool.not_false, Bool.true_and]
@@ -3514,7 +3514,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0d1
     simp
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: tail) := by
+        = ([.swap], some n2 :: some n1 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -4181,7 +4181,7 @@ runtime stack shape; the wave-12 d0d1 helper above discharges
 theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4231,7 +4231,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4280,7 +4280,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4329,7 +4329,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4379,7 +4379,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4429,7 +4429,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4478,7 +4478,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4527,7 +4527,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4576,7 +4576,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4627,7 +4627,7 @@ Requires `rt ≠ some "bytes"` so the lowerer's `===` branch picks
 theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4689,7 +4689,7 @@ Requires `rt ≠ some "bytes"` so the lowerer's `!==` branch picks
 theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4747,7 +4747,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4796,7 +4796,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4845,7 +4845,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4894,7 +4894,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0d1_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShr_d0d1_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 bn bcap : String) (tail : List String)
+    (n1 n2 bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -4979,11 +4979,11 @@ operand `n1` sits at depth 2, the right operand `n2` at depth 0, with one
 "stepped-over" middle slot `nm` at depth 1. Params reversed is
 `n2 :: nm :: n1 :: tail`. -/
 def singletonBinOpWithCap_dge2_d0 (m : ANFMethod)
-    (opName : String) (n1 n2 nm bn bcap : String) (tail : List String)
+    (opName : String) (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .binOp opName n1 n2 rt, src⟩,
             ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n2 :: nm :: n1 :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n2 :: some nm :: some n1 :: tail ∧
   n1 ≠ n2 ∧ n1 ≠ nm ∧ n2 ≠ nm ∧
   bn ≠ bcap ∧ bcap ≠ n1 ∧ bcap ≠ n2
 
@@ -5002,7 +5002,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_dge2_d0 m opName n1 n2 nm bn bcap tail rt src srcCap)
     (hNotNeqBytes : (opName == "!==") = false) :
@@ -5015,7 +5015,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
   -- Depth-2 lookup of n1 in [n2, nm, n1, ...tail] is some 2.
-  have hFind1 : (n2 :: nm :: n1 :: tail).findIdx? (· == n1) = some 2 := by
+  have hFind1 : (some n2 :: some nm :: some n1 :: tail).findIdx? (· == some n1) = some 2 := by
     have h21 : (n2 == n1) = false := by
       have h : n2 ≠ n1 := fun h => hne12 h.symm
       simp [beq_iff_eq, h]
@@ -5025,7 +5025,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
     unfold List.findIdx?
     simp [List.findIdx?.go, h21, hm1]
   -- Depth-1 lookup of n2 in [n1, n2, nm, ...tail] (after the rot) is some 1.
-  have hFind2 : (n1 :: n2 :: nm :: tail).findIdx? (· == n2) = some 1 := by
+  have hFind2 : (some n1 :: some n2 :: some nm :: tail).findIdx? (· == some n2) = some 1 := by
     have h12 : (n1 == n2) = false := by
       simp [beq_iff_eq, hne12]
     unfold List.findIdx?
@@ -5033,7 +5033,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
   -- Build a `loadRefLive` result for n1 at depth 2, consume-mode: `[.rot]`.
   have hLoadN1 :
       Stack.Lower.loadRefLive (n2 :: nm :: n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([.rot], n1 :: n2 :: nm :: tail) := by
+        = ([.rot], some n1 :: some n2 :: some nm :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
@@ -5043,7 +5043,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
   -- Same for n2 at depth 1 of the rotated sm: `[.swap]`.
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: n2 :: nm :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: nm :: tail) := by
+        = ([.swap], some n2 :: some n1 :: some nm :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -5078,7 +5078,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge2_d0
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_dge2_d0 m opName n1 n2 nm bn bcap tail rt src srcCap)
     (hIsNeq : opName = "!==") :
@@ -5090,7 +5090,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge2_d0
   rw [hBody, hRev]
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
-  have hFind1 : (n2 :: nm :: n1 :: tail).findIdx? (· == n1) = some 2 := by
+  have hFind1 : (some n2 :: some nm :: some n1 :: tail).findIdx? (· == some n1) = some 2 := by
     have h21 : (n2 == n1) = false := by
       have h : n2 ≠ n1 := fun h => hne12 h.symm
       simp [beq_iff_eq, h]
@@ -5099,14 +5099,14 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge2_d0
       simp [beq_iff_eq, h]
     unfold List.findIdx?
     simp [List.findIdx?.go, h21, hm1]
-  have hFind2 : (n1 :: n2 :: nm :: tail).findIdx? (· == n2) = some 1 := by
+  have hFind2 : (some n1 :: some n2 :: some nm :: tail).findIdx? (· == some n2) = some 1 := by
     have h12 : (n1 == n2) = false := by
       simp [beq_iff_eq, hne12]
     unfold List.findIdx?
     simp [List.findIdx?.go, h12]
   have hLoadN1 :
       Stack.Lower.loadRefLive (n2 :: nm :: n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([.rot], n1 :: n2 :: nm :: tail) := by
+        = ([.rot], some n1 :: some n2 :: some nm :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
@@ -5115,7 +5115,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge2_d0
     simp [Stack.Lower.StackMap.removeAtDepth, Stack.Lower.StackMap.push]
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: n2 :: nm :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: nm :: tail) := by
+        = ([.swap], some n2 :: some n1 :: some nm :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -5801,7 +5801,7 @@ with a stepped-over middle slot at depth 1. The lowerer emits
 theorem runMethod_lower_public_unique_no_post_singletonBinAdd_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -5851,7 +5851,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinSub_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -5901,7 +5901,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinMul_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -5951,7 +5951,7 @@ consume.** Requires `b ≠ 0`. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinDiv_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6002,7 +6002,7 @@ consume.** Requires `b ≠ 0`. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinMod_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6053,7 +6053,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinLt_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6103,7 +6103,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinLe_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6153,7 +6153,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinGt_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6203,7 +6203,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinGe_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6253,7 +6253,7 @@ consume.** Requires `rt ≠ some "bytes"` so the lowerer picks `OP_NUMEQUAL`. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinEq_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6313,7 +6313,7 @@ consume.** Requires `rt ≠ some "bytes"` so the lowerer picks `OP_NUMNOTEQUAL`.
 theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6372,7 +6372,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinAnd_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6422,7 +6422,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinOr_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6472,7 +6472,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinShl_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6522,7 +6522,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinShr_dge2_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -6575,11 +6575,11 @@ operand `n1` sits at depth 0, the right operand `n2` at depth 2, with one
 "stepped-over" middle slot `nm` at depth 1. Params reversed is
 `n1 :: nm :: n2 :: tail`. -/
 def singletonBinOpWithCap_d0_dge2 (m : ANFMethod)
-    (opName : String) (n1 n2 nm bn bcap : String) (tail : List String)
+    (opName : String) (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .binOp opName n1 n2 rt, src⟩,
             ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n1 :: nm :: n2 :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n1 :: some nm :: some n2 :: tail ∧
   n1 ≠ n2 ∧ n1 ≠ nm ∧ n2 ≠ nm ∧
   bn ≠ bcap ∧ bcap ≠ n1 ∧ bcap ≠ n2
 
@@ -6595,7 +6595,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0_dge2 m opName n1 n2 nm bn bcap tail rt src srcCap)
     (hNotNeqBytes : (opName == "!==") = false) :
@@ -6608,11 +6608,11 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
   -- Depth-0 lookup of n1 in [n1, nm, n2, ...tail] is some 0.
-  have hFind1 : (n1 :: nm :: n2 :: tail).findIdx? (· == n1) = some 0 := by
+  have hFind1 : (some n1 :: some nm :: some n2 :: tail).findIdx? (· == some n1) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
   -- Depth-2 lookup of n2 in [n1, nm, n2, ...tail] (sm unchanged after no-op) is some 2.
-  have hFind2 : (n1 :: nm :: n2 :: tail).findIdx? (· == n2) = some 2 := by
+  have hFind2 : (some n1 :: some nm :: some n2 :: tail).findIdx? (· == some n2) = some 2 := by
     have h12 : (n1 == n2) = false := by
       simp [beq_iff_eq, hne12]
     have hm2 : (nm == n2) = false := by
@@ -6623,7 +6623,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
   -- Load n1 at depth 0, consume-mode: no-op, sm unchanged.
   have hLoadN1 :
       Stack.Lower.loadRefLive (n1 :: nm :: n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([], n1 :: nm :: n2 :: tail) := by
+        = ([], some n1 :: some nm :: some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
@@ -6633,7 +6633,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
   -- Load n2 at depth 2 of the unchanged sm: `[.rot]`.
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: nm :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.rot], n2 :: n1 :: nm :: tail) := by
+        = ([.rot], some n2 :: some n1 :: some nm :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -6668,7 +6668,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge2
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0_dge2 m opName n1 n2 nm bn bcap tail rt src srcCap)
     (hIsNeq : opName = "!==") :
@@ -6680,10 +6680,10 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge2
   rw [hBody, hRev]
   rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
-  have hFind1 : (n1 :: nm :: n2 :: tail).findIdx? (· == n1) = some 0 := by
+  have hFind1 : (some n1 :: some nm :: some n2 :: tail).findIdx? (· == some n1) = some 0 := by
     unfold List.findIdx?
     simp [List.findIdx?.go]
-  have hFind2 : (n1 :: nm :: n2 :: tail).findIdx? (· == n2) = some 2 := by
+  have hFind2 : (some n1 :: some nm :: some n2 :: tail).findIdx? (· == some n2) = some 2 := by
     have h12 : (n1 == n2) = false := by
       simp [beq_iff_eq, hne12]
     have hm2 : (nm == n2) = false := by
@@ -6693,7 +6693,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge2
     simp [List.findIdx?.go, h12, hm2]
   have hLoadN1 :
       Stack.Lower.loadRefLive (n1 :: nm :: n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([], n1 :: nm :: n2 :: tail) := by
+        = ([], some n1 :: some nm :: some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
@@ -6702,7 +6702,7 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge2
     simp
   have hLoadN2 :
       Stack.Lower.loadRefLive (n1 :: nm :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.rot], n2 :: n1 :: nm :: tail) := by
+        = ([.rot], some n2 :: some n1 :: some nm :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
@@ -7377,7 +7377,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7427,7 +7427,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7477,7 +7477,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7527,7 +7527,7 @@ consume.** Requires `b ≠ 0`. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7578,7 +7578,7 @@ consume.** Requires `b ≠ 0`. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7629,7 +7629,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7679,7 +7679,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7729,7 +7729,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7779,7 +7779,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7829,7 +7829,7 @@ consume.** Requires `rt ≠ some "bytes"` so the lowerer picks `OP_NUMEQUAL`. -/
 theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7889,7 +7889,7 @@ consume.** Requires `rt ≠ some "bytes"` so the lowerer picks `OP_NUMNOTEQUAL`.
 theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7948,7 +7948,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -7998,7 +7998,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -8048,7 +8048,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -8098,7 +8098,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinShr_d0_dge2_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 nm bn bcap : String) (tail : List String)
+    (n1 n2 nm bn bcap : String) (tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -8196,9 +8196,9 @@ private theorem eraseIdx_cons_pos {α} (x : α) (xs : List α) (d : Nat) (hd : 1
 
 /-- `findIdx?` skips a target-free prefix: the index lands at the prefix
 length. -/
-private theorem findIdx_skip_pre (target : String) (pre suf : List String)
-    (hPre : ∀ x ∈ pre, (x == target) = false) :
-    (pre ++ target :: suf).findIdx? (· == target) = some pre.length := by
+private theorem findIdx_skip_pre (target : String) (pre suf : Stack.Lower.StackMap)
+    (hPre : ∀ x ∈ pre, (x == some target) = false) :
+    (pre ++ some target :: suf).findIdx? (· == some target) = some pre.length := by
   induction pre with
   | nil =>
       simp only [List.nil_append, List.length_nil]
@@ -8215,8 +8215,8 @@ private theorem findIdx_skip_pre (target : String) (pre suf : List String)
 
 /-- `removeAtDepth` at a prefix length removes the element just past the
 prefix. -/
-private theorem removeAt_skip_pre (target : String) (pre suf : List String) :
-    Stack.Lower.StackMap.removeAtDepth (pre ++ target :: suf) pre.length = pre ++ suf := by
+private theorem removeAt_skip_pre (target : String) (pre suf : Stack.Lower.StackMap) :
+    Stack.Lower.StackMap.removeAtDepth (pre ++ some target :: suf) pre.length = pre ++ suf := by
   induction pre with
   | nil => simp [Stack.Lower.StackMap.removeAtDepth]
   | cons h t ih =>
@@ -8234,13 +8234,13 @@ is `n2 :: m1 :: m2 :: midsRest ++ n1 :: tail`. The `hPre` clause asserts
 `n1` is distinct from `n2` and every middle slot (so the depth-`d`
 lookup is unambiguous). -/
 def singletonBinOpWithCap_dge3_d0 (m : ANFMethod)
-    (opName : String) (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (opName : String) (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .binOp opName n1 n2 rt, src⟩,
             ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n2 :: m1 :: m2 :: midsRest ++ n1 :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail ∧
   n1 ≠ n2 ∧
-  (∀ x ∈ (n2 :: m1 :: m2 :: midsRest), (x == n1) = false) ∧
+  (∀ x ∈ (some n2 :: some m1 :: some m2 :: midsRest), (x == some n1) = false) ∧
   bn ≠ bcap ∧ bcap ≠ n1 ∧ bcap ≠ n2
 
 /-! ### Lowering of `singletonBinOpWithCap_dge3_d0`:
@@ -8259,7 +8259,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_dge3_d0 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
     (hNotNeqBytes : (opName == "!==") = false) :
@@ -8274,25 +8274,25 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
   -- Load n1 at depth (midsRest.length + 3), consume-mode: `[.roll d]`.
   have hLoadN1 :
       Stack.Lower.loadRefLive
-          (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+          (some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
         = ([.roll (midsRest.length + 3)],
-           n1 :: n2 :: m1 :: m2 :: midsRest ++ tail) := by
+           some n1 :: some n2 :: some m1 :: some m2 :: midsRest ++ tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
     have hFind :
-        (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail).findIdx? (· == n1)
-          = some (n2 :: m1 :: m2 :: midsRest).length := by
-      have := findIdx_skip_pre n1 (n2 :: m1 :: m2 :: midsRest) tail hPre
+        (some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail).findIdx? (· == some n1)
+          = some (some n2 :: some m1 :: some m2 :: midsRest).length := by
+      have := findIdx_skip_pre n1 (some n2 :: some m1 :: some m2 :: midsRest) tail hPre
       simpa using this
     rw [hFind]
     simp only [List.length_cons]
     have hRem :
         Stack.Lower.StackMap.removeAtDepth
-            (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail)
-            (n2 :: m1 :: m2 :: midsRest).length
-          = n2 :: m1 :: m2 :: midsRest ++ tail := by
+            (some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail)
+            (some n2 :: some m1 :: some m2 :: midsRest).length
+          = some n2 :: some m1 :: some m2 :: midsRest ++ tail := by
       have := removeAt_skip_pre n1 (n2 :: m1 :: m2 :: midsRest) tail
       simpa using this
     simp only [List.length_cons] at hRem
@@ -8301,14 +8301,14 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
   -- Load n2 at depth 1 of the rolled sm: `[.swap]`.
   have hLoadN2 :
       Stack.Lower.loadRefLive
-          (n1 :: n2 :: m1 :: m2 :: midsRest ++ tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: m1 :: m2 :: midsRest ++ tail) := by
+          (some n1 :: some n2 :: some m1 :: some m2 :: midsRest ++ tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], some n2 :: some n1 :: some m1 :: some m2 :: midsRest ++ tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
     have hFind2 :
-        (n1 :: n2 :: m1 :: m2 :: midsRest ++ tail).findIdx? (· == n2) = some 1 := by
+        (some n1 :: some n2 :: some m1 :: some m2 :: midsRest ++ tail).findIdx? (· == some n2) = some 1 := by
       have h12 : (n1 == n2) = false := by simp [beq_iff_eq, hne12]
       unfold List.findIdx?
       simp [List.findIdx?.go, h12]
@@ -8342,7 +8342,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge3_d0
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_dge3_d0 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
     (hIsNeq : opName = "!==") :
@@ -8357,25 +8357,25 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge3_d0
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
   have hLoadN1 :
       Stack.Lower.loadRefLive
-          (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+          (some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
         = ([.roll (midsRest.length + 3)],
-           n1 :: n2 :: m1 :: m2 :: midsRest ++ tail) := by
+           some n1 :: some n2 :: some m1 :: some m2 :: midsRest ++ tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
     have hFind :
-        (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail).findIdx? (· == n1)
-          = some (n2 :: m1 :: m2 :: midsRest).length := by
-      have := findIdx_skip_pre n1 (n2 :: m1 :: m2 :: midsRest) tail hPre
+        (some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail).findIdx? (· == some n1)
+          = some (some n2 :: some m1 :: some m2 :: midsRest).length := by
+      have := findIdx_skip_pre n1 (some n2 :: some m1 :: some m2 :: midsRest) tail hPre
       simpa using this
     rw [hFind]
     simp only [List.length_cons]
     have hRem :
         Stack.Lower.StackMap.removeAtDepth
-            (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail)
-            (n2 :: m1 :: m2 :: midsRest).length
-          = n2 :: m1 :: m2 :: midsRest ++ tail := by
+            (some n2 :: some m1 :: some m2 :: midsRest ++ some n1 :: tail)
+            (some n2 :: some m1 :: some m2 :: midsRest).length
+          = some n2 :: some m1 :: some m2 :: midsRest ++ tail := by
       have := removeAt_skip_pre n1 (n2 :: m1 :: m2 :: midsRest) tail
       simpa using this
     simp only [List.length_cons] at hRem
@@ -8383,14 +8383,14 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge3_d0
     rfl
   have hLoadN2 :
       Stack.Lower.loadRefLive
-          (n1 :: n2 :: m1 :: m2 :: midsRest ++ tail) n2 0 [(n2, 0), (n1, 0)] []
-        = ([.swap], n2 :: n1 :: m1 :: m2 :: midsRest ++ tail) := by
+          (some n1 :: some n2 :: some m1 :: some m2 :: midsRest ++ tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], some n2 :: some n1 :: some m1 :: some m2 :: midsRest ++ tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
     have hFind2 :
-        (n1 :: n2 :: m1 :: m2 :: midsRest ++ tail).findIdx? (· == n2) = some 1 := by
+        (some n1 :: some n2 :: some m1 :: some m2 :: midsRest ++ tail).findIdx? (· == some n2) = some 1 := by
       have h12 : (n1 == n2) = false := by simp [beq_iff_eq, hne12]
       unfold List.findIdx?
       simp [List.findIdx?.go, h12]
@@ -8562,7 +8562,7 @@ runtime's tagged middle/tail blocks (`d = midTags.length + 1`). -/
 theorem runMethod_lower_public_unique_no_post_singletonBinAdd_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9132,7 +9132,7 @@ private theorem runOps_rollSwap_shr_pushTrue_of_agreesTagged_dge3_d0
 theorem runMethod_lower_public_unique_no_post_singletonBinSub_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9184,7 +9184,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMul_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9236,7 +9236,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinDiv_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9289,7 +9289,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMod_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9342,7 +9342,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLt_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9394,7 +9394,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLe_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9446,7 +9446,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGt_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9498,7 +9498,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGe_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9550,7 +9550,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinEq_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9612,7 +9612,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9674,7 +9674,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinAnd_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9726,7 +9726,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinOr_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9778,7 +9778,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShl_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9830,7 +9830,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_dge3_d0_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShr_dge3_d0_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -9886,13 +9886,13 @@ stepped-over middle slots `m1 :: m2 :: midsRest` between them. Params
 reversed is `n1 :: m1 :: m2 :: midsRest ++ n2 :: tail`. The `hPre`
 clause asserts `n2` is distinct from `n1` and every middle slot. -/
 def singletonBinOpWithCap_d0_dge3 (m : ANFMethod)
-    (opName : String) (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (opName : String) (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc) : Prop :=
   m.body = [⟨bn, .binOp opName n1 n2 rt, src⟩,
             ⟨bcap, .loadConst (.bool true), srcCap⟩] ∧
-  (m.params.map (fun p => p.name)).reverse = n1 :: m1 :: m2 :: midsRest ++ n2 :: tail ∧
+  (m.params.map (fun p => some p.name)).reverse = some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail ∧
   n1 ≠ n2 ∧
-  (∀ x ∈ (n1 :: m1 :: m2 :: midsRest), (x == n2) = false) ∧
+  (∀ x ∈ (some n1 :: some m1 :: some m2 :: midsRest), (x == some n2) = false) ∧
   bn ≠ bcap ∧ bcap ≠ n1 ∧ bcap ≠ n2
 
 /-! ### Lowering of `singletonBinOpWithCap_d0_dge3`:
@@ -9909,7 +9909,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0_dge3 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
     (hNotNeqBytes : (opName == "!==") = false) :
@@ -9924,13 +9924,13 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
   -- Load n1 at depth 0, consume-mode: no-op, sm unchanged.
   have hLoadN1 :
       Stack.Lower.loadRefLive
-          (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([], n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) := by
+          (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([], some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
-    have hFind1 : (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail).findIdx? (· == n1) = some 0 := by
+    have hFind1 : (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail).findIdx? (· == some n1) = some 0 := by
       simp only [List.cons_append]
       rw [List.findIdx?_cons]
       simp
@@ -9939,25 +9939,25 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
   -- Load n2 at depth d of the unchanged sm: `[.roll d]`.
   have hLoadN2 :
       Stack.Lower.loadRefLive
-          (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
+          (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
         = ([.roll (midsRest.length + 3)],
-           n2 :: n1 :: m1 :: m2 :: midsRest ++ tail) := by
+           some n2 :: some n1 :: some m1 :: some m2 :: midsRest ++ tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
     have hFind2 :
-        (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail).findIdx? (· == n2)
-          = some (n1 :: m1 :: m2 :: midsRest).length := by
+        (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail).findIdx? (· == some n2)
+          = some (some n1 :: some m1 :: some m2 :: midsRest).length := by
       have := findIdx_skip_pre n2 (n1 :: m1 :: m2 :: midsRest) tail hPre
       simpa using this
     rw [hFind2]
     simp only [List.length_cons]
     have hRem :
         Stack.Lower.StackMap.removeAtDepth
-            (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail)
-            (n1 :: m1 :: m2 :: midsRest).length
-          = n1 :: m1 :: m2 :: midsRest ++ tail := by
+            (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail)
+            (some n1 :: some m1 :: some m2 :: midsRest).length
+          = some n1 :: some m1 :: some m2 :: midsRest ++ tail := by
       have := removeAt_skip_pre n2 (n1 :: m1 :: m2 :: midsRest) tail
       simpa using this
     simp only [List.length_cons] at hRem
@@ -9991,7 +9991,7 @@ set_option linter.unusedSimpArgs false in
 private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge3
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (m : ANFMethod) (opName : String)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0_dge3 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
     (hIsNeq : opName = "!==") :
@@ -10006,13 +10006,13 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge3
   rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
   have hLoadN1 :
       Stack.Lower.loadRefLive
-          (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
-        = ([], n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) := by
+          (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([], some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
-    have hFind1 : (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail).findIdx? (· == n1) = some 0 := by
+    have hFind1 : (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail).findIdx? (· == some n1) = some 0 := by
       simp only [List.cons_append]
       rw [List.findIdx?_cons]
       simp
@@ -10020,25 +10020,25 @@ private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge3
     simp
   have hLoadN2 :
       Stack.Lower.loadRefLive
-          (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
+          (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
         = ([.roll (midsRest.length + 3)],
-           n2 :: n1 :: m1 :: m2 :: midsRest ++ tail) := by
+           some n2 :: some n1 :: some m1 :: some m2 :: midsRest ++ tail) := by
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
     simp only [Bool.not_false, Bool.true_and]
     unfold Stack.Lower.StackMap.depth?
     have hFind2 :
-        (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail).findIdx? (· == n2)
-          = some (n1 :: m1 :: m2 :: midsRest).length := by
+        (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail).findIdx? (· == some n2)
+          = some (some n1 :: some m1 :: some m2 :: midsRest).length := by
       have := findIdx_skip_pre n2 (n1 :: m1 :: m2 :: midsRest) tail hPre
       simpa using this
     rw [hFind2]
     simp only [List.length_cons]
     have hRem :
         Stack.Lower.StackMap.removeAtDepth
-            (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail)
-            (n1 :: m1 :: m2 :: midsRest).length
-          = n1 :: m1 :: m2 :: midsRest ++ tail := by
+            (some n1 :: some m1 :: some m2 :: midsRest ++ some n2 :: tail)
+            (some n1 :: some m1 :: some m2 :: midsRest).length
+          = some n1 :: some m1 :: some m2 :: midsRest ++ tail := by
       have := removeAt_skip_pre n2 (n1 :: m1 :: m2 :: midsRest) tail
       simpa using this
     simp only [List.length_cons] at hRem
@@ -10178,7 +10178,7 @@ consume.** -/
 theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -10746,7 +10746,7 @@ private theorem runOps_roll_shr_pushTrue_of_agreesTagged_d0_dge3
 theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -10798,7 +10798,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -10850,7 +10850,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -10903,7 +10903,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -10956,7 +10956,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11008,7 +11008,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11060,7 +11060,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11112,7 +11112,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11164,7 +11164,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11226,7 +11226,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11288,7 +11288,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11340,7 +11340,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11392,7 +11392,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11444,7 +11444,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0_dge3_isSome
 theorem runMethod_lower_public_unique_no_post_singletonBinShr_d0_dge3_isSome
     (contractName : String) (props : List ANFProperty)
     (methods : List ANFMethod) (m : ANFMethod) (initialStack : StackState)
-    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : Stack.Lower.StackMap)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap) (anfSt : State) (a b : Int)
     (hMem : m ∈ methods)
@@ -11676,6 +11676,25 @@ theorem structuralArithConsumeBody_toRunChainRelP
   | consBinOp hRun _hRest ih => exact RunChainRelP.cons hRun ih
   | consUnaryOp hRun _hRest ih => exact RunChainRelP.cons hRun ih
 
+/-- The consume-mode arith fragment binds no `array_literal` (its only two
+cons constructors are `binOp` / `unaryOp`), so the method-wide element
+table is empty on it.  Unlike the `hRaw` side condition the capstone
+carries for `collectRawSlots` — the arith fragment DOES admit the
+byte-array producers — this one is derivable from the witness. -/
+theorem arrayElemsOf_nil_of_structuralArithConsumeBody
+    {progMethods : List ANFMethod} {props : List ANFProperty} {budget : Nat}
+    {lastUses : List (String × Nat)} {outerProtected : List String}
+    {constInts : List (String × Int)}
+    {body : List ANFBinding} {sm sm' : StackMap} {currentIndex : Nat}
+    {localBindings : List String} {stkSt stkSt' : StackState}
+    (h : structuralArithConsumeBody progMethods props budget lastUses outerProtected constInts
+          body sm currentIndex localBindings stkSt sm' stkSt') :
+    Stack.Lower.arrayElemsOf body = [] := by
+  induction h with
+  | nil => simp [Stack.Lower.arrayElemsOf]
+  | consBinOp _hRun _hRest ih => simpa [Stack.Lower.arrayElemsOf] using ih
+  | consUnaryOp _hRun _hRest ih => simpa [Stack.Lower.arrayElemsOf] using ih
+
 /-- **Deliverable B — multi-step operand provenance fold.**
 
 By induction over the body, every binding's operands resolve to a
@@ -11775,7 +11794,15 @@ theorem runMethod_lower_public_unique_no_post_structuralArithConsumeBody_whole_i
     (hNoPreimage : Stack.Lower.bindingsUseCheckPreimage m.body = false)
     (hNoCode : Stack.Lower.bindingsUseCodePart m.body = false)
     (hNoTerminalAssert : Stack.Lower.bodyEndsInAssert m.body = false)
-    (hNoDeserialize : Stack.Lower.bindingsUseDeserializeState m.body = false) :
+    (hNoDeserialize : Stack.Lower.bindingsUseDeserializeState m.body = false)
+    -- NEW-004: the arith fragment ADMITS the byte-array producers
+    -- (`<< >> & | ^ ~`), so an empty raw-slot set does not follow from
+    -- `hArith` and is assumed. Decidable, so a concrete body discharges it
+    -- by `decide`. What it excludes is exactly a method whose byte-array
+    -- result is read in numeric context, where `lowerMethod` emits the
+    -- `OP_BIN2NUM`s that the `RunChainRelP` substrate (stated at the
+    -- default) does not describe.
+    (hRaw : Stack.Lower.collectRawSlots m.body = []) :
     (Stack.Eval.runMethod
         (Stack.Lower.lower
           { contractName := contractName, properties := props, methods := methods })
@@ -11785,6 +11812,8 @@ theorem runMethod_lower_public_unique_no_post_structuralArithConsumeBody_whole_i
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
   show (runOps (lowerMethodUserRawOps methods props m) initialStack).toOption.isSome
   unfold lowerMethodUserRawOps
+  rw [hRaw]
+  rw [arrayElemsOf_nil_of_structuralArithConsumeBody hArith]
   exact runOps_lowerBindingsP_RunChainRelP_isSome
     (structuralArithConsumeBody_toRunChainRelP hArith)
 
@@ -11900,7 +11929,7 @@ private theorem wave19_sm0
         (Stack.Lower.computeLastUses wave19SmokeBody) []
         ["t0", "t1", "t2"] (Stack.Lower.collectConstInts wave19SmokeBody)
         ["p0", "p1", "p2"] "t0" (.binOp "+" "p0" "p1" none)).2.1
-      = ["t0", "p2"] := by
+      = (["t0", "p2"] : Stack.Lower.StackMap) := by
   rw [wave19_computeLastUses, wave19_collectConstInts]
   unfold Stack.Lower.lowerValueP; simp only []
   unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
@@ -11948,7 +11977,7 @@ private theorem wave19_sm1
         (Stack.Lower.computeLastUses wave19SmokeBody) []
         ["t0", "t1", "t2"] (Stack.Lower.collectConstInts wave19SmokeBody)
         ["t0", "p2"] "t1" (.binOp "-" "t0" "p2" none)).2.1
-      = ["t1"] := by
+      = (["t1"] : Stack.Lower.StackMap) := by
   rw [wave19_computeLastUses, wave19_collectConstInts]
   unfold Stack.Lower.lowerValueP; simp only []
   unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
@@ -12169,6 +12198,11 @@ theorem wave19_consume_capstone_smoke
     contractName ([] : List ANFProperty) [wave19SmokeMethod] wave19SmokeMethod initialStack
     _ _ List.mem_cons_self rfl hUniq hArith
     wave19_noPreimage wave19_noCode wave19_noTerminalAssert wave19_noDeserialize
+    -- NEW-004: this smoke body is `+`/`-` only, so it marks no raw slot.
+    (by
+      simp [wave19SmokeMethod, wave19SmokeBody, Stack.Lower.collectRawSlots,
+            Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+            Stack.Lower.isByteArrayBinOp])
 
 /-! ## Path 2 Tier 1 Wave 20 — consume-mode arith reflection
      + generic depth dispatcher
@@ -12276,7 +12310,9 @@ theorem build_consume_binOp_witness_d0d1
     | cons _ tl =>
         cases tl with
         | nil => rw [hsm] at hDepthR; simp [Stack.Lower.StackMap.depth?] at hDepthR
-        | cons _ _ => rfl
+        | cons _ _ =>
+            simp only [Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self,
+              List.nil_append, List.append_assoc, List.singleton_append]
   rw [hOps]
   exact stageC_simpleStep_binOp_d0d1_consume_core
     l r k_l k_r tsm_rest anfSt stkSt a b
@@ -12314,7 +12350,8 @@ theorem build_consume_unaryOp_witness_d0
         = [StackOp.opcode (Stack.Lower.unaryOpcode op)] := by
     unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
-      hLastUse, hDepth, if_true, List.nil_append]
+      hLastUse, hDepth, if_true, List.nil_append,
+      Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self]
   rw [hOps]; exact hRun
 
 /-- **Deliverable A — generic operand-depth dispatcher (binOp).**
@@ -12848,6 +12885,11 @@ theorem wave20_reflect_capstone_smoke
     contractName ([] : List ANFProperty) [wave19SmokeMethod] wave19SmokeMethod initialStack
     _ _ List.mem_cons_self rfl hUniq hArith
     wave19_noPreimage wave19_noCode wave19_noTerminalAssert wave19_noDeserialize
+    -- NEW-004: this smoke body is `+`/`-` only, so it marks no raw slot.
+    (by
+      simp [wave19SmokeMethod, wave19SmokeBody, Stack.Lower.collectRawSlots,
+            Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+            Stack.Lower.isByteArrayBinOp])
 
 /-- **Deliverable C — Bool → capstone, fully closed.**
 
@@ -13427,6 +13469,11 @@ theorem wave27_lockstep_capstone_smoke
     contractName ([] : List ANFProperty) [wave19SmokeMethod] wave19SmokeMethod initialStack
     _ _ List.mem_cons_self rfl hUniq hArith
     wave19_noPreimage wave19_noCode wave19_noTerminalAssert wave19_noDeserialize
+    -- NEW-004: this smoke body is `+`/`-` only, so it marks no raw slot.
+    (by
+      simp [wave19SmokeMethod, wave19SmokeBody, Stack.Lower.collectRawSlots,
+            Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+            Stack.Lower.isByteArrayBinOp])
 
 /-! ### Wave 28 Deliverable A — general (arbitrary-length) consume-arith lockstep
 
@@ -13626,7 +13673,7 @@ theorem lowerValueP_binOp_d0d1_smOut
     (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         [] localBindings constInts sm name (.binOp op l r rt)).2.1
-      = name :: sm.tail.tail := by
+      = some name :: sm.tail.tail := by
   match sm, hDepthL, hDepthR with
   | [], hDepthL, _ => simp [Stack.Lower.StackMap.depth?] at hDepthL
   | [_a], _, hDepthR => simp [Stack.Lower.StackMap.depth?] at hDepthR
@@ -13650,7 +13697,7 @@ theorem lowerValueP_binOp_d0d1_smOut
       simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
         hLastUseL, hLastUseR, hDepthL, hDepthR, if_true]
       show ((Stack.Lower.StackMap.popN (b :: a :: rest) 2).push name : StackMap)
-        = name :: (a :: b :: rest).tail.tail
+        = some name :: (a :: b :: rest).tail.tail
       simp only [Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push, List.tail_cons]
 
 /-- **Wave 28 — d0 consume unaryOp stack-map advance.**
@@ -13668,7 +13715,7 @@ theorem lowerValueP_unaryOp_d0_smOut
     (hLastUse : Stack.Lower.isLastUse lastUses operand currentIndex = true) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         [] localBindings constInts sm name (.unaryOp op operand rt)).2.1
-      = name :: sm.tail := by
+      = some name :: sm.tail := by
   match sm, hDepth with
   | [], hDepth => simp [Stack.Lower.StackMap.depth?] at hDepth
   | a :: tl, hDepth =>
@@ -13676,7 +13723,7 @@ theorem lowerValueP_unaryOp_d0_smOut
       simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
         hLastUse, hDepth, if_true]
       show ((Stack.Lower.StackMap.popN (a :: tl) 1).push name : StackMap)
-        = name :: (a :: tl).tail
+        = some name :: (a :: tl).tail
       simp only [Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push, List.tail_cons]
 
 /-- **Wave 28 — tagged-map decomposition at depths (0, 1).**
@@ -13701,15 +13748,15 @@ theorem tsm_decompose_d0d1
       simp [untagSm, Stack.Lower.StackMap.depth?] at hDepthR
   | (n0, k0) :: (n1, k1) :: tsm_rest, hUntag =>
       -- `untagSm` gives `sm = n0 :: n1 :: untagSm tsm_rest`.
-      have hsm : sm = n0 :: n1 :: untagSm tsm_rest := by
+      have hsm : sm = some n0 :: some n1 :: untagSm tsm_rest := by
         rw [← hUntag]; simp only [untagSm]
       -- Depth 0 ⇒ head matches `l`.
       have hHead : n0 = l := by
         rw [hsm] at hDepthL
         unfold Stack.Lower.StackMap.depth? at hDepthL
         rw [List.findIdx?_cons] at hDepthL
-        by_cases hc : (n0 == l) = true
-        · exact (beq_iff_eq.mp hc)
+        by_cases hc : ((some n0 : Option String) == some l) = true
+        · exact Option.some.inj (beq_iff_eq.mp hc)
         · simp only [hc, Bool.false_eq_true, if_false, Option.map_eq_some_iff] at hDepthL
           obtain ⟨_w, _, hEq⟩ := hDepthL
           omega
@@ -13718,15 +13765,15 @@ theorem tsm_decompose_d0d1
         rw [hsm] at hDepthR
         unfold Stack.Lower.StackMap.depth? at hDepthR
         rw [List.findIdx?_cons] at hDepthR
-        by_cases hc : (n0 == r) = true
+        by_cases hc : ((some n0 : Option String) == some r) = true
         · rw [if_pos hc] at hDepthR; exact absurd hDepthR (by decide)
         · simp only [hc, Bool.false_eq_true, if_false, Option.map_eq_some_iff] at hDepthR
           obtain ⟨w, hw, hEq⟩ := hDepthR
           have hw0 : w = 0 := by omega
           subst hw0
           rw [List.findIdx?_cons] at hw
-          by_cases hc1 : (n1 == r) = true
-          · exact (beq_iff_eq.mp hc1)
+          by_cases hc1 : ((some n1 : Option String) == some r) = true
+          · exact Option.some.inj (beq_iff_eq.mp hc1)
           · simp only [hc1, Bool.false_eq_true, if_false, Option.map_eq_some_iff] at hw
             obtain ⟨_w2, _, hEq2⟩ := hw
             omega
@@ -13744,14 +13791,14 @@ theorem tsm_decompose_d0
   | [], hUntag =>
       rw [← hUntag] at hDepth; simp [untagSm, Stack.Lower.StackMap.depth?] at hDepth
   | (n0, k0) :: tsm_rest, hUntag =>
-      have hsm : sm = n0 :: untagSm tsm_rest := by
+      have hsm : sm = some n0 :: untagSm tsm_rest := by
         rw [← hUntag]; simp only [untagSm]
       have hHead : n0 = operand := by
         rw [hsm] at hDepth
         unfold Stack.Lower.StackMap.depth? at hDepth
         rw [List.findIdx?_cons] at hDepth
-        by_cases hc : (n0 == operand) = true
-        · exact (beq_iff_eq.mp hc)
+        by_cases hc : ((some n0 : Option String) == some operand) = true
+        · exact Option.some.inj (beq_iff_eq.mp hc)
         · simp only [hc, Bool.false_eq_true, if_false, Option.map_eq_some_iff] at hDepth
           obtain ⟨_w, _, hEq⟩ := hDepth
           omega
@@ -13911,6 +13958,88 @@ def emittableArithChainReadyNoDblNeg
       freshIn name sm.tail ∧
       emittableArithChainReadyNoDblNeg lastUses rest (name :: sm.tail) (currentIndex + 1) true
   | _ :: _, _sm, _currentIndex, _prevWasNeg => False
+
+/-- NEW-004: the emittable arith chain admits only `+ - *` binOps and the
+unary `-`, none of which is a byte-array opcode, so nothing is marked raw. -/
+theorem collectRawSlots_nil_of_emittableArithChainReadyNoDblNeg
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat)
+      (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      Stack.Lower.collectRawSlots body = [] := by
+  have go : ∀ (body : List ANFBinding) (acc : List String) (sm : StackMap)
+      (currentIndex : Nat) (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      Stack.Lower.collectRawSlotsGo acc body = acc := by
+    intro body
+    induction body with
+    | nil => intro acc _ _ _ _; simp only [Stack.Lower.collectRawSlotsGo]
+    | cons hd rest ih =>
+        intro acc sm currentIndex prevWasNeg h
+        obtain ⟨name, v, src⟩ := hd
+        match v, h with
+        | .binOp op l r rt, ⟨hOp, _, _, hRest⟩ =>
+            have hNotBA : Stack.Lower.isByteArrayBinOp op = false := by
+              rcases hOp with rfl | rfl | rfl <;> rfl
+            simp only [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+              hNotBA, Bool.false_and, Bool.false_eq_true, if_false]
+            exact ih acc _ _ _ hRest
+        | .unaryOp op operand rt, ⟨hOp, _, _, _, hRest⟩ =>
+            subst hOp
+            simp only [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+              Bool.false_and, Bool.false_eq_true, if_false]
+            exact ih acc _ _ _ hRest
+  intro body sm currentIndex prevWasNeg h
+  unfold Stack.Lower.collectRawSlots
+  exact go body [] sm currentIndex prevWasNeg h
+
+/-- `arrayElems` peer: the emittable arith chain admits only `.binOp` and
+`.unaryOp` bindings, so it binds no `array_literal`. -/
+theorem arrayElemsOf_nil_of_emittableArithChainReadyNoDblNeg
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat)
+      (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      Stack.Lower.arrayElemsOf body = [] := by
+  intro body
+  induction body with
+  | nil => intro _ _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons hd rest ih =>
+      intro sm currentIndex prevWasNeg h
+      obtain ⟨name, v, src⟩ := hd
+      match v, h with
+      | .binOp op l r rt, ⟨_hOp, _, _, hRest⟩ =>
+          simpa [Stack.Lower.arrayElemsOf] using ih _ _ _ hRest
+      | .unaryOp op operand rt, ⟨hOp, _, _, _, hRest⟩ =>
+          subst hOp
+          simpa [Stack.Lower.arrayElemsOf] using ih _ _ _ hRest
+
+/-- Issue #150: the emittable arith chain admits only `.binOp` and
+`.unaryOp`, neither of which reads `lowerValueP`'s `insideBranch` flag, so
+an arith branch lowered under an `.ifVal` arm (`insideBranch = true`) lowers
+exactly as it does at the default. Lets every arith walk stated at the
+default apply unchanged inside a branch. -/
+theorem insideBranchFreeBodyB_of_emittableArithChainReadyNoDblNeg
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat)
+      (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      insideBranchFreeBodyB body = true := by
+  intro body
+  induction body with
+  | nil => intro _ _ _ _; rfl
+  | cons hd rest ih =>
+      intro sm currentIndex prevWasNeg h
+      obtain ⟨name, v, src⟩ := hd
+      match v, h with
+      | .binOp _ _ _ _, ⟨_, _, _, hRest⟩ =>
+          simp only [insideBranchFreeBodyB, insideBranchFreeValueB,
+            Bool.and_eq_true, true_and]
+          exact ih _ _ _ hRest
+      | .unaryOp _ _ _, ⟨_, _, _, _, hRest⟩ =>
+          simp only [insideBranchFreeBodyB, insideBranchFreeValueB,
+            Bool.and_eq_true, true_and]
+          exact ih _ _ _ hRest
 
 /-- **Wave 38 Step 1 — Bool mirror of `emittableArithChainReadyNoDblNeg`.** -/
 def emittableArithChainReadyNoDblNegBool
@@ -14119,7 +14248,9 @@ private theorem lowerValueP_binOp_d0d1_ops
   | cons _ tl =>
       cases tl with
       | nil => rw [hsm] at hDepthR; simp [Stack.Lower.StackMap.depth?] at hDepthR
-      | cons _ _ => rfl
+      | cons _ _ =>
+          simp only [Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self,
+            List.nil_append, List.append_assoc, List.singleton_append]
 
 /-- The `.1`-projection shape of an emittable unaryOp consume binding:
 `[.opcode (unaryOpcode op)]`. -/
@@ -14135,7 +14266,8 @@ private theorem lowerValueP_unaryOp_d0_ops
       = [StackOp.opcode (Stack.Lower.unaryOpcode op)] := by
   unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
   simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
-    hLastUse, hDepth, if_true, List.nil_append]
+    hLastUse, hDepth, if_true, List.nil_append,
+    Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self]
 
 /-- `AreRunarEmittable` distributes over append (add-only; Parse.lean
 defines only the `nil`/`cons` constructors). -/
@@ -14958,7 +15090,7 @@ theorem structuralArithConsumeBody_of_entry_agreesTagged
           have hSmOut :
               (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                   [] localBindings constInts sm name (.binOp op l r rt)).2.1
-                = name :: sm.tail.tail :=
+                = some name :: sm.tail.tail :=
             lowerValueP_binOp_d0d1_smOut progMethods props budget currentIndex lastUses
               localBindings constInts sm name op l r rt hDl hDr
               (by
@@ -14970,7 +15102,7 @@ theorem structuralArithConsumeBody_of_entry_agreesTagged
                 simp only [structuralArithConsumeValueBool, Bool.and_eq_true] at hShapeCopy2
                 exact hShapeCopy2.1.2)
           -- The coherence `untagSm ((name,.binding)::tsm_rest) = name :: sm.tail.tail`.
-          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = name :: sm.tail.tail := by
+          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = some name :: sm.tail.tail := by
             simp only [untagSm]; rw [hUntagRest]
           -- Apply the IH on `rest` at the advanced state.
           obtain ⟨sm', stkFinal, hTail⟩ :=
@@ -15041,10 +15173,10 @@ theorem structuralArithConsumeBody_of_entry_agreesTagged
           have hSmOut :
               (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                   [] localBindings constInts sm name (.unaryOp op operand rt)).2.1
-                = name :: sm.tail :=
+                = some name :: sm.tail :=
             lowerValueP_unaryOp_d0_smOut progMethods props budget currentIndex lastUses
               localBindings constInts sm name op operand rt hD hLu
-          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = name :: sm.tail := by
+          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = some name :: sm.tail := by
             simp only [untagSm]; rw [hUntagRest]
           obtain ⟨sm', stkFinal, hTail⟩ :=
             ih (name :: sm.tail) localBindings (currentIndex + 1)
@@ -15309,7 +15441,7 @@ per-binding intermediate is DERIVED. -/
 theorem wave28_general_lockstep_capstone_smoke
     (contractName : String) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap) (anfSt0 : State)
-    (hUntag : untagSm tsm = ["p0", "p1", "p2", "p3", "p4"])
+    (hUntag : untagSm tsm = (["p0", "p1", "p2", "p3", "p4"] : Stack.Lower.StackMap))
     (hAgrees0 : agreesTagged tsm anfSt0 initialStack)
     (hAllBigint : taggedAllBigint anfSt0 tsm) :
     (Stack.Eval.runMethod
@@ -15337,6 +15469,11 @@ theorem wave28_general_lockstep_capstone_smoke
     contractName ([] : List ANFProperty) [wave28SmokeMethod] wave28SmokeMethod initialStack
     sm' stkFinal List.mem_cons_self rfl hUniq hArith
     wave28_noPreimage wave28_noCode wave28_noTerminalAssert wave28_noDeserialize
+    -- NEW-004: this smoke body is `+`/`-` only, so it marks no raw slot.
+    (by
+      simp [wave28SmokeMethod, wave28SmokeBody, Stack.Lower.collectRawSlots,
+            Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue,
+            Stack.Lower.isByteArrayBinOp])
 
 /-! ### Wave 30 (option B) — the both-fail leg / failure lockstep
 
@@ -15877,7 +16014,7 @@ succeed; first non-bigint read ⇒ both fail. -/
 theorem wave30_bigint_both_succeed_branch
     (contractName : String) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap) (anfSt0 : State)
-    (hUntag : untagSm tsm = ["p0", "p1", "p2", "p3", "p4"])
+    (hUntag : untagSm tsm = (["p0", "p1", "p2", "p3", "p4"] : Stack.Lower.StackMap))
     (hAgrees0 : agreesTagged tsm anfSt0 initialStack)
     (hAllBigint : taggedAllBigint anfSt0 tsm) :
     (Stack.Eval.runMethod
@@ -16539,7 +16676,7 @@ theorem agreesTagged_arith_walk_iff
           have hSmOut :
               (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                   [] localBindings constInts sm name (.binOp op l r rt)).2.1
-                = name :: sm.tail.tail :=
+                = some name :: sm.tail.tail :=
             lowerValueP_binOp_d0d1_smOut progMethods props budget currentIndex lastUses
               localBindings constInts sm name op l r rt hDl hDr hLuL hLuR
           -- `localBindings` is unchanged across the binOp lowering.
@@ -16556,7 +16693,7 @@ theorem agreesTagged_arith_walk_iff
                 = (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                       [] localBindings constInts sm name (.binOp op l r rt)).1
                   ++ (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1)
-                        lastUses [] localBindings constInts (name :: sm.tail.tail) rest).1 := by
+                        lastUses [] localBindings constInts (some name :: sm.tail.tail) rest).1 := by
             rw [Stack.Lower.lowerBindingsP]
             simp only [hSmOut, hLb]
           rw [hLowerCons]
@@ -16577,7 +16714,7 @@ theorem agreesTagged_arith_walk_iff
           have hCoh1 :
               tsmCoherent (anfSt.addBinding name out) ((name, .binding) :: tsm_rest) :=
             tsmCoherent_consume_top_two anfSt l r k_l k_r tsm_rest name out hCoh hFreshRest
-          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = name :: sm.tail.tail := by
+          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = some name :: sm.tail.tail := by
             simp only [untagSm]; rw [hUntagRest]
           -- IH on `rest` at the post-state ⇒ the POST iff.
           have hPostIff := ih (name :: sm.tail.tail) localBindings (currentIndex + 1)
@@ -16607,7 +16744,7 @@ theorem agreesTagged_arith_walk_iff
           have hSmOut :
               (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                   [] localBindings constInts sm name (.unaryOp "-" operand rt)).2.1
-                = name :: sm.tail :=
+                = some name :: sm.tail :=
             lowerValueP_unaryOp_d0_smOut progMethods props budget currentIndex lastUses
               localBindings constInts sm name "-" operand rt hD hLu
           have hLb :
@@ -16622,7 +16759,7 @@ theorem agreesTagged_arith_walk_iff
                 = (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                       [] localBindings constInts sm name (.unaryOp "-" operand rt)).1
                   ++ (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1)
-                        lastUses [] localBindings constInts (name :: sm.tail) rest).1 := by
+                        lastUses [] localBindings constInts (some name :: sm.tail) rest).1 := by
             rw [Stack.Lower.lowerBindingsP]
             simp only [hSmOut, hLb]
           rw [hLowerCons]
@@ -16640,7 +16777,7 @@ theorem agreesTagged_arith_walk_iff
           have hCoh1 :
               tsmCoherent (anfSt.addBinding name out) ((name, .binding) :: tsm_rest) :=
             tsmCoherent_consume_top_one anfSt operand k_op tsm_rest name out hCoh hFreshRest
-          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = name :: sm.tail := by
+          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = some name :: sm.tail := by
             simp only [untagSm]; rw [hUntagRest]
           have hPostIff := ih (name :: sm.tail) localBindings (currentIndex + 1)
             ((name, .binding) :: tsm_rest) (anfSt.addBinding name out)
@@ -16782,7 +16919,7 @@ private def wave35SmokeTsm : TaggedStackMap :=
   [("p0", .param), ("p1", .param), ("p2", .param), ("p3", .param), ("p4", .param)]
 
 private theorem wave35_untag :
-    untagSm wave35SmokeTsm = ["p0", "p1", "p2", "p3", "p4"] := by
+    untagSm wave35SmokeTsm = (["p0", "p1", "p2", "p3", "p4"] : Stack.Lower.StackMap) := by
   unfold wave35SmokeTsm untagSm; rfl
 
 private theorem wave35_agreesTagged :
@@ -16948,11 +17085,11 @@ theorem build_consume_binOp_witness_d1d0
       = .ok ({stkSt with stack := stkSt.stack.tail.tail}.push out) := by
   -- `findIdx?` facts: `l` is at depth 1 in `r :: l :: smRest`, and `r` is at
   -- depth 1 in the post-first-swap map `l :: r :: smRest`.
-  have hFindL : (r :: l :: smRest).findIdx? (· == l) = some 1 := by
+  have hFindL : (some r :: some l :: smRest).findIdx? (· == some l) = some 1 := by
     unfold List.findIdx?; simp [List.findIdx?.go, hNeq]
   have hLrNeq : (l == r) = false := by
     rw [beq_eq_false_iff_ne]; rw [beq_eq_false_iff_ne] at hNeq; exact fun h => hNeq h.symm
-  have hFindR : (l :: r :: smRest).findIdx? (· == r) = some 1 := by
+  have hFindR : (some l :: some r :: smRest).findIdx? (· == some r) = some 1 := by
     unfold List.findIdx?; simp [List.findIdx?.go, hLrNeq]
   -- Derive the lowered-ops shape `[.swap, .swap, .opcode (binopOpcode op rt)]`.
   have hOps :
@@ -16975,7 +17112,8 @@ theorem build_consume_binOp_witness_d1d0
       Stack.Lower.StackMap.depth?
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLastUseL, hLastUseR, hFindL, hFindR, if_true, hNotBytes, Bool.false_eq_true, if_false,
-      List.append_assoc, List.cons_append, List.nil_append]
+      List.append_assoc, List.cons_append, List.nil_append,
+      Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil, ite_self]
   rw [hOps]
   exact stageC_simpleStep_binOp_d1d0_consume_core
     r l k_r k_l tsm_rest anfSt stkSt a b

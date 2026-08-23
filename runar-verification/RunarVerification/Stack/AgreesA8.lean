@@ -320,6 +320,72 @@ theorem lowerBindingsP_singleton_leafEmpty_methodCall_ops
 `methodLeafEmptyMethodCallBody` yields the empty op list. The budget
 is `defaultInlineBudget = 8 = 7 + 1`, so the value-level reduction
 fires. -/
+
+/-- NEW-004: a singleton `.methodCall` body marks no raw slot. Stated on
+the concrete shape the singleton wrappers below carry. -/
+theorem collectRawSlots_singleton_methodCall
+    (bn obj method : String) (args : List String) (src : Option SourceLoc) :
+    Stack.Lower.collectRawSlots
+      [ANFBinding.mk bn (.methodCall obj method args) src] = [] := by
+  simp [Stack.Lower.collectRawSlots, Stack.Lower.collectRawSlotsGo,
+        Stack.Lower.rawResultValue]
+
+/-- `arrayElems` peer: a singleton `.methodCall` body binds no
+`array_literal` (`arrayElemsOf` does not descend through `methodCall` —
+the callee's own entries are merged at the inline site instead). -/
+theorem arrayElemsOf_singleton_methodCall
+    (bn obj method : String) (args : List String) (src : Option SourceLoc) :
+    Stack.Lower.arrayElemsOf
+      [ANFBinding.mk bn (.methodCall obj method args) src] = [] := by
+  simp [Stack.Lower.arrayElemsOf]
+
+/-- NEW-004: `.methodCall` is not a byte-array producer, so a body whose
+single binding is one marks nothing raw. -/
+theorem collectRawSlots_nil_of_leafEmptyMethodCallValue
+    (progMethods : List ANFMethod) (sm : StackMap) (b : ANFBinding)
+    (h : leafEmptyMethodCallValue progMethods sm b.value) :
+    Stack.Lower.collectRawSlotsGo [] [b] = [] := by
+  obtain ⟨name, v, src⟩ := b
+  unfold leafEmptyMethodCallValue leafEmptyMethodCallValueB at h
+  simp only [ANFBinding.value] at h
+  cases v <;>
+    simp_all [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue]
+
+/-- Tier 1' body-level: the leaf-empty methodCall fragment has an empty
+raw-slot set, so the method-level wrappers below need no extra
+hypothesis. -/
+theorem collectRawSlots_nil_of_methodLeafEmptyMethodCallBody
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodLeafEmptyMethodCallBody progMethods m) :
+    Stack.Lower.collectRawSlots m.body = [] := by
+  unfold methodLeafEmptyMethodCallBody singletonLeafEmptyMethodCallBody
+    singletonLeafEmptyMethodCallBodyB at h
+  match hb : m.body, h with
+  | [b], hbv =>
+      unfold Stack.Lower.collectRawSlots
+      exact collectRawSlots_nil_of_leafEmptyMethodCallValue progMethods _ b hbv
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_leafEmptyMethodCallValue`. -/
+theorem arrayElemsOf_nil_of_leafEmptyMethodCallValue
+    (progMethods : List ANFMethod) (sm : StackMap) (b : ANFBinding)
+    (h : leafEmptyMethodCallValue progMethods sm b.value) :
+    Stack.Lower.arrayElemsOf [b] = [] := by
+  obtain ⟨name, v, src⟩ := b
+  unfold leafEmptyMethodCallValue leafEmptyMethodCallValueB at h
+  simp only [ANFBinding.value] at h
+  cases v <;> simp_all [Stack.Lower.arrayElemsOf]
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_methodLeafEmptyMethodCallBody`. -/
+theorem arrayElemsOf_nil_of_methodLeafEmptyMethodCallBody
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodLeafEmptyMethodCallBody progMethods m) :
+    Stack.Lower.arrayElemsOf m.body = [] := by
+  unfold methodLeafEmptyMethodCallBody singletonLeafEmptyMethodCallBody
+    singletonLeafEmptyMethodCallBodyB at h
+  match hb : m.body, h with
+  | [b], hbv =>
+      exact arrayElemsOf_nil_of_leafEmptyMethodCallValue progMethods _ b hbv
+
 theorem lowerMethodUserRawOps_methodCall_leafEmpty
     (progMethods : List ANFMethod) (props : List ANFProperty) (m : ANFMethod)
     (h : methodLeafEmptyMethodCallBody progMethods m) :
@@ -328,7 +394,8 @@ theorem lowerMethodUserRawOps_methodCall_leafEmpty
   unfold methodLeafEmptyMethodCallBody at h
   -- `defaultInlineBudget = 8 = 7 + 1` definitionally.
   have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
-  rw [hBudget]
+  rw [hBudget, collectRawSlots_nil_of_methodLeafEmptyMethodCallBody progMethods m h,
+      arrayElemsOf_nil_of_methodLeafEmptyMethodCallBody progMethods m h]
   exact lowerBindingsP_singleton_leafEmpty_methodCall_ops
     progMethods props 7 0 (Stack.Lower.computeLastUses m.body) []
     (m.body.map (fun b => b.name)) (Stack.Lower.collectConstInts m.body)
@@ -471,11 +538,13 @@ theorem lowerValueP_methodCall_singletonLeaf_ops
       outerProtected (m.body.map (fun b => b.name))
       (constInts ++ Stack.Lower.collectConstInts m.body)
       m.body sm 0 hConst
+  have hRaw := Agrees.collectRawSlots_nil_of_structuralConstBody m.body hConst
+  have hArrElems := Agrees.arrayElemsOf_nil_of_structuralConstBody m.body hConst
   unfold Stack.Lower.lowerValueP
   simp only [hLookup, hObj,
              Stack.Lower.loadAndBindArgsLive,
              List.append_nil, List.nil_append,
-             hBindings]
+             hRaw, hArrElems, hBindings]
 
 /-- Success of `runOps` on the Tier 1 widening's singleton methodCall
 body, from ANY initial stack. The proof composes:
@@ -581,6 +650,36 @@ theorem runOps_lowerBindingsP_singleton_methodCallLeaf_isSome
           | .arrayLiteral _     => simp [singletonMethodCallLeafValue] at hVal
           | .rawScript _ _ _    => simp [singletonMethodCallLeafValue] at hVal
 
+
+/-- NEW-004 peer for the Tier 1 `singletonMethodCallLeafValue` shape. -/
+theorem collectRawSlots_nil_of_methodSingletonMethodCallLeafBody
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodSingletonMethodCallLeafBody progMethods m) :
+    Stack.Lower.collectRawSlots m.body = [] := by
+  unfold methodSingletonMethodCallLeafBody singletonMethodCallLeafBody at h
+  match hb : m.body, h with
+  | [b], hbv =>
+      obtain ⟨name, v, src⟩ := b
+      unfold singletonMethodCallLeafValue at hbv
+      simp only [ANFBinding.value] at hbv
+      unfold Stack.Lower.collectRawSlots
+      cases v <;>
+        simp_all [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue]
+
+/-- `arrayElems` peer of
+`collectRawSlots_nil_of_methodSingletonMethodCallLeafBody`. -/
+theorem arrayElemsOf_nil_of_methodSingletonMethodCallLeafBody
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodSingletonMethodCallLeafBody progMethods m) :
+    Stack.Lower.arrayElemsOf m.body = [] := by
+  unfold methodSingletonMethodCallLeafBody singletonMethodCallLeafBody at h
+  match hb : m.body, h with
+  | [b], hbv =>
+      obtain ⟨name, v, src⟩ := b
+      unfold singletonMethodCallLeafValue at hbv
+      simp only [ANFBinding.value] at hbv
+      cases v <;> simp_all [Stack.Lower.arrayElemsOf]
+
 /-- Method-shaped raw-body success for the Tier 1 widening. Composes
 the per-binding success lemma with the `lowerMethodUserRawOps`
 unfolding. -/
@@ -593,7 +692,8 @@ theorem runOps_lowerMethodUserRawOps_singletonMethodCallLeaf_isSome
   unfold methodSingletonMethodCallLeafBody at h
   -- `defaultInlineBudget = 8 = 7 + 1`.
   have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
-  rw [hBudget]
+  rw [hBudget, collectRawSlots_nil_of_methodSingletonMethodCallLeafBody progMethods m h,
+      arrayElemsOf_nil_of_methodSingletonMethodCallLeafBody progMethods m h]
   exact runOps_lowerBindingsP_singleton_methodCallLeaf_isSome
     progMethods props 7 0 (Stack.Lower.computeLastUses m.body) []
     (m.body.map (fun b => b.name)) (Stack.Lower.collectConstInts m.body)
@@ -893,6 +993,42 @@ theorem runOps_lowerBindingsP_leafEmptyMethodCall_then_const_isSome
           | .rawScript _ _ _    => simp [leafEmptyMethodCallValueB,
               leafEmptyMethodCallValue] at hVal
 
+
+/-- NEW-004 peer for the Tier 4a shape: a methodCall head plus a
+structurally-constant tail marks nothing raw either. -/
+theorem collectRawSlots_nil_of_methodLeafEmptyMethodCallThenConstBody
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodLeafEmptyMethodCallThenConstBody progMethods m) :
+    Stack.Lower.collectRawSlots m.body = [] := by
+  unfold methodLeafEmptyMethodCallThenConstBody leafEmptyMethodCallThenConstBody at h
+  match hb : m.body, h with
+  | b :: rest, ⟨hHead, hTail⟩ =>
+      have hRest : Stack.Lower.collectRawSlotsGo [] rest = [] := by
+        have := Agrees.collectRawSlots_nil_of_structuralConstBody rest hTail
+        simpa [Stack.Lower.collectRawSlots] using this
+      obtain ⟨name, v, src⟩ := b
+      unfold leafEmptyMethodCallValue leafEmptyMethodCallValueB at hHead
+      simp only [ANFBinding.value] at hHead
+      unfold Stack.Lower.collectRawSlots
+      cases v <;>
+        simp_all [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue]
+
+/-- `arrayElems` peer of
+`collectRawSlots_nil_of_methodLeafEmptyMethodCallThenConstBody`. -/
+theorem arrayElemsOf_nil_of_methodLeafEmptyMethodCallThenConstBody
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodLeafEmptyMethodCallThenConstBody progMethods m) :
+    Stack.Lower.arrayElemsOf m.body = [] := by
+  unfold methodLeafEmptyMethodCallThenConstBody leafEmptyMethodCallThenConstBody at h
+  match hb : m.body, h with
+  | b :: rest, ⟨hHead, hTail⟩ =>
+      have hRest : Stack.Lower.arrayElemsOf rest = [] :=
+        Agrees.arrayElemsOf_nil_of_structuralConstBody rest hTail
+      obtain ⟨name, v, src⟩ := b
+      unfold leafEmptyMethodCallValue leafEmptyMethodCallValueB at hHead
+      simp only [ANFBinding.value] at hHead
+      cases v <;> simp_all [Stack.Lower.arrayElemsOf]
+
 /-- Method-shaped raw-body success for the Tier 4a widening. -/
 theorem runOps_lowerMethodUserRawOps_leafEmptyMethodCall_then_const_isSome
     (progMethods : List ANFMethod) (props : List ANFProperty) (m : ANFMethod)
@@ -902,7 +1038,9 @@ theorem runOps_lowerMethodUserRawOps_leafEmptyMethodCall_then_const_isSome
   unfold lowerMethodUserRawOps
   unfold methodLeafEmptyMethodCallThenConstBody at h
   have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
-  rw [hBudget]
+  rw [hBudget,
+      collectRawSlots_nil_of_methodLeafEmptyMethodCallThenConstBody progMethods m h,
+      arrayElemsOf_nil_of_methodLeafEmptyMethodCallThenConstBody progMethods m h]
   exact runOps_lowerBindingsP_leafEmptyMethodCall_then_const_isSome
     progMethods props 7 0 (Stack.Lower.computeLastUses m.body) []
     (m.body.map (fun b => b.name)) (Stack.Lower.collectConstInts m.body)
@@ -984,7 +1122,14 @@ theorem lowerValueP_methodCall_singleton_calleeBodyP_ops
             (Stack.Lower.computeLastUses m.body)
             outerProtected (m.body.map (fun b => b.name))
             (constInts ++ Stack.Lower.collectConstInts m.body)
-            sm m.body).1 := by
+            sm m.body
+            -- NEW-004: the inlined callee body is lowered against the
+            -- caller's raw-slot set merged with its own. The caller's is
+            -- the `[]` default here, so what remains is the callee's.
+            (Stack.Lower.collectRawSlots m.body)
+            false
+            -- Same merge shape for the `array_literal` element table.
+            (Stack.Lower.arrayElemsOf m.body)).1 := by
   subst hArgs
   -- Dispatch through methodCall arm:
   --   budget = budget' + 1 avoids the budget-exhausted fallback.
@@ -1039,7 +1184,7 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_refCallee_isSo
       m.body = [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
     (hLookup : Stack.Lower.lookupMethod methods method = some callee)
     (hObj :
-      StackMap.depth? (List.reverse (m.params.map (fun p => p.name))) obj
+      StackMap.depth? (List.reverse (m.params.map (fun p => some p.name))) obj
         = none)
     (hArgs : args = [])
     (hCalleeParams : callee.params = [])
@@ -1048,12 +1193,12 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_refCallee_isSo
         (Stack.Lower.computeLastUses callee.body) []
         (callee.body.map (fun b => b.name))
         (Stack.Lower.collectConstInts callee.body)
-        callee.body (List.reverse (m.params.map (fun p => p.name))) 0)
-    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => p.name)))
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0)
+    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => some p.name)))
     (hAgrees : agreesTagged tsm anfSt initialStack)
     (hCalleeBodyFresh :
       ∀ b ∈ callee.body,
-        b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+        some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hCalleeBodyNodup : (callee.body.map (fun b => b.name)).Nodup) :
     (Stack.Eval.runMethod
         (Stack.Lower.lower
@@ -1079,7 +1224,7 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_refCallee_isSo
             (fun b => b.name))
           (Stack.Lower.collectConstInts
             [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-          (List.reverse (m.params.map (fun p => p.name)))
+          (List.reverse (m.params.map (fun p => some p.name)))
           [ANFBinding.mk bn (ANFValue.methodCall obj method args) src]).1
         = (Stack.Lower.lowerValueP methods props (7 + 1) 0
               (Stack.Lower.computeLastUses
@@ -1089,10 +1234,14 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_refCallee_isSo
                 (fun b => b.name))
               (Stack.Lower.collectConstInts
                 [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-              (List.reverse (m.params.map (fun p => p.name))) bn
+              (List.reverse (m.params.map (fun p => some p.name))) bn
               (ANFValue.methodCall obj method args)).1 := by
     with_unfolding_all
       simp [Stack.Lower.lowerBindingsP]
+  -- NEW-004: the OUTER body is a singleton methodCall, which marks nothing
+  -- raw, so the method-wide set it is lowered against is empty.
+  rw [collectRawSlots_singleton_methodCall bn obj method args src]
+  rw [arrayElemsOf_singleton_methodCall bn obj method args src]
   rw [hUnfold]
   -- Rewrite the methodCall's op list to the callee body's `lowerBindingsP.1`.
   rw [lowerValueP_methodCall_singleton_calleeBodyP_ops
@@ -1104,20 +1253,32 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_refCallee_isSo
           (fun b => b.name))
         (Stack.Lower.collectConstInts
           [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-        (List.reverse (m.params.map (fun p => p.name))) bn obj method args
+        (List.reverse (m.params.map (fun p => some p.name))) bn obj method args
         callee hLookup hObj hArgs hCalleeParams]
   -- The outer body's `collectConstInts` is `[]` (singleton methodCall has
   -- no `loadConst (.int _)`). Rewrite `[] ++ collectConstInts callee.body`
   -- to `collectConstInts callee.body` to match the substrate's `constInts`.
   simp only [Stack.Lower.collectConstInts, List.nil_append]
   -- Apply the wave-9-exposed structuralRefBody substrate.
+  -- NEW-004: the ref fragment marks nothing raw, so the callee body is
+  -- lowered against the empty set.
+  rw [Agrees.collectRawSlots_nil_of_structuralRefBody
+        methods props 7 (Stack.Lower.computeLastUses callee.body) []
+        (callee.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts callee.body)
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0 hCalleeBody]
+  rw [Agrees.arrayElemsOf_nil_of_structuralRefBody
+        methods props 7 (Stack.Lower.computeLastUses callee.body) []
+        (callee.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts callee.body)
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0 hCalleeBody]
   exact runOps_lowerBindingsP_structuralRefBody_isSome
     methods props 7
     (Stack.Lower.computeLastUses callee.body) []
     (callee.body.map (fun b => b.name))
     (Stack.Lower.collectConstInts callee.body)
     callee.body
-    (List.reverse (m.params.map (fun p => p.name))) 0
+    (List.reverse (m.params.map (fun p => some p.name))) 0
     tsm anfSt initialStack hUntagSm hAgrees hCalleeBody
     hCalleeBodyFresh hCalleeBodyNodup
 
@@ -1152,7 +1313,7 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_arithCallee_is
       m.body = [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
     (hLookup : Stack.Lower.lookupMethod methods method = some callee)
     (hObj :
-      StackMap.depth? (List.reverse (m.params.map (fun p => p.name))) obj
+      StackMap.depth? (List.reverse (m.params.map (fun p => some p.name))) obj
         = none)
     (hArgs : args = [])
     (hCalleeParams : callee.params = [])
@@ -1161,10 +1322,18 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_arithCallee_is
         (Stack.Lower.computeLastUses callee.body) []
         (callee.body.map (fun b => b.name))
         (Stack.Lower.collectConstInts callee.body)
-        callee.body (List.reverse (m.params.map (fun p => p.name))) 0)
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0)
+    -- NEW-004: unlike the ref fragment, the arith / builtin-call fragments
+    -- ADMIT the byte-array producers (`<< >> & | ^ ~`), so an empty
+    -- raw-slot set does not follow from the fragment and is assumed. It is
+    -- decidable, so a concrete callee discharges it by `decide`. What it
+    -- excludes is exactly a callee whose byte-array result is read in
+    -- numeric context — there the inlined body carries `OP_BIN2NUM`s the
+    -- substrate lemma (stated at the default) does not describe.
+    (hCalleeRaw : Stack.Lower.collectRawSlots callee.body = [])
     (hCalleeBodyFresh :
       ∀ b ∈ callee.body,
-        b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+        some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hCalleeBodyNodup : (callee.body.map (fun b => b.name)).Nodup)
     (hCalleeBodyRunOk :
       ∀ b ∈ callee.body, ∀ idx : Nat, ∀ sm_acc : StackMap,
@@ -1195,7 +1364,7 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_arithCallee_is
             (fun b => b.name))
           (Stack.Lower.collectConstInts
             [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-          (List.reverse (m.params.map (fun p => p.name)))
+          (List.reverse (m.params.map (fun p => some p.name)))
           [ANFBinding.mk bn (ANFValue.methodCall obj method args) src]).1
         = (Stack.Lower.lowerValueP methods props (7 + 1) 0
               (Stack.Lower.computeLastUses
@@ -1205,10 +1374,14 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_arithCallee_is
                 (fun b => b.name))
               (Stack.Lower.collectConstInts
                 [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-              (List.reverse (m.params.map (fun p => p.name))) bn
+              (List.reverse (m.params.map (fun p => some p.name))) bn
               (ANFValue.methodCall obj method args)).1 := by
     with_unfolding_all
       simp [Stack.Lower.lowerBindingsP]
+  -- NEW-004: the OUTER body is a singleton methodCall, which marks nothing
+  -- raw, so the method-wide set it is lowered against is empty.
+  rw [collectRawSlots_singleton_methodCall bn obj method args src]
+  rw [arrayElemsOf_singleton_methodCall bn obj method args src]
   rw [hUnfold]
   rw [lowerValueP_methodCall_singleton_calleeBodyP_ops
         methods props 7 0
@@ -1219,17 +1392,23 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_arithCallee_is
           (fun b => b.name))
         (Stack.Lower.collectConstInts
           [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-        (List.reverse (m.params.map (fun p => p.name))) bn obj method args
+        (List.reverse (m.params.map (fun p => some p.name))) bn obj method args
         callee hLookup hObj hArgs hCalleeParams]
   simp only [Stack.Lower.collectConstInts, List.nil_append]
   -- Apply the wave-9-exposed structuralArithBody substrate.
+  rw [hCalleeRaw]
+  rw [Agrees.arrayElemsOf_nil_of_structuralArithBody
+        methods props 7 (Stack.Lower.computeLastUses callee.body) []
+        (callee.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts callee.body)
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0 hCalleeBody]
   exact runOps_lowerBindingsP_structuralArithBody_isSome
     methods props 7
     (Stack.Lower.computeLastUses callee.body) []
     (callee.body.map (fun b => b.name))
     (Stack.Lower.collectConstInts callee.body)
     callee.body
-    (List.reverse (m.params.map (fun p => p.name))) 0 initialStack
+    (List.reverse (m.params.map (fun p => some p.name))) 0 initialStack
     hCalleeBody hCalleeBodyFresh hCalleeBodyNodup hCalleeBodyRunOk
 
 /-! ### Tier 3c — singleton methodCall with `structuralCallBody` callee
@@ -1259,7 +1438,7 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_callCallee_isS
       m.body = [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
     (hLookup : Stack.Lower.lookupMethod methods method = some callee)
     (hObj :
-      StackMap.depth? (List.reverse (m.params.map (fun p => p.name))) obj
+      StackMap.depth? (List.reverse (m.params.map (fun p => some p.name))) obj
         = none)
     (hArgs : args = [])
     (hCalleeParams : callee.params = [])
@@ -1268,10 +1447,18 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_callCallee_isS
         (Stack.Lower.computeLastUses callee.body) []
         (callee.body.map (fun b => b.name))
         (Stack.Lower.collectConstInts callee.body)
-        callee.body (List.reverse (m.params.map (fun p => p.name))) 0)
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0)
+    -- NEW-004: unlike the ref fragment, the arith / builtin-call fragments
+    -- ADMIT the byte-array producers (`<< >> & | ^ ~`), so an empty
+    -- raw-slot set does not follow from the fragment and is assumed. It is
+    -- decidable, so a concrete callee discharges it by `decide`. What it
+    -- excludes is exactly a callee whose byte-array result is read in
+    -- numeric context — there the inlined body carries `OP_BIN2NUM`s the
+    -- substrate lemma (stated at the default) does not describe.
+    (hCalleeRaw : Stack.Lower.collectRawSlots callee.body = [])
     (hCalleeBodyFresh :
       ∀ b ∈ callee.body,
-        b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+        some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hCalleeBodyNodup : (callee.body.map (fun b => b.name)).Nodup)
     (hCalleeBodyRunOk :
       ∀ b ∈ callee.body, ∀ idx : Nat, ∀ sm_acc : StackMap,
@@ -1301,7 +1488,7 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_callCallee_isS
             (fun b => b.name))
           (Stack.Lower.collectConstInts
             [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-          (List.reverse (m.params.map (fun p => p.name)))
+          (List.reverse (m.params.map (fun p => some p.name)))
           [ANFBinding.mk bn (ANFValue.methodCall obj method args) src]).1
         = (Stack.Lower.lowerValueP methods props (7 + 1) 0
               (Stack.Lower.computeLastUses
@@ -1311,10 +1498,14 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_callCallee_isS
                 (fun b => b.name))
               (Stack.Lower.collectConstInts
                 [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-              (List.reverse (m.params.map (fun p => p.name))) bn
+              (List.reverse (m.params.map (fun p => some p.name))) bn
               (ANFValue.methodCall obj method args)).1 := by
     with_unfolding_all
       simp [Stack.Lower.lowerBindingsP]
+  -- NEW-004: the OUTER body is a singleton methodCall, which marks nothing
+  -- raw, so the method-wide set it is lowered against is empty.
+  rw [collectRawSlots_singleton_methodCall bn obj method args src]
+  rw [arrayElemsOf_singleton_methodCall bn obj method args src]
   rw [hUnfold]
   rw [lowerValueP_methodCall_singleton_calleeBodyP_ops
         methods props 7 0
@@ -1325,17 +1516,23 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_callCallee_isS
           (fun b => b.name))
         (Stack.Lower.collectConstInts
           [ANFBinding.mk bn (ANFValue.methodCall obj method args) src])
-        (List.reverse (m.params.map (fun p => p.name))) bn obj method args
+        (List.reverse (m.params.map (fun p => some p.name))) bn obj method args
         callee hLookup hObj hArgs hCalleeParams]
   simp only [Stack.Lower.collectConstInts, List.nil_append]
   -- Apply the wave-9-exposed structuralCallBody substrate.
+  rw [hCalleeRaw]
+  rw [Agrees.arrayElemsOf_nil_of_structuralCallBody
+        methods props 7 (Stack.Lower.computeLastUses callee.body) []
+        (callee.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts callee.body)
+        callee.body (List.reverse (m.params.map (fun p => some p.name))) 0 hCalleeBody]
   exact runOps_lowerBindingsP_structuralCallBody_isSome
     methods props 7
     (Stack.Lower.computeLastUses callee.body) []
     (callee.body.map (fun b => b.name))
     (Stack.Lower.collectConstInts callee.body)
     callee.body
-    (List.reverse (m.params.map (fun p => p.name))) 0 initialStack
+    (List.reverse (m.params.map (fun p => some p.name))) 0 initialStack
     hCalleeBody hCalleeBodyFresh hCalleeBodyNodup hCalleeBodyRunOk
 
 /-! ## ANF-side `method_call` success — the missing half of A8
@@ -1781,7 +1978,7 @@ theorem lowerValueP_methodCall_passthrough_ops
   have hArgLoad :
       Stack.Lower.loadAndBindArgsLive currentIndex lastUses outerProtected [a]
           (a :: rest) [a] [p]
-        = ([], p :: rest) := by
+        = ([], some p :: rest) := by
     unfold Stack.Lower.loadAndBindArgsLive
     simp only [Stack.Lower.loadRefOperand_singleton]
     unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
@@ -1792,8 +1989,15 @@ theorem lowerValueP_methodCall_passthrough_ops
   rw [hLookup]
   -- objDropOps: obj absent ⇒ ([], a :: rest). args = [a], params = [p].
   simp only [hObj, hParams, List.map_cons, List.map_nil, hArgLoad]
-  rw [hBodyOps]
-  simp only [List.append_nil]
+  -- NEW-004: the callee body is a single `loadParam`, which marks nothing
+  -- raw, so the merged set the inlined body sees is empty.
+  have hRaw : Stack.Lower.collectRawSlots m.body = [] := by
+    rw [hBody]
+    simp [Stack.Lower.collectRawSlots, Stack.Lower.collectRawSlotsGo,
+          Stack.Lower.rawResultValue]
+  have hArrElems : Stack.Lower.arrayElemsOf m.body = [] := by
+    rw [hBody]; simp [Stack.Lower.arrayElemsOf]
+  simp only [hRaw, hArrElems, List.nil_append, List.append_nil, hBodyOps]
 
 /-- Stack-side success of the Tier-2 passthrough fragment, from ANY
 initial stack: the singleton body `[bn := methodCall obj method [a]]`
@@ -2072,6 +2276,27 @@ def methodCallConsumeShapeBool
             | some m' => methodCallConsumeCalleeBool m')
   | _, _ => false
 
+/-- NEW-004: the methodCall-consume shape is a singleton `.methodCall`
+body, which marks no raw slot. -/
+theorem collectRawSlots_nil_of_methodCallConsumeShapeBool
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodCallConsumeShapeBool progMethods m = true) :
+    Stack.Lower.collectRawSlots m.body = [] := by
+  unfold methodCallConsumeShapeBool at h
+  match hp : m.params, hb : m.body, h with
+  | [pa], [ANFBinding.mk bn (.methodCall obj method [arg]) src], _ =>
+      exact collectRawSlots_singleton_methodCall bn obj method [arg] src
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_methodCallConsumeShapeBool`. -/
+theorem arrayElemsOf_nil_of_methodCallConsumeShapeBool
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodCallConsumeShapeBool progMethods m = true) :
+    Stack.Lower.arrayElemsOf m.body = [] := by
+  unfold methodCallConsumeShapeBool at h
+  match hp : m.params, hb : m.body, h with
+  | [pa], [ANFBinding.mk bn (.methodCall obj method [arg]) src], _ =>
+      exact arrayElemsOf_singleton_methodCall bn obj method [arg] src
+
 /-- Callee extraction: a `methodCallConsumeCalleeBool`-true callee is
 EXACTLY a one-param identity helper. -/
 theorem methodCallConsumeCalleeBool_extract (m' : ANFMethod)
@@ -2245,13 +2470,15 @@ theorem lowerMethodUserRawOps_methodCall_passthrough
   have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
   rw [hBudget]
   -- The method's reversed param-name stack map is `[a]`.
-  have hSm : (m.params.map (fun pp => pp.name) |>.reverse) = [a] := by
+  have hSm : (m.params.map (fun pp => some pp.name) |>.reverse)
+      = ([a] : Stack.Lower.StackMap) := by
     rw [hPa]; rfl
   rw [hSm, hBd]
   -- `obj` is absent from `[a]` (since `obj ≠ a`).
-  have hObj : Stack.Lower.StackMap.depth? (a :: []) obj = none := by
+  have hObj : Stack.Lower.StackMap.depth? (some a :: []) obj = none := by
     unfold Stack.Lower.StackMap.depth? List.findIdx?
-    have hne : (a == obj) = false := beq_eq_false_iff_ne.mpr (fun hh => hObjNe hh.symm)
+    have hne : ((some a : Option String) == some obj) = false :=
+      beq_eq_false_iff_ne.mpr (fun hh => hObjNe (Option.some.inj hh).symm)
     simp [List.findIdx?.go, hne]
   -- The arg last-use, retargeted onto the body shape pinned by `hBd`.
   have hArgLast :
@@ -2259,6 +2486,8 @@ theorem lowerMethodUserRawOps_methodCall_passthrough
         (Stack.Lower.computeLastUses
           [ANFBinding.mk bn (.methodCall obj method [a]) src]) a 0 = true := by
     rw [← hBd]; exact hLast
+  rw [collectRawSlots_singleton_methodCall bn obj method [a] src,
+      arrayElemsOf_singleton_methodCall bn obj method [a] src]
   exact lowerBindingsP_singleton_passthrough_methodCall_ops
     progMethods props 7 0
     (Stack.Lower.computeLastUses [ANFBinding.mk bn (.methodCall obj method [a]) src])

@@ -315,17 +315,14 @@ fn const_to_anf_value(cv: &ConstValue) -> ANFValue {
     }
 }
 
-/// Serialise a `BigInt` to `serde_json::Value` for IR-JSON. Mirrors
-/// `anf_lower::bigint_to_json` — small values become JSON numbers,
-/// oversize values become quoted decimal strings with a trailing `n`
-/// suffix so the IR loader can discriminate them from hex-encoded
-/// `ByteString` literals.
+/// Serialise a `BigInt` to `serde_json::Value` for IR-JSON. Delegates to
+/// `anf_lower::bigint_to_json` so the JS-safe-integer boundary is defined
+/// exactly once: values a bare JSON number carries losslessly become JSON
+/// numbers, everything else becomes a quoted decimal string with a
+/// trailing `n` suffix so the IR loader can discriminate them from
+/// hex-encoded `ByteString` literals.
 fn bigint_to_json(v: &BigInt) -> serde_json::Value {
-    if let Some(i) = v.to_i64() {
-        serde_json::Value::Number(serde_json::Number::from(i))
-    } else {
-        serde_json::Value::String(format!("{}n", v))
-    }
+    crate::frontend::anf_lower::bigint_to_json(v)
 }
 
 // ---------------------------------------------------------------------------

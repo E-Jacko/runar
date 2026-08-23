@@ -55,25 +55,36 @@ class TestBigIntLiteralWidening < Minitest::Test
     assert_equal EC_N, v.const_big_int
   end
 
-  def test_make_load_const_int_keeps_int64_as_json_number
+  def test_make_load_const_int_keeps_small_value_as_json_number
     v = RunarCompiler::Frontend._make_load_const_int(42)
     parsed = JSON.parse(v.raw_value)
     assert_equal 42, parsed
     assert_equal 42, v.const_big_int
   end
 
-  def test_make_load_const_int_int64_boundary_stays_numeric
-    boundary = RunarCompiler::Frontend::INT64_MAX_LOAD_CONST
+  def test_make_load_const_int_safe_integer_boundary_stays_numeric
+    boundary = RunarCompiler::Frontend::JS_MAX_SAFE_INTEGER_LOAD_CONST
     v = RunarCompiler::Frontend._make_load_const_int(boundary)
     parsed = JSON.parse(v.raw_value)
     assert_equal boundary, parsed
   end
 
-  def test_make_load_const_int_just_above_int64_uses_n_suffix
-    over = RunarCompiler::Frontend::INT64_MAX_LOAD_CONST + 1
+  # NEW-009: the boundary is Number.MAX_SAFE_INTEGER, not int64. A bare JSON
+  # number is read as an IEEE-754 double by every JS consumer (and by Go's
+  # encoding/json into interface{}), so 2**53 + 1 must already carry the
+  # `n` suffix even though it fits int64 with room to spare.
+  def test_make_load_const_int_just_above_safe_integer_uses_n_suffix
+    over = RunarCompiler::Frontend::JS_MAX_SAFE_INTEGER_LOAD_CONST + 1
     v = RunarCompiler::Frontend._make_load_const_int(over)
     parsed = JSON.parse(v.raw_value)
     assert_equal "#{over}n", parsed
+  end
+
+  def test_make_load_const_int_negative_below_safe_integer_uses_n_suffix
+    under = -(RunarCompiler::Frontend::JS_MAX_SAFE_INTEGER_LOAD_CONST + 1)
+    v = RunarCompiler::Frontend._make_load_const_int(under)
+    parsed = JSON.parse(v.raw_value)
+    assert_equal "#{under}n", parsed
   end
 
   def test_decode_const_value_accepts_n_suffix_string

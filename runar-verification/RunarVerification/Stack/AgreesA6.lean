@@ -384,14 +384,14 @@ theorem runMethod_lower_public_unique_no_post_structuralIfVal_narrow_isSome
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hCondLoad :
       ∀ bn cond thn els results src,
         m.body = [.mk bn (.ifVal cond thn els results) src] →
         ∃ condV stk1,
           runOps
             (Stack.Lower.loadRef
-              (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+              (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
             = .ok stk1
           ∧ stk1.stack = condV :: initialStack.stack
           ∧ (∃ b, asBool? condV = some b)) :
@@ -404,7 +404,7 @@ theorem runMethod_lower_public_unique_no_post_structuralIfVal_narrow_isSome
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
   rw [hRawEqStructural]
   exact runOps_lowerBindings_structuralIfValBodyNarrow_isSome
-    m.body (m.params.map (fun p => p.name) |>.reverse) initialStack hBody hCondLoad
+    m.body (m.params.map (fun p => some p.name) |>.reverse) initialStack hBody hCondLoad
 
 /-! ## Tier 1 — Predicate-side preservation for the same-name single-const
 both-branches `if_val` fragment
@@ -657,7 +657,7 @@ private def w40SmokeThnOps : List StackOp :=
   (Stack.Lower.lowerBindingsP [] [] 1000 0 (Stack.Lower.computeLastUses w40SmokeThn)
       [] [] [] ["p0", "p1"] w40SmokeThn).1
 
-private theorem w40_untag : untagSm w40SmokeTsm = ["p0", "p1"] := by
+private theorem w40_untag : untagSm w40SmokeTsm = (["p0", "p1"] : Stack.Lower.StackMap) := by
   unfold w40SmokeTsm untagSm; rfl
 
 private theorem w40_agreesTagged :
@@ -915,14 +915,14 @@ theorem runMethod_lower_public_unique_no_post_ifValSingleConst_preserves
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hAgrees : agreesTagged initialTsm initialAnf initialStack)
     (hFresh : freshIn bn (untagSm initialTsm))
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -957,7 +957,7 @@ theorem runMethod_lower_public_unique_no_post_ifValSingleConst_preserves
           ∃ condV stk1,
             runOps
               (Stack.Lower.loadRef
-                (m.params.map (fun p => p.name) |>.reverse) cond') initialStack
+                (m.params.map (fun p => some p.name) |>.reverse) cond') initialStack
               = .ok stk1
             ∧ stk1.stack = condV :: initialStack.stack
             ∧ (∃ b, asBool? condV = some b) := by
@@ -981,7 +981,7 @@ theorem runMethod_lower_public_unique_no_post_ifValSingleConst_preserves
     -- preservation lemma above.
     obtain ⟨stk', _hRun, hStkEq, hAgrees'⟩ :=
       simpleStepRel_ifVal_singleConstBranches_preserves
-        (m.params.map (fun p => p.name) |>.reverse) initialTsm initialAnf
+        (m.params.map (fun p => some p.name) |>.reverse) initialTsm initialAnf
         initialStack bn cond vn src i hAgrees hFresh hCondLoad
     exact ⟨stk', hAgrees', hStkEq⟩
 
@@ -1210,14 +1210,14 @@ theorem runMethod_lower_public_unique_no_post_ifValIdenticalConst_preserves
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hAgrees : agreesTagged initialTsm initialAnf initialStack)
     (hFresh : freshIn bn (untagSm initialTsm))
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -1249,7 +1249,7 @@ theorem runMethod_lower_public_unique_no_post_ifValIdenticalConst_preserves
           ∃ condV stk1,
             runOps
               (Stack.Lower.loadRef
-                (m.params.map (fun p => p.name) |>.reverse) cond') initialStack
+                (m.params.map (fun p => some p.name) |>.reverse) cond') initialStack
               = .ok stk1
             ∧ stk1.stack = condV :: initialStack.stack
             ∧ (∃ b, asBool? condV = some b) := by
@@ -1271,7 +1271,7 @@ theorem runMethod_lower_public_unique_no_post_ifValIdenticalConst_preserves
     -- branches preservation lemma above.
     obtain ⟨stk', _hRun, hStkEq, hAgrees'⟩ :=
       simpleStepRel_ifVal_identicalSingleConst_preserves
-        (m.params.map (fun p => p.name) |>.reverse) initialTsm initialAnf
+        (m.params.map (fun p => some p.name) |>.reverse) initialTsm initialAnf
         initialStack bn cond vn src c hConst hAgrees hFresh hCondLoad
     exact ⟨stk', hAgrees', hStkEq⟩
 
@@ -1713,12 +1713,12 @@ theorem runMethod_lower_public_unique_no_post_ifValAnyConstChain_preserves
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -1737,7 +1737,7 @@ theorem runMethod_lower_public_unique_no_post_ifValAnyConstChain_preserves
   -- The predicate-side `simpleStepRel_ifVal_anyConstChain_preserves` discharges
   -- *both* halves: it produces a `stk'` witnessing runOps success AND the
   -- `stackEquivModuloIntermediates` post-state.
-  let sm := (m.params.map (fun p => p.name) |>.reverse)
+  let sm := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', hRun, hEquiv, hLookup⟩ :=
     simpleStepRel_ifVal_anyConstChain_preserves
       sm initialAnf initialStack bn cond vn src c thn els hThn hEls hCondLoad
@@ -1997,12 +1997,12 @@ theorem runMethod_lower_public_unique_no_post_ifValHeteroConstChain_preserves
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -2024,7 +2024,7 @@ theorem runMethod_lower_public_unique_no_post_ifValHeteroConstChain_preserves
             = some (if b then constToValue cThn else constToValue cEls) := by
   -- The Tier 4 predicate-side lemma produces the cond-dependent post-state plus
   -- a runtime-success witness.
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', b, hRun, _hWit, hEquivT, hEquivE⟩ :=
     simpleStepRel_ifVal_heteroConstChains_preserves
       smArg initialStack bn cond vnThn vnEls srcThn srcEls cThn cEls thn els
@@ -2119,7 +2119,7 @@ theorem simpleStepRel_ifVal_constThenCopyRef_preserves
     (hAgreesEls : agreesTagged tsmEls anfStEls stkSt)
     (hEls : structuralCopyBody lastUsesEls outerProtectedEls localBindingsEls
               els sm currentIndexEls)
-    (hElsFresh : ∀ b ∈ els, b.name ∉ sm)
+    (hElsFresh : ∀ b ∈ els, some b.name ∉ sm)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hCondLoad :
       ∃ condV stk1,
@@ -2225,7 +2225,7 @@ theorem simpleStepRel_ifVal_constThenCopyRef_preserves_metadata
     (hAgreesEls : agreesTagged tsmEls anfStEls stkSt)
     (hEls : structuralCopyBody lastUsesEls outerProtectedEls localBindingsEls
               els sm currentIndexEls)
-    (hElsFresh : ∀ b ∈ els, b.name ∉ sm)
+    (hElsFresh : ∀ b ∈ els, some b.name ∉ sm)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hCondLoad :
       ∃ condV stk1,
@@ -2300,22 +2300,22 @@ theorem runMethod_lower_public_unique_no_post_ifVal_constThenCopyRef_preserves
       m.body = [.mk bn (.ifVal cond thn els) src])
     (hThn : structuralConstBodyEndsWithConst vnThn cThn srcThn thn)
     (hUntagSmEls :
-      untagSm tsmEls = (m.params.map (fun p => p.name) |>.reverse))
+      untagSm tsmEls = (m.params.map (fun p => some p.name) |>.reverse))
     (hAgreesEls : agreesTagged tsmEls anfStEls initialStack)
     (hEls : structuralCopyBody lastUsesEls outerProtectedEls localBindingsEls
-              els (m.params.map (fun p => p.name) |>.reverse) currentIndexEls)
+              els (m.params.map (fun p => some p.name) |>.reverse) currentIndexEls)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ (m.params.map (fun p => p.name) |>.reverse))
+      ∀ b ∈ els, some b.name ∉ (m.params.map (fun p => some p.name) |>.reverse))
     (hElsNodup : (els.map (·.name)).Nodup)
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -2335,7 +2335,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_constThenCopyRef_preserves
           ∧ stk'.outputs = initialStack.outputs
           ∧ stk'.props = initialStack.props
           ∧ stk'.preimage = initialStack.preimage) := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', b, hRun, _hWit, hEquivT, hMetaE⟩ :=
     simpleStepRel_ifVal_constThenCopyRef_preserves
       smArg initialStack bn cond vnThn srcThn cThn thn els
@@ -2382,7 +2382,7 @@ theorem simpleStepRel_ifVal_copyRefThenConst_preserves
     (hAgreesThn : agreesTagged tsmThn anfStThn stkSt)
     (hThn : structuralCopyBody lastUsesThn outerProtectedThn localBindingsThn
               thn sm currentIndexThn)
-    (hThnFresh : ∀ b ∈ thn, b.name ∉ sm)
+    (hThnFresh : ∀ b ∈ thn, some b.name ∉ sm)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hEls : structuralConstBodyEndsWithConst vnEls cEls srcEls els)
     (hCondLoad :
@@ -2478,7 +2478,7 @@ theorem simpleStepRel_ifVal_copyRefThenConst_preserves_metadata
     (hAgreesThn : agreesTagged tsmThn anfStThn stkSt)
     (hThn : structuralCopyBody lastUsesThn outerProtectedThn localBindingsThn
               thn sm currentIndexThn)
-    (hThnFresh : ∀ b ∈ thn, b.name ∉ sm)
+    (hThnFresh : ∀ b ∈ thn, some b.name ∉ sm)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hEls : structuralConstBodyEndsWithConst vnEls cEls srcEls els)
     (hCondLoad :
@@ -2542,23 +2542,23 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenConst_preserves
     (hBodyShape :
       m.body = [.mk bn (.ifVal cond thn els) src])
     (hUntagSmThn :
-      untagSm tsmThn = (m.params.map (fun p => p.name) |>.reverse))
+      untagSm tsmThn = (m.params.map (fun p => some p.name) |>.reverse))
     (hAgreesThn : agreesTagged tsmThn anfStThn initialStack)
     (hThn : structuralCopyBody lastUsesThn outerProtectedThn localBindingsThn
-              thn (m.params.map (fun p => p.name) |>.reverse) currentIndexThn)
+              thn (m.params.map (fun p => some p.name) |>.reverse) currentIndexThn)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ (m.params.map (fun p => p.name) |>.reverse))
+      ∀ b ∈ thn, some b.name ∉ (m.params.map (fun p => some p.name) |>.reverse))
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hEls : structuralConstBodyEndsWithConst vnEls cEls srcEls els)
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -2578,7 +2578,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenConst_preserves
           ∧ stk'.preimage = initialStack.preimage)
         ∧ (b = false →
           stackEquivModuloIntermediates stk' (initialStack.push (constToValue cEls))) := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', b, hRun, _hWit, hMetaT, hEquivE⟩ :=
     simpleStepRel_ifVal_copyRefThenConst_preserves
       smArg initialStack bn cond vnEls srcEls cEls thn els
@@ -2619,13 +2619,13 @@ theorem simpleStepRel_ifVal_copyRefThenCopyRef_preserves
     (hAgreesThn : agreesTagged tsmThn anfStThn stkSt)
     (hThn : structuralCopyBody lastUsesThn outerProtectedThn localBindingsThn
               thn sm currentIndexThn)
-    (hThnFresh : ∀ b ∈ thn, b.name ∉ sm)
+    (hThnFresh : ∀ b ∈ thn, some b.name ∉ sm)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls : untagSm tsmEls = sm)
     (hAgreesEls : agreesTagged tsmEls anfStEls stkSt)
     (hEls : structuralCopyBody lastUsesEls outerProtectedEls localBindingsEls
               els sm currentIndexEls)
-    (hElsFresh : ∀ b ∈ els, b.name ∉ sm)
+    (hElsFresh : ∀ b ∈ els, some b.name ∉ sm)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hCondLoad :
       ∃ condV stk1,
@@ -2718,13 +2718,13 @@ theorem simpleStepRel_ifVal_copyRefThenCopyRef_preserves_metadata
     (hAgreesThn : agreesTagged tsmThn anfStThn stkSt)
     (hThn : structuralCopyBody lastUsesThn outerProtectedThn localBindingsThn
               thn sm currentIndexThn)
-    (hThnFresh : ∀ b ∈ thn, b.name ∉ sm)
+    (hThnFresh : ∀ b ∈ thn, some b.name ∉ sm)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls : untagSm tsmEls = sm)
     (hAgreesEls : agreesTagged tsmEls anfStEls stkSt)
     (hEls : structuralCopyBody lastUsesEls outerProtectedEls localBindingsEls
               els sm currentIndexEls)
-    (hElsFresh : ∀ b ∈ els, b.name ∉ sm)
+    (hElsFresh : ∀ b ∈ els, some b.name ∉ sm)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hCondLoad :
       ∃ condV stk1,
@@ -2780,30 +2780,30 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenCopyRef_preserves
     (hBodyShape :
       m.body = [.mk bn (.ifVal cond thn els) src])
     (hUntagSmThn :
-      untagSm tsmThn = (m.params.map (fun p => p.name) |>.reverse))
+      untagSm tsmThn = (m.params.map (fun p => some p.name) |>.reverse))
     (hAgreesThn : agreesTagged tsmThn anfStThn initialStack)
     (hThn : structuralCopyBody lastUsesThn outerProtectedThn localBindingsThn
-              thn (m.params.map (fun p => p.name) |>.reverse) currentIndexThn)
+              thn (m.params.map (fun p => some p.name) |>.reverse) currentIndexThn)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ (m.params.map (fun p => p.name) |>.reverse))
+      ∀ b ∈ thn, some b.name ∉ (m.params.map (fun p => some p.name) |>.reverse))
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
-      untagSm tsmEls = (m.params.map (fun p => p.name) |>.reverse))
+      untagSm tsmEls = (m.params.map (fun p => some p.name) |>.reverse))
     (hAgreesEls : agreesTagged tsmEls anfStEls initialStack)
     (hEls : structuralCopyBody lastUsesEls outerProtectedEls localBindingsEls
-              els (m.params.map (fun p => p.name) |>.reverse) currentIndexEls)
+              els (m.params.map (fun p => some p.name) |>.reverse) currentIndexEls)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ (m.params.map (fun p => p.name) |>.reverse))
+      ∀ b ∈ els, some b.name ∉ (m.params.map (fun p => some p.name) |>.reverse))
     (hElsNodup : (els.map (·.name)).Nodup)
     (hRawEqStructural :
       lowerMethodUserRawOps methods props m =
         (Stack.Lower.lowerBindings
-          (m.params.map (fun p => p.name) |>.reverse) m.body).1)
+          (m.params.map (fun p => some p.name) |>.reverse) m.body).1)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRef
-            (m.params.map (fun p => p.name) |>.reverse) cond) initialStack
+            (m.params.map (fun p => some p.name) |>.reverse) cond) initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
         ∧ stk1.altstack = initialStack.altstack
@@ -2820,7 +2820,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenCopyRef_preserves
         ∧ stk'.outputs = initialStack.outputs
         ∧ stk'.props = initialStack.props
         ∧ stk'.preimage = initialStack.preimage := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', _b, hRun, _hWit, hAlt, hOut, hProps, hPre⟩ :=
     simpleStepRel_ifVal_copyRefThenCopyRef_preserves
       smArg initialStack bn cond thn els
@@ -2917,8 +2917,15 @@ theorem runOps_ifValBranchP_structuralConstEndsWith_stackEquiv
       runOps
         (Stack.Lower.lowerBindingsP progMethods props budget 0
           (Stack.Lower.computeLastUses body) innerProtected
-          (List.map (fun b => b.name) body) constInts smBranch body).1 stk = .ok stk'
+          (List.map (fun b => b.name) body) constInts smBranch body [] true).1 stk = .ok stk'
       ∧ stackEquivModuloIntermediates stk' (stk.push (constToValue c)) := by
+  -- Issue #150: the arm lowers at `insideBranch = true`; a const body reads
+  -- none of the four flag-sensitive constructors, so this is the default
+  -- lowering and every bridge below applies unchanged.
+  rw [lowerBindingsP_insideBranch_irrelevant progMethods props budget
+    (Stack.Lower.computeLastUses body) innerProtected constInts [] true
+    body (List.map (fun b => b.name) body) smBranch 0
+    (insideBranchFreeBodyB_of_structuralConstBody body h.1)]
   have hBridge :
       Stack.Lower.lowerBindingsP progMethods props budget 0
           (Stack.Lower.computeLastUses body) innerProtected
@@ -2949,18 +2956,27 @@ theorem runOps_ifValBranchP_structuralConsumeBody_preserves_metadata
                   (Stack.Lower.computeLastUses body) innerProtected
                   (List.map (fun b => b.name) body) constInts
                   body smBranch currentIndex)
-    (hFresh : ∀ b ∈ body, b.name ∉ smBranch)
+    (hFresh : ∀ b ∈ body, some b.name ∉ smBranch)
     (hNodup : (body.map (·.name)).Nodup) :
     ∃ stk',
       runOps
         (Stack.Lower.lowerBindingsP progMethods props budget currentIndex
           (Stack.Lower.computeLastUses body) innerProtected
-          (List.map (fun b => b.name) body) constInts smBranch body).1 stk = .ok stk'
+          (List.map (fun b => b.name) body) constInts smBranch body [] true).1 stk = .ok stk'
       ∧ stk'.altstack = stk.altstack
       ∧ stk'.outputs = stk.outputs
       ∧ stk'.props = stk.props
-      ∧ stk'.preimage = stk.preimage :=
-  runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
+      ∧ stk'.preimage = stk.preimage := by
+  -- Issue #150: consume bodies admit literals / `loadParam` / `@ref` only,
+  -- none of which reads `insideBranch`, so the arm's `true` lowering is the
+  -- default lowering the wave-11 lemma is stated at.
+  rw [lowerBindingsP_insideBranch_irrelevant progMethods props budget
+    (Stack.Lower.computeLastUses body) innerProtected constInts [] true
+    body (List.map (fun b => b.name) body) smBranch currentIndex
+    (insideBranchFreeBodyB_of_structuralConsumeBody progMethods props budget
+      (Stack.Lower.computeLastUses body) innerProtected
+      (List.map (fun b => b.name) body) constInts body smBranch currentIndex hConsume)]
+  exact runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
     progMethods props budget (Stack.Lower.computeLastUses body) innerProtected
     (List.map (fun b => b.name) body) constInts
     body smBranch currentIndex tsm anfSt stk hUntagSm hAgrees hConsume hFresh hNodup
@@ -2983,17 +2999,24 @@ theorem runOps_ifValBranchP_structuralCopyBody_preserves_metadata
                   (Stack.Lower.computeLastUses body) innerProtected
                   (List.map (fun b => b.name) body)
                   body smBranch currentIndex)
-    (hFresh : ∀ b ∈ body, b.name ∉ smBranch)
+    (hFresh : ∀ b ∈ body, some b.name ∉ smBranch)
     (hNodup : (body.map (·.name)).Nodup) :
     ∃ stk',
       runOps
         (Stack.Lower.lowerBindingsP progMethods props budget currentIndex
           (Stack.Lower.computeLastUses body) innerProtected
-          (List.map (fun b => b.name) body) constInts smBranch body).1 stk = .ok stk'
+          (List.map (fun b => b.name) body) constInts smBranch body [] true).1 stk = .ok stk'
       ∧ stk'.altstack = stk.altstack
       ∧ stk'.outputs = stk.outputs
       ∧ stk'.props = stk.props
       ∧ stk'.preimage = stk.preimage := by
+  -- Issue #150: copy bodies are flag-free, so the arm's `true` lowering is
+  -- the default lowering the wave-9 bridge is stated at.
+  rw [lowerBindingsP_insideBranch_irrelevant progMethods props budget
+    (Stack.Lower.computeLastUses body) innerProtected constInts [] true
+    body (List.map (fun b => b.name) body) smBranch currentIndex
+    (insideBranchFreeBodyB_of_structuralCopyBody (Stack.Lower.computeLastUses body)
+      innerProtected (List.map (fun b => b.name) body) body smBranch currentIndex hCopy)]
   have hBridge :
       Stack.Lower.lowerBindingsP progMethods props budget currentIndex
           (Stack.Lower.computeLastUses body) innerProtected
@@ -3041,7 +3064,7 @@ theorem simpleStepRel_ifVal_constThenConsumeRef_preserves
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -3113,14 +3136,14 @@ theorem simpleStepRel_ifVal_constThenConsumeRef_preserves
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) thn) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
               (some (Stack.Lower.lowerBindingsP progMethods props budget 0
                 (Stack.Lower.computeLastUses els)
                 (Stack.Lower.computeBranchProtected
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) els) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
         rw [hPop]
         simp only []
         rw [hBool]
@@ -3142,14 +3165,14 @@ theorem simpleStepRel_ifVal_constThenConsumeRef_preserves
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) thn) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
               (some (Stack.Lower.lowerBindingsP progMethods props budget 0
                 (Stack.Lower.computeLastUses els)
                 (Stack.Lower.computeBranchProtected
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) els) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
         rw [hPop]
         simp only []
         rw [hBool]
@@ -3186,7 +3209,7 @@ theorem simpleStepRel_ifVal_constThenConsumeRef_preserves_metadata
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -3262,32 +3285,32 @@ theorem runMethod_lower_public_unique_no_post_ifVal_constThenConsumeRef_preserve
     (hThn : structuralConstBodyEndsWithConst vnThn cThn srcThn thn)
     (hUntagSmEls :
       untagSm tsmEls =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesEls : agreesTagged tsmEls anfStEls initialStack)
     (hEls : structuralConsumeBody methods props Stack.Lower.defaultInlineBudget
               (Stack.Lower.computeLastUses els)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) els) (Stack.Lower.collectConstInts m.body)
               els
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ els, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape methods props Stack.Lower.defaultInlineBudget 0
                 (Stack.Lower.computeLastUses m.body) []
                 (Stack.Lower.collectConstInts m.body)
-                (m.params.map (fun p => p.name) |>.reverse) cond thn els)
+                (m.params.map (fun p => some p.name) |>.reverse) cond thn els)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRefLive
-            (m.params.map (fun p => p.name) |>.reverse) cond 0
+            (m.params.map (fun p => some p.name) |>.reverse) cond 0
             (Stack.Lower.computeLastUses m.body) []).1 initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
@@ -3308,7 +3331,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_constThenConsumeRef_preserve
           ∧ stk'.outputs = initialStack.outputs
           ∧ stk'.props = initialStack.props
           ∧ stk'.preimage = initialStack.preimage) := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', b, hRun, _hWit, hEquivT, hMetaE⟩ :=
     simpleStepRel_ifVal_constThenConsumeRef_preserves
       methods props Stack.Lower.defaultInlineBudget 0
@@ -3328,7 +3351,25 @@ theorem runMethod_lower_public_unique_no_post_ifVal_constThenConsumeRef_preserve
             (Stack.Lower.collectConstInts m.body) smArg bn (.ifVal cond thn els)).1 := by
     unfold lowerMethodUserRawOps
     rw [hBodyShape]
-    simp [Stack.Lower.lowerBindingsP, smArg]
+    -- NEW-004: neither arm of this `if` contains a byte-array
+    -- producer, so the singleton body marks no raw slot.
+    have hRawThn : Stack.Lower.collectRawSlotsGo [] thn = [] := by
+      have := collectRawSlots_nil_of_structuralConstBody thn
+        (structuralConstBodyEndsWithConst_implies_structuralConstBody _ _ _ _ hThn)
+      simpa [Stack.Lower.collectRawSlots] using this
+    have hRawEls : Stack.Lower.collectRawSlotsGo [] els = [] := by
+      have := collectRawSlots_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hEls
+      simpa [Stack.Lower.collectRawSlots] using this
+    -- …and neither arm binds an `array_literal`.
+    have hArrThn : Stack.Lower.arrayElemsOf thn = [] :=
+      arrayElemsOf_nil_of_structuralConstBody thn
+        (structuralConstBodyEndsWithConst_implies_structuralConstBody _ _ _ _ hThn)
+    have hArrEls : Stack.Lower.arrayElemsOf els = [] :=
+      arrayElemsOf_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hEls
+    rw [Stack.Lower.collectRawSlots_singleton_ifVal_of_arms
+          bn cond thn els _ src hRawThn hRawEls]
+    simp [Stack.Lower.lowerBindingsP, smArg,
+      Stack.Lower.arrayElemsOf, hArrThn, hArrEls]
   rw [hUnfold]
   rw [hRun]
   simp [Except.toOption]
@@ -3364,7 +3405,7 @@ theorem simpleStepRel_ifVal_consumeRefThenConst_preserves
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hEls : structuralConstBodyEndsWithConst vnEls cEls srcEls els)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
@@ -3433,14 +3474,14 @@ theorem simpleStepRel_ifVal_consumeRefThenConst_preserves
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) thn) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
               (some (Stack.Lower.lowerBindingsP progMethods props budget 0
                 (Stack.Lower.computeLastUses els)
                 (Stack.Lower.computeBranchProtected
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) els) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
         rw [hPop]
         simp only []
         rw [hBool]
@@ -3462,14 +3503,14 @@ theorem simpleStepRel_ifVal_consumeRefThenConst_preserves
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) thn) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
               (some (Stack.Lower.lowerBindingsP progMethods props budget 0
                 (Stack.Lower.computeLastUses els)
                 (Stack.Lower.computeBranchProtected
                   ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                   lastUses currentIndex outerProtected)
                 (List.map (fun b => b.name) els) constInts
-                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+                ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
         rw [hPop]
         simp only []
         rw [hBool]
@@ -3503,7 +3544,7 @@ theorem simpleStepRel_ifVal_consumeRefThenConst_preserves_metadata
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hEls : structuralConstBodyEndsWithConst vnEls cEls srcEls els)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
@@ -3569,33 +3610,33 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenConst_preserve
       m.body = [.mk bn (.ifVal cond thn els) src])
     (tsmThn_untag :
       untagSm tsmThn =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesThn : agreesTagged tsmThn anfStThn initialStack)
     (hThn : structuralConsumeBody methods props Stack.Lower.defaultInlineBudget
               (Stack.Lower.computeLastUses thn)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) thn) (Stack.Lower.collectConstInts m.body)
               thn
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ thn, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hEls : structuralConstBodyEndsWithConst vnEls cEls srcEls els)
     (hClean : ifValCleanShape methods props Stack.Lower.defaultInlineBudget 0
                 (Stack.Lower.computeLastUses m.body) []
                 (Stack.Lower.collectConstInts m.body)
-                (m.params.map (fun p => p.name) |>.reverse) cond thn els)
+                (m.params.map (fun p => some p.name) |>.reverse) cond thn els)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRefLive
-            (m.params.map (fun p => p.name) |>.reverse) cond 0
+            (m.params.map (fun p => some p.name) |>.reverse) cond 0
             (Stack.Lower.computeLastUses m.body) []).1 initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
@@ -3616,7 +3657,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenConst_preserve
           ∧ stk'.preimage = initialStack.preimage)
         ∧ (b = false →
           stackEquivModuloIntermediates stk' (initialStack.push (constToValue cEls))) := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', b, hRun, _hWit, hMetaT, hEquivE⟩ :=
     simpleStepRel_ifVal_consumeRefThenConst_preserves
       methods props Stack.Lower.defaultInlineBudget 0
@@ -3636,7 +3677,25 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenConst_preserve
             (Stack.Lower.collectConstInts m.body) smArg bn (.ifVal cond thn els)).1 := by
     unfold lowerMethodUserRawOps
     rw [hBodyShape]
-    simp [Stack.Lower.lowerBindingsP, smArg]
+    -- NEW-004: neither arm of this `if` contains a byte-array
+    -- producer, so the singleton body marks no raw slot.
+    have hRawThn : Stack.Lower.collectRawSlotsGo [] thn = [] := by
+      have := collectRawSlots_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hThn
+      simpa [Stack.Lower.collectRawSlots] using this
+    have hRawEls : Stack.Lower.collectRawSlotsGo [] els = [] := by
+      have := collectRawSlots_nil_of_structuralConstBody els
+        (structuralConstBodyEndsWithConst_implies_structuralConstBody _ _ _ _ hEls)
+      simpa [Stack.Lower.collectRawSlots] using this
+    -- …and neither arm binds an `array_literal`.
+    have hArrThn : Stack.Lower.arrayElemsOf thn = [] :=
+      arrayElemsOf_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hThn
+    have hArrEls : Stack.Lower.arrayElemsOf els = [] :=
+      arrayElemsOf_nil_of_structuralConstBody els
+        (structuralConstBodyEndsWithConst_implies_structuralConstBody _ _ _ _ hEls)
+    rw [Stack.Lower.collectRawSlots_singleton_ifVal_of_arms
+          bn cond thn els _ src hRawThn hRawEls]
+    simp [Stack.Lower.lowerBindingsP, smArg,
+      Stack.Lower.arrayElemsOf, hArrThn, hArrEls]
   rw [hUnfold]
   rw [hRun]
   simp [Except.toOption]
@@ -3666,7 +3725,7 @@ theorem simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
       untagSm tsmEls = ifValSmBranch sm cond currentIndex lastUses outerProtected)
@@ -3678,7 +3737,7 @@ theorem simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -3745,14 +3804,14 @@ theorem simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) thn) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
             (some (Stack.Lower.lowerBindingsP progMethods props budget 0
               (Stack.Lower.computeLastUses els)
               (Stack.Lower.computeBranchProtected
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) els) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
       rw [hPop]
       simp only []
       rw [hBool]
@@ -3773,14 +3832,14 @@ theorem simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) thn) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
             (some (Stack.Lower.lowerBindingsP progMethods props budget 0
               (Stack.Lower.computeLastUses els)
               (Stack.Lower.computeBranchProtected
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) els) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
       rw [hPop]
       simp only []
       rw [hBool]
@@ -3813,7 +3872,7 @@ theorem simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves_metadata
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
       untagSm tsmEls = ifValSmBranch sm cond currentIndex lastUses outerProtected)
@@ -3825,7 +3884,7 @@ theorem simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves_metadata
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -3880,51 +3939,51 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenConsumeRef_pre
       m.body = [.mk bn (.ifVal cond thn els) src])
     (tsmThn_untag :
       untagSm tsmThn =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesThn : agreesTagged tsmThn anfStThn initialStack)
     (hThn : structuralConsumeBody methods props Stack.Lower.defaultInlineBudget
               (Stack.Lower.computeLastUses thn)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) thn) (Stack.Lower.collectConstInts m.body)
               thn
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ thn, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hThnNodup : (thn.map (·.name)).Nodup)
     (tsmEls_untag :
       untagSm tsmEls =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesEls : agreesTagged tsmEls anfStEls initialStack)
     (hEls : structuralConsumeBody methods props Stack.Lower.defaultInlineBudget
               (Stack.Lower.computeLastUses els)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) els) (Stack.Lower.collectConstInts m.body)
               els
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ els, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape methods props Stack.Lower.defaultInlineBudget 0
                 (Stack.Lower.computeLastUses m.body) []
                 (Stack.Lower.collectConstInts m.body)
-                (m.params.map (fun p => p.name) |>.reverse) cond thn els)
+                (m.params.map (fun p => some p.name) |>.reverse) cond thn els)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRefLive
-            (m.params.map (fun p => p.name) |>.reverse) cond 0
+            (m.params.map (fun p => some p.name) |>.reverse) cond 0
             (Stack.Lower.computeLastUses m.body) []).1 initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
@@ -3942,7 +4001,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenConsumeRef_pre
         ∧ stk'.outputs = initialStack.outputs
         ∧ stk'.props = initialStack.props
         ∧ stk'.preimage = initialStack.preimage := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', _b, hRun, _hWit, hAlt, hOut, hProps, hPre⟩ :=
     simpleStepRel_ifVal_consumeRefThenConsumeRef_preserves
       methods props Stack.Lower.defaultInlineBudget 0
@@ -3963,7 +4022,23 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenConsumeRef_pre
             (Stack.Lower.collectConstInts m.body) smArg bn (.ifVal cond thn els)).1 := by
     unfold lowerMethodUserRawOps
     rw [hBodyShape]
-    simp [Stack.Lower.lowerBindingsP, smArg]
+    -- NEW-004: neither arm of this `if` contains a byte-array
+    -- producer, so the singleton body marks no raw slot.
+    have hRawThn : Stack.Lower.collectRawSlotsGo [] thn = [] := by
+      have := collectRawSlots_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hThn
+      simpa [Stack.Lower.collectRawSlots] using this
+    have hRawEls : Stack.Lower.collectRawSlotsGo [] els = [] := by
+      have := collectRawSlots_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hEls
+      simpa [Stack.Lower.collectRawSlots] using this
+    -- …and neither arm binds an `array_literal`.
+    have hArrThn : Stack.Lower.arrayElemsOf thn = [] :=
+      arrayElemsOf_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hThn
+    have hArrEls : Stack.Lower.arrayElemsOf els = [] :=
+      arrayElemsOf_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hEls
+    rw [Stack.Lower.collectRawSlots_singleton_ifVal_of_arms
+          bn cond thn els _ src hRawThn hRawEls]
+    simp [Stack.Lower.lowerBindingsP, smArg,
+      Stack.Lower.arrayElemsOf, hArrThn, hArrEls]
   rw [hUnfold]
   rw [hRun]
   simp [Except.toOption]
@@ -3993,7 +4068,7 @@ theorem simpleStepRel_ifVal_copyRefThenConsumeRef_preserves
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
       untagSm tsmEls = ifValSmBranch sm cond currentIndex lastUses outerProtected)
@@ -4005,7 +4080,7 @@ theorem simpleStepRel_ifVal_copyRefThenConsumeRef_preserves
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -4072,14 +4147,14 @@ theorem simpleStepRel_ifVal_copyRefThenConsumeRef_preserves
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) thn) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
             (some (Stack.Lower.lowerBindingsP progMethods props budget 0
               (Stack.Lower.computeLastUses els)
               (Stack.Lower.computeBranchProtected
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) els) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
       rw [hPop]
       simp only []
       rw [hBool]
@@ -4100,14 +4175,14 @@ theorem simpleStepRel_ifVal_copyRefThenConsumeRef_preserves
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) thn) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
             (some (Stack.Lower.lowerBindingsP progMethods props budget 0
               (Stack.Lower.computeLastUses els)
               (Stack.Lower.computeBranchProtected
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) els) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
       rw [hPop]
       simp only []
       rw [hBool]
@@ -4138,7 +4213,7 @@ theorem simpleStepRel_ifVal_copyRefThenConsumeRef_preserves_metadata
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
       untagSm tsmEls = ifValSmBranch sm cond currentIndex lastUses outerProtected)
@@ -4150,7 +4225,7 @@ theorem simpleStepRel_ifVal_copyRefThenConsumeRef_preserves_metadata
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -4204,51 +4279,51 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenConsumeRef_preser
       m.body = [.mk bn (.ifVal cond thn els) src])
     (tsmThn_untag :
       untagSm tsmThn =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesThn : agreesTagged tsmThn anfStThn initialStack)
     (hThn : structuralCopyBody
               (Stack.Lower.computeLastUses thn)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) thn)
               thn
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ thn, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hThnNodup : (thn.map (·.name)).Nodup)
     (tsmEls_untag :
       untagSm tsmEls =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesEls : agreesTagged tsmEls anfStEls initialStack)
     (hEls : structuralConsumeBody methods props Stack.Lower.defaultInlineBudget
               (Stack.Lower.computeLastUses els)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) els) (Stack.Lower.collectConstInts m.body)
               els
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ els, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape methods props Stack.Lower.defaultInlineBudget 0
                 (Stack.Lower.computeLastUses m.body) []
                 (Stack.Lower.collectConstInts m.body)
-                (m.params.map (fun p => p.name) |>.reverse) cond thn els)
+                (m.params.map (fun p => some p.name) |>.reverse) cond thn els)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRefLive
-            (m.params.map (fun p => p.name) |>.reverse) cond 0
+            (m.params.map (fun p => some p.name) |>.reverse) cond 0
             (Stack.Lower.computeLastUses m.body) []).1 initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
@@ -4266,7 +4341,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenConsumeRef_preser
         ∧ stk'.outputs = initialStack.outputs
         ∧ stk'.props = initialStack.props
         ∧ stk'.preimage = initialStack.preimage := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', _b, hRun, _hWit, hAlt, hOut, hProps, hPre⟩ :=
     simpleStepRel_ifVal_copyRefThenConsumeRef_preserves
       methods props Stack.Lower.defaultInlineBudget 0
@@ -4287,7 +4362,23 @@ theorem runMethod_lower_public_unique_no_post_ifVal_copyRefThenConsumeRef_preser
             (Stack.Lower.collectConstInts m.body) smArg bn (.ifVal cond thn els)).1 := by
     unfold lowerMethodUserRawOps
     rw [hBodyShape]
-    simp [Stack.Lower.lowerBindingsP, smArg]
+    -- NEW-004: neither arm of this `if` contains a byte-array
+    -- producer, so the singleton body marks no raw slot.
+    have hRawThn : Stack.Lower.collectRawSlotsGo [] thn = [] := by
+      have := collectRawSlots_nil_of_structuralCopyBody _ _ _ _ _ _ hThn
+      simpa [Stack.Lower.collectRawSlots] using this
+    have hRawEls : Stack.Lower.collectRawSlotsGo [] els = [] := by
+      have := collectRawSlots_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hEls
+      simpa [Stack.Lower.collectRawSlots] using this
+    -- …and neither arm binds an `array_literal`.
+    have hArrThn : Stack.Lower.arrayElemsOf thn = [] :=
+      arrayElemsOf_nil_of_structuralCopyBody _ _ _ _ _ _ hThn
+    have hArrEls : Stack.Lower.arrayElemsOf els = [] :=
+      arrayElemsOf_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hEls
+    rw [Stack.Lower.collectRawSlots_singleton_ifVal_of_arms
+          bn cond thn els _ src hRawThn hRawEls]
+    simp [Stack.Lower.lowerBindingsP, smArg,
+      Stack.Lower.arrayElemsOf, hArrThn, hArrEls]
   rw [hUnfold]
   rw [hRun]
   simp [Except.toOption]
@@ -4317,7 +4408,7 @@ theorem simpleStepRel_ifVal_consumeRefThenCopyRef_preserves
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
       untagSm tsmEls = ifValSmBranch sm cond currentIndex lastUses outerProtected)
@@ -4329,7 +4420,7 @@ theorem simpleStepRel_ifVal_consumeRefThenCopyRef_preserves
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -4396,14 +4487,14 @@ theorem simpleStepRel_ifVal_consumeRefThenCopyRef_preserves
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) thn) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
             (some (Stack.Lower.lowerBindingsP progMethods props budget 0
               (Stack.Lower.computeLastUses els)
               (Stack.Lower.computeBranchProtected
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) els) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
       rw [hPop]
       simp only []
       rw [hBool]
@@ -4424,14 +4515,14 @@ theorem simpleStepRel_ifVal_consumeRefThenCopyRef_preserves
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) thn) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn).1
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) thn [] true).1
             (some (Stack.Lower.lowerBindingsP progMethods props budget 0
               (Stack.Lower.computeLastUses els)
               (Stack.Lower.computeBranchProtected
                 ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1)
                 lastUses currentIndex outerProtected)
               (List.map (fun b => b.name) els) constInts
-              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els).1) []]
+              ((Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected).2.popN 1) els [] true).1) []]
       rw [hPop]
       simp only []
       rw [hBool]
@@ -4462,7 +4553,7 @@ theorem simpleStepRel_ifVal_consumeRefThenCopyRef_preserves_metadata
               thn (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ thn, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hThnNodup : (thn.map (·.name)).Nodup)
     (hUntagSmEls :
       untagSm tsmEls = ifValSmBranch sm cond currentIndex lastUses outerProtected)
@@ -4474,7 +4565,7 @@ theorem simpleStepRel_ifVal_consumeRefThenCopyRef_preserves_metadata
               els (ifValSmBranch sm cond currentIndex lastUses outerProtected)
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      ∀ b ∈ els, some b.name ∉ ifValSmBranch sm cond currentIndex lastUses outerProtected)
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
                 outerProtected constInts sm cond thn els)
@@ -4528,51 +4619,51 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenCopyRef_preser
       m.body = [.mk bn (.ifVal cond thn els) src])
     (tsmThn_untag :
       untagSm tsmThn =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesThn : agreesTagged tsmThn anfStThn initialStack)
     (hThn : structuralConsumeBody methods props Stack.Lower.defaultInlineBudget
               (Stack.Lower.computeLastUses thn)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) thn) (Stack.Lower.collectConstInts m.body)
               thn
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hThnFresh :
-      ∀ b ∈ thn, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ thn, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hThnNodup : (thn.map (·.name)).Nodup)
     (tsmEls_untag :
       untagSm tsmEls =
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hAgreesEls : agreesTagged tsmEls anfStEls initialStack)
     (hEls : structuralCopyBody
               (Stack.Lower.computeLastUses els)
-              (ifValInnerProtected (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValInnerProtected (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               (List.map (fun b => b.name) els)
               els
-              (ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+              (ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
                 (Stack.Lower.computeLastUses m.body) [])
               0)
     (hElsFresh :
-      ∀ b ∈ els, b.name ∉
-        ifValSmBranch (m.params.map (fun p => p.name) |>.reverse) cond 0
+      ∀ b ∈ els, some b.name ∉
+        ifValSmBranch (m.params.map (fun p => some p.name) |>.reverse) cond 0
           (Stack.Lower.computeLastUses m.body) [])
     (hElsNodup : (els.map (·.name)).Nodup)
     (hClean : ifValCleanShape methods props Stack.Lower.defaultInlineBudget 0
                 (Stack.Lower.computeLastUses m.body) []
                 (Stack.Lower.collectConstInts m.body)
-                (m.params.map (fun p => p.name) |>.reverse) cond thn els)
+                (m.params.map (fun p => some p.name) |>.reverse) cond thn els)
     (hCondLoad :
       ∃ condV stk1,
         runOps
           (Stack.Lower.loadRefLive
-            (m.params.map (fun p => p.name) |>.reverse) cond 0
+            (m.params.map (fun p => some p.name) |>.reverse) cond 0
             (Stack.Lower.computeLastUses m.body) []).1 initialStack
           = .ok stk1
         ∧ stk1.stack = condV :: initialStack.stack
@@ -4590,7 +4681,7 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenCopyRef_preser
         ∧ stk'.outputs = initialStack.outputs
         ∧ stk'.props = initialStack.props
         ∧ stk'.preimage = initialStack.preimage := by
-  let smArg := (m.params.map (fun p => p.name) |>.reverse)
+  let smArg := (m.params.map (fun p => some p.name) |>.reverse)
   obtain ⟨stk', _b, hRun, _hWit, hAlt, hOut, hProps, hPre⟩ :=
     simpleStepRel_ifVal_consumeRefThenCopyRef_preserves
       methods props Stack.Lower.defaultInlineBudget 0
@@ -4611,7 +4702,23 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenCopyRef_preser
             (Stack.Lower.collectConstInts m.body) smArg bn (.ifVal cond thn els)).1 := by
     unfold lowerMethodUserRawOps
     rw [hBodyShape]
-    simp [Stack.Lower.lowerBindingsP, smArg]
+    -- NEW-004: neither arm of this `if` contains a byte-array
+    -- producer, so the singleton body marks no raw slot.
+    have hRawThn : Stack.Lower.collectRawSlotsGo [] thn = [] := by
+      have := collectRawSlots_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hThn
+      simpa [Stack.Lower.collectRawSlots] using this
+    have hRawEls : Stack.Lower.collectRawSlotsGo [] els = [] := by
+      have := collectRawSlots_nil_of_structuralCopyBody _ _ _ _ _ _ hEls
+      simpa [Stack.Lower.collectRawSlots] using this
+    -- …and neither arm binds an `array_literal`.
+    have hArrThn : Stack.Lower.arrayElemsOf thn = [] :=
+      arrayElemsOf_nil_of_structuralConsumeBody _ _ _ _ _ _ _ _ _ _ hThn
+    have hArrEls : Stack.Lower.arrayElemsOf els = [] :=
+      arrayElemsOf_nil_of_structuralCopyBody _ _ _ _ _ _ hEls
+    rw [Stack.Lower.collectRawSlots_singleton_ifVal_of_arms
+          bn cond thn els _ src hRawThn hRawEls]
+    simp [Stack.Lower.lowerBindingsP, smArg,
+      Stack.Lower.arrayElemsOf, hArrThn, hArrEls]
   rw [hUnfold]
   rw [hRun]
   simp [Except.toOption]
@@ -4687,6 +4794,32 @@ def ifValArithBody
       ifValCleanShape progMethods props budget currentIndex lastUses
         outerProtected constInts sm cond thn els
   | _ => False
+
+/-- NEW-004: both arms of an `ifValArithBody` are emittable arith chains
+(`+ - *` and unary `-`), so neither marks a raw slot and the singleton
+value-`if` body marks none either. -/
+theorem collectRawSlots_nil_of_ifValArithBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) :
+    ∀ (body : List ANFBinding),
+      ifValArithBody progMethods props budget currentIndex lastUses
+        outerProtected constInts sm body →
+      Stack.Lower.collectRawSlots body = [] := by
+  intro body h
+  match body, h with
+  | [.mk bn (.ifVal cond thn els []) src], ⟨hThn, hEls, _⟩ =>
+      have hRawThn : Stack.Lower.collectRawSlotsGo [] thn = [] := by
+        have := collectRawSlots_nil_of_emittableArithChainReadyNoDblNeg
+          (Stack.Lower.computeLastUses thn) thn _ 0 false hThn
+        simpa [Stack.Lower.collectRawSlots] using this
+      have hRawEls : Stack.Lower.collectRawSlotsGo [] els = [] := by
+        have := collectRawSlots_nil_of_emittableArithChainReadyNoDblNeg
+          (Stack.Lower.computeLastUses els) els _ 0 false hEls
+        simpa [Stack.Lower.collectRawSlots] using this
+      exact Stack.Lower.collectRawSlots_singleton_ifVal_of_arms
+        bn cond thn els [] src hRawThn hRawEls
 
 /-- **Wave 41 A — Bool mirror of `ifValArithBody`.**  Mirrors the predicate
 arm-for-arm: the `emittableArithChainReadyNoDblNeg` conjuncts become their
@@ -4784,7 +4917,7 @@ private theorem lvp_binOp_snd
     (hll : Stack.Lower.isLastUse lu l ci = true)
     (hlr : Stack.Lower.isLastUse lu r ci = true) :
     (Stack.Lower.lowerValueP pm pr bud ci lu [] lb cs smm nm (.binOp op l r rt)).2
-      = (nm :: smm.tail.tail, lb) :=
+      = (some nm :: smm.tail.tail, lb) :=
   Prod.ext
     (lowerValueP_binOp_d0d1_smOut pm pr bud ci lu lb cs smm nm op l r rt hl hr hll hlr)
     (lowerValueP_binOp_localBindings pm pr bud ci lu [] lb cs smm nm op l r rt)
@@ -4801,7 +4934,7 @@ private def sA_sm : StackMap := ["c", "p0", "p1", "p2"]
 private def sA_lu : List (String × Nat) := Stack.Lower.computeLastUses sA_body
 
 private theorem sA_smBranch :
-    ifValSmBranch sA_sm "c" 0 sA_lu [] = ["p0", "p1", "p2"] := by
+    ifValSmBranch sA_sm "c" 0 sA_lu [] = (["p0", "p1", "p2"] : Stack.Lower.StackMap) := by
   unfold ifValSmBranch Stack.Lower.loadRefLive Stack.Lower.bringToTop
     sA_sm sA_lu sA_body sA_thn sA_els
   decide
@@ -4813,8 +4946,9 @@ private theorem sA_ip :
   decide
 
 private theorem sA_thnSm :
-    (ifValThnRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn).2 = ["t1"] := by
-  unfold ifValThnRes; rw [sA_smBranch, sA_ip, sA_thn]
+    (ifValThnRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn).2 = (["t1"] : Stack.Lower.StackMap) := by
+  rw [ifValThnRes_eq_default [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn (by rfl)]
+  rw [sA_smBranch, sA_ip, sA_thn]
   simp only [List.map_cons, List.map_nil, ANFBinding.name]
   rw [Stack.Lower.lowerBindingsP.eq_2]
   rcases h1 : Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
@@ -4822,7 +4956,7 @@ private theorem sA_thnSm :
        ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) []
       ["t0", "t1"] [] ["p0", "p1", "p2"] "t0" (.binOp "+" "p0" "p1" none)
     with ⟨o1, s1, l1⟩
-  have e1 : (s1, l1) = (["t0", "p2"], ["t0", "t1"]) := by
+  have e1 : (s1, l1) = ((["t0", "p2"] : Stack.Lower.StackMap), ["t0", "t1"]) := by
     have := lvp_binOp_snd [] [] 8 0 (Stack.Lower.computeLastUses
       [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
        ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) ["t0", "t1"] []
@@ -4837,7 +4971,7 @@ private theorem sA_thnSm :
        ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) []
       ["t0", "t1"] [] ["t0", "p2"] "t1" (.binOp "+" "t0" "p2" none)
     with ⟨o2, s2, l2⟩
-  have e2 : (s2, l2) = (["t1"], ["t0", "t1"]) := by
+  have e2 : (s2, l2) = ((["t1"] : Stack.Lower.StackMap), ["t0", "t1"]) := by
     have := lvp_binOp_snd [] [] 8 1 (Stack.Lower.computeLastUses
       [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
        ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) ["t0", "t1"] []
@@ -4848,8 +4982,9 @@ private theorem sA_thnSm :
   simp only [Stack.Lower.lowerBindingsP]
 
 private theorem sA_elsSm :
-    (ifValElsRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els).2 = ["u1"] := by
-  unfold ifValElsRes; rw [sA_smBranch, sA_ip, sA_els]
+    (ifValElsRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els).2 = (["u1"] : Stack.Lower.StackMap) := by
+  rw [ifValElsRes_eq_default [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els (by rfl)]
+  rw [sA_smBranch, sA_ip, sA_els]
   simp only [List.map_cons, List.map_nil, ANFBinding.name]
   rw [Stack.Lower.lowerBindingsP.eq_2]
   rcases h1 : Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
@@ -4857,7 +4992,7 @@ private theorem sA_elsSm :
        ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) []
       ["u0", "u1"] [] ["p0", "p1", "p2"] "u0" (.binOp "-" "p0" "p1" none)
     with ⟨o1, s1, l1⟩
-  have e1 : (s1, l1) = (["u0", "p2"], ["u0", "u1"]) := by
+  have e1 : (s1, l1) = ((["u0", "p2"] : Stack.Lower.StackMap), ["u0", "u1"]) := by
     have := lvp_binOp_snd [] [] 8 0 (Stack.Lower.computeLastUses
       [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
        ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) ["u0", "u1"] []
@@ -4872,7 +5007,7 @@ private theorem sA_elsSm :
        ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) []
       ["u0", "u1"] [] ["u0", "p2"] "u1" (.binOp "-" "u0" "p2" none)
     with ⟨o2, s2, l2⟩
-  have e2 : (s2, l2) = (["u1"], ["u0", "u1"]) := by
+  have e2 : (s2, l2) = ((["u1"] : Stack.Lower.StackMap), ["u0", "u1"]) := by
     have := lvp_binOp_snd [] [] 8 1 (Stack.Lower.computeLastUses
       [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
        ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) ["u0", "u1"] []
@@ -4884,7 +5019,8 @@ private theorem sA_elsSm :
 
 private theorem sA_elsOps :
     (ifValElsRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els).1 ≠ [] := by
-  unfold ifValElsRes; rw [sA_smBranch, sA_ip, sA_els]
+  rw [ifValElsRes_eq_default [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els (by rfl)]
+  rw [sA_smBranch, sA_ip, sA_els]
   simp only [List.map_cons, List.map_nil, ANFBinding.name]
   rw [Stack.Lower.lowerBindingsP.eq_2]
   rcases h1 : Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
@@ -4908,6 +5044,8 @@ private theorem sA_elsOps :
 
 private theorem sA_clean :
     ifValCleanShape [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn sA_els := by
+  -- Issue #149 is repaired in the PARENT (`sinkResultBlock`), so the clean
+  -- shape no longer carries a per-arm reconcile conjunct.
   refine ⟨by decide, ?_, ?_, ?_, sA_elsOps⟩
   · rw [sA_smBranch, sA_elsSm, sA_thnSm]; decide
   · rw [sA_smBranch, sA_thnSm, sA_elsSm]; decide
@@ -5300,9 +5438,13 @@ theorem wave41_successAgrees_ifVal_arith_smoke :
     unfold sC_branchTsm untagSm sA_sm; rfl
   rw [hUntagSm] at hCondRun
   have hThn := sC_branchWalk sA_thn (by unfold sA_thn; decide)
-    (by unfold ifValThnRes; rw [sA_smBranch, sA_ip, hCCI])
+    (by rw [ifValThnRes_eq_default [] [] 8 0 sA_lu []
+          (Stack.Lower.collectConstInts sA_body) sA_sm "c" sA_thn (by rfl),
+        sA_smBranch, sA_ip, hCCI])
   have hEls := sC_branchWalk sA_els (by unfold sA_els; decide)
-    (by unfold ifValThnRes; rw [sA_smBranch, sA_ip, hCCI])
+    (by rw [ifValThnRes_eq_default [] [] 8 0 sA_lu []
+          (Stack.Lower.collectConstInts sA_body) sA_sm "c" sA_els (by rfl),
+        sA_smBranch, sA_ip, hCCI])
   rw [hCCI] at hThn hEls
   -- `ifValThnRes … sA_els = ifValElsRes … sA_els` definitionally (same lowering).
   have hElsConv :
@@ -5453,7 +5595,9 @@ theorem successAgrees_ifVal_arith_from_entry
         = Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses branch) []
             (List.map (fun bnd => bnd.name) branch) constInts
             (ifValSmBranch sm cond 0 lastUses []) branch := by
-      unfold ifValThnRes; rw [hIP]
+      rw [ifValThnRes_eq_default progMethods props budget 0 lastUses [] constInts sm cond branch
+        (insideBranchFreeBodyB_of_emittableArithChainReadyNoDblNeg _ branch _ 0 false hChain)]
+      rw [hIP]
     rw [hRes]
     exact successAgrees_arith_consume_unconditional progMethods props budget
       (Stack.Lower.computeLastUses branch) constInts Γ branch
@@ -5671,11 +5815,9 @@ theorem loweredIfValArith_areEmittable
   -- Branch op-lists are emittable-arith.
   have hThnEmit : RunarVerification.Script.Parse.AreRunarEmittable
       (ifValThnRes progMethods props budget currentIndex lastUses [] constInts sm cond thn).1 := by
-    show RunarVerification.Script.Parse.AreRunarEmittable
-      (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
-        (ifValInnerProtected sm cond currentIndex lastUses [])
-        (List.map (fun b => b.name) thn) constInts
-        (ifValSmBranch sm cond currentIndex lastUses []) thn).1
+    rw [ifValThnRes_eq_default progMethods props budget currentIndex lastUses [] constInts
+      sm cond thn
+      (insideBranchFreeBodyB_of_emittableArithChainReadyNoDblNeg _ thn _ 0 false hThnChain)]
     rw [hInnerEmpty]
     exact loweredEmittableArith_areEmittable progMethods props budget
       (Stack.Lower.computeLastUses thn)
@@ -5685,11 +5827,9 @@ theorem loweredIfValArith_areEmittable
         (ifValSmBranch sm cond currentIndex lastUses []) 0 false hThnChain)
   have hElsEmit : RunarVerification.Script.Parse.AreRunarEmittable
       (ifValElsRes progMethods props budget currentIndex lastUses [] constInts sm cond els).1 := by
-    show RunarVerification.Script.Parse.AreRunarEmittable
-      (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
-        (ifValInnerProtected sm cond currentIndex lastUses [])
-        (List.map (fun b => b.name) els) constInts
-        (ifValSmBranch sm cond currentIndex lastUses []) els).1
+    rw [ifValElsRes_eq_default progMethods props budget currentIndex lastUses [] constInts
+      sm cond els
+      (insideBranchFreeBodyB_of_emittableArithChainReadyNoDblNeg _ els _ 0 false hElsChain)]
     rw [hInnerEmpty]
     exact loweredEmittableArith_areEmittable progMethods props budget
       (Stack.Lower.computeLastUses els)
@@ -5839,20 +5979,18 @@ theorem loweredIfValArith_peepholeId
       = (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
           [] (List.map (fun b => b.name) thn) constInts
           (ifValSmBranch sm cond currentIndex lastUses []) thn).1 := by
-    show (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
-        (ifValInnerProtected sm cond currentIndex lastUses [])
-        (List.map (fun b => b.name) thn) constInts
-        (ifValSmBranch sm cond currentIndex lastUses []) thn).1 = _
+    rw [ifValThnRes_eq_default progMethods props budget currentIndex lastUses [] constInts
+      sm cond thn
+      (insideBranchFreeBodyB_of_emittableArithChainReadyNoDblNeg _ thn _ 0 false hThnChain)]
     rw [hInnerEmpty]
   have hElsEq :
       (ifValElsRes progMethods props budget currentIndex lastUses [] constInts sm cond els).1
       = (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
           [] (List.map (fun b => b.name) els) constInts
           (ifValSmBranch sm cond currentIndex lastUses []) els).1 := by
-    show (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
-        (ifValInnerProtected sm cond currentIndex lastUses [])
-        (List.map (fun b => b.name) els) constInts
-        (ifValSmBranch sm cond currentIndex lastUses []) els).1 = _
+    rw [ifValElsRes_eq_default progMethods props budget currentIndex lastUses [] constInts
+      sm cond els
+      (insideBranchFreeBodyB_of_emittableArithChainReadyNoDblNeg _ els _ 0 false hElsChain)]
     rw [hInnerEmpty]
   obtain ⟨hThnPassAll, hThnPostFold, hThnChainF, hThnRollP⟩ :=
     loweredArithBranch_peephole_fixpoints progMethods props budget
@@ -5971,14 +6109,20 @@ the parent-protected set is empty.  The foldl accumulator never grows: at the
 empty initial accumulator each step's `aliveAfter` and `parentProtected` are
 both false, so the `acc ++ [ref]` arm is never taken. -/
 private theorem computeBranchProtected_nil_of_allLastUse
-    (smBranch : List String) (lastUses : List (String × Nat)) (currentIndex : Nat)
-    (hAll : ∀ ref ∈ smBranch, Stack.Lower.isLastUse lastUses ref currentIndex = true) :
+    (smBranch : Stack.Lower.StackMap) (lastUses : List (String × Nat))
+    (currentIndex : Nat)
+    (hAll : ∀ ref ∈ smBranch, ∀ nm, ref = some nm →
+      Stack.Lower.isLastUse lastUses nm currentIndex = true) :
     Stack.Lower.computeBranchProtected smBranch lastUses currentIndex [] = [] := by
   unfold Stack.Lower.computeBranchProtected
   -- The accumulator stays `[]`: prove the foldl-invariant `acc = []`.
+  -- An anonymous slot short-circuits to `acc`, so it cannot grow it either.
   suffices h : ∀ (acc : List String), acc = [] →
       List.foldl
-        (fun acc ref =>
+        (fun acc slot =>
+          match slot with
+          | none => acc
+          | some ref =>
           if Stack.Lower.listContains acc ref then acc
           else
             let aliveAfter :=
@@ -5994,14 +6138,20 @@ private theorem computeBranchProtected_nil_of_allLastUse
   | cons hd rest ih =>
       intro acc hacc
       subst hacc
-      have hHd : Stack.Lower.isLastUse lastUses hd currentIndex = true :=
-        hAll hd (List.mem_cons_self)
+      have hTail : ∀ ref ∈ rest, ∀ nm, ref = some nm →
+          Stack.Lower.isLastUse lastUses nm currentIndex = true :=
+        fun ref hRef => hAll ref (List.mem_cons_of_mem hd hRef)
+      cases hd with
+      | none => simpa using ih hTail [] rfl
+      | some hdName =>
+      have hHd : Stack.Lower.isLastUse lastUses hdName currentIndex = true :=
+        hAll (some hdName) (List.mem_cons_self) hdName rfl
       have hAlive :
-          (match Stack.Lower.lastUsesLookup lastUses hd with
+          (match Stack.Lower.lastUsesLookup lastUses hdName with
            | some idx => decide (idx > currentIndex)
            | none => false) = false := by
         unfold Stack.Lower.isLastUse at hHd
-        cases hLk : Stack.Lower.lastUsesLookup lastUses hd with
+        cases hLk : Stack.Lower.lastUsesLookup lastUses hdName with
         | none => rfl
         | some last =>
             rw [hLk] at hHd
@@ -6010,7 +6160,7 @@ private theorem computeBranchProtected_nil_of_allLastUse
             exact hHd
       simp only [List.foldl_cons, Stack.Lower.listContains, List.any_nil,
         Bool.false_eq_true, if_false, hAlive, Bool.or_self, if_false]
-      exact ih (fun ref hRef => hAll ref (List.mem_cons_of_mem hd hRef)) [] rfl
+      exact ih hTail [] rfl
 
 /-- **Wave 42 C — empty `ifValInnerProtected` derivation.**  Self-contained
 branches (no branch-stackmap entry alive after the if) at a top-level entry
@@ -6019,8 +6169,8 @@ branches (no branch-stackmap entry alive after the if) at a top-level entry
 theorem ifValInnerProtected_empty
     (sm : StackMap) (cond : String) (currentIndex : Nat)
     (lastUses : List (String × Nat))
-    (hAll : ∀ ref ∈ ifValSmBranch sm cond currentIndex lastUses [],
-      Stack.Lower.isLastUse lastUses ref currentIndex = true) :
+    (hAll : ∀ ref ∈ ifValSmBranch sm cond currentIndex lastUses [], ∀ nm, ref = some nm →
+      Stack.Lower.isLastUse lastUses nm currentIndex = true) :
     ifValInnerProtected sm cond currentIndex lastUses [] = [] := by
   unfold ifValInnerProtected
   exact computeBranchProtected_nil_of_allLastUse

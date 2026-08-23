@@ -94,9 +94,13 @@ values (`_opPushTxSig`, `_codePart`) that the lowering pass tracks
 separately from the per-binding stack growth.
 -/
 def stackAligned : StackMap → State → List Value → Prop
-  | [],          _,     _              => True
-  | _ :: _,      _,     []             => False
-  | n :: smRest, anfSt, v :: stkRest    =>
+  | [],               _,     _              => True
+  | _ :: _,           _,     []             => False
+  | none :: smRest,   anfSt, _ :: stkRest   =>
+      -- An ANONYMOUS slot occupies the position but names no ANF value,
+      -- so it constrains nothing about the value sitting there.
+      stackAligned smRest anfSt stkRest
+  | some n :: smRest, anfSt, v :: stkRest    =>
       lookupAnf anfSt n = some v ∧ stackAligned smRest anfSt stkRest
 
 /-! ## Phase 6 Step 3 — Tagged stack alignment
@@ -128,7 +132,16 @@ inductive SlotKind where
 pipeline does NOT use this — it remains untagged for byte-exact
 emission. Tagging happens once, in the simulation predicate, at the
 boundary where Stage B's per-construct lemmas reason about per-kind
-lookups. -/
+lookups.
+
+NAMED-ONLY, deliberately. `StackMap` carries anonymity (`none` slots,
+see `Stack/Lower.lean`) because the codegen substrate must; the
+simulation decoration does not, so every lemma stated over a
+`TaggedStackMap` is a lemma about an ALL-NAMED stack map — which is
+exactly the set of maps the model can build, since `StackMap.pushAnon`
+has no call site in the lowering yet. `untagSm` therefore lands in the
+`some`-only image of `StackMap`. Extending the tagged layer is the
+work a lowering that actually pushes anonymous slots would force. -/
 abbrev TaggedStackMap := List (String × SlotKind)
 
 /-- Resolve a tagged slot in the ANF state via the kind-appropriate
@@ -160,20 +173,23 @@ def tagSlot (env : WF.ScopeEnv) (n : String) : SlotKind :=
   else if env.props.contains n then .prop
   else .binding  -- unreachable under WF.ScopeEnv.resolves
 
-/-- Decorate a plain `StackMap` against a `WF.ScopeEnv`. -/
-def tagSm (env : WF.ScopeEnv) : StackMap → TaggedStackMap
+/-- Decorate a list of slot NAMES against a `WF.ScopeEnv`. Domain is
+`List String`, not `StackMap`: an anonymous slot has no name to tag
+(see the `TaggedStackMap` docstring). -/
+def tagSm (env : WF.ScopeEnv) : List String → TaggedStackMap
   | []        => []
   | n :: rest => (n, tagSlot env n) :: tagSm env rest
 
-/-- Strip kind tags. -/
+/-- Strip kind tags. Every tagged slot is named, so the result is a
+`StackMap` with no anonymous entry. -/
 def untagSm : TaggedStackMap → StackMap
   | []             => []
-  | (n, _) :: rest => n :: untagSm rest
+  | (n, _) :: rest => some n :: untagSm rest
 
 @[simp] theorem untagSm_tagSm (env : WF.ScopeEnv) :
-    ∀ sm, untagSm (tagSm env sm) = sm := by
-  intro sm
-  induction sm with
+    ∀ ns : List String, untagSm (tagSm env ns) = ns.map some := by
+  intro ns
+  induction ns with
   | nil => rfl
   | cons hd tl ih =>
       unfold tagSm untagSm
@@ -341,7 +357,7 @@ preserves alignment.
 
 /-- A name is **fresh** w.r.t. a stack map when no entry in `sm`
 matches it. -/
-def freshIn (bn : String) (sm : StackMap) : Prop := ¬ bn ∈ sm
+def freshIn (bn : String) (sm : StackMap) : Prop := ¬ (some bn) ∈ sm
 
 theorem stackAligned_addBinding_fresh
     (sm : StackMap) (anfSt : State) (stk : List Value)
@@ -358,19 +374,26 @@ theorem stackAligned_addBinding_fresh
           -- impossible: stackAligned (hd :: tl) _ [] is False
           simp [stackAligned] at h
       | cons hv tlv =>
-          -- hFresh : bn ∉ (hd :: tl), so bn ≠ hd and bn ∉ tl.
-          have hNeq : bn ≠ hd := by
-            intro hEq
-            apply hFresh
-            simp [hEq]
           have hFreshTl : freshIn bn tl := by
             intro hMem
             apply hFresh
             simp [hMem]
-          unfold stackAligned at h ⊢
-          refine ⟨?_, ih tlv hFreshTl h.2⟩
-          rw [addBinding_preserves_lookup anfSt bn v hd hNeq]
-          exact h.1
+          cases hd with
+          | none =>
+              -- An anonymous slot names nothing, so `addBinding` cannot
+              -- disturb it: the constraint is the tail's alone.
+              unfold stackAligned at h ⊢
+              exact ih tlv hFreshTl h
+          | some hdName =>
+              -- hFresh : some bn ∉ (some hdName :: tl), so bn ≠ hdName.
+              have hNeq : bn ≠ hdName := by
+                intro hEq
+                apply hFresh
+                simp [hEq]
+              unfold stackAligned at h ⊢
+              refine ⟨?_, ih tlv hFreshTl h.2⟩
+              rw [addBinding_preserves_lookup anfSt bn v hdName hNeq]
+              exact h.1
 
 /-! ## Stage B: per-constructor preservation lemmas
 
@@ -11084,7 +11107,7 @@ theorem stageC_two_loadConst_int
     -- for the inner [b2] singleton.
     have hSm1 :
         (Stack.Lower.lowerValue (untagSm tsm) bn1 (.loadConst (.int i1))).2
-          = bn1 :: untagSm tsm := rfl
+          = some bn1 :: untagSm tsm := rfl
     have hRest : runOps (Stack.Lower.lowerBindings
                           (bn1 :: untagSm tsm)
                           [.mk bn2 (.loadConst (.int i2)) none]).1
@@ -11281,7 +11304,7 @@ theorem stageC_mixed_loadConst_unaryNegate
     addBinding_self_lookup anfSt bn1 (.vBigint i)
   -- Convert hFresh2 into the form expected by stageC_simpleStep_unaryOp_NEGATE_d0.
   have hFresh2' : freshIn bn2 (bn1 :: untagSm tsm) := by
-    show ¬ bn2 ∈ (bn1 :: untagSm tsm)
+    show ¬ some bn2 ∈ (some bn1 :: untagSm tsm)
     exact hFresh2
   have ⟨hRun2, hStep2⟩ :=
     stageC_simpleStep_unaryOp_NEGATE_d0
@@ -11292,7 +11315,7 @@ theorem stageC_mixed_loadConst_unaryNegate
   · -- Operational composition.
     have hSm1 :
         (Stack.Lower.lowerValue (untagSm tsm) bn1 (.loadConst (.int i))).2
-          = bn1 :: untagSm tsm := rfl
+          = some bn1 :: untagSm tsm := rfl
     have hRest : runOps (Stack.Lower.lowerBindings
                           (bn1 :: untagSm tsm)
                           [.mk bn2 (.unaryOp "-" bn1 rt) none]).1
@@ -11418,10 +11441,10 @@ theorem stageC_three_double_negation
   · -- Operational composition: 3-fold cons.
     have hSm1 :
         (Stack.Lower.lowerValue (untagSm tsm) bn1 (.loadConst (.int i))).2
-          = bn1 :: untagSm tsm := rfl
+          = some bn1 :: untagSm tsm := rfl
     have hSm2 :
         (Stack.Lower.lowerValue (bn1 :: untagSm tsm) bn2 (.unaryOp "-" bn1 rt2)).2
-          = bn2 :: bn1 :: untagSm tsm := rfl
+          = some bn2 :: some bn1 :: untagSm tsm := rfl
     -- Innermost: singleton lift for bn3.
     have hRest3 : runOps (Stack.Lower.lowerBindings
                           (bn2 :: bn1 :: untagSm tsm)
@@ -12208,7 +12231,15 @@ def lowerMethodUserRawOps
     (m.body.map (fun b => b.name))
     (Stack.Lower.collectConstInts m.body)
     (m.params.map (fun p => p.name) |>.reverse)
-    m.body).1
+    m.body
+    -- NEW-004: mirror `lowerMethod`, which threads the method-wide
+    -- raw-slot set so every numeric read of a byte-array result is
+    -- re-minimised. Omitting it here would make this "raw ops"
+    -- abbreviation describe a lowering `lowerMethod` does not perform.
+    (Stack.Lower.collectRawSlots m.body)
+    false
+    -- Same reason for the method-wide `array_literal` element table.
+    (Stack.Lower.arrayElemsOf m.body)).1
 
 /-! ### Option 1 — structural/program-aware lowering equality
 
@@ -12232,6 +12263,57 @@ def structuralConstValue : ANFValue → Prop
 def structuralConstBody : List ANFBinding → Prop
   | [] => True
   | (.mk _ v _) :: rest => structuralConstValue v ∧ structuralConstBody rest
+
+/-- NEW-004: the const fragment holds only literal pushes — no
+`& | ^ << >> ~` producer and no `@ref` alias — so nothing is ever marked
+raw. This discharges the raw-slot side condition of the bridges below
+from the fragment alone, so they need no extra hypothesis. -/
+theorem collectRawSlots_nil_of_structuralConstBody :
+    ∀ bs : List ANFBinding, structuralConstBody bs →
+      Stack.Lower.collectRawSlots bs = [] := by
+  have go : ∀ bs : List ANFBinding, structuralConstBody bs →
+      Stack.Lower.collectRawSlotsGo [] bs = [] := by
+    intro bs
+    induction bs with
+    | nil => intro _; simp [Stack.Lower.collectRawSlotsGo]
+    | cons b rest ih =>
+        obtain ⟨name, v, src⟩ := b
+        intro h
+        obtain ⟨hv, hrest⟩ := h
+        have hTail := ih hrest
+        match v, hv with
+        | .loadConst (.int _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bool _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bytes _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+  intro bs h
+  unfold Stack.Lower.collectRawSlots
+  exact go bs h
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_structuralConstBody`.
+`arrayElemsOf` only contributes for `.arrayLiteral` / `.ifVal` / `.loop`
+bindings, none of which the const fragment admits, so the method-wide
+element table is empty on it. -/
+theorem arrayElemsOf_nil_of_structuralConstBody :
+    ∀ bs : List ANFBinding, structuralConstBody bs →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih hrest
+      match v, hv with
+      | .loadConst (.int _), _ =>
+          simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bool _), _ =>
+          simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bytes _), _ =>
+          simpa [Stack.Lower.arrayElemsOf] using hTail
 
 /-! ### F1 decidability — `structuralConstValue` / `structuralConstBody`
 
@@ -12341,6 +12423,8 @@ theorem lowerMethodUserRawOps_eq_lowerBindings_structuralConst
       (Stack.Lower.lowerBindings
         (m.params.map (fun p => p.name) |>.reverse) m.body).1 := by
   unfold lowerMethodUserRawOps
+  rw [collectRawSlots_nil_of_structuralConstBody m.body hConst]
+  rw [arrayElemsOf_nil_of_structuralConstBody m.body hConst]
   rw [lowerBindingsP_eq_lowerBindings_structuralConst
         progMethods props Stack.Lower.defaultInlineBudget
         (Stack.Lower.computeLastUses m.body) []
@@ -12563,6 +12647,65 @@ def structuralCopyBody
       structuralCopyBody lastUses outerProtected localBindings rest
         (Stack.Lower.lowerValue sm name v).2 (currentIndex + 1)
 
+/-- NEW-004 peer of `collectRawSlots_nil_of_structuralConstBody`. The copy
+fragment adds `loadParam` / `loadProp` / `@ref` alias — still no
+byte-array producer, and an alias only inherits a marker its referent
+already carries, so starting from the empty set nothing is ever added. -/
+theorem collectRawSlots_nil_of_structuralCopyBody
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralCopyBody lastUses outerProtected localBindings bs sm currentIndex →
+      Stack.Lower.collectRawSlots bs = [] := by
+  have go : ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralCopyBody lastUses outerProtected localBindings bs sm currentIndex →
+      Stack.Lower.collectRawSlotsGo [] bs = [] := by
+    intro bs
+    induction bs with
+    | nil => intro _ _ _; simp [Stack.Lower.collectRawSlotsGo]
+    | cons b rest ih =>
+        obtain ⟨name, v, src⟩ := b
+        intro sm currentIndex h
+        obtain ⟨hv, hrest⟩ := h
+        have hTail := ih _ _ hrest
+        match v, hv with
+        | .loadConst (.int _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bool _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bytes _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadParam _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadProp _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.refAlias _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.listContains] using hTail
+  intro bs sm currentIndex h
+  unfold Stack.Lower.collectRawSlots
+  exact go bs sm currentIndex h
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_structuralCopyBody`. -/
+theorem arrayElemsOf_nil_of_structuralCopyBody
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralCopyBody lastUses outerProtected localBindings bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      match v, hv with
+      | .loadConst (.int _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bool _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bytes _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadParam _, _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadProp _, _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.refAlias _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+
 /-- One-step equality for the copied-reference fragment. -/
 theorem lowerValueP_eq_lowerValue_structuralCopy
     (progMethods : List ANFMethod) (props : List ANFProperty)
@@ -12667,6 +12810,14 @@ theorem lowerMethodUserRawOps_eq_lowerBindings_structuralCopy
       (Stack.Lower.lowerBindings
         (m.params.map (fun p => p.name) |>.reverse) m.body).1 := by
   unfold lowerMethodUserRawOps
+  rw [collectRawSlots_nil_of_structuralCopyBody
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name)) m.body
+        (m.params.map (fun p => p.name) |>.reverse) 0 hCopy]
+  rw [arrayElemsOf_nil_of_structuralCopyBody
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name)) m.body
+        (m.params.map (fun p => p.name) |>.reverse) 0 hCopy]
   rw [lowerBindingsP_eq_lowerBindings_structuralCopy
         progMethods props Stack.Lower.defaultInlineBudget
         (Stack.Lower.computeLastUses m.body) []
@@ -12780,7 +12931,7 @@ theorem lowerValueP_loadParam_consume_d0_witness
     ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((n, k) :: tsm_rest)) bn (.loadParam n)).2.1
-        = bn :: untagSm tsm_rest
+        = some bn :: untagSm tsm_rest
     ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((n, k) :: tsm_rest)) bn (.loadParam n)).2.2
@@ -12791,8 +12942,8 @@ theorem lowerValueP_loadParam_consume_d0_witness
       Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((n, k) :: tsm_rest)) bn (.loadParam n)
-        = (([] : List StackOp), bn :: untagSm tsm_rest, localBindings) := by
-    have hUntag : untagSm ((n, k) :: tsm_rest) = n :: untagSm tsm_rest := rfl
+        = (([] : List StackOp), some bn :: untagSm tsm_rest, localBindings) := by
+    have hUntag : untagSm ((n, k) :: tsm_rest) = some n :: untagSm tsm_rest := rfl
     have hDepthTop : Stack.Lower.StackMap.depth? (n :: untagSm tsm_rest) n = some 0 := by
       unfold Stack.Lower.StackMap.depth? List.findIdx? List.findIdx?.go
       simp
@@ -12919,7 +13070,7 @@ theorem lowerValueP_loadParam_consume_d1_witness
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts
             (untagSm ((topName, k_top) :: (n, k) :: tsm_rest)) bn (.loadParam n)).2.1
-          = bn :: topName :: untagSm tsm_rest
+          = some bn :: some topName :: untagSm tsm_rest
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts
             (untagSm ((topName, k_top) :: (n, k) :: tsm_rest)) bn (.loadParam n)).2.2
@@ -12930,10 +13081,10 @@ theorem lowerValueP_loadParam_consume_d1_witness
       Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((topName, k_top) :: (n, k) :: tsm_rest)) bn (.loadParam n)
-        = ([.swap], bn :: topName :: untagSm tsm_rest, localBindings) := by
+        = ([.swap], some bn :: some topName :: untagSm tsm_rest, localBindings) := by
     have hUntag :
         untagSm ((topName, k_top) :: (n, k) :: tsm_rest)
-          = topName :: n :: untagSm tsm_rest := rfl
+          = some topName :: some n :: untagSm tsm_rest := rfl
     unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveParam
       Stack.Lower.bringToTop
     simp [hUntag, hDepth1, hConsume]
@@ -13107,7 +13258,7 @@ theorem lowerValueP_loadParam_consume_d2_witness
             (untagSm
               ((topName, k_top) :: (secondName, k_second) :: (n, k) :: tsm_rest))
             bn (.loadParam n)).2.1
-          = bn :: topName :: secondName :: untagSm tsm_rest
+          = some bn :: some topName :: some secondName :: untagSm tsm_rest
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts
             (untagSm
@@ -13123,10 +13274,10 @@ theorem lowerValueP_loadParam_consume_d2_witness
           (untagSm
             ((topName, k_top) :: (secondName, k_second) :: (n, k) :: tsm_rest))
           bn (.loadParam n)
-        = ([.rot], bn :: topName :: secondName :: untagSm tsm_rest, localBindings) := by
+        = ([.rot], some bn :: some topName :: some secondName :: untagSm tsm_rest, localBindings) := by
     have hUntag :
         untagSm ((topName, k_top) :: (secondName, k_second) :: (n, k) :: tsm_rest)
-          = topName :: secondName :: n :: untagSm tsm_rest := rfl
+          = some topName :: some secondName :: some n :: untagSm tsm_rest := rfl
     unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveParam
       Stack.Lower.bringToTop
     simp [hUntag, hDepth2, hConsume, Stack.Lower.StackMap.removeAtDepth,
@@ -13167,7 +13318,7 @@ theorem lowerValueP_refAlias_consume_d0_witness
     ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((n, k) :: tsm_rest)) bn (.loadConst (.refAlias n))).2.1
-        = bn :: untagSm tsm_rest
+        = some bn :: untagSm tsm_rest
     ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((n, k) :: tsm_rest)) bn (.loadConst (.refAlias n))).2.2
@@ -13178,8 +13329,8 @@ theorem lowerValueP_refAlias_consume_d0_witness
       Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           outerProtected localBindings constInts
           (untagSm ((n, k) :: tsm_rest)) bn (.loadConst (.refAlias n))
-        = (([] : List StackOp), bn :: untagSm tsm_rest, localBindings) := by
-    have hUntag : untagSm ((n, k) :: tsm_rest) = n :: untagSm tsm_rest := rfl
+        = (([] : List StackOp), some bn :: untagSm tsm_rest, localBindings) := by
+    have hUntag : untagSm ((n, k) :: tsm_rest) = some n :: untagSm tsm_rest := rfl
     have hDepthTop : Stack.Lower.StackMap.depth? (n :: untagSm tsm_rest) n = some 0 := by
       unfold Stack.Lower.StackMap.depth? List.findIdx? List.findIdx?.go
       simp
@@ -13222,7 +13373,7 @@ theorem lowerValueP_refAlias_consume_d1_witness
             outerProtected localBindings constInts
             (untagSm ((topName, k_top) :: (n, k) :: tsm_rest))
             bn (.loadConst (.refAlias n))).2.1
-          = bn :: topName :: untagSm tsm_rest
+          = some bn :: some topName :: untagSm tsm_rest
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts
             (untagSm ((topName, k_top) :: (n, k) :: tsm_rest))
@@ -13235,10 +13386,10 @@ theorem lowerValueP_refAlias_consume_d1_witness
           outerProtected localBindings constInts
           (untagSm ((topName, k_top) :: (n, k) :: tsm_rest))
           bn (.loadConst (.refAlias n))
-        = ([.swap], bn :: topName :: untagSm tsm_rest, localBindings) := by
+        = ([.swap], some bn :: some topName :: untagSm tsm_rest, localBindings) := by
     have hUntag :
         untagSm ((topName, k_top) :: (n, k) :: tsm_rest)
-          = topName :: n :: untagSm tsm_rest := rfl
+          = some topName :: some n :: untagSm tsm_rest := rfl
     unfold Stack.Lower.lowerValueP Stack.Lower.bringToTop
     simp [hUntag, hDepth1, hConsume]
   obtain ⟨resSt, hRunSwap, hAgreesRes⟩ :=
@@ -13289,7 +13440,7 @@ theorem lowerValueP_refAlias_consume_d2_witness
             (untagSm
               ((topName, k_top) :: (secondName, k_second) :: (n, k) :: tsm_rest))
             bn (.loadConst (.refAlias n))).2.1
-          = bn :: topName :: secondName :: untagSm tsm_rest
+          = some bn :: some topName :: some secondName :: untagSm tsm_rest
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts
             (untagSm
@@ -13305,10 +13456,10 @@ theorem lowerValueP_refAlias_consume_d2_witness
           (untagSm
             ((topName, k_top) :: (secondName, k_second) :: (n, k) :: tsm_rest))
           bn (.loadConst (.refAlias n))
-        = ([.rot], bn :: topName :: secondName :: untagSm tsm_rest, localBindings) := by
+        = ([.rot], some bn :: some topName :: some secondName :: untagSm tsm_rest, localBindings) := by
     have hUntag :
         untagSm ((topName, k_top) :: (secondName, k_second) :: (n, k) :: tsm_rest)
-          = topName :: secondName :: n :: untagSm tsm_rest := rfl
+          = some topName :: some secondName :: some n :: untagSm tsm_rest := rfl
     unfold Stack.Lower.lowerValueP Stack.Lower.bringToTop
     simp [hUntag, hDepth2, hConsume, Stack.Lower.StackMap.removeAtDepth,
       Stack.Lower.StackMap.push]
@@ -13341,7 +13492,7 @@ private theorem untagSm_eraseIdx_eq_removeAtDepth :
 private theorem mem_removeAtDepth
     (bn : String) :
     ∀ (sm : StackMap) (d : Nat),
-      bn ∈ Stack.Lower.StackMap.removeAtDepth sm d → bn ∈ sm := by
+      some bn ∈ Stack.Lower.StackMap.removeAtDepth sm d → some bn ∈ sm := by
   intro sm
   induction sm with
   | nil =>
@@ -13537,7 +13688,7 @@ theorem lowerValueP_loadParam_consume_dge3_witness
           stkSt = .ok resSt
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts (untagSm tsm) bn (.loadParam n)).2.1
-          = bn :: untagSm (tsm.eraseIdx d)
+          = some bn :: untagSm (tsm.eraseIdx d)
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts (untagSm tsm) bn (.loadParam n)).2.2
           = localBindings
@@ -13589,7 +13740,7 @@ theorem lowerValueP_refAlias_consume_dge3_witness
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts (untagSm tsm) bn
             (.loadConst (.refAlias n))).2.1
-          = bn :: untagSm (tsm.eraseIdx d)
+          = some bn :: untagSm (tsm.eraseIdx d)
       ∧ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts (untagSm tsm) bn
             (.loadConst (.refAlias n))).2.2
@@ -14375,7 +14526,7 @@ private theorem depth?_isSome_push_of_ne (sm : StackMap) (n name : String)
 
 /-- `(sm.depth? n).isSome = true` iff `n ∈ sm`. -/
 private theorem depth?_isSome_iff_mem (sm : StackMap) (n : String) :
-    (Stack.Lower.StackMap.depth? sm n).isSome = true ↔ n ∈ sm := by
+    (Stack.Lower.StackMap.depth? sm n).isSome = true ↔ some n ∈ sm := by
   simp only [Stack.Lower.StackMap.depth?, List.findIdx?_isSome, List.any_eq_true, beq_iff_eq]
   constructor
   · intro ⟨x, hxMem, hxEq⟩; rwa [← hxEq]
@@ -14419,7 +14570,7 @@ private theorem bringToTop_consume_sm2_eq
           · simp [Stack.Lower.StackMap.depth?] at hDepth
           · -- single element: depth? can return at most some 0
             obtain ⟨hLen, _, _⟩ := List.findIdx?_eq_some_iff_getElem.mp
-              (show [a].findIdx? (· == refName) = some 1 from hDepth)
+              (show [a].findIdx? (· == some refName) = some 1 from hDepth)
             exact absurd hLen (by simp)
           · simp [Stack.Lower.StackMap.removeAtDepth, Stack.Lower.StackMap.push]
       | succ d2 =>
@@ -14464,7 +14615,7 @@ private theorem lowerValueP_refAlias_consume_sm2_eq
           rcases sm with _ | ⟨a, _ | ⟨b, rest⟩⟩
           · simp [Stack.Lower.StackMap.depth?] at hDepth
           · obtain ⟨hLen, _, _⟩ := List.findIdx?_eq_some_iff_getElem.mp
-              (show [a].findIdx? (· == refName) = some 1 from hDepth)
+              (show [a].findIdx? (· == some refName) = some 1 from hDepth)
             exact absurd hLen (by simp)
           · unfold Stack.Lower.lowerValueP Stack.Lower.bringToTop
             rw [hDepth]
@@ -14510,7 +14661,7 @@ private theorem lowerValueP_loadParam_consume_sm2_eq
           rcases sm with _ | ⟨a, _ | ⟨b, rest⟩⟩
           · simp [Stack.Lower.StackMap.depth?] at hDepth
           · obtain ⟨hLen, _, _⟩ := List.findIdx?_eq_some_iff_getElem.mp
-              (show [a].findIdx? (· == paramName) = some 1 from hDepth)
+              (show [a].findIdx? (· == some paramName) = some 1 from hDepth)
             exact absurd hLen (by simp)
           · unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveParam Stack.Lower.bringToTop
             rw [hDepth]
@@ -14579,7 +14730,7 @@ theorem evalBindings_structuralCopyBody_isSome :
       -- RefReady: every name in sm resolves in anfSt.
       (∀ n, (sm.depth? n).isSome = true → ∃ val, anfSt.resolveRef n = some val) →
       -- SSA freshness: binding names are not in the initial stack map.
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       (RunarVerification.ANF.Eval.evalBindings anfSt body).toOption.isSome
   | [], _sm, _idx, _lu, _op, _lb, _s, _h, _hp, _hpr, _hr, _hf, _hn => by
@@ -14642,14 +14793,14 @@ theorem evalBindings_structuralCopyBody_isSome :
       -- Freshness for the tail.
       simp only [List.map_cons, List.nodup_cons] at hNodup
       obtain ⟨hNameNotInRest, hRestNodup⟩ := hNodup
-      have hFreshTail : ∀ b ∈ rest, b.name ∉ (Stack.Lower.lowerValue sm name v).2 := by
+      have hFreshTail : ∀ b ∈ rest, some b.name ∉ (Stack.Lower.lowerValue sm name v).2 := by
         intro b hbMem
-        rw [hLowerSnd, show Stack.Lower.StackMap.push sm name = name :: sm from rfl]
+        rw [hLowerSnd, show Stack.Lower.StackMap.push sm name = some name :: sm from rfl]
         intro hMem
         simp only [List.mem_cons] at hMem
         cases hMem with
         | inl hEq =>
-            exact hNameNotInRest (List.mem_map.mpr ⟨b, hbMem, hEq⟩)
+            exact hNameNotInRest (List.mem_map.mpr ⟨b, hbMem, Option.some.inj hEq⟩)
         | inr hInSm =>
             exact hFresh b (List.mem_cons_of_mem _ hbMem) hInSm
       exact evalBindings_structuralCopyBody_isSome
@@ -15363,7 +15514,7 @@ theorem runOps_lowerBindings_structuralCopyBody_isSome :
       untagSm tsm = sm →
       agreesTagged tsm anfSt stkSt →
       structuralCopyBody lastUses outerProtected localBindings body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       (runOps (Stack.Lower.lowerBindings sm body).1 stkSt).toOption.isSome
   | [], _sm, _idx, _lu, _op, _lb, _tsm, _anfSt, _stkSt, _h1, _h2, _h3, _h4, _h5 => by
@@ -15373,7 +15524,7 @@ theorem runOps_lowerBindings_structuralCopyBody_isSome :
       simp only [structuralCopyBody] at h
       obtain ⟨hHead, hRest⟩ := h
       -- Extract freshness for the head binding.
-      have hFreshHead : name ∉ sm :=
+      have hFreshHead : some name ∉ sm :=
         hFreshInSm (.mk name v _) List.mem_cons_self
       have hFresh : freshIn name (untagSm tsm) := by
         rw [hUntagSm]; exact hFreshHead
@@ -15402,7 +15553,7 @@ theorem runOps_lowerBindings_structuralCopyBody_isSome :
       obtain ⟨hNameNotInRest, hRestNodup⟩ := hBodyNodup
       -- Derive freshness for the tail from hLowerSnd, Nodup, and the original freshness.
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉ (Stack.Lower.lowerValue sm name v).2 := by
+          ∀ b ∈ rest, some b.name ∉ (Stack.Lower.lowerValue sm name v).2 := by
         intro b hbMem
         rw [hLowerSnd, Stack.Lower.StackMap.push]
         intro hMem
@@ -15447,7 +15598,7 @@ theorem runOps_lowerBindings_structuralCopyBody_preserves_metadata :
       untagSm tsm = sm →
       agreesTagged tsm anfSt stkSt →
       structuralCopyBody lastUses outerProtected localBindings body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       ∃ stkSt',
         runOps (Stack.Lower.lowerBindings sm body).1 stkSt = .ok stkSt'
@@ -15462,7 +15613,7 @@ theorem runOps_lowerBindings_structuralCopyBody_preserves_metadata :
       tsm, anfSt, stkSt, hUntagSm, hAgrees, h, hFreshInSm, hBodyNodup => by
       simp only [structuralCopyBody] at h
       obtain ⟨hHead, hRest⟩ := h
-      have hFreshHead : name ∉ sm :=
+      have hFreshHead : some name ∉ sm :=
         hFreshInSm (.mk name v _) List.mem_cons_self
       have hFresh : freshIn name (untagSm tsm) := by
         rw [hUntagSm]; exact hFreshHead
@@ -15484,7 +15635,7 @@ theorem runOps_lowerBindings_structuralCopyBody_preserves_metadata :
       simp only [List.map_cons, List.nodup_cons] at hBodyNodup
       obtain ⟨hNameNotInRest, hRestNodup⟩ := hBodyNodup
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉ (Stack.Lower.lowerValue sm name v).2 := by
+          ∀ b ∈ rest, some b.name ∉ (Stack.Lower.lowerValue sm name v).2 := by
         intro b hbMem
         rw [hLowerSnd, Stack.Lower.StackMap.push]
         intro hMem
@@ -15536,10 +15687,11 @@ theorem runMethod_lower_public_unique_no_post_structuralCopy_isSome
       structuralCopyBody (Stack.Lower.computeLastUses m.body) []
         (m.body.map (fun b => b.name)) m.body
         (List.reverse (m.params.map (fun p => p.name))) 0)
-    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => p.name)))
+    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => some p.name)))
     (hAgrees : agreesTagged tsm anfSt initialStack)
     -- SSA side conditions: body names are fresh in the initial stack map and pairwise distinct.
-    (hBodyFresh : ∀ b ∈ m.body, b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+    (hBodyFresh : ∀ b ∈ m.body,
+      some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hBodyNodup : (m.body.map (fun b => b.name)).Nodup) :
     (Stack.Eval.runMethod
         (Stack.Lower.lower
@@ -15551,7 +15703,7 @@ theorem runMethod_lower_public_unique_no_post_structuralCopy_isSome
   rw [lowerMethodUserRawOps_eq_lowerBindings_structuralCopy
         methods props m hCopy]
   exact runOps_lowerBindings_structuralCopyBody_isSome
-    m.body (List.reverse (m.params.map (fun p => p.name))) 0
+    m.body (List.reverse (m.params.map (fun p => some p.name))) 0
     (Stack.Lower.computeLastUses m.body) []
     (m.body.map (fun b => b.name)) tsm anfSt initialStack hUntagSm hAgrees hCopy
     hBodyFresh hBodyNodup
@@ -15692,7 +15844,7 @@ needed by the freshness induction.
 /-- Any element of `untagSm (tsm.eraseIdx d)` is also in `untagSm tsm`. -/
 private theorem untagSm_mem_of_mem_eraseIdx
     {tsm : TaggedStackMap} {d : Nat} {x : String}
-    (h : x ∈ untagSm (tsm.eraseIdx d)) : x ∈ untagSm tsm := by
+    (h : some x ∈ untagSm (tsm.eraseIdx d)) : some x ∈ untagSm tsm := by
   rw [untagSm_eraseIdx_eq_removeAtDepth] at h
   exact mem_removeAtDepth x (untagSm tsm) d h
 
@@ -15760,6 +15912,258 @@ def structuralConsumeBody
         (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts sm name v).2.1
         (currentIndex + 1)
+
+/-- NEW-004 peer of the const/copy fragment lemmas. `structuralConsumeValue`
+admits literals, `loadParam` and `@ref` alias only — no `& | ^ << >> ~`
+producer — so starting from the empty set nothing is ever marked raw and
+the bridges below need no extra hypothesis. -/
+theorem collectRawSlots_nil_of_structuralConsumeBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralConsumeBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.collectRawSlots bs = [] := by
+  have go : ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralConsumeBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.collectRawSlotsGo [] bs = [] := by
+    intro bs
+    induction bs with
+    | nil => intro _ _ _; simp [Stack.Lower.collectRawSlotsGo]
+    | cons b rest ih =>
+        obtain ⟨name, v, src⟩ := b
+        intro sm currentIndex h
+        obtain ⟨hv, hrest⟩ := h
+        have hTail := ih _ _ hrest
+        match v, hv with
+        | .loadConst (.int _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bool _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bytes _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadParam _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.refAlias _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.listContains] using hTail
+  intro bs sm currentIndex h
+  unfold Stack.Lower.collectRawSlots
+  exact go bs sm currentIndex h
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_structuralConsumeBody`. -/
+theorem arrayElemsOf_nil_of_structuralConsumeBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralConsumeBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      match v, hv with
+      | .loadConst (.int _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bool _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bytes _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadParam _, _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.refAlias _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+
+/-! ### Issue #150 — `insideBranch` irrelevance on the flag-free fragments
+
+`Stack.Lower.lowerValueP` reads its `insideBranch` argument at exactly four
+arms: `.methodCall` (propagates it into the inlined body), `.ifVal` (sets it
+to `true` for both arms — TS `lowerIf`'s `thenCtx._insideBranch = true` /
+`elseCtx._insideBranch = true`), `.updateProp` (gates the stale-property-slot
+removal on it, mirroring TS `lowerUpdateProp`'s `!this._insideBranch`) and
+`.loop` (propagates it). On every OTHER constructor the arm never mentions
+the flag, so the lowering is literally independent of it.
+
+`insideBranchFreeValueB` names exactly the constructors this corpus needs on
+that side of the line: the literal / reference loads admitted by
+`structuralConstValue`, `structuralCopyValue` and `structuralConsumeValue`,
+plus the `binOp` / `unaryOp` pair admitted by
+`emittableArithChainReadyNoDblNeg`. None of the four flag-reading
+constructors is in any of those fragments, which is what makes the
+irrelevance below provable rather than merely plausible.
+
+Why this matters: an `.ifVal` arm lowers its body at `insideBranch = true`,
+so every lemma in the corpus stated at the default `false` would otherwise
+stop applying under a branch. `lowerBindingsP_insideBranch_irrelevant`
+rewrites the `true` form back to the `false` form on exactly the bodies
+those lemmas admit, so they continue to apply unchanged. -/
+def insideBranchFreeValueB : ANFValue → Bool
+  | .loadConst _ => true
+  | .loadParam _ => true
+  | .loadProp _ => true
+  | .binOp _ _ _ _ => true
+  | .unaryOp _ _ _ => true
+  | _ => false
+
+/-- Every binding in the body is flag-free. -/
+def insideBranchFreeBodyB : List ANFBinding → Bool
+  | [] => true
+  | (.mk _ v _) :: rest => insideBranchFreeValueB v && insideBranchFreeBodyB rest
+
+/-- On a flag-free value, `lowerValueP` ignores `insideBranch` entirely.
+Each admitted arm is closed by `rfl` because, once the outer `match` has
+reduced on the constructor, the two sides are the SAME term — the flag
+simply does not occur in it. -/
+theorem lowerValueP_insideBranch_irrelevant
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName : String) (v : ANFValue)
+    (rawSlots : List String) (insideBranch : Bool)
+    (h : insideBranchFreeValueB v = true) :
+    Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName v rawSlots insideBranch
+      = Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName v rawSlots false := by
+  cases v with
+  | loadConst c =>
+      -- `lowerValueP` matches the const kinds under nested patterns, so the
+      -- outer match only reduces once `c` is a constructor.
+      cases c <;> (unfold Stack.Lower.lowerValueP; rfl)
+  | loadParam _ => unfold Stack.Lower.lowerValueP; rfl
+  | loadProp _ => unfold Stack.Lower.lowerValueP; rfl
+  | binOp _ _ _ _ => unfold Stack.Lower.lowerValueP; rfl
+  | unaryOp _ _ _ => unfold Stack.Lower.lowerValueP; rfl
+  | call _ _ => simp [insideBranchFreeValueB] at h
+  | methodCall _ _ _ => simp [insideBranchFreeValueB] at h
+  | ifVal _ _ _ _ => simp [insideBranchFreeValueB] at h
+  | loop _ _ _ => simp [insideBranchFreeValueB] at h
+  | assert _ => simp [insideBranchFreeValueB] at h
+  | updateProp _ _ => simp [insideBranchFreeValueB] at h
+  | getStateScript => simp [insideBranchFreeValueB] at h
+  | checkPreimage _ => simp [insideBranchFreeValueB] at h
+  | deserializeState _ => simp [insideBranchFreeValueB] at h
+  | addOutput _ _ _ => simp [insideBranchFreeValueB] at h
+  | addRawOutput _ _ => simp [insideBranchFreeValueB] at h
+  | addDataOutput _ _ => simp [insideBranchFreeValueB] at h
+  | arrayLiteral _ => simp [insideBranchFreeValueB] at h
+  | rawScript _ _ _ => simp [insideBranchFreeValueB] at h
+
+/-- Body-level form: on a flag-free body, `lowerBindingsP` at any
+`insideBranch` equals `lowerBindingsP` at the default `false`.
+
+`localBindings` is universally quantified because `lowerBindingsP` threads
+the value step's third component into the tail call. -/
+theorem lowerBindingsP_insideBranch_irrelevant
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String)
+    (constInts : List (String × Int))
+    (rawSlots : List String) (insideBranch : Bool) :
+    ∀ (body : List ANFBinding) (localBindings : List String)
+      (sm : StackMap) (currentIndex : Nat),
+      insideBranchFreeBodyB body = true →
+      Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          outerProtected localBindings constInts sm body rawSlots insideBranch
+        = Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          outerProtected localBindings constInts sm body rawSlots false := by
+  intro body
+  induction body with
+  | nil =>
+      intro _ _ _ _
+      unfold Stack.Lower.lowerBindingsP
+      rfl
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro localBindings sm currentIndex h
+      simp only [insideBranchFreeBodyB, Bool.and_eq_true] at h
+      obtain ⟨hv, hrest⟩ := h
+      -- Rewrite the head step to an explicit triple of projections of the
+      -- `false` form. That makes the `let`-destructuring in `lowerBindingsP`
+      -- reduce, exposing the threaded `sm'` / `localBindings'` as concrete
+      -- terms the induction hypothesis can be instantiated at — the same
+      -- shape the `structuralConst` / `structuralCopy` bridges above use.
+      have hHead :
+          Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+              outerProtected localBindings constInts sm name v rawSlots insideBranch
+            = ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  outerProtected localBindings constInts sm name v rawSlots false).1,
+               (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  outerProtected localBindings constInts sm name v rawSlots false).2.1,
+               (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  outerProtected localBindings constInts sm name v rawSlots false).2.2) := by
+        rw [lowerValueP_insideBranch_irrelevant progMethods props budget currentIndex
+          lastUses outerProtected localBindings constInts sm name v rawSlots insideBranch hv]
+      have hTail := ih
+        (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          outerProtected localBindings constInts sm name v rawSlots false).2.2
+        (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          outerProtected localBindings constInts sm name v rawSlots false).2.1
+        (currentIndex + 1) hrest
+      simp only [Stack.Lower.lowerBindingsP, hHead, hTail]
+
+/-- `structuralConstBody` bodies are flag-free (literals only). -/
+theorem insideBranchFreeBodyB_of_structuralConstBody :
+    ∀ (body : List ANFBinding), structuralConstBody body →
+      insideBranchFreeBodyB body = true
+  | [], _ => rfl
+  | (.mk _ v _) :: rest, h => by
+      obtain ⟨hv, hrest⟩ := h
+      simp only [insideBranchFreeBodyB, Bool.and_eq_true]
+      refine ⟨?_, insideBranchFreeBodyB_of_structuralConstBody rest hrest⟩
+      cases v with
+      | loadConst _ => rfl
+      | loadParam _ => rfl
+      | loadProp _ => rfl
+      | binOp _ _ _ _ => rfl
+      | unaryOp _ _ _ => rfl
+      | _ => simp [structuralConstValue] at hv
+
+/-- `structuralCopyBody` bodies are flag-free (literals + copied refs). -/
+theorem insideBranchFreeBodyB_of_structuralCopyBody
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralCopyBody lastUses outerProtected localBindings body sm currentIndex →
+      insideBranchFreeBodyB body = true
+  | [], _, _, _ => rfl
+  | (.mk _ v _) :: rest, sm, currentIndex, h => by
+      obtain ⟨hv, hrest⟩ := h
+      simp only [insideBranchFreeBodyB, Bool.and_eq_true]
+      refine ⟨?_, insideBranchFreeBodyB_of_structuralCopyBody lastUses outerProtected
+        localBindings rest _ (currentIndex + 1) hrest⟩
+      cases v with
+      | loadConst _ => rfl
+      | loadParam _ => rfl
+      | loadProp _ => rfl
+      | binOp _ _ _ _ => rfl
+      | unaryOp _ _ _ => rfl
+      | _ => simp [structuralCopyValue] at hv
+
+/-- `structuralConsumeBody` bodies are flag-free (literals + consumed refs). -/
+theorem insideBranchFreeBodyB_of_structuralConsumeBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralConsumeBody progMethods props budget lastUses outerProtected
+        localBindings constInts body sm currentIndex →
+      insideBranchFreeBodyB body = true
+  | [], _, _, _ => rfl
+  | (.mk _ v _) :: rest, sm, currentIndex, h => by
+      obtain ⟨hv, hrest⟩ := h
+      simp only [insideBranchFreeBodyB, Bool.and_eq_true]
+      refine ⟨?_, insideBranchFreeBodyB_of_structuralConsumeBody progMethods props budget
+        lastUses outerProtected localBindings constInts rest _ (currentIndex + 1) hrest⟩
+      cases v with
+      | loadConst _ => rfl
+      | loadParam _ => rfl
+      | loadProp _ => rfl
+      | binOp _ _ _ _ => rfl
+      | unaryOp _ _ _ => rfl
+      | _ => simp [structuralConsumeValue] at hv
 
 /-- The third component of `lowerValueP`'s result equals `localBindings`
 for all values admitted by `structuralCopyValue` or `structuralConsumeValue`.
@@ -16574,7 +16978,7 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_isSome
       agreesTagged tsm anfSt stkSt →
       structuralConsumeBody progMethods props budget lastUses outerProtected
           localBindings constInts body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
                  outerProtected localBindings constInts sm body).1
@@ -16589,7 +16993,7 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_isSome
       have hHeadSm : structuralConsumeValue lastUses outerProtected localBindings (untagSm tsm)
           currentIndex v := by rw [hUntagSm]; exact hHead
       -- Freshness for the head.
-      have hFreshHead : name ∉ sm := hFreshInSm (.mk name v _src) List.mem_cons_self
+      have hFreshHead : some name ∉ sm := hFreshInSm (.mk name v _src) List.mem_cons_self
       have hFresh : freshIn name (untagSm tsm) := by rw [hUntagSm]; exact hFreshHead
       -- Apply the single-value witness.
       obtain ⟨stkSt', loadedVal, hHeadRun, tsm', hUntagTsm', hAgreesNew⟩ :=
@@ -16625,9 +17029,9 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_isSome
       obtain ⟨hNameNotInRest, hRestNodup⟩ := hBodyNodup
       -- A helper: any element ≠ name in (lowerValueP ...).2.1 is in sm.
       have hTailSubsetSm : ∀ x, x ≠ name →
-          x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          some x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                     outerProtected localBindings constInts sm name v).2.1 →
-          x ∈ sm := by
+          some x ∈ sm := by
         intro x hxNe hxMem
         cases v with
         | loadConst c =>
@@ -16636,24 +17040,24 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_isSome
                 -- lowerValueP emits push; output sm = sm.push name = name :: sm
                 have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                         outerProtected localBindings constInts sm name
-                        (.loadConst (.int i))).2.1 = name :: sm := by
+                        (.loadConst (.int i))).2.1 = some name :: sm := by
                   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
                 rw [hSm] at hxMem
-                exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
             | bool b =>
                 have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                         outerProtected localBindings constInts sm name
-                        (.loadConst (.bool b))).2.1 = name :: sm := by
+                        (.loadConst (.bool b))).2.1 = some name :: sm := by
                   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
                 rw [hSm] at hxMem
-                exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
             | bytes bs =>
                 have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                         outerProtected localBindings constInts sm name
-                        (.loadConst (.bytes bs))).2.1 = name :: sm := by
+                        (.loadConst (.bytes bs))).2.1 = some name :: sm := by
                   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
                 rw [hSm] at hxMem
-                exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
             | thisRef => simp [structuralConsumeValue] at hHead
             | refAlias consuming =>
                 unfold structuralConsumeValue at hHead
@@ -16680,7 +17084,7 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_isSome
             exact mem_removeAtDepth x sm d (hxMem.resolve_left hxNe)
         | _ => simp [structuralConsumeValue] at hHead
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉
+          ∀ b ∈ rest, some b.name ∉
             (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                 outerProtected localBindings constInts sm name v).2.1 := by
         intro b hbMem hbIn
@@ -16739,7 +17143,7 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
       agreesTagged tsm anfSt stkSt →
       structuralConsumeBody progMethods props budget lastUses outerProtected
           localBindings constInts body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       ∃ stkSt',
         runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex
@@ -16758,7 +17162,7 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
       obtain ⟨hHead, hRest⟩ := h
       have hHeadSm : structuralConsumeValue lastUses outerProtected localBindings (untagSm tsm)
           currentIndex v := by rw [hUntagSm]; exact hHead
-      have hFreshHead : name ∉ sm := hFreshInSm (.mk name v _src) List.mem_cons_self
+      have hFreshHead : some name ∉ sm := hFreshInSm (.mk name v _src) List.mem_cons_self
       have hFresh : freshIn name (untagSm tsm) := by rw [hUntagSm]; exact hFreshHead
       obtain ⟨stkSt', loadedVal, hHeadRun, tsm', hUntagTsm', hAgreesNew⟩ :=
         runOps_lowerValueP_structuralConsumeValue_ok
@@ -16886,9 +17290,9 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
       simp only [List.map_cons, List.nodup_cons] at hBodyNodup
       obtain ⟨hNameNotInRest, hRestNodup⟩ := hBodyNodup
       have hTailSubsetSm : ∀ x, x ≠ name →
-          x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          some x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                     outerProtected localBindings constInts sm name v).2.1 →
-          x ∈ sm := by
+          some x ∈ sm := by
         intro x hxNe hxMem
         cases v with
         | loadConst c =>
@@ -16896,27 +17300,27 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
             | int i =>
                 have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                         outerProtected localBindings constInts sm name
-                        (.loadConst (.int i))).2.1 = name :: sm := by
+                        (.loadConst (.int i))).2.1 = some name :: sm := by
                   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
                     Stack.Lower.StackMap.push; rfl
                 rw [hSm] at hxMem
-                exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
             | bool b =>
                 have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                         outerProtected localBindings constInts sm name
-                        (.loadConst (.bool b))).2.1 = name :: sm := by
+                        (.loadConst (.bool b))).2.1 = some name :: sm := by
                   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
                     Stack.Lower.StackMap.push; rfl
                 rw [hSm] at hxMem
-                exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
             | bytes bs =>
                 have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                         outerProtected localBindings constInts sm name
-                        (.loadConst (.bytes bs))).2.1 = name :: sm := by
+                        (.loadConst (.bytes bs))).2.1 = some name :: sm := by
                   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
                     Stack.Lower.StackMap.push; rfl
                 rw [hSm] at hxMem
-                exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
             | thisRef => simp [structuralConsumeValue] at hHead
             | refAlias consuming =>
                 unfold structuralConsumeValue at hHead
@@ -16942,7 +17346,7 @@ theorem runOps_lowerBindingsP_structuralConsumeBody_preserves_metadata
             exact mem_removeAtDepth x sm d (hxMem.resolve_left hxNe)
         | _ => simp [structuralConsumeValue] at hHead
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉
+          ∀ b ∈ rest, some b.name ∉
             (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                 outerProtected localBindings constInts sm name v).2.1 := by
         intro b hbMem hbIn
@@ -16998,10 +17402,11 @@ theorem runMethod_lower_public_unique_no_post_structuralConsume_isSome
         (Stack.Lower.computeLastUses m.body) []
         (m.body.map (fun b => b.name))
         (Stack.Lower.collectConstInts m.body)
-        m.body (List.reverse (m.params.map (fun p => p.name))) 0)
-    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => p.name)))
+        m.body (List.reverse (m.params.map (fun p => some p.name))) 0)
+    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => some p.name)))
     (hAgrees : agreesTagged tsm anfSt initialStack)
-    (hBodyFresh : ∀ b ∈ m.body, b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+    (hBodyFresh : ∀ b ∈ m.body,
+      some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hBodyNodup : (m.body.map (fun b => b.name)).Nodup) :
     (Stack.Eval.runMethod
         (Stack.Lower.lower
@@ -17011,12 +17416,27 @@ theorem runMethod_lower_public_unique_no_post_structuralConsume_isSome
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
   unfold lowerMethodUserRawOps
+  -- NEW-004: the consume fragment admits no byte-array producer, so the
+  -- method-wide raw-slot set is empty and the threaded lowering is the
+  -- pre-NEW-004 one the generic lemma is stated about.
+  rw [collectRawSlots_nil_of_structuralConsumeBody
+        methods props Stack.Lower.defaultInlineBudget
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts m.body)
+        m.body (List.reverse (m.params.map (fun p => some p.name))) 0 hConsume]
+  rw [arrayElemsOf_nil_of_structuralConsumeBody
+        methods props Stack.Lower.defaultInlineBudget
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts m.body)
+        m.body (List.reverse (m.params.map (fun p => some p.name))) 0 hConsume]
   exact runOps_lowerBindingsP_structuralConsumeBody_isSome
     methods props Stack.Lower.defaultInlineBudget
     (Stack.Lower.computeLastUses m.body) []
     (m.body.map (fun b => b.name))
     (Stack.Lower.collectConstInts m.body)
-    m.body (List.reverse (m.params.map (fun p => p.name))) 0
+    m.body (List.reverse (m.params.map (fun p => some p.name))) 0
     tsm anfSt initialStack hUntagSm hAgrees hConsume
     hBodyFresh hBodyNodup
 
@@ -17056,6 +17476,73 @@ def structuralRefBody
         (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts sm name v).2.1
         (currentIndex + 1)
+
+/-- NEW-004: `structuralRefValue` is `structuralCopyValue ∨
+structuralConsumeValue`, and neither admits a byte-array producer, so the
+ref fragment marks nothing raw either. -/
+theorem collectRawSlots_nil_of_structuralRefBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralRefBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.collectRawSlots bs = [] := by
+  have go : ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralRefBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.collectRawSlotsGo [] bs = [] := by
+    intro bs
+    induction bs with
+    | nil => intro _ _ _; simp [Stack.Lower.collectRawSlotsGo]
+    | cons b rest ih =>
+        obtain ⟨name, v, src⟩ := b
+        intro sm currentIndex h
+        obtain ⟨hv, hrest⟩ := h
+        have hTail := ih _ _ hrest
+        -- `structuralRefValue` unfolds to the copy/consume disjunction; in
+        -- both disjuncts the admitted value shapes are the same five.
+        match v, hv with
+        | .loadConst (.int _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bool _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.bytes _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadParam _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadProp _, _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.rawResultValue] using hTail
+        | .loadConst (.refAlias _), _ =>
+            simpa [Stack.Lower.collectRawSlotsGo, Stack.Lower.listContains] using hTail
+  intro bs sm currentIndex h
+  unfold Stack.Lower.collectRawSlots
+  exact go bs sm currentIndex h
+
+/-- `arrayElems` peer of `collectRawSlots_nil_of_structuralRefBody`. -/
+theorem arrayElemsOf_nil_of_structuralRefBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralRefBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      match v, hv with
+      | .loadConst (.int _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bool _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.bytes _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadParam _, _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadProp _, _ => simpa [Stack.Lower.arrayElemsOf] using hTail
+      | .loadConst (.refAlias _), _ => simpa [Stack.Lower.arrayElemsOf] using hTail
 
 /-- ANF-side success for the ref fragment: case-split on copy vs consume. -/
 theorem evalBindings_structuralRefBody_isSome
@@ -17177,7 +17664,7 @@ theorem evalBindings_structuralRefBody_isSome
                       simp only [List.head?, h2, List.getElem_cons_zero, beq_iff_eq] at *
                       exact congrArg some hAt
                 rw [hHead0] at this
-                exact hEq (Option.some.inj this).symm
+                exact hEq (Option.some.inj (Option.some.inj this)).symm
             | succ d'' =>
                 -- depth d''+1: n is in the tail of (lowerValueP ...).2.1.
                 -- The tail of (lowerValueP ...).2.1 is a subset of sm.
@@ -17186,12 +17673,13 @@ theorem evalBindings_structuralRefBody_isSome
                 -- derive ∃ k, smTail.findIdx? (· == n) = some k.
                 have findIdxConsSucc :
                     ∀ (smTail : StackMap),
-                    (name :: smTail).findIdx? (· == n) = some (d'' + 1) →
-                    ∃ k, smTail.findIdx? (· == n) = some k := by
+                    (some name :: smTail).findIdx? (· == some n) = some (d'' + 1) →
+                    ∃ k, smTail.findIdx? (· == some n) = some k := by
                   intro smTail hTail
-                  have hne : (name == n) = false := beq_eq_false_iff_ne.mpr (Ne.symm hEq)
+                  have hne : ((some name : Option String) == some n) = false :=
+                    beq_eq_false_iff_ne.mpr (fun hEqSome => hEq (Option.some.inj hEqSome).symm)
                   rw [List.findIdx?_cons, hne] at hTail
-                  cases h : smTail.findIdx? (· == n) with
+                  cases h : smTail.findIdx? (· == some n) with
                   | none => simp [h] at hTail
                   | some k => exact ⟨k, rfl⟩
                 cases hHead with
@@ -17355,7 +17843,7 @@ theorem runOps_lowerBindingsP_structuralRefBody_isSome
       agreesTagged tsm anfSt stkSt →
       structuralRefBody progMethods props budget lastUses outerProtected
           localBindings constInts body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
                  outerProtected localBindings constInts sm body).1
@@ -17367,7 +17855,7 @@ theorem runOps_lowerBindingsP_structuralRefBody_isSome
       simp only [structuralRefBody] at h
       obtain ⟨hHead, hRest⟩ := h
       simp only [structuralRefValue] at hHead
-      have hFreshHead : name ∉ sm := hFreshInSm (.mk name v _src) List.mem_cons_self
+      have hFreshHead : some name ∉ sm := hFreshInSm (.mk name v _src) List.mem_cons_self
       have hFresh : freshIn name (untagSm tsm) := by rw [hUntagSm]; exact hFreshHead
       -- Dispatch on copy vs consume.
       have hHeadSm : structuralRefValue lastUses outerProtected localBindings (untagSm tsm)
@@ -17431,9 +17919,9 @@ theorem runOps_lowerBindingsP_structuralRefBody_isSome
       obtain ⟨hNameNotInRest, hRestNodup⟩ := hBodyNodup
       -- A helper: any element ≠ name in (lowerValueP ...).2.1 is in sm.
       have hTailSubsetSmRef : ∀ x, x ≠ name →
-          x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          some x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                     outerProtected localBindings constInts sm name v).2.1 →
-          x ∈ sm := by
+          some x ∈ sm := by
         intro x hxNe hxMem
         cases hHead with
         | inl hCopy =>
@@ -17456,22 +17944,22 @@ theorem runOps_lowerBindingsP_structuralRefBody_isSome
                 cases c with
                 | int i =>
                     have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                            outerProtected localBindings constInts sm name (.loadConst (.int i))).2.1 = name :: sm := by
+                            outerProtected localBindings constInts sm name (.loadConst (.int i))).2.1 = some name :: sm := by
                       unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
                     rw [hSm] at hxMem
-                    exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                    exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
                 | bool b =>
                     have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                            outerProtected localBindings constInts sm name (.loadConst (.bool b))).2.1 = name :: sm := by
+                            outerProtected localBindings constInts sm name (.loadConst (.bool b))).2.1 = some name :: sm := by
                       unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
                     rw [hSm] at hxMem
-                    exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                    exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
                 | bytes bs =>
                     have hSm : (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
-                            outerProtected localBindings constInts sm name (.loadConst (.bytes bs))).2.1 = name :: sm := by
+                            outerProtected localBindings constInts sm name (.loadConst (.bytes bs))).2.1 = some name :: sm := by
                       unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
                     rw [hSm] at hxMem
-                    exact (List.mem_cons.mp hxMem).resolve_left hxNe
+                    exact (List.mem_cons.mp hxMem).resolve_left (fun h => hxNe (Option.some.inj h))
                 | refAlias consuming =>
                     unfold structuralConsumeValue at hConsume
                     obtain ⟨⟨d, hDepth⟩, hCons⟩ := hConsume
@@ -17497,7 +17985,7 @@ theorem runOps_lowerBindingsP_structuralRefBody_isSome
                 exact mem_removeAtDepth x sm d (hxMem.resolve_left hxNe)
             | _ => simp [structuralConsumeValue] at hConsume
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉
+          ∀ b ∈ rest, some b.name ∉
             (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                 outerProtected localBindings constInts sm name v).2.1 := by
         intro b hbMem hbIn
@@ -17536,10 +18024,11 @@ theorem runMethod_lower_public_unique_no_post_structuralRef_isSome
         (Stack.Lower.computeLastUses m.body) []
         (m.body.map (fun b => b.name))
         (Stack.Lower.collectConstInts m.body)
-        m.body (List.reverse (m.params.map (fun p => p.name))) 0)
-    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => p.name)))
+        m.body (List.reverse (m.params.map (fun p => some p.name))) 0)
+    (hUntagSm : untagSm tsm = List.reverse (m.params.map (fun p => some p.name)))
     (hAgrees : agreesTagged tsm anfSt initialStack)
-    (hBodyFresh : ∀ b ∈ m.body, b.name ∉ List.reverse (m.params.map (fun p => p.name)))
+    (hBodyFresh : ∀ b ∈ m.body,
+      some b.name ∉ List.reverse (m.params.map (fun p => some p.name)))
     (hBodyNodup : (m.body.map (fun b => b.name)).Nodup) :
     (Stack.Eval.runMethod
         (Stack.Lower.lower
@@ -17549,12 +18038,26 @@ theorem runMethod_lower_public_unique_no_post_structuralRef_isSome
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
   unfold lowerMethodUserRawOps
+  -- NEW-004: see the `structuralConsume` peer above — the ref fragment is
+  -- copy ∨ consume, and neither marks a slot raw.
+  rw [collectRawSlots_nil_of_structuralRefBody
+        methods props Stack.Lower.defaultInlineBudget
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts m.body)
+        m.body (List.reverse (m.params.map (fun p => some p.name))) 0 hRef]
+  rw [arrayElemsOf_nil_of_structuralRefBody
+        methods props Stack.Lower.defaultInlineBudget
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts m.body)
+        m.body (List.reverse (m.params.map (fun p => some p.name))) 0 hRef]
   exact runOps_lowerBindingsP_structuralRefBody_isSome
     methods props Stack.Lower.defaultInlineBudget
     (Stack.Lower.computeLastUses m.body) []
     (m.body.map (fun b => b.name))
     (Stack.Lower.collectConstInts m.body)
-    m.body (List.reverse (m.params.map (fun p => p.name))) 0
+    m.body (List.reverse (m.params.map (fun p => some p.name))) 0
     tsm anfSt initialStack hUntagSm hAgrees hRef
     hBodyFresh hBodyNodup
 
@@ -17853,6 +18356,32 @@ def structuralArithBody
             outerProtected localBindings constInts sm name v).2.1
         (currentIndex + 1)
 
+/-- `arrayElems` peer for the (map-threaded) arith fragment.
+`structuralArithValue` is `structuralRefValue` plus `binOp` / `unaryOp` /
+`assert`; none of the three metadata-bearing constructors is in it. -/
+theorem arrayElemsOf_nil_of_structuralArithBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralArithBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      cases v <;>
+        first
+          | (simpa [Stack.Lower.arrayElemsOf] using hTail)
+          | (exact absurd hv
+              (by simp [structuralArithValue, structuralRefValue,
+                        structuralCopyValue, structuralConsumeValue]))
+
 /-! #### Helper: copy-mode `loadRefLive` equality -/
 
 /-- When the consume flag is false, `loadRefLive` reduces to
@@ -17905,7 +18434,7 @@ private theorem depth?_isSome_of_push_left
     exact ⟨0, by simp [List.findIdx?_cons, beq_self_eq_true]⟩
   · refine ⟨dr + 1, ?_⟩
     rw [List.findIdx?_cons]
-    simp only [beq_iff_eq, heq, if_false]
+    simp only [beq_iff_eq, Option.some.injEq, heq, if_false]
     simp [hdr]
 
 /-- For any `loadConst` that is not `refAlias` or `thisRef` (i.e. `int`, `bool`, `bytes`),
@@ -17981,6 +18510,10 @@ theorem lowerValueP_binOp_copy_eq_lowerValue
              loadRefOperand_copy_eq (sm.push l) r [l, r] currentIndex lastUses outerProtected dr' hdr' hr_copy]
   -- Simplify sm2.popN 2 = sm
   simp only [Stack.Lower.StackMap.push, Stack.Lower.StackMap.popN]
+  -- NEW-004: with no raw slots in scope both sides of each operand's
+  -- raw-vs-normalise gate are the same load, so the gate collapses.
+  simp only [Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil,
+             ite_self]
   -- Now match lowerValue
   unfold Stack.Lower.lowerValue
   rfl
@@ -18005,6 +18538,10 @@ theorem lowerValueP_unaryOp_copy_eq_lowerValue
   unfold Stack.Lower.lowerValueP
   rw [loadRefLive_copy_eq sm operand currentIndex lastUses outerProtected d hd' hcopy]
   simp only [Stack.Lower.StackMap.push, Stack.Lower.StackMap.popN]
+  -- NEW-004: `~` reads its operand raw, every other unary op normalises
+  -- it; with no raw slots in scope both branches are the same load.
+  simp only [Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil,
+             ite_self]
   unfold Stack.Lower.lowerValue
   rfl
 
@@ -18170,6 +18707,31 @@ theorem lowerBindingsP_eq_lowerBindings_structuralArith
           rest (Stack.Lower.lowerValue sm name v).2 (currentIndex + 1) hRest
       simp [Stack.Lower.lowerBindingsP, Stack.Lower.lowerBindings, hValue, hTail]
 
+/-- `arrayElems` peer of the fragment lemmas above, for the arith
+fragment.  Unlike `collectRawSlots` — which the arith fragment genuinely
+can populate, hence the `hRaw` side condition below — `arrayElemsOf` only
+fires on `.arrayLiteral` / `.ifVal` / `.loop`, and `structuralArithCopyValue`
+admits none of the three (it is `structuralCopyValue` plus `binOp` /
+`unaryOp` / `assert`). So the element table is unconditionally empty here. -/
+theorem arrayElemsOf_nil_of_structuralArithCopyBody
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralArithCopyBody lastUses outerProtected localBindings bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      cases v <;>
+        first
+          | (simpa [Stack.Lower.arrayElemsOf] using hTail)
+          | (exact absurd hv
+              (by simp [structuralArithCopyValue, structuralCopyValue]))
+
 /-- **Item 1 keystone (method level).**  The method-shaped specialization
 of the arith bridge for the raw body ops exposed by
 `lowerMethodUserRawOps`.  This is the arith peer of
@@ -18183,11 +18745,35 @@ theorem lowerMethodUserRawOps_eq_lowerBindings_structuralArith
     (hArith :
       structuralArithCopyBody (Stack.Lower.computeLastUses m.body) []
         (m.body.map (fun b => b.name)) m.body
-        (m.params.map (fun p => p.name) |>.reverse) 0) :
+        (m.params.map (fun p => p.name) |>.reverse) 0)
+    -- NEW-004: unlike the const / copy / consume / ref fragments, the arith
+    -- fragment genuinely ADMITS the byte-array producers — `isProvedBinOpKind`
+    -- accepts `<< >> & | ^` and `isProvedUnaryOpKind` accepts `~` — so
+    -- `collectRawSlots m.body = []` does NOT follow from `hArith` and has to
+    -- be assumed. It is decidable (`List String` equality), so a concrete
+    -- body discharges it by `decide`.
+    --
+    -- What it excludes: exactly the methods the NEW-004 repair was written
+    -- for — one whose byte-array result is later read in numeric context, so
+    -- `lowerMethod` emits an `OP_BIN2NUM` that the SIMPLE lowerer
+    -- (`lowerBindings`, which has no `rawSlots` thread) does not. For those
+    -- the two sides differ by exactly those opcodes and the bridge is FALSE,
+    -- not merely unproved. Removing the side condition means porting
+    -- `rawSlots` into `lowerBindings` as well, which in turn needs the VM
+    -- model to accept `OP_BIN2NUM` on an already-minimal `.vBigint`
+    -- (`Stack/Eval.lean` currently rejects it via `asBytes?`). This bridge
+    -- has no downstream consumers today, so that work would buy no extra
+    -- coverage; it is deferred rather than done speculatively.
+    (hRaw : Stack.Lower.collectRawSlots m.body = []) :
     lowerMethodUserRawOps progMethods props m =
       (Stack.Lower.lowerBindings
         (m.params.map (fun p => p.name) |>.reverse) m.body).1 := by
   unfold lowerMethodUserRawOps
+  rw [hRaw]
+  rw [arrayElemsOf_nil_of_structuralArithCopyBody
+        (Stack.Lower.computeLastUses m.body) []
+        (m.body.map (fun b => b.name)) m.body
+        (m.params.map (fun p => p.name) |>.reverse) 0 hArith]
   rw [lowerBindingsP_eq_lowerBindings_structuralArith
         progMethods props Stack.Lower.defaultInlineBudget
         (Stack.Lower.computeLastUses m.body) []
@@ -18612,7 +19198,7 @@ theorem runOps_lowerBindingsP_structuralArithBody_isSome
     ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat) (stkSt : StackState),
       structuralArithBody progMethods props budget lastUses outerProtected
           localBindings constInts body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       -- Runtime success witness: uniform over any stack map, any pre-stack,
       -- AND any index (needed to thread through the tail with index + 1).
@@ -18697,9 +19283,9 @@ theorem runOps_lowerBindingsP_structuralArithBody_isSome
       -- Tail freshness: any element ≠ name in (lowerValueP ...).2.1 is in sm
       -- Note: hHead was already unfolded by simp [structuralArithValue] in hLBUnchanged.
       have hTailSubset : ∀ x, x ≠ name →
-          x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          some x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                   outerProtected localBindings constInts sm name v).2.1 →
-          x ∈ sm := by
+          some x ∈ sm := by
         intro x hxNe hxMem
         rcases hHead with hRef | ⟨op, l, r, rt, hvEq, _, _, _, _, _⟩ |
           ⟨op, operand, rt, hvEq, _, _, _⟩ | ⟨ref, hvEq, _, _⟩
@@ -18778,7 +19364,7 @@ theorem runOps_lowerBindingsP_structuralArithBody_isSome
           exact hxMem
           all_goals assumption
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉
+          ∀ b ∈ rest, some b.name ∉
             (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                 outerProtected localBindings constInts sm name v).2.1 := by
         intro b hbMem hbIn
@@ -19291,6 +19877,33 @@ def structuralCallBody
         (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
             outerProtected localBindings constInts sm name v).2.1
         (currentIndex + 1)
+
+/-- `arrayElems` peer for the call fragment: `structuralCallValue` is
+`structuralArithValue` plus the arity-1/2/3 builtin `call` shapes, so it
+still admits no `.arrayLiteral` / `.ifVal` / `.loop`. -/
+theorem arrayElemsOf_nil_of_structuralCallBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (bs : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      structuralCallBody progMethods props budget lastUses outerProtected
+          localBindings constInts bs sm currentIndex →
+      Stack.Lower.arrayElemsOf bs = [] := by
+  intro bs
+  induction bs with
+  | nil => intro _ _ _; simp [Stack.Lower.arrayElemsOf]
+  | cons b rest ih =>
+      obtain ⟨name, v, src⟩ := b
+      intro sm currentIndex h
+      obtain ⟨hv, hrest⟩ := h
+      have hTail := ih _ _ hrest
+      cases v <;>
+        first
+          | (simpa [Stack.Lower.arrayElemsOf] using hTail)
+          | (exact absurd hv
+              (by simp [structuralCallValue, structuralArithValue,
+                        structuralRefValue, structuralCopyValue,
+                        structuralConsumeValue]))
 
 /-! #### Bridge lemmas: sm2 equality for each arity group
 
@@ -19907,7 +20520,7 @@ theorem runOps_lowerBindingsP_structuralCallBody_isSome
     ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat) (stkSt : StackState),
       structuralCallBody progMethods props budget lastUses outerProtected
           localBindings constInts body sm currentIndex →
-      (∀ b ∈ body, b.name ∉ sm) →
+      (∀ b ∈ body, some b.name ∉ sm) →
       (body.map (·.name)).Nodup →
       -- Runtime success witness: uniform over any stack map, any pre-stack, any index
       (∀ b ∈ body, ∀ idx : Nat, ∀ sm_acc : StackMap, ∀ stkPre : StackState,
@@ -20010,9 +20623,9 @@ theorem runOps_lowerBindingsP_structuralCallBody_isSome
       rw [hLBUnchanged]
       -- Tail subset: x ≠ name ∧ x ∈ sm2 → x ∈ sm
       have hTailSubset : ∀ x, x ≠ name →
-          x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          some x ∈ (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                   outerProtected localBindings constInts sm name v).2.1 →
-          x ∈ sm := by
+          some x ∈ sm := by
         intro x hxNe hxMem
         simp only [structuralCallValue] at hHead
         rcases hHead with hArith | ⟨ax, hOr1, _⟩ | ⟨al, ar, hOr2, _, _⟩ | ⟨ax, lo, hi, hwithin, _, _, _⟩
@@ -20117,7 +20730,7 @@ theorem runOps_lowerBindingsP_structuralCallBody_isSome
           simp [List.mem_cons] at hxMem
           exact hxMem.resolve_left hxNe
       have hFreshInSm' :
-          ∀ b ∈ rest, b.name ∉
+          ∀ b ∈ rest, some b.name ∉
             (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
                 outerProtected localBindings constInts sm name v).2.1 := by
         intro b hbMem hbIn
@@ -23663,7 +24276,10 @@ parent slot the other kept, so the asymmetric-consumption cleanup path
 (ROLL+DROP injection) does not fire. -/
 def ifValDrops (smBranch refSm otherSm : StackMap) : List String :=
   List.foldl
-    (fun acc n =>
+    (fun acc slot =>
+      match slot with
+      | none => acc
+      | some n =>
       if Stack.Lower.listContains acc n = true then acc
       else
         match refSm.depth? n, otherSm.depth? n with
@@ -23695,7 +24311,7 @@ abbrev ifValThnRes (progMethods : List ANFMethod) (props : List ANFProperty) (bu
   Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
     (ifValInnerProtected sm cond currentIndex lastUses outerProtected)
     (List.map (fun b => b.name) thn) constInts
-    (ifValSmBranch sm cond currentIndex lastUses outerProtected) thn
+    (ifValSmBranch sm cond currentIndex lastUses outerProtected) thn [] true
 
 /-- Result of lowering the ELSE branch exactly as the `.ifVal` arm does. -/
 abbrev ifValElsRes (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
@@ -23705,7 +24321,62 @@ abbrev ifValElsRes (progMethods : List ANFMethod) (props : List ANFProperty) (bu
   Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
     (ifValInnerProtected sm cond currentIndex lastUses outerProtected)
     (List.map (fun b => b.name) els) constInts
-    (ifValSmBranch sm cond currentIndex lastUses outerProtected) els
+    (ifValSmBranch sm cond currentIndex lastUses outerProtected) els [] true
+
+/-- Issue #150: on a flag-free THEN body, the arm's `insideBranch = true`
+lowering coincides with the default `false` lowering. Every lemma in the
+corpus stated at the default therefore keeps applying under an `.ifVal`
+arm, for exactly the bodies those lemmas admit. -/
+theorem ifValThnRes_eq_default
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) (cond : String) (thn : List ANFBinding)
+    (h : insideBranchFreeBodyB thn = true) :
+    ifValThnRes progMethods props budget currentIndex lastUses outerProtected
+        constInts sm cond thn
+      = Stack.Lower.lowerBindingsP progMethods props budget 0
+          (Stack.Lower.computeLastUses thn)
+          (ifValInnerProtected sm cond currentIndex lastUses outerProtected)
+          (List.map (fun b => b.name) thn) constInts
+          (ifValSmBranch sm cond currentIndex lastUses outerProtected) thn :=
+  lowerBindingsP_insideBranch_irrelevant progMethods props budget
+    (Stack.Lower.computeLastUses thn)
+    (ifValInnerProtected sm cond currentIndex lastUses outerProtected)
+    constInts [] true thn (List.map (fun b => b.name) thn)
+    (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 h
+
+/-- ELSE-branch peer of `ifValThnRes_eq_default`. -/
+theorem ifValElsRes_eq_default
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) (cond : String) (els : List ANFBinding)
+    (h : insideBranchFreeBodyB els = true) :
+    ifValElsRes progMethods props budget currentIndex lastUses outerProtected
+        constInts sm cond els
+      = Stack.Lower.lowerBindingsP progMethods props budget 0
+          (Stack.Lower.computeLastUses els)
+          (ifValInnerProtected sm cond currentIndex lastUses outerProtected)
+          (List.map (fun b => b.name) els) constInts
+          (ifValSmBranch sm cond currentIndex lastUses outerProtected) els :=
+  lowerBindingsP_insideBranch_irrelevant progMethods props budget
+    (Stack.Lower.computeLastUses els)
+    (ifValInnerProtected sm cond currentIndex lastUses outerProtected)
+    constInts [] true els (List.map (fun b => b.name) els)
+    (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 h
+
+/-- The parent map the `.ifVal` arm reconciles to: the post-cond-pop parent
+minus the names the THEN arm gave up. Names the `smParentReconciled`
+intermediate, which is what `restoreInheritedLayout` is handed. -/
+abbrev ifValParentReconciled (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) (cond : String) (thn : List ANFBinding) : StackMap :=
+  Stack.Lower.removeNames (ifValSmBranch sm cond currentIndex lastUses outerProtected)
+    (Stack.Lower.consumedNames (ifValSmBranch sm cond currentIndex lastUses outerProtected)
+      (ifValThnRes progMethods props budget currentIndex lastUses outerProtected
+        constInts sm cond thn).2)
 
 /-- **Clean-path precondition for the `lowerValueP` `.ifVal` arm.**
 
@@ -23767,39 +24438,48 @@ theorem lowerValueP_ifVal_clean_shape
   unfold Stack.Lower.lowerValueP
   cases hLR : Stack.Lower.loadRefLive sm cond currentIndex lastUses outerProtected with
   | mk condOps sm1 =>
-    simp only [ifValThnRes, ifValElsRes, ifValSmBranch, ifValInnerProtected, hLR]
+    simp only [ifValThnRes, ifValElsRes, ifValSmBranch, ifValInnerProtected,
+      ifValParentReconciled, hLR]
       at hDropsEls hDropsThn hDepth hElsNonEmpty ⊢
     generalize hRemEls :
       Stack.Lower.removeConsumedAtDepths
         (Stack.Lower.lowerBindingsP progMethods props budget 0
           (Stack.Lower.computeLastUses (b1 :: b2 :: rest))
           (Stack.Lower.computeBranchProtected (sm1.popN 1) lastUses currentIndex outerProtected)
-          (List.map (fun b => b.name) (b1 :: b2 :: rest)) constInts (sm1.popN 1) (b1 :: b2 :: rest)).2 _ = remEls
+          (List.map (fun b => b.name) (b1 :: b2 :: rest)) constInts (sm1.popN 1) (b1 :: b2 :: rest) [] true).2 _ = remEls
     generalize hRemThn :
       Stack.Lower.removeConsumedAtDepths
         (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
           (Stack.Lower.computeBranchProtected (sm1.popN 1) lastUses currentIndex outerProtected)
-          (List.map (fun b => b.name) thn) constInts (sm1.popN 1) thn).2 _ = remThn
+          (List.map (fun b => b.name) thn) constInts (sm1.popN 1) thn [] true).2 _ = remThn
     have hEemEls : remEls = ([],
         (Stack.Lower.lowerBindingsP progMethods props budget 0
           (Stack.Lower.computeLastUses (b1 :: b2 :: rest))
           (Stack.Lower.computeBranchProtected (sm1.popN 1) lastUses currentIndex outerProtected)
-          (List.map (fun b => b.name) (b1 :: b2 :: rest)) constInts (sm1.popN 1) (b1 :: b2 :: rest)).2) := by
+          (List.map (fun b => b.name) (b1 :: b2 :: rest)) constInts (sm1.popN 1) (b1 :: b2 :: rest) [] true).2) := by
       rw [← hRemEls]
       show Stack.Lower.removeConsumedAtDepths _ (ifValDrops (sm1.popN 1) _ _) = _
       rw [hDropsEls]; rfl
     have hEemThn : remThn = ([],
         (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
           (Stack.Lower.computeBranchProtected (sm1.popN 1) lastUses currentIndex outerProtected)
-          (List.map (fun b => b.name) thn) constInts (sm1.popN 1) thn).2) := by
+          (List.map (fun b => b.name) thn) constInts (sm1.popN 1) thn [] true).2) := by
       rw [← hRemThn]
       show Stack.Lower.removeConsumedAtDepths _ (ifValDrops (sm1.popN 1) _ _) = _
       rw [hDropsThn]; rfl
     rw [hEemEls, hEemThn]
     simp only []
-    rw [if_neg (by omega), if_neg (by omega)]
+    -- Issue #150: the arms agree in depth (`hDepth`), so `padArm` owes neither
+    -- of them a slot. Was `rw [if_neg (by omega), if_neg (by omega)]` when the
+    -- depth balance was a two-armed `if` instead of the reference's `while`.
+    rw [Stack.Lower.padArm_of_eq hDepth _ _, Stack.Lower.padArm_of_eq hDepth.symm _ _]
     simp only [List.append_nil]
     rw [if_neg (by simpa using hElsNonEmpty)]
+    -- Issue #149: the arms emit nothing — the reference repairs the layout in
+    -- the PARENT via `sinkResultBlock`, so both arm op-lists are `[]` by
+    -- definition; the `append_nil` above already discharged them.
+    -- NEW-004: no raw slots in scope, so the cond load is not re-minimised.
+    simp only [Stack.Lower.rawSlotsInScope_nil, Stack.Lower.normalizeRaw_nil]
 
 /-! ### Smoke test (consumability proof) -/
 
@@ -23808,6 +24488,18 @@ private def smokeCleanBr : List ANFBinding :=
   [ANFBinding.mk "v1" (.loadConst (.int 9)) none,
    ANFBinding.mk "v2" (.loadConst (.int 9)) none]
 private def smokeCleanLU : List (String × Nat) := [("c", 0)]
+
+/-- The smoke fixture's `if` consumes its only parent slot (the cond), so the
+parent's post-`if` model is empty and issue #149's layout reconcile has nothing
+to sort. -/
+private theorem smokeCleanParentReconciled_nil :
+    ifValParentReconciled [] [] 8 0 smokeCleanLU [] [] smokeCleanSm "c" smokeCleanBr = [] := by
+  have hb : ifValSmBranch smokeCleanSm "c" 0 smokeCleanLU [] = [] := by
+    unfold ifValSmBranch Stack.Lower.loadRefLive smokeCleanSm smokeCleanLU
+    decide
+  unfold ifValParentReconciled
+  rw [hb]
+  rfl
 
 /-- Consumability smoke test: `lowerValueP_ifVal_clean_shape` applies to a
 concrete two-binding-branch `.ifVal`, with `ifValCleanShape` discharged
@@ -24104,7 +24796,7 @@ theorem wave18_consume_chain_smoke
   have hSm0 :
       (Stack.Lower.lowerValueP ([] : List ANFMethod) ([] : List ANFProperty) 64 0
           wave18SmokeLU [] [] ([] : List (String × Int)) ["p0", "p1", "p2"] "t0"
-          (.binOp "+" "p0" "p1" none)).2.1 = ["t0", "p2"] := by
+          (.binOp "+" "p0" "p1" none)).2.1 = (["t0", "p2"] : Stack.Lower.StackMap) := by
     unfold Stack.Lower.lowerValueP; simp only []
     unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
       Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
@@ -24153,7 +24845,7 @@ theorem wave18_consume_chain_smoke
   have hSm1 :
       (Stack.Lower.lowerValueP ([] : List ANFMethod) ([] : List ANFProperty) 64 1
           wave18SmokeLU [] [] ([] : List (String × Int)) ["t0", "p2"] "t1"
-          (.binOp "-" "t0" "p2" none)).2.1 = ["t1"] := by
+          (.binOp "-" "t0" "p2" none)).2.1 = (["t1"] : Stack.Lower.StackMap) := by
     unfold Stack.Lower.lowerValueP; simp only []
     unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
       Stack.Lower.bringToTop Stack.Lower.StackMap.depth?

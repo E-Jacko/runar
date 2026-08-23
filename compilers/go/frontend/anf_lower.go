@@ -1685,12 +1685,7 @@ func extractLoopStep(stmt ForStmt) int {
 // bigIntStartRaw encodes a loop iterator start value into the raw JSON form the
 // loop ANF node emits (issue #121), mirroring the load_const bigint encoding.
 func bigIntStartRaw(val *big.Int) json.RawMessage {
-	if val.IsInt64() {
-		raw, _ := json.Marshal(val.Int64())
-		return raw
-	}
-	raw, _ := json.Marshal(val.String() + "n")
-	return raw
+	return ir.BigIntToRawJSON(val)
 }
 
 func extractBigIntValue(expr Expression) *big.Int {
@@ -2280,13 +2275,12 @@ func makeLoadConstInt(val *big.Int) ir.ANFValue {
 	// oversize bigints as a quoted decimal string with the canonical JS
 	// BigInt `n` suffix so the IR round-trips losslessly across tiers AND
 	// so the consuming IR decoder can distinguish a decimal-encoded big
-	// integer from a hex-encoded ByteString literal.
-	var raw json.RawMessage
-	if val.IsInt64() {
-		raw, _ = json.Marshal(val.Int64())
-	} else {
-		raw, _ = json.Marshal(val.String() + "n")
-	}
+	// integer from a hex-encoded ByteString literal. The boundary is
+	// Number.MAX_SAFE_INTEGER, not int64: a bare JSON number is read as an
+	// IEEE-754 double by every JS consumer (and by Go itself when decoding
+	// into interface{}), so `9007199254740993` — comfortably inside int64 —
+	// still round-trips as `9007199254740992`.
+	raw := ir.BigIntToRawJSON(val)
 	v := ir.ANFValue{
 		Kind:        "load_const",
 		RawValue:    raw,

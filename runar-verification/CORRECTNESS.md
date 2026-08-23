@@ -6,16 +6,10 @@ narrative summary; the authoritative trust boundary is `TRUST_MANIFEST.md`
 §"v1 Trust Boundary" (where this document and the manifest disagree, the
 manifest is correct), and the proofs themselves are the ultimate authority.
 
-**Status:** 71 axioms (2026-07-06) (down from 125 at the start of the
+**Status:** 70 axioms (2026-06-21) (down from 125 at the start of the
 campaign). Build green, `tests/PipelineConformance.lean` exit 0, drift gate
-`scripts/check-tcb-drift.sh` exit 0 (`TARGET_AXIOMS=71`). Every retirement was
-independently re-verified on `main` via `#print axioms`.
-
-The count reached its 2026-06-21 low of 70 and then went **back up by one** on
-2026-07-06 with the BUG-100 on-chain `checkPreimage` binding rewrite: that
-change RETIRED the pre-BUG-100 BIP-143 witness-existence axiom (−1) and ADDED
-the two opaque OP_PUSH_TX codegen→runtime binding shims (+2). See §4.3/§4.4
-and `TRUST_MANIFEST.md` §"v1 Trust Boundary".
+`scripts/check-tcb-drift.sh` exit 0. Every retirement was independently
+re-verified on `main` via `#print axioms`.
 
 ---
 
@@ -130,7 +124,7 @@ will close on this codebase:
 
 ---
 
-## 4. The trusted base (71 axioms)
+## 4. The trusted base (70 axioms)
 
 Categorized by the `scripts/check-tcb-drift.sh` invariants
 (`opaques = 0`, `opaque stubs = 0`, `partial defs = 0`):
@@ -159,16 +153,10 @@ Documented in `PATH2_PLAN.md §11.6` and the `TRUST_MANIFEST.md` trajectory.
 Each is sound by its own external standard but not verified in this codebase
 by project decision:
 
-* **BIP-143 `OP_PUSH_TX`** — the `OP_CHECKSIGVERIFY(_opPushTxSig, G)
-  ⟺ checkPreimage(preimage)` correspondence is the foundation of every
-  stateful BSV contract; not formalizing ECDSA + the BIP-143 sighash is the
-  principled trust-footprint choice. Since BUG-100 (2026-07-06) this is no
-  longer a *witness-existence* crypto assumption about a spender-supplied
-  signature: the injected `checkPreimage` emits a fixed 760-byte on-chain
-  blob that DERIVES the ECDSA signature from `hash256(preimage)`, so the
-  binding is enforced by codegen. What remains is the codegen→runtime
-  characterisation of that blob (§4.4), because the Stack evaluator models it
-  as an opaque `.rawBytes` push.
+* **BIP-143 `OP_PUSH_TX`** — the bridge `OP_CHECKSIGVERIFY(_opPushTxSig, G)
+  ⟺ checkPreimage(preimage)` is the foundation of every stateful BSV
+  contract; treating it as a named crypto axiom (rather than formalizing
+  ECDSA + the BIP-143 sighash) is the principled trust-footprint choice.
 * **SLH-DSA** (6 FIPS-205 parameter sets) — post-quantum signature codegen
   spans hundreds of kilobytes of Script; out of project scope.
 * **BabyBear / KoalaBear / Poseidon2 / BN254 / FRI** — proof-system
@@ -180,14 +168,13 @@ by project decision:
   equivalence in Script semantics over ~60k ops, research-grade. Documented
   as a known structural mismatch in `Crypto/Spec.lean §7`.
 
-### 4.4 The remaining composition-path structural axioms
+### 4.4 The remaining composition-path structural axiom
 
 The `dispatch`, `loop`, and `stateful` sub-omnibus axioms have all been
-**retired**. The composition layer is now proven down to exactly **three**
-structural axioms — one codegen-soundness fallback plus the two OP_PUSH_TX
-binding shims the canonical stateful gated-prologue relies on. They are
-documented with their precise blockers in `PATH2_PLAN.md §11.6` and
-`TRUST_MANIFEST.md`:
+**retired**. The composition layer is now proven down to exactly **one**
+structural codegen-soundness axiom (plus the BIP-143 bridge from §4.3, which
+the canonical stateful gated-prologue relies on). It is documented with its
+precise blocker in `PATH2_PLAN.md §11.6` and `TRUST_MANIFEST.md`:
 
 * **`crypto_call`** — the *residual universal fallback*. Hypothesis `True`;
   every body not matching a discharged classifier (including all
@@ -195,24 +182,11 @@ documented with their precise blockers in `PATH2_PLAN.md §11.6` and
   families above, and any non-fragment shape of an already-retired family)
   lands here. By definition, this axiom only disappears when nothing falls
   through. It is the safety net — narrowable but provably never zero.
-* **`AgreesStateful.runOps_checkPreimageBindingRaw_eq`** — the gated-prologue
-  OP_PUSH_TX shim (`Stack/AgreesStateful.lean:134`).
-* **`AgreesStateful.runOps_statefulFullParsedOps_scriptAccepts`** — the
-  widened prologue+epilogue OP_PUSH_TX shim
-  (`Stack/AgreesStateful.lean:660`).
 
-The latter two are peers of Blake3's `runOps_b3HashOps_eq`: the deployed
-760-byte binding blob is real executable Script but is emitted as an opaque
-`.rawBytes` op, so its runtime abort behaviour is characterised rather than
-executed by the model. They replaced the retired witness-existence axiom
-`exists_checkSig_witness_under_validTxContext` (−1 +2 = the +1 that took the
-base from 70 to 71).
-
-These three are the **structural composition-path axioms** the manifest's
-"v1 Trust Boundary" calls out; everything else in the 71-axiom base is
-primitive-level (crypto semantics + per-primitive codegen→runtime bridges)
-or one of the three opaque crypto backends that anchor the model to a real
-crypto implementation.
+Together with the BIP-143 `exists_checkSig_witness` bridge (§4.3), these are
+the **two structural composition-path axioms** the manifest's "v1 Trust
+Boundary" calls out; everything else in the 70-axiom base is primitive-level
+(crypto semantics + per-primitive codegen→runtime bridges).
 
 ---
 
@@ -263,12 +237,12 @@ within the differential test's coverage.
 | What's the property? | Accept/reject agreement between the ANF reference interpreter and the compiled Bitcoin Script. |
 | What pipeline is covered? | ANF IR → Stack IR → peephole → emit → bytes → parse → execute (the back half). |
 | For which programs is it proven *unconditionally* (no codegen axiom)? | Single-public methods whose bodies lie in arith / if_val / math_byte / update_prop / method_call fragments, plus the dispatch selection fact and the 8 in-scope secp256k1 EC ops. |
-| What's the trusted base? | 71 axioms (drift-gated at `TARGET_AXIOMS=71`): 3 standard Lean + irreducible crypto primitives + 4 explicit scope-outs (BIP-143, SLH-DSA, Go-only proof-system families, ecMul/ecMulGen) + 3 remaining composition-path axioms with their precise blockers documented — the `crypto_call` fallback (the `dispatch`, `loop`, and `stateful` sub-omnibuses were all retired) and the two BUG-100 OP_PUSH_TX codegen→runtime binding shims. |
+| What's the trusted base? | 70 axioms: 3 standard Lean + irreducible crypto primitives + 4 explicit scope-outs (BIP-143, SLH-DSA, Go-only proof-system families, ecMul/ecMulGen) + 1 remaining composition-path sub-omnibus codegen axiom (`crypto_call`; the `dispatch`, `loop`, and `stateful` sub-omnibuses were all retired) with its precise blocker documented. The two structural composition-path axioms are `crypto_call` + the BIP-143 bridge. |
 | How does it connect to the real compilers? | Per-fixture byte-equality between Lean `compileSafe` and `expected-script.hex`, plus `conformance/runner.ts` enforcing real compilers match the goldens. |
 | What's not covered? | Source-format parsing/typechecking; output/state equivalence (beyond accept/reject); proof of the Script VM model against BSV consensus (differential-tested instead); the scoped-out families above. |
 
 This is a strong, defensible result for a production compiler: a
 kernel-checked accept/reject correctness theorem for the compiler back-half
 on an explicitly-bounded set of contract shapes, with a clearly-inventoried
-71-axiom trusted base and per-fixture validation against the 7 real-tier
+70-axiom trusted base and per-fixture validation against the 7 real-tier
 compilers.
