@@ -12,10 +12,10 @@ pipeline. The package is useful in two roles:
 
 | Area | Status |
 |---|---:|
-| Conformance fixtures discovered (Lean-recognised) | 71/71 (dynamic readDir) |
+| Conformance fixtures discovered (Lean-recognised) | 72/72 (dynamic readDir) |
 | ANF parse + well-formedness | 64/64 |
 | ANF JSON round-trip | 64/64 |
-| Default byte-exact gate (`pipelineGolden`) | 48/65 byte-exact (40 baseline + 8 stored crypto constants; see note) |
+| Default byte-exact gate (`pipelineGolden`) | 57/72 byte-exact (49 baseline + 8 live-regenerated crypto anchors; see note) |
 | Formal-evidence gate (`pipelineConformance`) | **0/64 VERIFIED-direct**, **64/64 VERIFIED-modulo-codegen-axioms** (Phase D harness omnibus tier; soundness conditional on the codegen-soundness axioms documented in `TRUST_MANIFEST.md`) |
 | Crypto-heavy fixtures | 20 `cryptoAxiomPending` (8 byte-exact via stored constants) |
 | Full/sharded byte-exact target | live `cryptoAxiomPending` bucket regeneration |
@@ -29,8 +29,13 @@ pipeline. The package is useful in two roles:
 | End-to-end capstone — multi-method dispatch | `Pipeline.compileSafe_multi_public_observational_correct` (Phase D) |
 | Crypto codegen-to-spec links | 13 primitive families (SHA-256 / RIPEMD-160 / hash160 / hash256 / BLAKE3 / secp256k1 / P-256 / P-384 / ECDSA / BabyBear / Merkle / WOTS+ / SLH-DSA × 6 / Rabin) |
 
-Default `pipelineGolden` is the fast gate and currently reports 48/65
-fixtures byte-exact (40 baseline + 8 stored crypto-pending constants).
+Default `pipelineGolden` is the fast gate and currently reports 57/72
+fixtures byte-exact (49 baseline + 8 live-regenerated crypto anchors).
+Three fixtures — `shift-ops`, `bitwise-ops` and `oversize-bigint-shift` —
+sit in `lowerDivergencePending`: the real compilers emit a minimality
+normalisation (OP_BIN2NUM at numeric reads of byte-array results) that this
+model does not, so it correctly fails to match their goldens. The compilers
+are right and the model lags.
 The crypto-heavy fixtures are counted only through stored
 Lean-produced constants, not by comparing `expected-script.hex` to
 itself. They remain visible as the `cryptoAxiomPending` bucket because
@@ -161,7 +166,7 @@ auto-tracks new fixtures (the `goldenLoad` binary prints `found N
 expected-ir.json files` and asserts all N parse + satisfy WF; the
 `asm-raw-script` fixture parses cleanly after the `raw_script` ANF kind
 landed; only its codegen-to-Stack-IR simulation discharge is deferred).
-`pipelineGolden` reports 48/65 byte-exact across its tracked
+`pipelineGolden` reports 57/72 byte-exact across its tracked
 inventory (see the note above); the crypto stored-constant fixtures whose
 emit hex is regenerated rather than compared live in the
 `cryptoAxiomPending` bucket.
@@ -179,7 +184,7 @@ lake env ./.lake/build/bin/pipelineGolden
 
 `scripts/lean-verify.sh` builds every tracked Lean module, including
 standalone test modules that are outside the default root import closure.
-`pipelineGolden` is the default fast byte-exact gate (48/65).
+`pipelineGolden` is the default fast byte-exact gate (57/72).
 
 Full and scheduled checks:
 
