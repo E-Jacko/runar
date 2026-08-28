@@ -986,9 +986,27 @@ describe('wire-format-pr-audit — CLI', () => {
     const file = changedFile(HISTORICAL_110_WIRE_PATHS);
     const { code, out } = cli(['--changed-file', file, '--root', REPO_ROOT, '--json']);
     expect(code).toBe(1);
-    const parsed = JSON.parse(out) as { ok: boolean; wireHits: string[] };
+    const parsed = JSON.parse(out) as {
+      ok: boolean;
+      wireHits: string[];
+      exceptionsUsed: { path: string }[];
+    };
     expect(parsed.ok).toBe(false);
-    expect(parsed.wireHits).toHaveLength(HISTORICAL_110_WIRE_PATHS.length);
+    // The TOTAL stays pinned at the full historical set. Some of those paths
+    // may be covered by a live, content-pinned entry in
+    // wire-format-exceptions.json (2026-08-28: `packages/runar-sdk/src/contract.ts`
+    // is, for the issue-#106 warning-scoping change), and such a path is
+    // reported under `exceptionsUsed` rather than `wireHits`. Asserting
+    // hits + excepted == the historical set keeps this a real regression test
+    // for the #110 incident: an exception can MOVE a path between the two
+    // buckets, but it can never make one disappear. Lowering the expected
+    // count to match whatever is excepted today would delete exactly the
+    // property this test exists to hold.
+    expect(parsed.wireHits.length + parsed.exceptionsUsed.length).toBe(
+      HISTORICAL_110_WIRE_PATHS.length,
+    );
+    const accounted = [...parsed.wireHits, ...parsed.exceptionsUsed.map((e) => e.path)].sort();
+    expect(accounted).toEqual([...HISTORICAL_110_WIRE_PATHS].sort());
   });
 });
 
@@ -1170,12 +1188,33 @@ describe('wire-format-pr-audit — exceptions file loader', () => {
     }
   });
 
-  it('the checked-in exceptions file has ZERO entries (P1-4: an exception is never routine)', () => {
+  it('the checked-in exceptions file holds exactly the reviewed entries (P1-4: an exception is never routine)', () => {
     // The whole point of the gate is that a wire change moves bytes. Every
     // entry here is a wire change that shipped with NO byte evidence, so the
     // count is part of the gate's own audit trail: adding one must be a
     // deliberate, reviewed edit to THIS assertion, not a quiet JSON append.
-    expect(loadExceptions(REPO_ROOT)).toEqual([]);
+    //
+    // 2026-08-28 — three entries, one per SDK tier, for the issue-#106
+    // warning-scoping change on `contract.{ts,rs,py}` (PR #147). Those files
+    // are listed under constructor-slot-splicing, but the change adds a
+    // read-only OR-CHECKSIG probe whose only consumer is an INFORMATIONAL
+    // warn() call, so no encoder, offset or byte-producing branch can observe
+    // it. Each entry is pinned to that file's reviewed sha256 and expires
+    // 2026-11-26, so it authorises exactly this version and self-invalidates
+    // on the next edit.
+    const entries = loadExceptions(REPO_ROOT);
+    expect(entries.map((e) => e.path).sort()).toEqual([
+      'packages/runar-py/runar/sdk/contract.py',
+      'packages/runar-rs/src/sdk/contract.rs',
+      'packages/runar-sdk/src/contract.ts',
+    ]);
+    // Pin the shape too: an entry that loses its expiry or sign-off is not an
+    // exception, it is a permanent hole.
+    for (const e of entries) {
+      expect(e.expires).toBe('2026-11-26');
+      expect(e.reviewer).toBe('gh:icellan');
+      expect(e.sha256).toMatch(/^[0-9a-f]{64}$/);
+    }
   });
 
   it('the checked-in exceptions file (if present) is well formed', () => {
