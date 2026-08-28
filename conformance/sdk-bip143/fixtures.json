@@ -30,6 +30,19 @@
       "digestHex": "efe39a2e99d3eba8c03298cb8f4a056289236dc17ccbefee0d31e11cc8841bf0",
       "sigHex": "3044022071d117a425787845d18393dfa5467bfd7aa4407bbca4b03785914e73007c279c022069b45940ecbc59f803f2649e2d99dbcad9d7674fb78f60fed6f19ee4eb93399341",
       "pubkeyHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "scenario": "multi_input_spend",
+      "description": "Multi-input spend: 2 inputs with distinct sequences, signing input INDEX 1 (not 0), SIGHASH_ALL|FORKID. Pins hashPrevouts/hashSequence over more than one input and a non-zero signing index.",
+      "unsignedTxHex": "0100000002cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000fdffffffdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd0200000000ffffffff01b80b0000000000001976a914751e76e8199196d454941c45d1b3a323f1433bd688ac00000000",
+      "inputIndex": 1,
+      "prevScriptHex": "76a914751e76e8199196d454941c45d1b3a323f1433bd688ac",
+      "prevValueSats": 7000,
+      "sighashFlags": 65,
+      "preimageHex": "01000000e6414cd0c5253a5c7dfaf98b5ff27fb26978d1fe7ad91bd0c6a17c7881f03eebe8421900817cfe6d5377a71cb681de004f52792ef448ff3c41d15a233e230b0adddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd020000001976a914751e76e8199196d454941c45d1b3a323f1433bd688ac581b000000000000ffffffff277c99349f87eff64ad8e7dce41085421f19fac2c57c8d5947aa794ade1e21c50000000041000000",
+      "digestHex": "704e41a2d7faf8160cb908e3408bcb97e2ced03a3de6b5ae2b18b8c61e45d63d",
+      "sigHex": "30440220514aa8427269e8d94dc6063484cb2544dad2cab73a99eafe4c326d386f7bd9d702202a078bb8e0ddae8762725d0c05c5d2fd353d7494da9de8419cd1d7d8f555595941",
+      "pubkeyHex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
     }
   ]
 }
