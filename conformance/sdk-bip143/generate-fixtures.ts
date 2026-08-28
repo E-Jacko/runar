@@ -336,6 +336,47 @@ async function buildScenarios(): Promise<Scenario[]> {
     ),
   );
 
+  // ---- Scenario 3: multi-input spend — signing input 1 of 2 ----
+  // Both prior scenarios sign input 0 of a SINGLE-input transaction, so
+  // nothing pinned the two things a second input changes:
+  //   * hashPrevouts / hashSequence become digests over MORE than one
+  //     outpoint / sequence, and
+  //   * the signing index is non-zero, so a tier that assumed index 0 (or
+  //     that indexed the wrong input's value / scriptCode) still passed.
+  // That gap is not hypothetical: bsv-sdk 2.4.0 began requiring a
+  // locking_script on EVERY input, and packages/runar-py only populated the
+  // one it was signing — a break that only a multi-input spend can surface.
+  // The funding input deliberately carries a DIFFERENT sequence so a tier that
+  // hashed one sequence twice diverges here.
+  const s3Inputs: TxIn[] = [
+    {
+      prevTxid: 'c'.repeat(64), // funding input, NOT the one being signed
+      prevVout: 0,
+      sequence: 0xfffffffd,
+    },
+    {
+      prevTxid: 'd'.repeat(64), // contract input — the signing input
+      prevVout: 2,
+      sequence: 0xffffffff,
+    },
+  ];
+  const s3Outputs: TxOut[] = [
+    { satoshis: 3000, scriptHex: p2pkhScript(pkh) },
+  ];
+  scenarios.push(
+    buildScenario(
+      'multi_input_spend',
+      'Multi-input spend: 2 inputs with distinct sequences, signing input INDEX 1 ' +
+        '(not 0), SIGHASH_ALL|FORKID. Pins hashPrevouts/hashSequence over more ' +
+        'than one input and a non-zero signing index.',
+      s3Inputs,
+      s3Outputs,
+      1,
+      p2pkhPrevScript,
+      7000,
+    ),
+  );
+
   return scenarios;
 }
 
