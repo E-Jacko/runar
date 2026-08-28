@@ -155,6 +155,27 @@ class LocalSigner(Signer):
         tx.inputs[input_index].locking_script = locking_script
         tx.inputs[input_index].satoshis = satoshis
 
+        # bsv-sdk 2.4.0 (2026-08-28) tightened the batch preimage path:
+        # `transaction_preimage._inputs_to_tuples` now dereferences
+        # `inp.locking_script.serialize()` for EVERY input, and its docstring
+        # calls a missing one "a caller error". `tx_hex` is a serialized
+        # transaction, which carries no source-output data, so every input we
+        # did not just populate has `locking_script = None` — on a 2-input call
+        # (contract UTXO + funding UTXO) that raised
+        # `AttributeError: 'NoneType' object has no attribute 'serialize'`.
+        #
+        # An empty placeholder is sound here, not a papering-over: BIP-143
+        # binds only the SIGNING input's scriptCode into its digest. The other
+        # inputs reach that digest exclusively through `hashPrevouts` and
+        # `hashSequence`, which hash outpoints and sequence numbers — never
+        # scripts. So the signature this method extracts for `input_index` is
+        # byte-identical with or without these placeholders; they exist purely
+        # to let the batch path serialize.
+        empty_script = Script()
+        for i, inp in enumerate(tx.inputs):
+            if i != input_index and inp.locking_script is None:
+                inp.locking_script = empty_script
+
         # Clear existing unlocking script so sign() processes this input
         tx.inputs[input_index].unlocking_script = None
 
