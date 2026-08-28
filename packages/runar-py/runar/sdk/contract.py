@@ -62,6 +62,19 @@ def is_empty_sig(value: object) -> bool:
     return isinstance(value, _EmptySig)
 
 
+def _is_likely_or_checksig(artifact) -> bool:
+    """True for OR-CHECKSIG (OP_BOOLOR+OP_CHECKSIG), false for OP_CHECKMULTISIG."""
+    asm = (getattr(artifact, 'asm', None) or '').upper()
+    if 'OP_CHECKMULTISIG' in asm:
+        return False
+    if 'OP_BOOLOR' in asm and 'OP_CHECKSIG' in asm:
+        return True
+    script = (getattr(artifact, 'script', None) or getattr(artifact, 'script_hex', None) or '').lower()
+    if not asm and ('ae' in script or 'af' in script):
+        return False
+    return False
+
+
 #: The well-known ByteString parameter the SDK fills in with the transaction's
 #: concatenated outpoints (36 bytes per input) once the input list has
 #: converged. It is the ONLY ByteString slot for which a ``None`` call arg is a
@@ -585,13 +598,9 @@ class RunarContract:
             # None, so it is never added to `sig_indices` and never signed. It
             # stays in `resolved_args` and `_encode_arg` emits OP_0 for it.
 
-        # Soft heuristic (issue #106): more than one auto-signed Sig slot usually
-        # means an OR-CHECKSIG method whose non-matching branch should use
-        # EMPTY_SIG instead — otherwise every branch gets the same real signature
-        # and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
-        # AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
-        # informational only (the ABI does not encode OR-vs-AND topology).
-        if len(sig_indices) >= 2:
+        # Soft heuristic (issue #106): warn only for likely OR-CHECKSIG
+        # (OP_BOOLOR + OP_CHECKSIG), not genuine multi-sig (OP_CHECKMULTISIG).
+        if len(sig_indices) >= 2 and _is_likely_or_checksig(self.artifact):
             warnings.warn(
                 f"runar-sdk: {self.artifact.contract_name}.call('{method_name}') "
                 f"has {len(sig_indices)} auto-signed Sig slots. If this is an "

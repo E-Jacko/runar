@@ -33,6 +33,7 @@ comptime {
     _ = @import("slhdsa_test.zig");
     _ = @import("bsv20_token_test.zig");
     _ = @import("bsv21_token_test.zig");
+    _ = @import("phase_a_residuals_test.zig");
 }
 
 test "integration_setup" {

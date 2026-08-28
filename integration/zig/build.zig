@@ -50,4 +50,20 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run Zig integration tests");
     test_step.dependOn(&run_tests.step);
+
+    // Phase A residual-only suite (clearer PASS evidence for residual goal)
+    const phase_a_module = b.createModule(.{
+        .root_source_file = b.path("src/phase_a_only_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    phase_a_module.addImport("bsvz", bsvz_module);
+    phase_a_module.addImport("runar", runar_module);
+    phase_a_module.addImport("runar_frontend", frontend_module);
+    const phase_a_tests = b.addTest(.{
+        .root_module = phase_a_module,
+    });
+    const run_phase_a = b.addRunArtifact(phase_a_tests);
+    const phase_a_step = b.step("test-phase-a", "Run Phase A residual Zig integration tests only");
+    phase_a_step.dependOn(&run_phase_a.step);
 }

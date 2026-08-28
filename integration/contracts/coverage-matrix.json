@@ -1,0 +1,328 @@
+{
+  "version": 2,
+  "description": "Regtest deploy+spend coverage for integration/contracts residuals",
+  "features": [
+    {
+      "id": "branch-merged-locals-k2-asymmetric",
+      "category": "constructs",
+      "description": "Palmer-1: \u22652 locals asymmetric if/else + on-chain expectedState",
+      "contract": "constructs/BranchMergedLocals.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/branch-merged-locals.test.ts",
+        "go": "integration/go/branch_merged_locals_test.go",
+        "rust": "integration/rust/tests/phase_a_residuals.rs",
+        "python": "integration/python/test_phase_a_residuals.py",
+        "ruby": "integration/ruby/spec/phase_a_residuals_spec.rb",
+        "zig": "integration/zig/src/phase_a_residuals_test.zig",
+        "java": "integration/java/src/test/java/runar/integration/PhaseAResidualsIntegrationTest.java"
+      },
+      "requireStrong": {
+        "ts": "deploy+spend+expectedState",
+        "go": "deploy+spend+expectedState"
+      },
+      "notes": " Strong on-chain state/framing pins: ts+go only. Other tiers: deploy+spend smoke."
+    },
+    {
+      "id": "cond-write-multi-field",
+      "category": "constructs",
+      "description": "Issue #99 multi-property if-without-else + on-chain state",
+      "contract": "constructs/CondWriteMultiField.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/cond-write-multi-field.test.ts",
+        "go": "integration/go/cond_write_multi_field_test.go",
+        "rust": "integration/rust/tests/phase_a_residuals.rs",
+        "python": "integration/python/test_phase_a_residuals.py",
+        "ruby": "integration/ruby/spec/phase_a_residuals_spec.rb",
+        "zig": "integration/zig/src/phase_a_residuals_test.zig",
+        "java": "integration/java/src/test/java/runar/integration/PhaseAResidualsIntegrationTest.java"
+      },
+      "requireStrong": {
+        "ts": "deploy+spend+expectedState",
+        "go": "deploy+spend+expectedState"
+      },
+      "notes": " Strong on-chain state/framing pins: ts+go only. Other tiers: deploy+spend smoke."
+    },
+    {
+      "id": "conditional-data-output",
+      "category": "constructs",
+      "description": "addDataOutput on branch keeps continuation",
+      "contract": "constructs/ConditionalDataOutput.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/conditional-data-output.test.ts",
+        "go": "integration/go/conditional_data_output_test.go",
+        "rust": "integration/rust/tests/phase_a_residuals.rs",
+        "python": "integration/python/test_phase_a_residuals.py",
+        "ruby": "integration/ruby/spec/phase_a_residuals_spec.rb",
+        "zig": "integration/zig/src/phase_a_residuals_test.zig",
+        "java": "integration/java/src/test/java/runar/integration/PhaseAResidualsIntegrationTest.java"
+      },
+      "requireStrong": {
+        "ts": "deploy+spend+outputShape",
+        "go": "deploy+spend+outputShape"
+      },
+      "notes": "Output shape pins: ts+go only. Other tiers: deploy+spend smoke."
+    },
+    {
+      "id": "state-bytestring-1byte-op-n",
+      "category": "constructs",
+      "description": "1-byte ByteString state framing + wrong-length reject",
+      "contract": "constructs/StateByteString1B.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/state-bytestring-1b.test.ts",
+        "go": "integration/go/state_bytestring_1b_test.go",
+        "rust": "integration/rust/tests/phase_a_residuals.rs",
+        "python": "integration/python/test_phase_a_residuals.py",
+        "ruby": "integration/ruby/spec/phase_a_residuals_spec.rb",
+        "zig": "integration/zig/src/phase_a_residuals_test.zig",
+        "java": "integration/java/src/test/java/runar/integration/PhaseAResidualsIntegrationTest.java"
+      },
+      "requireStrong": {
+        "ts": "deploy+spend+expectedState+framing",
+        "go": "deploy+spend+expectedState+framing"
+      },
+      "notes": " Strong on-chain state/framing pins: ts+go only. Other tiers: deploy+spend smoke."
+    },
+    {
+      "id": "add-raw-output",
+      "category": "outputs",
+      "description": "addRawOutput order [raw][state][change]",
+      "contract": "outputs/RawOutput.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/raw-output.test.ts",
+        "go": "integration/go/raw_output_test.go",
+        "rust": "integration/rust/tests/phase_a_residuals.rs",
+        "python": "integration/python/test_phase_a_residuals.py",
+        "ruby": "integration/ruby/spec/phase_a_residuals_spec.rb",
+        "zig": "integration/zig/src/phase_a_residuals_test.zig",
+        "java": "integration/java/src/test/java/runar/integration/PhaseAResidualsIntegrationTest.java"
+      },
+      "requireStrong": {
+        "ts": "deploy+spend+outputShape",
+        "go": "deploy+spend+outputShape"
+      },
+      "notes": "Output order [raw][state] + re-spend: ts+go only. Other tiers: deploy+spend smoke."
+    },
+    {
+      "id": "checkMultiSig-2of3",
+      "category": "crypto",
+      "description": "checkMultiSig 2-of-3; TS/Go PrepareCall multi-key; other tiers same-key SDK Call",
+      "contract": "crypto/MultiSig2of3.runar.ts",
+      "require": "deploy+spend+reject-wrong-keys",
+      "regtest": {
+        "ts": "integration/ts/multisig-2of3.test.ts",
+        "go": "integration/go/multisig_2of3_test.go",
+        "rust": "integration/rust/tests/phase_a_residuals.rs",
+        "python": "integration/python/test_phase_a_residuals.py",
+        "ruby": "integration/ruby/spec/phase_a_residuals_spec.rb",
+        "java": "integration/java/src/test/java/runar/integration/PhaseAResidualsIntegrationTest.java"
+      },
+      "deferred": {
+        "zig": "MultiSig multi-signer not ported in zig residual suite this pass; other 5 Phase A contracts covered"
+      },
+      "notes": "TS+Go: distinct-key PrepareCall/FinalizeCall. Other tiers: same-key dual Auto/null SDK Call."
+    },
+    {
+      "id": "language-arithmetic",
+      "category": "language",
+      "description": "bare + - * / %",
+      "contract": "language/ArithmeticOps.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "language-boolean",
+      "category": "language",
+      "description": "&& || !",
+      "contract": "language/BooleanLogic.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "language-bitwise-shift",
+      "category": "language",
+      "description": "bigint & | ^ ~ << >>",
+      "contract": "language/BitwiseOps.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "language-bounded-loop",
+      "category": "language",
+      "description": "for unroll",
+      "contract": "language/BoundedLoop.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "language-bytestring-ops",
+      "category": "language",
+      "description": "len/cat/left/right/reverse/num2bin/bin2num",
+      "contract": "language/ByteStringOps.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "language-if-else",
+      "category": "language",
+      "description": "if/else k=1",
+      "contract": "language/IfElseSimple.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "language-ternary",
+      "category": "language",
+      "description": "?: ternary",
+      "contract": "language/TernaryOps.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "constructs-property-initializers",
+      "category": "constructs",
+      "description": "property = default",
+      "contract": "constructs/PropertyInitializers.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "unsafe-asm-anyone",
+      "category": "unsafe",
+      "description": "asm + UnsafeSmartContract",
+      "contract": "unsafe/AsmAnyone.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "intents-current-block-height",
+      "category": "intents",
+      "description": "currentBlockHeight sugar",
+      "contract": "intents/CurrentBlockHeight.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    },
+    {
+      "id": "crypto-preimage-extractors",
+      "category": "crypto",
+      "description": "extract* preimage fields",
+      "contract": "crypto/PreimageExtractors.runar.ts",
+      "require": "deploy+spend",
+      "regtest": {
+        "ts": "integration/ts/phase-bc-language.test.ts",
+        "go": "integration/go/phase_bc_language_test.go"
+      },
+      "deferred": {
+        "rust": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "python": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "ruby": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "zig": "Phase B/C 7-tier port out of scope this goal (TS+Go required)",
+        "java": "Phase B/C 7-tier port out of scope this goal (TS+Go required)"
+      }
+    }
+  ]
+}
