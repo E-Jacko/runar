@@ -62,7 +62,7 @@ describe('fold-OFF ≡ fold-ON execution equivalence (per witnessed fixture)', (
 
     // Group every declared spend (accept AND reject) by method — a fold that
     // changes accept/reject on EITHER kind of witness is a real fold bug.
-    const byMethod = new Map<string, WitnessArg[][]>();
+    const byMethod = new Map<string, (WitnessArg | WitnessSignMarker)[][]>();
     for (const s of spec.spends) {
       const arr = byMethod.get(s.method) ?? [];
       arr.push((s.args as unknown[]).map(decodeArg));
