@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"math/big"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -187,9 +188,28 @@ func TestRabinVerify_PostFixRejectsWrongMessage(t *testing.T) {
 // which is the same comparison the unfused tails in this file exercise.
 func TestRabinVerify_CompiledContractCarriesTheNumericTail(t *testing.T) {
 	const src = "../examples/ts/oracle-price/OraclePriceFeed.runar.ts"
-	out, err := exec.Command("../compilers/go/runar-go", "--source", src, "--hex").Output()
+
+	// Resolve the compiler the way CI lays it out, not the way a local build
+	// does. The workflow downloads `runar-go` as an artifact into the REPO ROOT,
+	// while a local `go build` leaves it in compilers/go/. Hardcoding the local
+	// path passes here and fails in CI — which is exactly what it did, and is
+	// the same mistake the cross-tier rejection gate made before it was moved
+	// onto the runner's own finders.
+	bin := ""
+	for _, cand := range []string{"../runar-go", "../compilers/go/runar-go"} {
+		if fi, statErr := os.Stat(cand); statErr == nil && !fi.IsDir() {
+			bin = cand
+			break
+		}
+	}
+	if bin == "" {
+		t.Fatal("no runar-go binary found at ../runar-go or ../compilers/go/runar-go; " +
+			"this test compares REAL codegen and must not silently skip")
+	}
+
+	out, err := exec.Command(bin, "--source", src, "--hex").Output()
 	if err != nil {
-		t.Fatalf("could not compile oracle-price with the Go CLI: %v", err)
+		t.Fatalf("could not compile oracle-price with %s: %v", bin, err)
 	}
 	lockingHex := strings.TrimSpace(string(out))
 	if lockingHex == "" {
