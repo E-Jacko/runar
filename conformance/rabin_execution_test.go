@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -189,12 +190,11 @@ func TestRabinVerify_PostFixRejectsWrongMessage(t *testing.T) {
 func TestRabinVerify_CompiledContractCarriesTheNumericTail(t *testing.T) {
 	const src = "../examples/ts/oracle-price/OraclePriceFeed.runar.ts"
 
-	// Resolve the compiler the way CI lays it out, not the way a local build
-	// does. The workflow downloads `runar-go` as an artifact into the REPO ROOT,
-	// while a local `go build` leaves it in compilers/go/. Hardcoding the local
-	// path passes here and fails in CI — which is exactly what it did, and is
-	// the same mistake the cross-tier rejection gate made before it was moved
-	// onto the runner's own finders.
+	// Three layouts have to work. A local `go build` leaves the binary in
+	// compilers/go/; some workflow jobs stage it at the repo root; and the
+	// script-execution-oracle job that runs this file builds no Go binary at
+	// all. Prefer a prebuilt one, otherwise build from source — never skip,
+	// because this test compares REAL codegen and a skip would read as a pass.
 	bin := ""
 	for _, cand := range []string{"../runar-go", "../compilers/go/runar-go"} {
 		if fi, statErr := os.Stat(cand); statErr == nil && !fi.IsDir() {
@@ -203,8 +203,11 @@ func TestRabinVerify_CompiledContractCarriesTheNumericTail(t *testing.T) {
 		}
 	}
 	if bin == "" {
-		t.Fatal("no runar-go binary found at ../runar-go or ../compilers/go/runar-go; " +
-			"this test compares REAL codegen and must not silently skip")
+		bin = filepath.Join(t.TempDir(), "runar-go")
+		build := exec.Command("go", "build", "-o", bin, "github.com/icellan/runar/compilers/go")
+		if out, buildErr := build.CombinedOutput(); buildErr != nil {
+			t.Fatalf("no prebuilt runar-go, and building one failed: %v\n%s", buildErr, out)
+		}
 	}
 
 	out, err := exec.Command(bin, "--source", src, "--hex").Output()
