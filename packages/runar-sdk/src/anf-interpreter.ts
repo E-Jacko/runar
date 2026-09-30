@@ -116,15 +116,40 @@ export interface ExecutionResult {
   outputs: OrderedOutputEntry[];
 }
 
+/**
+ * Facts about the spend that ARE known off-chain before the transaction
+ * exists. The preimage intrinsics that read them answer from here instead of
+ * a placeholder; the ones whose value is a property of the not-yet-built
+ * transaction (`extractOutputHash`, `extractHashPrevouts`, …) keep theirs,
+ * as do — for now — `extractOutpoint` and `extractScriptCode`.
+ *
+ * Accepted as the trailing parameter of all three modes —
+ * {@link computeNewStateAndDataOutputs}, {@link executeStrict} and
+ * {@link executeOnChainAuthoritative} — so a method that asserts on or
+ * branches on `extractAmount` evaluates identically in each, including
+ * inside private helpers. The values are caller-trusted and unchecked: no
+ * mode verifies them against the preimage argument. Omitted, every mode
+ * answers the historical placeholder exactly as before.
+ */
+export interface SimulationInputs {
+  /**
+   * Satoshis locked in the UTXO being spent — what `extractAmount(preimage)`
+   * reads on-chain. `RunarContract` passes the value of the UTXO it is
+   * spending; the interpreter does not check it.
+   */
+  inputSatoshis?: bigint;
+}
+
 export function computeNewState(
   anf: ANFProgram,
   methodName: string,
   currentState: Record<string, unknown>,
   args: Record<string, unknown>,
   constructorArgs: unknown[] = [],
+  inputs?: SimulationInputs,
 ): Record<string, unknown> {
   return computeNewStateAndDataOutputs(
-    anf, methodName, currentState, args, constructorArgs,
+    anf, methodName, currentState, args, constructorArgs, inputs,
   ).state;
 }
 
@@ -142,8 +167,9 @@ export function computeNewStateAndDataOutputs(
   currentState: Record<string, unknown>,
   args: Record<string, unknown>,
   constructorArgs: unknown[] = [],
+  inputs?: SimulationInputs,
 ): ExecutionResult {
-  return runMethod(anf, methodName, currentState, args, constructorArgs, null);
+  return runMethod(anf, methodName, currentState, args, constructorArgs, null, inputs);
 }
 
 /**
@@ -180,10 +206,11 @@ export function executeStrict(
   currentState: Record<string, unknown>,
   args: Record<string, unknown>,
   constructorArgs: unknown[] = [],
+  inputs?: SimulationInputs,
 ): ExecutionResult {
   return runMethod(anf, methodName, currentState, args, constructorArgs, {
     methodName,
-  });
+  }, inputs);
 }
 
 /**
@@ -227,12 +254,13 @@ export function executeOnChainAuthoritative(
   args: Record<string, unknown>,
   constructorArgs: unknown[],
   ctx: OnChainCryptoContext,
+  inputs?: SimulationInputs,
 ): ExecutionResult {
   const sighash = normalizeSighash(ctx.sighash);
   return runMethod(anf, methodName, currentState, args, constructorArgs, {
     methodName,
     realCrypto: { sighash },
-  });
+  }, inputs);
 }
 
 interface StrictCtx {
@@ -263,6 +291,7 @@ function runMethod(
   args: Record<string, unknown>,
   constructorArgs: unknown[],
   strict: StrictCtx | null,
+  inputs?: SimulationInputs,
 ): ExecutionResult {
   // Find the method in ANF
   const method = anf.methods.find(
@@ -320,7 +349,7 @@ function runMethod(
   const outputs: OrderedOutputEntry[] = [];
 
   // Walk bindings
-  evalBindings(method.body, env, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict);
+  evalBindings(method.body, env, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, {}, inputs);
 
   return { state: { ...currentState, ...stateDelta }, dataOutputs, rawOutputs, outputs };
 }
@@ -343,10 +372,11 @@ function evalBindings(
   // length of a prior op's result instead of re-minimizing its numeric value.
   // `env` stays pure (decoded values) so state serialization is unaffected.
   scriptBytes: Record<string, number[]> = {},
+  inputs?: SimulationInputs,
 ): void {
   for (const binding of bindings) {
     const val = evalValue(
-      binding.value, env, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, binding.name, scriptBytes,
+      binding.value, env, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, binding.name, scriptBytes, inputs,
     );
     env[binding.name] = val;
   }
@@ -363,6 +393,7 @@ function evalValue(
   strict: StrictCtx | null = null,
   bindingName: string = '<anonymous>',
   scriptBytes: Record<string, number[]> = {},
+  inputs?: SimulationInputs,
 ): unknown {
   switch (value.kind) {
     case 'load_param':
@@ -460,6 +491,7 @@ function evalValue(
         value.func,
         value.args.map((a) => env[a]),
         strict?.realCrypto,
+        inputs,
       );
     }
 
@@ -473,6 +505,7 @@ function evalValue(
         rawOutputs,
         outputs,
         anf,
+        inputs,
       );
 
     case 'if': {
@@ -480,7 +513,7 @@ function evalValue(
       const branch = isTruthy(cond) ? value.then : value.else;
       // Create a child env for the branch
       const childEnv = { ...env };
-      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, scriptBytes);
+      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, scriptBytes, inputs);
       // Copy any new bindings back (the last binding is typically the branch result)
       Object.assign(env, childEnv);
       // Return the last binding's value from the branch
@@ -502,7 +535,7 @@ function evalValue(
       for (let i = 0; i < count; i++) {
         env[iterVar] = start + BigInt(i) * step;
         const loopEnv = { ...env };
-        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, scriptBytes);
+        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, strict, scriptBytes, inputs);
         // Copy loop bindings back
         Object.assign(env, loopEnv);
         if (body.length > 0) {
@@ -860,6 +893,7 @@ function evalCall(
   func: string,
   args: unknown[],
   realCrypto?: { sighash: number[] },
+  inputs?: SimulationInputs,
 ): unknown {
   switch (func) {
     // Crypto — mocked unless real-crypto context is present.
@@ -1008,8 +1042,25 @@ function evalCall(
 
     // Preimage intrinsics — return dummy values in simulation
     case 'extractOutputHash':
-    case 'extractAmount':
       return '00'.repeat(32);
+    // The input amount is NOT a property of a transaction that does not exist
+    // yet: it is the value of the UTXO being spent, which the SDK knows before
+    // it builds anything (it is the `sourceSatoshis` it signs over). Grouped
+    // with `extractOutputHash` above, this arm returned 32 zero bytes, so
+    // `this.addOutput(extractAmount(this.txPreimage), …)` — the natural way to
+    // pin "the continuation carries what it spends" — simulated a 0-satoshi
+    // continuation, and `prepareCall` built exactly that unless the caller
+    // also passed `CallOptions.satoshis`; the covenant's hashOutputs check
+    // then refused the SDK's own transaction. Answer from the spend when the
+    // caller supplies it; keep the historical placeholder when nothing is
+    // known (the runar-rs / runar-py / runar-rb interpreters do the same when
+    // no witness is present).
+    // The value is caller-trusted and unchecked in every mode: nothing here
+    // authenticates the preimage argument (compiled contracts lower
+    // `checkPreimage` to a `check_preimage` node this interpreter answers
+    // `undefined`), so the preimage is never read for its amount.
+    case 'extractAmount':
+      return inputs?.inputSatoshis ?? '00'.repeat(32);
     case 'extractLocktime':
       return 0n;
     // Dummy nVersion. Peers (runar-py/rs/zig/rb/java) already return 1;
@@ -1114,6 +1165,7 @@ function evalMethodCall(
   rawOutputs: RawOutputEntry[],
   outputs: OrderedOutputEntry[],
   anf?: ANFProgram,
+  inputs?: SimulationInputs,
 ): unknown {
   // Private method calls appear in the ANF with their bodies available
   // in anf.methods. Execute the method body to compute its return value.
@@ -1136,8 +1188,11 @@ function evalMethodCall(
       }
 
       // Execute the method body — pass real stateDelta so update_prop
-      // mutations in private methods are captured
-      evalBindings(method.body, methodEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf);
+      // mutations in private methods are captured. `strict` is not threaded
+      // into private bodies (`null` here is the long-standing behaviour, not
+      // a change); `inputs` is, so a helper that reads `extractAmount`
+      // answers the same as its caller.
+      evalBindings(method.body, methodEnv, stateDelta, dataOutputs, rawOutputs, outputs, anf, null, {}, inputs);
 
       // Propagate property changes back to the caller's env
       for (const prop of anf.properties) {

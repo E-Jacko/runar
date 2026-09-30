@@ -415,7 +415,7 @@ The OP_PUSH_TX pattern lets a script verify the transaction it's part of without
 
 ### ANF auto state
 
-When you call a stateful method without supplying `newState`, the SDK runs `computeNewStateAndDataOutputs(artifact.anf, methodName, currentState, args, ctorArgs)` against the contract's compiled ANF IR. This walks the same logic the script executes on chain, computes the resulting state, and (for methods that use `this.addDataOutput(...)`) emits matching data outputs in declaration order. The result is a continuation output whose `OP_HASH256` matches what the script will compute.
+When you call a stateful method without supplying `newState`, the SDK runs `computeNewStateAndDataOutputs(artifact.anf, methodName, currentState, args, ctorArgs, { inputSatoshis })` against the contract's compiled ANF IR, where `inputSatoshis` is the value of the contract UTXO being spent. This walks the same logic the script executes on chain, computes the resulting state, and (for methods that use `this.addDataOutput(...)`) emits matching data outputs in declaration order. The result is a continuation output whose `OP_HASH256` matches what the script will compute. Because the spent value is supplied, a method that pins its continuation with `this.addOutput(extractAmount(this.txPreimage), …)` simulates — and builds — a continuation carrying exactly what it spends, with no `CallOptions.satoshis` needed.
 
 If you supply `newState` explicitly, the SDK trusts you. If your value is wrong, the on-chain script rejects the transaction and `provider.broadcast(...)` throws.
 
@@ -1278,10 +1278,18 @@ computeNewState(
   currentState: Record<string, unknown>,
   args: Record<string, unknown>,
   constructorArgs?: unknown[],
+  inputs?: SimulationInputs,
 ): Record<string, unknown>
+
+interface SimulationInputs {
+  /** Satoshis locked in the UTXO being spent — what `extractAmount(preimage)` reads on-chain. */
+  inputSatoshis?: bigint;
+}
 ```
 
-Walks the artifact's ANF IR for `methodName`, mutating a virtual state environment as the on-chain script would, and returns the resulting state. Skips on-chain-only operations (`check_preimage`, `check_sig`, `add_output`, etc.). Used internally by `call()` to auto-compute `newState`.
+Walks the artifact's ANF IR for `methodName`, mutating a virtual state environment as the on-chain script would, and returns the resulting state. On-chain-only checks (`check_preimage`, `check_sig`, `assert`) are skipped; output-producing nodes (`add_output`, `add_data_output`, `add_raw_output`) are not executed as script but their satoshis and payloads are recorded, in source order, so `call()` can build matching outputs. Used internally by `call()` to auto-compute `newState`.
+
+`SimulationInputs` carries the facts about the spend that are known before the transaction exists. `extractAmount(preimage)` answers from `inputSatoshis`; without it the interpreter returns a 32-zero-byte placeholder (which `add_output` records as `0` satoshis), so pass the spent UTXO's value whenever the method reads the input amount. `computeNewStateAndDataOutputs`, `executeStrict` and `executeOnChainAuthoritative` take the same trailing parameter, so all three modes evaluate `extractAmount` identically, including inside private helpers. The value is caller-trusted and unchecked: no mode verifies it against the preimage argument. The other preimage intrinsics keep their placeholders — both the ones that are properties of the not-yet-built transaction (`extractOutputHash`, `extractHashPrevouts`, `extractHashSequence`, `extractLocktime`, `extractSequence`, `extractVersion`, `extractSigHashType`) and, for now, the two that come from the spent UTXO like the amount does (`extractOutpoint`, `extractScriptCode`).
 
 ### Code generation
 

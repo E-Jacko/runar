@@ -130,7 +130,7 @@ export {
   executeOnChainAuthoritative,
   AssertionFailureError,
 } from './anf-interpreter.js';
-export type { DataOutputEntry, RawOutputEntry, ExecutionResult, OnChainCryptoContext } from './anf-interpreter.js';
+export type { DataOutputEntry, RawOutputEntry, ExecutionResult, OnChainCryptoContext, SimulationInputs } from './anf-interpreter.js';
 
 // Re-export artifact types from runar-ir-schema for convenience
 export type {

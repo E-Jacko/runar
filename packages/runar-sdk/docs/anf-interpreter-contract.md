@@ -68,6 +68,20 @@ Every SDK ships the same three execution modes:
   (drivers invoked with `--mode=on-chain`; sighash supplied via the
   fixture's `sighash` field).
 
+In the TS SDK all three entry points take an optional trailing
+`SimulationInputs { inputSatoshis?: bigint }` — facts about the spend that
+are known off-chain before the transaction exists. `extractAmount` answers
+from `inputSatoshis` in every mode, including inside private helpers, so a
+method that asserts on or branches on it evaluates identically in lenient,
+strict and on-chain authoritative mode; `RunarContract.prepareCall`
+supplies the spent UTXO's value. The value is **caller-trusted and
+unchecked**: no mode verifies it against the preimage argument (compiled
+contracts lower `checkPreimage` to a `check_preimage` node the interpreter
+answers `undefined`, so nothing authenticates the preimage). With no
+`SimulationInputs` every mode keeps the historical 32-zero-byte
+placeholder, so callers and fixtures that never pass one see exactly the
+values they always saw.
+
 ### `add_raw_output` simulation — supported (pass-through only)
 
 `this.addRawOutput(satoshis, scriptBytes)` emits a Bitcoin output whose
@@ -115,8 +129,21 @@ locking script, only the on-chain VM catches it.
   call by accident without supplying the cryptographic inputs the
   verification needs. Use this to validate the exact transaction the
   caller intends to broadcast — a passing run guarantees the on-chain VM
-  will accept the call (modulo VM-only intrinsics like
-  `extractAmount` / `extractOutputHash`, which still return placeholders).
+  will accept the call, with two provisos. First, the preimage intrinsics
+  other than `extractAmount` still return placeholders rather than the
+  transaction's real values (TS `evalCall`): `extractOutputHash`,
+  `extractHashPrevouts`, `extractHashSequence` (32 zero bytes),
+  `extractOutpoint` (36 zero bytes), `extractScriptCode` (empty),
+  `extractLocktime` (0), `extractSequence` (0xfffffffe), `extractVersion`
+  (1) and `extractSigHashType` (undefined) — an assert that reads one of
+  them is evaluated against the placeholder, not the transaction; and
+  `extractInputIndex` / `extractOutputs` are not modelled at all, so a
+  method that reads either throws (fail-closed, A-3). Second,
+  `extractAmount` answers from the trailing `SimulationInputs.inputSatoshis`
+  argument when the caller supplies it, otherwise its placeholder; the
+  value is caller-trusted and unchecked (nothing authenticates the preimage
+  argument), so the guarantee assumes a supplied `inputSatoshis` is the
+  spent UTXO's real value.
 
 ---
 

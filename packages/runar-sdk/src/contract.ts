@@ -1316,10 +1316,29 @@ export class RunarContract {
       const namedArgs = buildNamedArgs(userParams, resolvedArgs);
       const flatState = flattenFixedArrayState(this._state, this.artifact.stateFields);
       const flatCtorArgs = flattenFixedArrayArgs(this.constructorArgs, this.artifact.abi.constructor.params);
+      // The spent UTXO's value is what `extractAmount(preimage)` reads
+      // on-chain; a method that pins its continuation to it must simulate
+      // the same number, or the continuation is built at 0. Read it from the
+      // `contractUtxo` snapshot the rest of this call is built from. When the
+      // caller supplies both `newState` and `satoshis` the simulation's
+      // amount and state are overridden anyway, so the value is not needed
+      // and the interpreter runs exactly as it always has (placeholder).
+      // Validate before the try below so a malformed value reports as
+      // itself rather than as an interpreter failure.
+      const needsInputSatoshis = !(options?.newState && options?.satoshis !== undefined);
+      if (needsInputSatoshis && (!Number.isSafeInteger(contractUtxo.satoshis) || contractUtxo.satoshis < 0)) {
+        throw new Error(
+          `RunarContract.call('${methodName}'): the contract UTXO ` +
+            `${contractUtxo.txid}:${contractUtxo.outputIndex} has a satoshi value that is not ` +
+            `a non-negative safe integer (${String(contractUtxo.satoshis)}).`,
+        );
+      }
+      const inputs = needsInputSatoshis ? { inputSatoshis: BigInt(contractUtxo.satoshis) } : undefined;
       try {
         const { state: computed, dataOutputs: anfDataOutputs, outputs: anfOutputs } = computeNewStateAndDataOutputs(
           this.artifact.anf, methodName, flatState, namedArgs,
           flatCtorArgs,
+          inputs,
         );
         autoComputedState = computed;
         autoFlatState = flatState;
@@ -1371,7 +1390,7 @@ export class RunarContract {
         anfOrderedOutputs.length === 1 && anfStateEntries.length === 1
           ? Number(anfStateEntries[0]!.satoshis)
           : undefined;
-      newSatoshis = options?.satoshis ?? singleExplicitStateSats ?? this.currentUtxo.satoshis;
+      newSatoshis = options?.satoshis ?? singleExplicitStateSats ?? contractUtxo.satoshis;
       if (options?.newState) {
         // Explicit newState takes priority (backward compat)
         this._state = { ...this._state, ...options.newState };
@@ -1426,7 +1445,7 @@ export class RunarContract {
     const changeScript = buildP2PKHScript(changeAddress);
     const allFundingUtxos = await provider.getUtxos(address);
     const candidateFundingUtxos = allFundingUtxos.filter(
-      (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
+      (u) => !(u.txid === contractUtxo.txid && u.outputIndex === contractUtxo.outputIndex),
     );
 
     // Resolve per-input args for additional contract inputs. Hoisted ABOVE the
@@ -1470,7 +1489,7 @@ export class RunarContract {
         : (newSatoshis ?? 0))
       + resolvedDataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
     const contractInputSats =
-      this.currentUtxo.satoshis
+      contractUtxo.satoshis
       + extraContractUtxos.reduce((sum, u) => sum + u.satoshis, 0);
     const fundingTarget = Math.max(0, contractOutputSats - contractInputSats);
     // Fee sizing hint for selectUtxos: the continuation script length (falls
@@ -1559,7 +1578,7 @@ export class RunarContract {
     // funding coin-selection, so their byte sizes feed the funding fee estimate.)
 
     let { tx, inputCount, changeAmount } = buildCallTransaction(
-      this.currentUtxo,
+      contractUtxo,
       unlockingScript,
       newLockingScript,
       newSatoshis,
@@ -1643,7 +1662,7 @@ export class RunarContract {
         }
         let newAmountHex = '';
         if (methodNeedsNewAmount) {
-          newAmountHex = encodeArg(BigInt(newSatoshis ?? this.currentUtxo!.satoshis));
+          newAmountHex = encodeArg(BigInt(newSatoshis ?? contractUtxo.satoshis));
         }
         const unlock = this.buildStatefulPrefix(opSig, methodUsesCodePart) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + witnessHex + methodSelectorHex;
         return { unlock, opSig, preimage };
@@ -1681,7 +1700,7 @@ export class RunarContract {
       // loop is added here; see the linked test for the invariant this bound
       // relies on.
       ({ tx, inputCount, changeAmount } = buildCallTransaction(
-        this.currentUtxo,
+        contractUtxo,
         input0Unlock,
         newLockingScript,
         newSatoshis,
@@ -1803,7 +1822,7 @@ export class RunarContract {
       _changePKHHex: changePKHHex,
       _changeAmount: changeAmount,
       _methodNeedsNewAmount: methodNeedsNewAmount,
-      _newAmount: newSatoshis ?? this.currentUtxo.satoshis,
+      _newAmount: newSatoshis ?? contractUtxo.satoshis,
       _preimageIndex: preimageIndex,
       _contractUtxo: contractUtxo,
       _newLockingScript: newLockingScript ?? '',
